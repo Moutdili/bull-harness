@@ -1,0 +1,25 @@
+# Exemple de fichier de scope (schéma v1). Programme fictif, domaines réservés (RFC 2606 / 5737).
+schema: 1
+program: demo
+platform: local
+source: null
+synced_at: null
+automation_allowed: true
+max_rps: 5
+required_headers:
+  X-Bug-Bounty: mio
+user_agent: "bull-harness (contact: see program profile)"
+in_scope:
+  - "*.example.com"          # sous-domaines, PAS l'apex
+  - example.com              # apex explicite
+  - "https://api.example.org/v2/"
+  - 192.0.2.0/24
+  - {type: repo, value: "github.com/example/project"}
+out_of_scope:
+  - admin.example.com
+  - "*.corp.example.com"
+  - "https://www.example.com/checkout/"
+  - 192.0.2.66
+forbidden_vulns: [dos, social-engineering, physical]
+identities:
+  - {name: user-a, secret_ref: "secrets/demo/user-a"}
