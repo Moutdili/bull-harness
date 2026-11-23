@@ -32,7 +32,8 @@ def _fmt(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
-def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, max_turns: int) -> None:
+def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, max_turns: int,
+         effort: str | None = None) -> None:
     board = Board()
     progs = [ProgState(f, load_scope(f).program) for f in scope_files]
     deadline = time.time() + hours * 3600
@@ -50,7 +51,7 @@ def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, m
         extra = "" if resume else "Fresh session: read the HANDOFF facts on the board first."
         p.last_run = time.time()
         res: SegmentResult = run_segment(p.file, model=model, max_turns=max_turns, minutes=minutes,
-                                         resume=resume, board=board, extra_task=extra)
+                                         resume=resume, board=board, extra_task=extra, effort=effort)
         p.resumes = p.resumes + 1 if resume else 0
         if res.status == "quota":
             print(f"quota reached; sleeping {QUOTA_SLEEP_S // 60} min")
