@@ -202,7 +202,7 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
 
     session = board.last_session(prog) if resume else None
     task = build_task(board.frontier(prog), first=session is None and not board.rows(
-        "SELECT 1 FROM facts WHERE program=? LIMIT 1", prog))
+        "SELECT 1 FROM facts WHERE program=? LIMIT 1", prog), max_turns=max_turns)
     if extra_task:
         task += "\n\nOperator instruction for this segment: " + extra_task
     run_id = board.run_start(prog, model)
@@ -216,6 +216,8 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
            AGENT, "claude", "-p", task, "--output-format", "stream-json", "--verbose",
            "--model", model, "--max-turns", str(max_turns),
            "--permission-mode", "bypassPermissions",
+           # token economy: every turn resends tool schemas + command listings; keep only what the hunt uses
+           "--tools", os.environ.get("BH_TOOLS", "Bash,Read"), "--disable-slash-commands",
            "--settings", "/opt/bh/hooks/settings.json",
            "--append-system-prompt-file", f"/work/{prog}/.bh/system.md"]
     if effort:

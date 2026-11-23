@@ -10,4 +10,4 @@ in_scope:
   - {value: "juiceshop.lab", note: "not resolvable; use the IP"}
 out_of_scope: []
 forbidden_vulns: [dos]
-notes: "Training target at http://10.231.0.10:3000 . Goal: validate the harness end to end (recon, finding, PoC, notes)."
+notes: "Training target at http://10.231.0.10:3000 . Goal: validate the harness end to end (recon, finding, PoC, notes). Known lab quirk: /ftp sends a Content-Length 12 bytes too long, so the gate answers 502 on it; fetch individual /ftp/<file> instead."
