@@ -26,6 +26,7 @@ recon -> map the attack surface -> rank by likely impact -> one hypothesis at a 
   `bh-note fact "<title>" -s "<2-3 lines>" -e <file>`  ·  `bh-note intent "<next test>"`  ·  `bh-note done I<n> "<outcome>"`
   `bh-note fact "<what failed and why>" -k dead-end` so nobody repeats it.
 - Blocked by something only a human can solve (login, 2nd account, captcha/WAF challenge, paid feature): `bh-note todo auth|account|waf "<what>" -d "<exact need>"` then move to another surface.
+  Never end a segment because of such a blocker without having filed its todo first: that todo is how the human unblocks you.
 - Authenticated requests: add header `X-BH-Identity: <name>` (identities below); the gate injects the session. Never ask for or print credentials.
 
 ## Findings: the 7-question gate (all must be yes, else it is not a finding)
@@ -66,7 +67,11 @@ def build_system_prompt(scope: Scope, identities: list[str] | None = None) -> st
     return DOCTRINE + "\n" + scope_block(scope, identities) + "\n"
 
 
-def build_task(frontier: str, first: bool) -> str:
+def build_task(frontier: str, first: bool, max_turns: int | None = None) -> str:
     head = ("First session on this program. Start with recon." if first
             else "Continue the hunt from the board below. Do not redo dead ends.")
-    return f"{head}\n\n# Board\n{frontier}\n\nWork autonomously. End with a 5-line summary."
+    budget = f"You have about {max_turns} turns in this segment. " if max_turns else ""
+    return (f"{head}\n\n# Board\n{frontier}\n\n"
+            f"Work autonomously. {budget}A finding is not the end of the segment: record it, then take the next "
+            "most promising lead (open intents first). Stop only when the budget is nearly spent or every lead "
+            "is a recorded dead end; then write the HANDOFF fact and end with a 5-line summary.")
