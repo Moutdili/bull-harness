@@ -41,7 +41,7 @@ Write a handoff for the next session: `bh-note fact "HANDOFF: <state>" -k handof
 """
 
 
-def scope_block(scope: Scope) -> str:
+def scope_block(scope: Scope, identities: list[str] | None = None) -> str:
     lines = [f"## Program: {scope.platform}/{scope.program}"]
     lines.append("In scope:")
     lines += [f"- {r.value}" + (f"  ({r.note})" if r.note else "") for r in scope.in_scope]
@@ -52,8 +52,9 @@ def scope_block(scope: Scope) -> str:
         lines.append("Excluded vulnerability types: " + ", ".join(scope.forbidden_vulns))
     if scope.max_rps:
         lines.append(f"Rate limit: {scope.max_rps:g} req/s (enforced by the gate)")
-    if scope.identities:
-        lines.append("Identities: " + ", ".join(i["name"] for i in scope.identities))
+    names = sorted({i["name"] for i in scope.identities} | set(identities or []))
+    if names:
+        lines.append("Identities (send header X-BH-Identity: <name>): " + ", ".join(names))
     else:
         lines.append("Identities: none yet (unauthenticated testing only; ask via a todo if needed)")
     if scope.notes:
@@ -61,8 +62,8 @@ def scope_block(scope: Scope) -> str:
     return "\n".join(lines)
 
 
-def build_system_prompt(scope: Scope) -> str:
-    return DOCTRINE + "\n" + scope_block(scope) + "\n"
+def build_system_prompt(scope: Scope, identities: list[str] | None = None) -> str:
+    return DOCTRINE + "\n" + scope_block(scope, identities) + "\n"
 
 
 def build_task(frontier: str, first: bool) -> str:
