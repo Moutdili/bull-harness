@@ -104,7 +104,7 @@ def _cmd_status(args) -> int:
 def _cmd_run(args) -> int:
     from bh.runner.run import run_segment
     res = run_segment(Path(args.scope), model=args.model, max_turns=args.max_turns, minutes=args.minutes,
-                      resume=not args.fresh, extra_task=args.task or "")
+                      resume=not args.fresh, extra_task=args.task or "", effort=args.effort)
     if res.text:
         print("\n" + res.text.strip())
     return 0 if res.status in ("ok", "max_turns", "timeout") else 1
@@ -113,7 +113,7 @@ def _cmd_run(args) -> int:
 def _cmd_hunt(args) -> int:
     from bh.runner.supervisor import hunt
     hunt([Path(f) for f in args.scopes], hours=args.hours, minutes=args.minutes, model=args.model,
-         max_turns=args.max_turns)
+         max_turns=args.max_turns, effort=args.effort)
     return 0
 
 
@@ -266,6 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--model", default=os.environ.get("BH_MODEL", "sonnet"))
         sp.add_argument("--max-turns", type=int, default=60)
         sp.add_argument("--minutes", type=float, default=30)
+        sp.add_argument("--effort", default=os.environ.get("BH_EFFORT"),
+                        choices=["low", "medium", "high", "xhigh", "max"])
 
     r = sub.add_parser("run", help="one agent segment on one program")
     r.add_argument("scope"); run_opts(r)

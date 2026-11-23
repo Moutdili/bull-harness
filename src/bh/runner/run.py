@@ -54,6 +54,15 @@ def container_running(name: str) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
+def push_file(container_path: str, text: str) -> None:
+    """Write a file inside the agent container as `hunter` (creates parent dirs)."""
+    r = subprocess.run(["podman", "exec", "-i", "--user", "hunter", AGENT, "sh", "-c",
+                        'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", container_path],
+                       input=text, text=True, capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot write {container_path} in {AGENT}: {r.stderr.strip()}")
+
+
 def activate_scope(scope_file: Path) -> None:
     """Atomically make this scope the gate's active scope (the gate hot-reloads on mtime)."""
     dst = home() / "var" / "state" / "active-scope.yaml"
@@ -165,7 +174,7 @@ def _short(obj, n=140) -> str:
 
 def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60, minutes: float = 30,
                 resume: bool = True, board: Board | None = None, quiet: bool = False,
-                extra_task: str = "") -> SegmentResult:
+                extra_task: str = "", effort: str | None = None) -> SegmentResult:
     scope: Scope = load_scope(scope_file)
     if scope.automation_allowed is False:
         raise SystemExit(f"{scope.program}: automation_allowed is false — refusing to run an agent on it")
@@ -176,15 +185,20 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
     prog = scope.program
     activate_scope(scope_file)
 
-    work = home() / "var" / "work" / prog
-    bh_dir = work / ".bh"
-    bh_dir.mkdir(parents=True, exist_ok=True)
-    (bh_dir / "frontier.md").write_text(board.frontier(prog))
-    board.export_facts(prog, bh_dir / "facts.json")
+    # /work belongs to `hunter` inside the container, i.e. a subuid on the host (rootless podman):
+    # the host cannot write there. Stage on the host, push through the container as hunter.
+    # The host only reads back (notes.jsonl), which the default 0644/0755 modes allow.
+    bh_dir = home() / "var" / "work" / prog / ".bh"
+    stage = home() / "var" / "stage" / prog
+    stage.mkdir(parents=True, exist_ok=True)
+    board.export_facts(prog, stage / "facts.json")
     ident_dir = home() / "var" / "state" / "identities" / prog
     idents = sorted(p.stem for p in ident_dir.glob("*.json")) if ident_dir.is_dir() else []
-    (bh_dir / "system.md").write_text(build_system_prompt(scope, idents))
-    shutil.copyfile(scope_file, bh_dir / "scope.yaml")
+    cbh = f"/work/{prog}/.bh"
+    push_file(f"{cbh}/frontier.md", board.frontier(prog))
+    push_file(f"{cbh}/facts.json", (stage / "facts.json").read_text())
+    push_file(f"{cbh}/system.md", build_system_prompt(scope, idents))
+    push_file(f"{cbh}/scope.yaml", Path(scope_file).read_text())
 
     session = board.last_session(prog) if resume else None
     task = build_task(board.frontier(prog), first=session is None and not board.rows(
@@ -204,12 +218,14 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
            "--permission-mode", "bypassPermissions",
            "--settings", "/opt/bh/hooks/settings.json",
            "--append-system-prompt-file", f"/work/{prog}/.bh/system.md"]
+    if effort:
+        cmd += ["--effort", effort]
     if session:
         cmd += ["--resume", session]
 
     res = SegmentResult(program=prog, run_id=run_id, status="error", session_id=session)
     say = (lambda *_: None) if quiet else (lambda m: print(m, flush=True))
-    say(f"▶ run {run_id} · {scope.platform}/{prog} · model={model} · max {max_turns} turns / {minutes:g} min"
+    say(f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · max {max_turns} turns / {minutes:g} min"
         + (f" · resume {session[:8]}" if session else ""))
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -226,7 +242,7 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
     timer.start()
     result_msg: dict | None = None
     try:
-        with open(stream_log, "w") as log:
+        with open(stream_log, "w", buffering=1) as log:  # line-buffered: the UI tails this file live
             for line in proc.stdout:
                 log.write(line)
                 try:

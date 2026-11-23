@@ -28,6 +28,12 @@ from bh.board import Board
 
 STATIC = Path(__file__).parent / "static"
 COOKIE = "bh_ui"
+# No inline style/script: the CSP below forbids them. GET form -> existing /login?token= handler.
+LOGIN_PAGE = (b'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+              b'<title>bull-harness login</title><link rel="stylesheet" href="/static/app.css">'
+              b'<form action="/login" method="get"><p>bull-harness - paste secrets/ui.token</p>'
+              b'<input name="token" type="password" autocomplete="current-password" autofocus required> '
+              b'<button type="submit">login</button></form>')
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
@@ -174,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Location": "/"})
             return self._send(403, b"bad token", "text/plain")
         if not self._authed():
-            return self._send(401, b"login: /login?token=<secrets/ui.token>", "text/plain")
+            return self._send(401, LOGIN_PAGE, "text/html; charset=utf-8")
         if u.path in ("/", "/index.html"):
             return self._send(200, (STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
         if u.path in ("/app.js", "/app.css"):
