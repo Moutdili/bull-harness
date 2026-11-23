@@ -4,6 +4,7 @@ has been resumed too many times. It never decides what to test — the agent doe
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,9 @@ from bh.scope import load_scope
 STAGNANT_LIMIT = 2  # segments without a new fact/finding before cooldown
 COOLDOWN_S = 2 * 3600
 QUOTA_SLEEP_S = 30 * 60
-MAX_RESUMES = 3  # then fresh session that reads the HANDOFF fact
+# Resuming re-reads the whole session history every turn: lab runs 5-7 cost $0.13-0.20 for 3-10 turns,
+# fresh sessions from the board + HANDOFF $0.03-0.04 for similar output. Default: always fresh.
+MAX_RESUMES = int(os.environ.get("BH_MAX_RESUMES", "0"))
 
 
 @dataclass
@@ -57,7 +60,7 @@ def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, m
             print(f"quota reached; sleeping {QUOTA_SLEEP_S // 60} min")
             time.sleep(QUOTA_SLEEP_S)
             continue
-        if res.new_facts + res.new_findings == 0:
+        if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1
         else:
             p.stagnant = 0

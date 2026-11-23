@@ -11,7 +11,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -46,6 +45,7 @@ class SegmentResult:
     tool_calls: int = 0
     text: str = ""
     usage: dict = field(default_factory=dict)
+    progress: int = 0  # new findings + new facts that are not bookkeeping (handoff, dead-end, blocked)
 
 
 def container_running(name: str) -> bool:
@@ -61,6 +61,16 @@ def push_file(container_path: str, text: str) -> None:
                        input=text, text=True, capture_output=True)
     if r.returncode != 0:
         raise SystemExit(f"cannot write {container_path} in {AGENT}: {r.stderr.strip()}")
+
+
+def kill_agent(program: str, grace: float = 8.0) -> None:
+    """Stop the claude process of this program inside the container (pid written by the launch wrapper).
+    `podman exec` does not forward signals, so killing the host-side process alone leaves an orphan."""
+    pidfile = f"/work/{program}/.bh/agent.pid"
+    script = (f'p=$(cat {pidfile} 2>/dev/null) || exit 0; kill -0 "$p" 2>/dev/null || exit 0; '
+              f'kill -INT "$p"; i=0; while kill -0 "$p" 2>/dev/null && [ $i -lt {int(grace * 2)} ]; do sleep 0.5; i=$((i+1)); done; '
+              f'pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; rm -f {pidfile}; true')
+    subprocess.run(["podman", "exec", AGENT, "sh", "-c", script], capture_output=True, timeout=grace + 20)
 
 
 def activate_scope(scope_file: Path) -> None:
@@ -103,14 +113,19 @@ def _read_new_lines(board: Board, path: Path, key: str) -> list[dict]:
     return out
 
 
-def ingest_notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple[int, int, int]:
-    facts = findings = todos = 0
+BOOKKEEPING_KINDS = ("handoff", "dead-end", "blocked")
+
+
+def ingest_notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple[int, int, int, int]:
+    """Returns (facts, findings, todos, progress). A segment that only writes a HANDOFF is stagnant."""
+    facts = findings = todos = progress = 0
     for n in _read_new_lines(board, bh_dir / "notes.jsonl", f"notes:{program}"):
         op = n.get("op")
         if op == "fact":
             board.add_fact(program, n.get("title", ""), n.get("summary", ""), n.get("evidence", ""),
                            kind=n.get("kind", "fact"), run_id=run_id)
             facts += 1
+            progress += n.get("kind", "fact") not in BOOKKEEPING_KINDS
         elif op == "intent":
             board.add_intent(program, n.get("title", ""), run_id=run_id)
         elif op == "done":
@@ -122,18 +137,24 @@ def ingest_notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple
                               **{k: n.get(k) for k in ("severity", "vuln_class", "url", "summary", "poc",
                                                        "evidence", "not_proven")})
             findings += 1
+            progress += 1
         elif op == "todo":
             if board.add_todo(n.get("kind", "other"), n.get("title", ""), n.get("detail", ""), program=program,
                               dedup=f"{program}:{n.get('kind')}:{n.get('title', '')[:120]}"):
                 todos += 1
-    return facts, findings, todos
+    return facts, findings, todos, progress
 
 
-def ingest_gate_events(board: Board, program: str, run_id: int) -> tuple[int, int]:
-    """Turn gate events into one summary fact + human todos (WAF, repeated 401)."""
+def ingest_gate_events(board: Board, program: str, run_id: int,
+                       identities: list[str] | None = None) -> tuple[int, int]:
+    """Turn gate events into one summary fact + human todos (WAF, repeated 401).
+
+    401 sent WITH an identity -> that identity's session is probably expired (todo per identity).
+    401 sent WITHOUT one -> todo only when the program has no identity at all: an agent probing
+    unauthenticated access control on purpose must not page the human."""
     events = _read_new_lines(board, home() / "var" / "state" / "events.jsonl", "gate-events")
     blocked: dict[str, int] = {}
-    auth: dict[str, int] = {}
+    auth: dict[tuple[str, str | None], int] = {}
     todos = 0
     for e in events:
         if e.get("program") not in (program, "-"):
@@ -148,17 +169,27 @@ def ingest_gate_events(board: Board, program: str, run_id: int) -> tuple[int, in
                               program=program, dedup=f"{program}:waf:{e.get('host')}"):
                 todos += 1
         elif kind == "auth":
-            auth[e.get("host", "?")] = auth.get(e.get("host", "?"), 0) + 1
+            key = (e.get("host", "?"), e.get("identity"))
+            auth[key] = auth.get(key, 0) + 1
         elif kind == "identity-missing":
             if board.add_todo("account", f"identity '{e.get('identity')}' requested but not configured",
                               f"create var/state/identities/{program}/{e.get('identity')}.json",
                               program=program, dedup=f"{program}:identity:{e.get('identity')}"):
                 todos += 1
-    for host, n in auth.items():
-        if n >= 3 and board.add_todo("auth", f"{host} answers 401 ({n}x): session needed",
-                                     "log in through the gate capture flow and store an identity",
-                                     program=program, dedup=f"{program}:auth:{host}"):
-            todos += 1
+    for (host, ident), n in auth.items():
+        if n < 3:
+            continue
+        if ident:
+            added = board.add_todo("auth", f"identity '{ident}' gets 401 on {host} ({n}x): session expired?",
+                                   f"refresh var/state/identities/{program}/{ident}.json",
+                                   program=program, dedup=f"{program}:auth:{host}:{ident}:{run_id}")
+        elif not identities:
+            added = board.add_todo("auth", f"{host} answers 401 ({n}x): session needed",
+                                   "log in through the gate capture flow and store an identity",
+                                   program=program, dedup=f"{program}:auth:{host}")
+        else:
+            added = None
+        todos += bool(added)
     if blocked:
         top = sorted(blocked.items(), key=lambda kv: -kv[1])[:8]
         board.add_fact(program, f"gate denied {sum(blocked.values())} requests",
@@ -213,7 +244,7 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
     cmd = ["podman", "exec", "-i", "--user", "hunter", "-w", f"/work/{prog}",
            "-e", f"BH_DIR=/work/{prog}/.bh", "-e", f"BH_PROGRAM={prog}",
            "-e", f"BH_RPS={scope.max_rps or 5:g}", "-e", "HOME=/home/hunter",
-           AGENT, "claude", "-p", task, "--output-format", "stream-json", "--verbose",
+           AGENT, "sh", "-c", 'echo $$ > "$BH_DIR/agent.pid"; exec claude "$@"', "sh", "-p", task, "--output-format", "stream-json", "--verbose",
            "--model", model, "--max-turns", str(max_turns),
            "--permission-mode", "bypassPermissions",
            # token economy: every turn resends tool schemas + command listings; keep only what the hunt uses
@@ -235,8 +266,8 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
 
     def _timeout():
         timed_out.set()
-        proc.send_signal(signal.SIGINT)
-        time.sleep(10)
+        kill_agent(prog)
+        time.sleep(5)
         if proc.poll() is None:
             proc.kill()
 
@@ -267,6 +298,16 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
                             say(f"  ⚙ {c.get('name')}: {_short(inp.get('command') or inp.get('description') or inp)}")
                 elif t == "result":
                     result_msg = ev
+    except BaseException:  # Ctrl-C / SIGTERM (bh hunt stopped): kill the agent, keep what it already wrote
+        timer.cancel()
+        kill_agent(prog)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        ingest_notes(board, prog, run_id, bh_dir)
+        board.run_end(run_id, status="stopped", session_id=res.session_id, note="stopped by operator")
+        say(f"■ run {run_id} stopped by operator (agent killed in {AGENT})")
+        raise
     finally:
         timer.cancel()
         proc.wait()
@@ -292,8 +333,8 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
         if res.status != "ok":
             res.status = "quota"
 
-    res.new_facts, res.new_findings, res.new_todos = ingest_notes(board, prog, run_id, bh_dir)
-    _, gate_todos = ingest_gate_events(board, prog, run_id)
+    res.new_facts, res.new_findings, res.new_todos, res.progress = ingest_notes(board, prog, run_id, bh_dir)
+    _, gate_todos = ingest_gate_events(board, prog, run_id, idents)
     res.new_todos += gate_todos
     if res.status == "refusal":
         board.add_todo("refusal", f"model refused during run {run_id}", f"see {stream_log}", program=prog,
@@ -305,7 +346,7 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
                   input_tokens=u.get("input_tokens"), output_tokens=u.get("output_tokens"),
                   cache_read=u.get("cache_read_input_tokens"), note=_short(res.text or err, 500))
     say(f"■ run {run_id} {res.status} · {res.turns} turns · {res.tool_calls} tools · "
-        f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_todos} todos"
+        f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_todos} todos (progress {res.progress})"
         + (f" · ${res.cost_usd:.2f} eq." if res.cost_usd else ""))
     if res.status == "error" and err.strip():
         say("  stderr: " + _short(err, 400))

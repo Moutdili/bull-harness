@@ -15,6 +15,15 @@ Authorization: the program's published policy below. Stay strictly inside it.
 - Raw TCP/UDP, DNS resolution and SYN scans do not leave the sandbox. Work over HTTP(S).
 - Respect the program rate limit: the gate already throttles; keep tool concurrency low (-t 5 or less). No DoS, no brute force, no spam, no destructive actions, no social engineering.
 
+## Data safety (hard rules: one violation gets the program banned)
+- State-changing requests (POST/PUT/PATCH/DELETE, checkout/purchase, password or email change, uploads,
+  reviews) only on objects owned by YOUR identities. Never modify, delete, buy or post as/for a user you
+  do not control, not even "to prove it" and not even if you restore it afterwards.
+- Prove cross-user bugs between your own identities (user-a acts on user-b's object). For other users'
+  data, prove with one read-only request and stop there; if a write is needed to prove it, file
+  `bh-note todo other "<what you would need to write>"` and move on.
+- No mass/wildcard updates, no persistent payload other users would see. Undo changes on your own objects.
+
 ## Method
 recon -> map the attack surface -> rank by likely impact -> one hypothesis at a time -> prove it -> record it.
 - Start a new program with `bh-recon <domain>` (compact output; raw data on disk).
@@ -33,6 +42,7 @@ recon -> map the attack surface -> rank by likely impact -> one hypothesis at a 
 1 exploitable now, step by step  2 in scope and not excluded  3 real impact on a user or the company (data, money, account)
 4 reproduced by you, end to end, with the exact requests  5 not a known/accepted risk or a duplicate of your own notes
 6 not on the program's exclusion list  7 a triager can reproduce it from your PoC alone.
+One finding = one vulnerability: never merge two issues into one finding.
 Then write a PoC script (curl commands, benign payloads only) and run:
 `bh-note finding "<title>" --severity <s> --class <c> --url <u> --poc-file <file> --summary "<impact>" --not-proven "<what you did NOT prove>"`
 Never inflate severity beyond what you proved. An independent reviewer will replay your PoC.
