@@ -1,0 +1,80 @@
+# bull-harness runtime. Podman rootless + podman-compose (docker compose compatible).
+#   sandbox : internal network, NO route out. agent + gate.
+#   egress  : normal network. gate only.
+#   lab     : internal network for local practice targets (profile "lab"). gate only.
+# The gate is therefore the only path from the agent to anything.
+name: bh
+
+networks:
+  sandbox:
+    internal: true
+  egress: {}
+  lab:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.231.0.0/24
+
+services:
+  gate:
+    build:
+      context: ./gate
+      dockerfile: Containerfile
+    image: localhost/bh-gate:dev
+    container_name: bh-gate
+    command:
+      - mitmdump
+      - --listen-port=8080
+      - --set=bh_state=/state
+      - --set=flow_detail=0
+      - --set=ignore_hosts=^api\.anthropic\.com:443$|^statsig\.anthropic\.com:443$|^console\.anthropic\.com:443$|^claude\.ai:443$|^platform\.claude\.com:443$
+      - -s
+      - /opt/bh/src/bh/gate/addon.py
+    environment:
+      PYTHONPATH: /opt/bh/src
+      BH_CA_PUB: /gate-ca
+    volumes:
+      - ../src:/opt/bh/src:ro,z
+      - ../var/gate/conf:/home/mitmproxy/.mitmproxy:Z
+      - ../var/state:/state:z
+      - ../var/gate-ca:/gate-ca:z
+    networks: [sandbox, egress, lab]
+    restart: unless-stopped
+
+  agent:
+    image: localhost/bh-agent:dev
+    container_name: bh-agent
+    depends_on: [gate]
+    env_file:
+      - ../secrets/agent.env
+    environment:
+      HTTP_PROXY: http://gate:8080
+      HTTPS_PROXY: http://gate:8080
+      http_proxy: http://gate:8080
+      https_proxy: http://gate:8080
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      DISABLE_AUTOUPDATER: "1"
+      BH_GATE: http://gate:8080
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+      - ../var/work:/work:z
+      - ./agent/bin:/opt/bh/bin:ro,z
+      - ./agent/hooks:/opt/bh/hooks:ro,z
+    networks: [sandbox]
+    restart: unless-stopped
+
+  # Local practice target: `podman-compose -f container/compose.yaml --profile lab up -d juiceshop`
+  juiceshop:
+    image: docker.io/bkimminich/juice-shop:latest
+    container_name: bh-lab-juiceshop
+    profiles: [lab]
+    networks:
+      lab:
+        ipv4_address: 10.231.0.10
+    restart: unless-stopped
