@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# bh-recon <domain> — builtin: passive subdomains + live HTTP probe, through the gate.
+# Prints a compact table (<= 40 rows) and the path of the raw data. Noise stays on disk.
+set -uo pipefail
+dom="${1:?usage: bh-recon <domain>}"
+out="/work/.bh/raw/recon-${dom//[^A-Za-z0-9.-]/_}-$(date +%s)"
+mkdir -p "$out"
+rps="${BH_RPS:-5}"
+gate="${BH_GATE:-http://gate:8080}"
+
+subfinder -d "$dom" -silent -all -proxy "$gate" -timeout 20 > "$out/subs.raw" 2> "$out/subfinder.err"
+{ echo "$dom"; cat "$out/subs.raw"; } | sort -u > "$out/subs.txt"
+
+httpx-toolkit -l "$out/subs.txt" -silent -json -http-proxy "$gate" -rl "$rps" -t 5 -timeout 10 \
+  -title -status-code -tech-detect -web-server -follow-redirects -no-color \
+  > "$out/httpx.jsonl" 2> "$out/httpx.err"
+
+subs=$(wc -l < "$out/subs.txt"); live=$(wc -l < "$out/httpx.jsonl")
+echo "recon $dom: $subs names, $live live HTTP services (gate-denied names are dropped silently)"
+jq -r '[.status_code, .url, ((.title // "")|.[0:50]), ((.tech // [])|join(","))|tostring] | @tsv' "$out/httpx.jsonl" 2>/dev/null \
+  | sort -k1,1 -k2,2 | head -40 | column -t -s $'\t'
+[ "$live" -gt 40 ] && echo "... $((live-40)) more"
+echo "raw: $out/{subs.txt,httpx.jsonl}"
