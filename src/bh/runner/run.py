@@ -181,7 +181,9 @@ def run_segment(scope_file: Path, *, model: str = "sonnet", max_turns: int = 60,
     bh_dir.mkdir(parents=True, exist_ok=True)
     (bh_dir / "frontier.md").write_text(board.frontier(prog))
     board.export_facts(prog, bh_dir / "facts.json")
-    (bh_dir / "system.md").write_text(build_system_prompt(scope))
+    ident_dir = home() / "var" / "state" / "identities" / prog
+    idents = sorted(p.stem for p in ident_dir.glob("*.json")) if ident_dir.is_dir() else []
+    (bh_dir / "system.md").write_text(build_system_prompt(scope, idents))
     shutil.copyfile(scope_file, bh_dir / "scope.yaml")
 
     session = board.last_session(prog) if resume else None

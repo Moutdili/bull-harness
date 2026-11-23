@@ -70,7 +70,10 @@ def _cmd_up(args) -> int:
     for d in ("var/gate/conf", "var/state/identities", "var/gate-ca", "var/work", "var/runs"):
         (home / d).mkdir(parents=True, exist_ok=True)
     cmd = COMPOSE + ["up", "-d"] + (["--build"] if args.build else [])
-    return subprocess.call(cmd, cwd=home)
+    rc = subprocess.call(cmd, cwd=home)
+    if rc == 0 and not args.no_ui:
+        _ui_start_daemon(None, 7340)
+    return rc
 
 
 def _cmd_down(args) -> int:
@@ -184,6 +187,53 @@ def _cmd_flows(args) -> int:
     return 0
 
 
+def _ui_pidfile() -> Path:
+    return _home() / "var" / "ui.pid"
+
+
+def _ui_alive() -> int | None:
+    try:
+        pid = int(_ui_pidfile().read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def _ui_start_daemon(host: str | None, port: int) -> int:
+    pid = _ui_alive()
+    if pid:
+        print(f"ui already running (pid {pid})")
+        return 0
+    (_home() / "var").mkdir(exist_ok=True)
+    log = open(_home() / "var" / "ui.log", "a")
+    cmd = [sys.executable, "-m", "bh.cli", "ui", "--foreground", "--port", str(port)] + (["--host", host] if host else [])
+    p = subprocess.Popen(cmd, cwd=_home(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                         env={**os.environ, "BH_HOME": str(_home())})
+    _ui_pidfile().write_text(str(p.pid))
+    time.sleep(1.5)
+    if p.poll() is not None:
+        print("ui failed to start, see var/ui.log", file=sys.stderr)
+        return 1
+    from bh.ui.server import default_host
+    print(f"ui: http://{host or default_host()}:{port}/login?token=$(cat secrets/ui.token)")
+    return 0
+
+
+def _cmd_ui(args) -> int:
+    if args.stop:
+        pid = _ui_alive()
+        if pid:
+            os.kill(pid, 15)
+            print(f"ui stopped (pid {pid})")
+        return 0
+    if args.foreground:
+        from bh.ui.server import serve
+        serve(args.host, args.port)
+        return 0
+    return _ui_start_daemon(args.host, args.port)
+
+
 def _todo_stub(name: str):
     def run(_) -> int:
         print(f"bh {name}: not implemented yet (see docs/TODO.md)", file=sys.stderr)
@@ -202,9 +252,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = scope.add_parser("show", help="print a parsed scope file")
     s.add_argument("file"); s.set_defaults(func=_cmd_scope_show)
 
-    u = sub.add_parser("up", help="start gate + agent containers"); u.add_argument("--build", action="store_true")
+    u = sub.add_parser("up", help="start gate + agent containers (+ web UI)"); u.add_argument("--build", action="store_true")
+    u.add_argument("--no-ui", action="store_true")
     u.set_defaults(func=_cmd_up)
     sub.add_parser("down", help="stop the stack").set_defaults(func=_cmd_down)
+    ui = sub.add_parser("ui", help="web UI (daemon by default; binds the Tailscale IP)")
+    ui.add_argument("--host"); ui.add_argument("--port", type=int, default=7340)
+    ui.add_argument("--foreground", action="store_true"); ui.add_argument("--stop", action="store_true")
+    ui.set_defaults(func=_cmd_ui)
     sub.add_parser("status", help="stack, last runs, todo count").set_defaults(func=_cmd_status)
 
     def run_opts(sp):
@@ -238,7 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
     fl = sub.add_parser("flows", help="last requests seen by the gate (targets only)")
     fl.add_argument("-n", type=int, default=30); fl.add_argument("--grep"); fl.set_defaults(func=_cmd_flows)
 
-    for name, helptext in (("plugin", "plugin manifests"), ("ui", "web dashboard"), ("alias", "token-saving aliases")):
+    for name, helptext in (("plugin", "plugin manifests"), ("alias", "token-saving aliases")):
         sub.add_parser(name, help=helptext).set_defaults(func=_todo_stub(name))
     return p
 
