@@ -114,6 +114,7 @@ class Gate:
         v = self.policy.classify(req.pretty_url, req.pretty_host, req.method)
         flow.metadata["bh_class"] = v.klass
         identity = req.headers.pop(IDENTITY_HEADER, None)
+        flow.metadata["bh_identity"] = identity
         if not v.allowed:
             self._deny(flow, v, "request")
             return
@@ -176,7 +177,7 @@ class Gate:
                                        "status": resp.status_code, "server": server, "flow": fid})
         elif resp.status_code == 401:
             self._log("events.jsonl", {"kind": "auth", "host": req.pretty_host, "url": req.pretty_url,
-                                       "flow": fid})
+                                       "flow": fid, "identity": flow.metadata.get("bh_identity")})
 
 
 addons = [Gate()]

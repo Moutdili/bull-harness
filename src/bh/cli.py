@@ -104,7 +104,7 @@ def _cmd_status(args) -> int:
 def _cmd_run(args) -> int:
     from bh.runner.run import run_segment
     res = run_segment(Path(args.scope), model=args.model, max_turns=args.max_turns, minutes=args.minutes,
-                      resume=not args.fresh, extra_task=args.task or "", effort=args.effort)
+                      resume=args.resume, extra_task=args.task or "", effort=args.effort)
     if res.text:
         print("\n" + res.text.strip())
     return 0 if res.status in ("ok", "max_turns", "timeout") else 1
@@ -271,7 +271,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="one agent segment on one program")
     r.add_argument("scope"); run_opts(r)
-    r.add_argument("--fresh", action="store_true", help="new session instead of resuming")
+    r.add_argument("--resume", action="store_true", help="resume the last session instead of a fresh one "
+                   "(fresh is the default: cheaper, the board + HANDOFF carry the state)")
     r.add_argument("--task", help="extra operator instruction for this segment")
     r.set_defaults(func=_cmd_run)
 
@@ -300,7 +301,13 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _sigterm(signum, frame):  # SIGTERM behaves like Ctrl-C: runners kill the in-container agent
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
+    import signal
+    signal.signal(signal.SIGTERM, _sigterm)
     args = build_parser().parse_args(argv)
     return args.func(args)
 

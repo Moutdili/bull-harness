@@ -45,6 +45,7 @@ services:
     image: localhost/bh-agent:dev
     container_name: bh-agent
     depends_on: [gate]
+    init: true  # reaps the processes the agent's tools leave behind (PID 1 is otherwise `sleep`)
     env_file:
       - ../secrets/agent.env
     environment:
