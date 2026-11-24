@@ -34,3 +34,25 @@ def test_post_hook_truncates(tmp_path, monkeypatch):
     raw = next((tmp_path / c.RAW).glob("*stdout.log"))
     assert raw.read_text() == text
     assert hooks.post_tool_use({"tool_name": "Bash", "tool_response": {"stdout": "short"}}) is None
+
+
+def test_program_that_forbids_scanners(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_DIR", str(tmp_path))
+    monkeypatch.setenv("BH_SCANNERS", "0")
+    for cmd in ("bh-scan http://h", "nuclei -u http://h", "sqlmap -u 'http://h/?q=1' --batch", "bh-content http://h"):
+        out = hooks.pre_tool_use(_ev(cmd))
+        assert out and out["hookSpecificOutput"]["permissionDecisionReason"].startswith(c.RULES_MARK), cmd
+    assert hooks.pre_tool_use(_ev("bh-crawl http://h")) is None
+    assert c.required_phases() == ("crawl",)
+    c.record_phase(tmp_path, "http://h:80", "crawl", status="ok", count=1, raw="")
+    assert hooks.pre_tool_use(_ev("curl -s http://h/api")) is None  # crawl alone unlocks the origin
+
+
+def test_builtin_refuses_when_scanners_are_forbidden(monkeypatch, capsys):
+    import pytest
+
+    from bh.agent import tools
+
+    monkeypatch.setenv("BH_SCANNERS", "0")
+    with pytest.raises(SystemExit, match="forbids automated scanners"):
+        tools.main("scan", ["http://h"])

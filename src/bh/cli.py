@@ -46,6 +46,57 @@ def cmd_scope_check(args) -> int:
     return 1 if denied else 0
 
 
+def cmd_scope_import(args) -> int:
+    """Public YesWeHack program -> scopes/ywh/<slug>.yaml (never widens; automation left to the human)."""
+    import yaml
+
+    from bh.scope import ScopeError, scope_from_dict
+    from bh.scope import yeswehack as ywh
+
+    username = args.username or _researcher().get("BH_YWH_USERNAME")
+    try:
+        imp = ywh.convert(ywh.fetch(args.slug), username)
+        scope_from_dict(imp.doc, args.slug)  # must load exactly like the file will
+    except ScopeError as exc:
+        raise SystemExit(f"ERR {exc}") from exc
+    dst = paths.scopes_dir() / "ywh" / f"{args.slug}.yaml"
+    if dst.exists() and not args.force:
+        raise SystemExit(f"{dst} exists (add --force to overwrite)")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        f"# Imported from YesWeHack ({imp.doc['source']}) on {imp.doc['synced_at']}.\n"
+        "# Review before running: read the program rules, then set automation_allowed and max_rps.\n"
+    )
+    dst.write_text(header + yaml.safe_dump(imp.doc, sort_keys=False, allow_unicode=True, width=110))
+    real = [r for r in imp.doc["in_scope"] if r.get("type") != "other"]
+    print(
+        f"wrote {dst.relative_to(paths.home())}: {len(real)} enforceable in-scope rules, "
+        f"{len(imp.doc['out_of_scope'])} exclusions, {len(imp.doc['forbidden_vulns'])} non-qualifying classes"
+    )
+    ua, rps = imp.doc["user_agent"] or "(none required)", imp.doc["max_rps"] or "not stated (gate default 2)"
+    print(f"user-agent: {ua} · max_rps: {rps}")
+    if imp.doc["scanners_allowed"] is False:
+        print("the rules forbid automated scanners: scanners_allowed=false (only bh-recon, bh-crawl and manual tests)")
+    if imp.skipped:
+        print("NOT enforced, translate by hand if you want them:\n  " + "\n  ".join(imp.skipped))
+    if imp.rule_excerpts:
+        print("rules lines about automation / rate / headers (read the full rules too):")
+        print("  " + "\n  ".join(line[:200] for line in imp.rule_excerpts))
+    print(
+        "next: set automation_allowed (true/false) after reading the rules; create test accounts with your "
+        "@yeswehack.ninja alias and store them as identities (UI > Todo or var/state/identities)."
+    )
+    return 0
+
+
+def _researcher() -> dict[str, str]:
+    """secrets/researcher.env: KEY=value lines (YWH alias e-mail, username). Never sent anywhere."""
+    p = paths.secrets_dir() / "researcher.env"
+    if not p.exists():
+        return {}
+    return dict(line.split("=", 1) for line in p.read_text().splitlines() if "=" in line and not line.startswith("#"))
+
+
 def cmd_scope_show(args) -> int:
     s = _load_scope_or_exit(args.file)
     print(f"{s.platform}/{s.program}  digest={s.digest[:12]}  rps={s.max_rps}  automation={s.automation_allowed}")
@@ -316,6 +367,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = scope.add_parser("show", help="print a parsed scope file")
     s.add_argument("file")
     s.set_defaults(func=cmd_scope_show)
+    im = scope.add_parser("import", help="import a public program (YesWeHack) into scopes/<platform>/")
+    im.add_argument("platform", choices=["ywh"])
+    im.add_argument("slug", help="program slug, as in https://yeswehack.com/programs/<slug>")
+    im.add_argument(
+        "--username", help="your YWH username (for the required User-Agent); default: secrets/researcher.env"
+    )
+    im.add_argument("--force", action="store_true", help="overwrite an existing scope file")
+    im.set_defaults(func=cmd_scope_import)
 
     u = sub.add_parser("up", help="start gate + agent containers (+ web UI)")
     u.add_argument("--build", action="store_true")

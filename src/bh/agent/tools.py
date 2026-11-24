@@ -514,6 +514,8 @@ def main(phase: str, argv: list[str] | None = None) -> None:
             help="subset of B, E, U (time-based and stacked queries are never allowed)",
         )
     a = p.parse_args(argv)
+    if not c.scanners_allowed() and phase not in c.LIGHT_PHASES:
+        sys.exit(f"{c.RULES_MARK} bh-{phase}: this program forbids automated scanners")
     url = a.target if "://" in a.target else f"https://{a.target}"
     job = Job(phase, url, a.identity, a.timeout)
     match phase:

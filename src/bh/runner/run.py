@@ -170,14 +170,21 @@ def manually_tested(board: Board, program: str) -> set[tuple[str, str]]:
     return out
 
 
-def frontier(board: Board, program: str) -> str:
+def phases_for(scope: Scope | None) -> tuple[str, ...]:
+    """Tool-lock phases for this program: the light ones only when it forbids automated scanners."""
+    return c.required_phases(scope is None or scope.scanners_allowed is not False)
+
+
+def frontier(board: Board, program: str, scope: Scope | None = None) -> str:
     """Board view + attack surface found by the tools, with what was tested by hand."""
-    surface = c.surface(paths.work_bh(program), also_tested=manually_tested(board, program))
+    surface = c.surface(paths.work_bh(program), also_tested=manually_tested(board, program), phases=phases_for(scope))
     return board.frontier(program) + (f"\n{surface}" if surface else "")
 
 
-def coverage_counts(board: Board, program: str) -> tuple[int, int]:
-    return c.surface_counts(paths.work_bh(program), also_tested=manually_tested(board, program))
+def coverage_counts(board: Board, scope: Scope) -> tuple[int, int]:
+    return c.surface_counts(
+        paths.work_bh(scope.program), also_tested=manually_tested(board, scope.program), phases=phases_for(scope)
+    )
 
 
 def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
@@ -204,6 +211,7 @@ def agent_command(
         "BH_DIR": bh,
         "BH_PROGRAM": prog,
         "BH_RPS": f"{scope.rate:g}",
+        "BH_SCANNERS": "0" if scope.scanners_allowed is False else "1",
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
     }
@@ -286,7 +294,7 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
                     if (
                         isinstance(block, dict)
                         and block.get("type") == "tool_result"
-                        and c.LOCK_MARK in _tool_result_text(block)
+                        and any(m in _tool_result_text(block) for m in (c.LOCK_MARK, c.RULES_MARK))
                     ):
                         res.locked_calls += 1
                         say("  🔒 manual HTTP refused by the tool lock")
@@ -367,7 +375,7 @@ def finish(
                 dedup=f"{prog}:refusal:{res.run_id}",
             )
         )
-    after = coverage_counts(board, prog)
+    after = coverage_counts(board, scope)
     res.progress = res.new_findings + max(0, after[0] - before[0]) + max(0, after[1] - before[1])
     u = res.usage
     board.run_end(
@@ -442,8 +450,8 @@ def _run_locked(
     run_id = board.run_start(prog, model)  # closes a run orphaned by a crash (we hold the lock)
     clean_sandbox(prog, run_id)
     prepare_workdir(board, scope, scope_file)
-    before = coverage_counts(board, prog)
-    task = build_task(frontier(board, prog), first=first, max_turns=max_turns)
+    before = coverage_counts(board, scope)
+    task = build_task(frontier(board, prog, scope), first=first, max_turns=max_turns)
     if extra_task:
         task += "\n\nOperator instruction for this segment: " + extra_task
     log_path = paths.run_log(run_id, prog)

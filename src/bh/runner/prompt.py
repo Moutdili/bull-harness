@@ -83,6 +83,11 @@ def scope_block(scope: Scope, identities: list[str] | None = None) -> str:
     if scope.forbidden_vulns:
         lines.append("Excluded vulnerability types: " + ", ".join(scope.forbidden_vulns))
     lines.append(f"Rate limit: {scope.rate:g} req/s (enforced by the gate)")
+    if scope.scanners_allowed is False:
+        lines.append(
+            "This program FORBIDS automated scanners: bh-content, bh-scan, bh-params, bh-sqli, bh-xss and direct "
+            "nuclei/sqlmap/ffuf/... are refused. Map with bh-recon and bh-crawl, then test by hand, few requests."
+        )
     names = sorted({i["name"] for i in scope.identities} | set(identities or []))
     if names:
         lines.append("Identities (send header X-BH-Identity: <name>): " + ", ".join(names))

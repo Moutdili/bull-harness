@@ -28,6 +28,9 @@ from urllib.parse import parse_qsl, urlsplit
 # Phases a builtin must have run on an origin before the agent may hand-craft requests to it.
 REQUIRED_PHASES = ("crawl", "content", "scan")
 ALL_PHASES = ("recon", *REQUIRED_PHASES, "params", "sqli", "xss")
+# Phases that are "automated scanners" in the sense of program rules. When a program forbids them
+# (scope `scanners_allowed: false` -> BH_SCANNERS=0), only these remain usable and required:
+LIGHT_PHASES = ("recon", "crawl")
 
 # Third-party recon sources: never targets, never locked. The gate imports these too.
 # Exact hosts only (no subdomains), GET/HEAD only; services that fetch arbitrary URLs or run tools
@@ -51,6 +54,7 @@ PASSIVE_DENY_PATHS = {"web.archive.org": ("/save",)}
 
 IDENTITY_HEADER = "X-BH-Identity"
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
+RULES_MARK = "[bh-rules]"  # prefix of a denial imposed by the program's rules
 SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
 WORK_ROOT = "/work"  # the agent's work volume (var/work on the host)
 
@@ -88,6 +92,16 @@ def sandbox_dir(program: str) -> str:
 
 def gate() -> str:
     return os.environ.get("BH_GATE", "http://gate:8080")
+
+
+def scanners_allowed() -> bool:
+    """From the environment claude was started with (the agent's own shell exports do not reach the hooks)."""
+    return os.environ.get("BH_SCANNERS", "1") != "0"
+
+
+def required_phases(scanners: bool | None = None) -> tuple[str, ...]:
+    allowed = scanners_allowed() if scanners is None else scanners
+    return REQUIRED_PHASES if allowed else tuple(p for p in REQUIRED_PHASES if p in LIGHT_PHASES)
 
 
 def rps() -> float:
@@ -215,7 +229,7 @@ def phase_done(entry: dict | None) -> bool:
 
 def missing_phases(d: Path, origin_: str) -> list[str]:
     done = read_json(d / COVERAGE, {}).get(origin_, {})
-    return [p for p in REQUIRED_PHASES if not phase_done(done.get(p))]
+    return [p for p in required_phases() if not phase_done(done.get(p))]
 
 
 def record_touched(d: Path, urls: list[str], via: str, method: str = "GET") -> None:
@@ -259,22 +273,26 @@ def _surface_data(d: Path, also_tested: Tested | None) -> tuple[dict, list, dict
     return eps, untested, read_json(d / COVERAGE, {})
 
 
-def surface_counts(d: Path, also_tested: Tested | None = None) -> tuple[int, int]:
+def surface_counts(
+    d: Path, also_tested: Tested | None = None, phases: tuple[str, ...] | None = None
+) -> tuple[int, int]:
     """(endpoints tested, required phases done across origins): the runner's progress measure."""
     eps, untested, cov = _surface_data(d, also_tested)
-    phases = sum(phase_done(ph.get(p)) for ph in cov.values() for p in REQUIRED_PHASES)
-    return len(eps) - len(untested), phases
+    req = phases or required_phases()
+    phases_done = sum(phase_done(ph.get(p)) for ph in cov.values() for p in req)
+    return len(eps) - len(untested), phases_done
 
 
-def surface(d: Path, limit: int = 12, also_tested: Tested | None = None) -> str:
+def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases: tuple[str, ...] | None = None) -> str:
     """Frontier block: what the tools found and what nobody tested yet."""
     eps, untested, cov = _surface_data(d, also_tested)
+    req = phases or required_phases()
     if not eps and not cov:
         return ""
     out = ["## attack surface (from your tools)"]
-    for o, phases in cov.items():
-        state = " ".join(f"{p}{_phase_mark(phases.get(p))}" for p in REQUIRED_PHASES)
-        extra = " ".join(p for p in phases if p not in REQUIRED_PHASES)
+    for o, done in cov.items():
+        state = " ".join(f"{p}{_phase_mark(done.get(p))}" for p in req)
+        extra = " ".join(p for p in done if p not in req)
         out.append(f"- {o}: {state}" + (f" · also {extra}" if extra else ""))
     with_params = sum(1 for v in eps.values() if v["params"])
     out.append(
@@ -282,7 +300,8 @@ def surface(d: Path, limit: int = 12, also_tested: Tested | None = None) -> str:
         f"{len(untested)} untested. Next untested:"
     )
     for (o, key), v in untested[:limit]:
-        params = f" ?{','.join(sorted(v['params']))}  → bh-sqli / bh-xss" if v["params"] else ""
+        hint = "  → bh-sqli / bh-xss" if req == REQUIRED_PHASES else "  → test by hand, low rate"
+        params = f" ?{','.join(sorted(v['params']))}{hint}" if v["params"] else ""
         out.append(f"  - {key}{params}  [{o}; {'+'.join(sorted(v['sources']))}]")
     return "\n".join(out)
 

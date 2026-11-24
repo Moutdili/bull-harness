@@ -46,6 +46,14 @@ podman exec -i bh-gate python3 - < lab/juiceshop/register_identities.py # lab ac
 Recreate only the agent (never the whole pod while the lab runs):
 `podman-compose -f container/compose.yaml up -d --force-recreate --no-deps agent`.
 
+## Real programs (YesWeHack)
+
+```sh
+uv run bh scope import ywh <slug> --username <your YWH username>   # public program -> scopes/ywh/<slug>.yaml
+```
+The import never widens a scope and leaves `automation_allowed` to you; programs whose rules forbid
+automated scanners get `scanners_allowed: false`. Full checklist: `docs/premiere-cible-ywh.md`.
+
 ## Running
 
 ```sh
