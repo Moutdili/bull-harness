@@ -330,6 +330,7 @@ class Gate:
             host_header=host_header,
             identity=identity,
             body_len=len(req.raw_content or b""),
+            body=req.raw_content if req.method not in ("GET", "HEAD") else None,
             authenticated=bool(identity or "authorization" in req.headers or "cookie" in req.headers),
         )
         flow.metadata["bh_class"] = v.klass
