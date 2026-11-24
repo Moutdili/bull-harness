@@ -46,8 +46,11 @@ def _now() -> float:
     return round(time.time(), 3)
 
 
-# headers that make a framework run another method than the request line's (POST + override = DELETE)
 AGENT_HOST = os.environ.get("BH_AGENT_HOST", "agent")
+# The only Claude API calls Claude Code makes with nonessential traffic off (measured 2026-11-24 on 2.1.330).
+RELAY_PATHS = frozenset({("POST", "/v1/messages"), ("POST", "/v1/messages/count_tokens")})
+RELAY_DEFAULT_MAX = 200  # requests per activation of a run when the runner names no budget
+# headers that make a framework run another method than the request line's (POST + override = DELETE)
 METHOD_OVERRIDES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
 
 
@@ -64,6 +67,17 @@ def _agent_ips() -> frozenset[str]:
             ips = frozenset()
         _AGENT_IPS = (time.time(), ips)
     return _AGENT_IPS[1]
+
+
+def _model(req: http.Request) -> str | None:
+    """The `model` a Claude API request asks for (JSON body), None when there is none."""
+    if req.method != "POST" or not req.raw_content or len(req.raw_content) > 32 << 20:
+        return None
+    try:
+        model = json.loads(req.get_content(strict=False) or b"").get("model")
+    except (ValueError, AttributeError):
+        return None
+    return model[:80] if isinstance(model, str) else None
 
 
 def refuse(flow: http.HTTPFlow, v: Verdict) -> None:
@@ -115,6 +129,7 @@ class Gate:
         self.seq = itertools.count(1)
         self._run: dict = {}
         self._run_mtime = -1.0
+        self._relay_used: dict[float, int] = {}  # activation of a run (active-run mtime) -> relay requests
         # server connection id -> hostname asked for. server_connect pins the address to a vetted IP,
         # and with the eager connection strategy that happens before the TLS / TCP hooks run.
         self._dest: dict[str, str] = {}
@@ -282,8 +297,24 @@ class Gate:
             self._deny(flow, deny(f"relay: only the agent container may use it (not {peer})"), "relay")
             return
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-        if not flow.request.path.startswith("/v1/") or not token:
-            self._deny(flow, deny("relay: Claude API /v1/ only" if token else "relay: no token in the gate"), "relay")
+        req = flow.request
+        path = req.path.split("?")[0]
+        run = self._active_run()
+        self._log(paths.EVENTS, {"kind": "relay", "method": req.method, "path": path[:120], "model": _model(req)})
+        if not token:
+            reason = "relay: no token in the gate"
+        elif (req.method, path) not in RELAY_PATHS:
+            reason = f"relay: {req.method} {path[:60]} is not a call Claude Code makes"
+        elif not run:  # between runs the sandbox has no business spending the quota
+            reason = "relay: no run in progress"
+        else:
+            used = self._relay_used.get(self._run_mtime, 0)
+            budget = run.get("relay_max") if isinstance(run.get("relay_max"), int) else RELAY_DEFAULT_MAX
+            reason = f"relay: this run's budget of {budget} API requests is spent" if used >= budget else ""
+            if not reason:
+                self._relay_used = {self._run_mtime: used + 1}  # one activation at a time
+        if reason:
+            self._deny(flow, deny(reason), "relay")
             return
         flow.request.headers.pop("x-api-key", None)
         flow.request.headers["Authorization"] = f"Bearer {token}"
