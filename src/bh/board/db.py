@@ -42,6 +42,14 @@ CREATE TABLE IF NOT EXISTS todos (
   id INTEGER PRIMARY KEY, program TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, detail TEXT,
   status TEXT NOT NULL DEFAULT 'open', dedup TEXT UNIQUE, created REAL NOT NULL, closed REAL
 );
+CREATE TABLE IF NOT EXISTS turns (
+  run_id INTEGER NOT NULL, idx INTEGER NOT NULL, ts REAL, input INTEGER, cache_read INTEGER, cache_write INTEGER,
+  output INTEGER, PRIMARY KEY(run_id, idx)
+);
+CREATE TABLE IF NOT EXISTS tool_calls (
+  run_id INTEGER NOT NULL, idx INTEGER NOT NULL, ts REAL, tool TEXT, kind TEXT, cmd TEXT, ms INTEGER,
+  locked INTEGER, PRIMARY KEY(run_id, idx)
+);
 CREATE INDEX IF NOT EXISTS facts_prog ON facts(program, id);
 CREATE INDEX IF NOT EXISTS findings_prog ON findings(program, status);
 CREATE INDEX IF NOT EXISTS todos_status ON todos(status);
@@ -55,6 +63,11 @@ MIGRATIONS = (
     ("runs", "locked_calls", "INTEGER"),
     ("runs", "cache_write", "INTEGER"),
     ("runs", "cards", "TEXT"),  # method cards loaded for the segment, comma-separated
+    ("runs", "gate_requests", "INTEGER"),  # target requests the gate forwarded for the run
+    ("runs", "gate_denied", "INTEGER"),
+    ("runs", "gate_errors", "INTEGER"),  # requests that never got an answer
+    ("runs", "gate_pushback", "INTEGER"),  # 429 / 503 answers (the gate slowed down)
+    ("runs", "verify_cost", "REAL"),  # verifier sessions started by this run (USD equivalent)
     ("findings", "proof", "TEXT"),  # proof.json written by the agent (steps: setup / attack / control)
     ("findings", "replay", "TEXT"),  # verifier stage A: deterministic replay result (JSON)
     ("findings", "poc_triager", "TEXT"),  # PoC generated from the replayed proof, sessions as placeholders
@@ -120,6 +133,43 @@ class Board:
 
     def run_end(self, run_id: int, **fields: Any) -> None:
         self.run_set(run_id, ended=time.time(), **fields)
+
+    def record_metrics(self, run_id: int, turns: list[dict], tools: list[dict]) -> None:
+        """Per-turn tokens and per-tool-call durations of a run (observability, plan v2 step 4)."""
+        base = self.db.execute("SELECT COUNT(*) FROM turns WHERE run_id=?", (run_id,)).fetchone()[0]
+        self.db.executemany(
+            "INSERT OR REPLACE INTO turns VALUES (?,?,?,?,?,?,?)",
+            [
+                (
+                    run_id,
+                    base + i,
+                    t.get("ts"),
+                    t.get("input"),
+                    t.get("cache_read"),
+                    t.get("cache_write"),
+                    t.get("output"),
+                )
+                for i, t in enumerate(turns)
+            ],
+        )
+        base = self.db.execute("SELECT COUNT(*) FROM tool_calls WHERE run_id=?", (run_id,)).fetchone()[0]
+        self.db.executemany(
+            "INSERT OR REPLACE INTO tool_calls VALUES (?,?,?,?,?,?,?,?)",
+            [
+                (
+                    run_id,
+                    base + i,
+                    t.get("ts"),
+                    t.get("tool"),
+                    t.get("kind"),
+                    t.get("cmd"),
+                    t.get("ms"),
+                    int(bool(t.get("locked"))),
+                )
+                for i, t in enumerate(tools)
+            ],
+        )
+        self.db.commit()
 
     def run_ids(self, program: str) -> set[int]:
         return {r["id"] for r in self.db.execute("SELECT id FROM runs WHERE program=?", (program,))}

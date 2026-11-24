@@ -284,6 +284,10 @@ class Handler(BaseHTTPRequestHandler):
             return [dict(r) for r in b.rows("SELECT * FROM todos WHERE status=? ORDER BY id DESC", st)]
         if path == "/api/runs":
             return [dict(r) for r in b.rows("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
+        if path == "/api/metrics":
+            return self._metrics(b)
+        if m := re.fullmatch(r"/api/runs/(\d+)/tools", path):
+            return [dict(r) for r in b.rows("SELECT * FROM tool_calls WHERE run_id=? ORDER BY idx", int(m.group(1)))]
         if m := re.fullmatch(r"/api/runs/(\d+|latest)/events", path):
             rid = m.group(1)
             if rid == "latest":
@@ -316,6 +320,29 @@ class Handler(BaseHTTPRequestHandler):
                 "identities": paths.identities(prog),
             }
         raise KeyError(path)
+
+    def _metrics(self, b: Board) -> dict:
+        """Observability: tokens, tools, gate and verifier per run; cost per verified finding."""
+        runs = [
+            dict(r)
+            for r in b.rows(
+                "SELECT r.*, (SELECT COUNT(*) FROM findings f WHERE f.run_id=r.id) AS findings_new, "
+                "(SELECT COUNT(*) FROM findings f WHERE f.run_id=r.id AND f.status IN ('verified','submitted')) "
+                "AS findings_verified, "
+                "(SELECT SUM(cache_write) FROM turns t WHERE t.run_id=r.id) AS cache_write_turns "
+                "FROM runs r ORDER BY r.id DESC LIMIT 60"
+            )
+        ]
+        cost = sum((r["cost_usd"] or 0) + (r["verify_cost"] or 0) for r in runs)
+        verified = sum(r["findings_verified"] for r in runs)
+        calls = b.rows("SELECT kind, COUNT(*) n, SUM(ms) ms FROM tool_calls GROUP BY kind")
+        return {
+            "runs": runs,
+            "cost": cost,
+            "verified": verified,
+            "cost_per_verified": cost / verified if verified else None,
+            "tool_kinds": {r["kind"]: {"n": r["n"], "ms": r["ms"]} for r in calls},
+        }
 
     def _programs(self, b: Board) -> list[dict]:
         from bh.scope import ScopeError, load_scope

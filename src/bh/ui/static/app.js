@@ -264,6 +264,37 @@ views.board = async () => {
         el("td", {}, `I${x.id}`), el("td", {}, x.status), el("td", {}, x.title, x.outcome ? el("div", { class: "small muted" }, x.outcome) : null)))) : el("div", { class: "empty" }, "—"))));
 };
 
+// ------------------------------------------------------------------ metrics (observability)
+const usd = (v) => (v == null ? "—" : `$${v.toFixed(2)}`);
+const kTok = (v) => (v == null ? "—" : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v));
+views.metrics = async () => {
+  const m = await api("/api/metrics");
+  const kinds = m.tool_kinds || {};
+  const total = Object.values(kinds).reduce((a, k) => a + k.n, 0) || 0;
+  const share = total ? Math.round(100 * ((kinds.arsenal?.n || 0) / total)) : null;
+  fill($("#metrics"),
+    el("div", { class: "grid" }, kpi("Coût total (éq. API)", usd(m.cost)), kpi("Findings vérifiés", m.verified),
+      kpi("Coût par finding vérifié", usd(m.cost_per_verified)), kpi("Part arsenal des outils", share == null ? "—" : `${share} %`)),
+    el("h2", {}, "Runs"),
+    el("div", { style: "overflow-x:auto" }, el("table", {},
+      el("tr", {}, ...["#", "programme", "statut", "legs·tours", "tokens lus / écrits / sortis", "outils a/m/🔒", "gate req · refus · 429", "findings → vérifiés", "fiches", "coût run + vérif"].map((h) => el("th", {}, h))),
+      ...m.runs.map((r) => el("tr", { class: "click", onclick: () => openRunTools(r) },
+        el("td", {}, r.id), el("td", {}, r.program), el("td", {}, el("span", { class: "badge" }, r.status)),
+        el("td", {}, `${r.turns ?? "—"}`), el("td", { class: "small" }, `${kTok(r.cache_read)} / ${kTok(r.cache_write ?? r.cache_write_turns)} / ${kTok(r.output_tokens)}`),
+        el("td", { class: "small" }, r.arsenal_calls == null ? "—" : `${r.arsenal_calls}/${r.manual_calls}/${r.locked_calls}`),
+        el("td", { class: "small" }, r.gate_requests == null ? "—" : `${r.gate_requests} · ${r.gate_denied} · ${r.gate_pushback}`),
+        el("td", {}, `${r.findings_new} → ${r.findings_verified}`), el("td", { class: "small muted" }, r.cards || "—"),
+        el("td", {}, `${usd(r.cost_usd)} + ${usd(r.verify_cost)}`))))));
+};
+async function openRunTools(r) {
+  const calls = await api(`/api/runs/${r.id}/tools`);
+  drawer(el("h3", {}, `Run ${r.id} · ${calls.length} appels d'outil`),
+    calls.length ? el("table", {}, el("tr", {}, ...["#", "type", "durée", "commande"].map((h) => el("th", {}, h))),
+      ...calls.map((t) => el("tr", {}, el("td", {}, t.idx + 1), el("td", {}, t.locked ? "🔒 " + t.kind : t.kind),
+        el("td", { class: "small" }, t.ms == null ? "—" : `${(t.ms / 1000).toFixed(1)} s`), el("td", { class: "mono small" }, (t.cmd || "").slice(0, 160)))))
+      : el("div", { class: "empty" }, "Pas de détail pour ce run (antérieur aux métriques)."));
+}
+
 // ------------------------------------------------------------------ programs + launch
 views.programs = async () => {
   const [progs, runs] = await Promise.all([api("/api/programs"), api("/api/runs")]);

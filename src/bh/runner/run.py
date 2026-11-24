@@ -71,6 +71,9 @@ class SegmentResult:
     locked_calls: int = 0  # commands refused by the tool lock
     text: str = ""
     usage: dict = field(default_factory=dict)
+    turn_log: list[dict] = field(default_factory=list)  # one per model message: tokens (observability)
+    tool_log: list[dict] = field(default_factory=list)  # one per tool call: kind, duration, locked
+    _pending: dict = field(default_factory=dict, repr=False)  # tool_use id -> index in tool_log
 
 
 # ------------------------------------------------------------------ guards
@@ -277,6 +280,15 @@ def agent_command(
     return cmd
 
 
+def command_kind(cmd: str) -> str:
+    """arsenal | manual | note | other: how a Bash command is counted in the metrics."""
+    if c.uses_arsenal(cmd):
+        return "arsenal"
+    if c.uses_manual_http(cmd):
+        return "manual"
+    return "note" if "bh-note" in cmd else "other"
+
+
 def _tool_result_text(block: dict) -> str:
     content = block.get("content")
     if isinstance(content, list):
@@ -300,6 +312,18 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
                 msg = ev.get("message", {})
                 if msg.get("stop_reason") == "refusal":
                     res.status = "refusal"
+                if msg.get("id") and msg["id"] not in {t["id"] for t in res.turn_log[-3:]}:
+                    u = msg.get("usage") or {}
+                    res.turn_log.append(
+                        {
+                            "id": msg["id"],
+                            "ts": time.time(),
+                            "input": u.get("input_tokens"),
+                            "cache_read": u.get("cache_read_input_tokens"),
+                            "cache_write": u.get("cache_creation_input_tokens"),
+                            "output": u.get("output_tokens"),
+                        }
+                    )
                 for block in msg.get("content", []):
                     if block.get("type") == "text" and block.get("text", "").strip():
                         say(f"  💬 {one_line(block['text'], 220)}")
@@ -309,14 +333,27 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
                         cmd = inp.get("command") or ""
                         res.arsenal_calls += c.uses_arsenal(cmd)
                         res.manual_calls += c.uses_manual_http(cmd)
+                        res._pending[block.get("id")] = len(res.tool_log)
+                        res.tool_log.append(
+                            {
+                                "ts": time.time(),
+                                "tool": block.get("name"),
+                                "kind": command_kind(cmd),
+                                "cmd": cmd[:300],
+                                "ms": None,
+                                "locked": False,
+                            }
+                        )
                         say(f"  ⚙ {block.get('name')}: {one_line(cmd or inp.get('description') or inp)}")
             case "user":
                 for block in (ev.get("message") or {}).get("content") or []:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "tool_result"
-                        and any(m in _tool_result_text(block) for m in (c.LOCK_MARK, c.RULES_MARK))
-                    ):
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    locked = any(m in _tool_result_text(block) for m in (c.LOCK_MARK, c.RULES_MARK))
+                    if (i := res._pending.pop(block.get("tool_use_id"), None)) is not None:
+                        call = res.tool_log[i]
+                        call["ms"], call["locked"] = int((time.time() - call["ts"]) * 1000), locked
+                    if locked:
                         res.locked_calls += 1
                         say("  🔒 manual HTTP refused by the tool lock")
             case "result":
@@ -385,6 +422,20 @@ def merge_result(res: SegmentResult, result: dict | None) -> None:
         )
 
 
+def gate_counts(run_id: int) -> dict[str, int]:
+    """What the gate did for this run (flows and events are tagged with the run id)."""
+    flows = [
+        f for f in c.read_jsonl(paths.flows_log()) if f.get("run") == run_id and f.get("class") in (None, "target")
+    ]
+    denied = sum(1 for e in c.read_jsonl(paths.events_log()) if e.get("run") == run_id and e.get("kind") == "blocked")
+    return {
+        "gate_requests": len(flows),
+        "gate_denied": denied,
+        "gate_errors": sum(1 for f in flows if f.get("status") == "error"),
+        "gate_pushback": sum(1 for f in flows if f.get("status") in (429, 503)),
+    }
+
+
 def finish(
     board: Board, res: SegmentResult, scope: Scope, before: tuple[int, int], *, effort: str | None, note: str
 ) -> None:
@@ -403,6 +454,8 @@ def finish(
                 dedup=f"{prog}:refusal:{res.run_id}",
             )
         )
+    board.record_metrics(res.run_id, res.turn_log, res.tool_log)
+    board.run_set(res.run_id, **gate_counts(res.run_id))
     graph = Graph(board, scope)
     graph.sync(res.run_id)
     for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
