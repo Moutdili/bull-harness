@@ -117,8 +117,10 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 
 ## Limites connues (après les deux revues hostiles du 2026-11-24)
 - **Jeton OAuth** : n'existe que dans le gate ; l'agent a un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081`.
-  Le relais n'accepte que le conteneur agent (le gate est aussi sur le réseau du lab). Reste : tout chemin `/v1/`
-  est relayé, et un `claude -p` imbriqué consomme le quota (sans jeton à exfiltrer).
+  Le relais n'accepte que le conteneur agent (le gate est aussi sur le réseau du lab), que les deux appels que fait
+  Claude Code (`POST /v1/messages`, `/v1/messages/count_tokens`, mesuré sur 2.1.330), seulement pendant un run, et
+  au plus `3 × max_turns + 30` requêtes par segment. Reste : dans ce budget, un `claude -p` imbriqué consomme le
+  quota (sans jeton à exfiltrer).
 - **Le sandbox n'est pas une frontière** : hooks, verrou d'outils et fichiers du contrat sont des aides. Les garanties
   dures sont dans le gate (scope jugé sur le nom demandé, méthodes et overrides, identités existantes, ports web,
   énumération sur la route normalisée, garde scanners par rafale de 404, websockets refusés, débit) et sur l'hôte
@@ -126,9 +128,14 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 - **Exclusions** : une entrée YWH n'exclut une classe entière que si elle la nomme ; les exclusions conditionnelles
   restent à l'humain. Brute force interdit par la doctrine et, pour les programmes sans scanners, freiné par la garde
   404 du gate. Exclusions sans signature réseau (social engineering, physique) : doctrine seulement.
-- **Vérificateur** : process du chasseur tués, HOME neuf, `python3 -I`, modèle différent (Opus). Reste : même
-  utilisateur Unix et même conteneur que le chasseur.
-- **Énumération** : les ids en query string, corps JSON ou GraphQL ne sont pas comptés.
+- **Vérificateur** : process du chasseur tués, HOME neuf, `python3 -I`, modèle différent (Opus), utilisateur Unix
+  `judge` propriétaire de son dossier et de son HOME (le chasseur lit le verdict mais ne peut pas l'écrire), verdict
+  valable seulement avec le nonce donné au seul process du juge. Reste : même conteneur que le chasseur, et le juge
+  lit des réponses de la cible (injection de prompt possible, comme pour tout relecteur).
+- **Énumération** : comptée sur le chemin, la query string, les corps formulaire et JSON et GraphQL (nom de
+  paramètre qui désigne un id, valeur qui en a la forme). Un id sous un nom quelconque (`?q=123`) n'est pas compté.
+- **Stockage** : fichiers de flux supprimés après 14 jours, journaux du gate tournés en gzip au-delà de 64 Mo
+  (`bh prune`, et au début de chaque segment). Images épinglées par digest ; les paquets apt de Kali suivent le dépôt.
 - **Coût du verrou sur une vraie cible** : crawl + content + scan par origine (~10 min chacun à 2 req/s).
 - **nuclei** : ~1,5 req/s via le gate, cause interne non trouvée ; borné par `--timeout`.
 - **Rechargement du gate** : mitmdump recharge `addon.py` mais pas `policy.py` ; après une modification de la

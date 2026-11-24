@@ -10,7 +10,7 @@ Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie qu
 | Phase | Fait | Reste |
 |---|---|---|
 | 0 Socle | 0.1, 0.2 (scope + 80+ tests), 0.4 board (+ migrations, reset), 0.5 CLI | 0.2b jokers mi-label / PSL. 0.3 remplacé par les builtins `bh.agent.tools` (pas de manifests YAML) |
-| 1 Confinement | 1.1 gate HTTP (décision sur la destination réelle, fail-closed, TCP brut coupé, méthodes, backoff 429/503/WAF), 1.1b passifs (hôtes exacts, IP publiques), 1.4 réseaux, **1.5 suite d'évasion `tests/escape/escape_check.sh` : 25/25** (HTTPS par nom, raisons des refus vérifiées) | 1.2 DNS filtrant (aujourd'hui : aucune résolution externe), 1.3 SOCKS (volontairement absent), sources passives de subfinder |
+| 1 Confinement | 1.1 gate HTTP (décision sur la destination réelle, fail-closed, TCP brut coupé, méthodes, backoff 429/503/WAF), 1.1b passifs (hôtes exacts, IP publiques), 1.4 réseaux, **1.5 suite d'évasion `tests/escape/escape_check.sh` : 29/29** (HTTPS par nom, raisons des refus vérifiées) | 1.2 DNS filtrant (aujourd'hui : aucune résolution externe), 1.3 SOCKS (volontairement absent), sources passives de subfinder |
 | 2 Tokens | 2.2 troncature, 2.3 `updatedToolOutput` vérifié, base par tour −62 % (`--tools Bash,Read`, sans slash commands), sessions neuves par défaut | 2.1 réécriture, 2.4 mineur, 2.5 calibrage, 2.6 alias |
 | 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope, H7 Gmail |
 | 4 Autonomie | 4.1 runner (stderr fichier, kill propre), 4.2 superviseur (progression réelle), 4.4 todos auth/waf/identity, **verrou d'outils + file de surface** | 4.2b rotation sur contexte, 4.5 capture de session, 4.6 skills (4.3 vérificateur : fait, F1 vérifié de bout en bout) |
@@ -30,15 +30,20 @@ Corrigé et testé : HTTPS par nom refusé (C1), scanners « null » = autorisé
 vérificateur non indépendant (C4), interdiction de scanners contournable (C5), H1 à H13, M1, M3 à M7,
 M10, M11, code mort et regex dupliquées. Détail : `git log` du 2026-11-24.
 
-Reste ouvert (propriétaire, critère) :
-- [ ] **C** Ids en query string, corps JSON ou GraphQL non comptés par la limite d'énumération. Critère : test gate.
-- [ ] **C** Vérificateur sous le même utilisateur Unix que le chasseur (process tués et HOME neuf, mais pas d'utilisateur ni de conteneur dédié, pas de nonce de verdict). Critère : verdict écrit hors de portée de `hunter`.
-- [ ] **C** Relais : tout chemin `/v1/` accepté pour l'agent ; pas de plafond de dépense. Critère : liste des chemins utilisés par Claude Code mesurée, puis allowlist.
-- [ ] **H** Rétention de `var/state/flows/` (≈ 650 Mo/jour à 2 req/s) et rotation de `flows.jsonl`. Critère : purge datée + test.
-- [ ] **H** Images épinglées par digest (`kali-rolling`, `juice-shop`, `mitmproxy`) et dépendances pip épinglées. Critère : `compose.yaml` sans tag mobile.
-- [ ] **C** Requêtes « fantômes » après abandon du client (M8), chemin HTTP/2 sans `/` initial (vérifié en HTTP/1 seulement).
-- [ ] **H** `max_rps` non extrait pour 13 programmes (M9 : repli prudent à 2 req/s).
-- [ ] **C** UI non auditée en profondeur.
+Points ouverts de la revue, traités le 2026-11-24 (branche `fix/review-open-items`) :
+- [x] Ids en query string, corps formulaire ou JSON et GraphQL comptés par la limite d'énumération (tests gate + suite d'évasion).
+- [x] Vérificateur sous son propre utilisateur Unix `judge` (dossier et HOME à lui, `hunter` ne peut pas écrire le verdict) et nonce de verdict. F1 revérifié en réel.
+- [x] Relais : seulement `POST /v1/messages` et `count_tokens` (mesuré), seulement pendant un run, budget `3 × max_turns + 30` requêtes par segment.
+- [x] Rétention : flux supprimés après 14 jours, journaux tournés en gzip au-delà de 64 Mo, curseurs par inode (`bh prune`).
+- [x] Images épinglées par digest, pyyaml et semgrep épinglés (les paquets apt de Kali suivent le dépôt rolling).
+- [x] M8 mesuré : une requête abandonnée pendant l'attente de débit n'atteint pas la cible. HTTP/2 sans `/` initial : refusé (suite d'évasion).
+- [x] M9 : 11 des 13 programmes utilisent le modèle YWH sans nombre (repli 2 req/s correct) ; `**30**` en gras est maintenant lu.
+- [x] UI : Content-Length négatif refusé (bloquait un thread sans login), timeout par connexion, sessions qui expirent, durées bornées, « stop » vérifie le pid.
+
+Reste ouvert :
+- [ ] **C** Juge et chasseur dans le même conteneur ; le juge lit les réponses de la cible (injection de prompt possible).
+- [ ] **C** Dans son budget, un `claude -p` imbriqué consomme encore le quota.
+- [ ] **H** Image agent : reconstruire depuis la base épinglée et consigner la liste des versions d'outils.
 
 ---
 
