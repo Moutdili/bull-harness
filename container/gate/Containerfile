@@ -1,4 +1,5 @@
 # bull-harness egress gate: mitmproxy + bh policy addon (bh source is mounted at /opt/bh/src).
-FROM docker.io/mitmproxy/mitmproxy:12.3.1
-RUN pip install --no-cache-dir "pyyaml>=6.0"
+# mitmproxy 12.3.1, pinned by digest: the gate is the security boundary, its code must not move under it.
+FROM docker.io/mitmproxy/mitmproxy@sha256:e2f810b6e618258dd4980716da143c4a8de0edcb3243264baea398e2185bbbfb
+RUN pip install --no-cache-dir "pyyaml==6.0.4"
 ENV PYTHONPATH=/opt/bh/src
