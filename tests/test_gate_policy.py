@@ -164,3 +164,20 @@ def test_scanner_guard_off_when_scanners_are_allowed(tmp_path):
     for i in range(pol.MISS_LIMIT * 2):
         p.note_answer(f"https://a.example.com/g{i}", 404)
     assert req(p, "https://a.example.com/api/me", "a.example.com").allowed
+
+
+def test_web_ports_on_every_request_not_only_connect(tmp_path):
+    p = _policy(tmp_path)
+    assert not req(p, "http://a.example.com:22/", "a.example.com").allowed
+    assert not req(p, "http://a.example.com:6379/", "a.example.com").allowed
+    assert req(p, "http://a.example.com:8080/", "a.example.com").allowed
+    assert req(p, "http://192.0.2.5:3000/", "192.0.2.5").allowed  # a CIDR rule grants the address, all ports
+
+
+def test_id_enumeration_sees_through_path_variants(tmp_path):
+    p = _policy(tmp_path)
+    for i in range(1, 5):
+        assert req(p, f"https://a.example.com/api/baskets/{i}", "a.example.com", authenticated=True).allowed
+    for variant in ("/api/baskets/5/", "/API/baskets/6", "/api//baskets/7", "/api/baskets/8;x=1", "/api/baskets/%39"):
+        v = req(p, "https://a.example.com" + variant, "a.example.com", authenticated=True)
+        assert not v.allowed and "enumeration" in v.reason, variant

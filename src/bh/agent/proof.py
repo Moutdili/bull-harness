@@ -120,8 +120,9 @@ def _expect_holds(exp: dict, status: int, body: str) -> tuple[bool, list[str]]:
     return not misses, misses
 
 
-def _send(step: dict) -> tuple[int, str]:
-    """One request through the environment's proxy (the gate). Redirects are not followed: a 302 is an answer."""
+def _send(step: dict) -> tuple[int, str, bool]:
+    """One request through the environment's proxy (the gate): (status, body, refused by the gate). Redirects are
+    not followed: a 302 is an answer. Only the gate sets X-BH-Gate (it strips the header from target answers)."""
     headers = {str(k): str(v) for k, v in (step.get("headers") or {}).items()}
     if step.get("as"):
         headers[c.IDENTITY_HEADER] = str(step["as"])
@@ -140,9 +141,13 @@ def _send(step: dict) -> tuple[int, str]:
     opener = urllib.request.build_opener(NoRedirect)
     try:
         with opener.open(req, timeout=TIMEOUT_S) as resp:
-            return resp.status, resp.read(1 << 20).decode("utf-8", "replace")
+            return resp.status, resp.read(1 << 20).decode("utf-8", "replace"), _gate_refused(resp.headers)
     except urllib.error.HTTPError as err:
-        return err.code, (err.read(1 << 20) or b"").decode("utf-8", "replace")
+        return err.code, (err.read(1 << 20) or b"").decode("utf-8", "replace"), _gate_refused(err.headers)
+
+
+def _gate_refused(headers) -> bool:
+    return (headers.get(c.GATE_HEADER) or "").lower() == "denied"
 
 
 def replay(proof: dict, rounds: int = ROUNDS) -> dict:
@@ -153,10 +158,9 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
         round_, answers = [], []
         for st in proof["steps"]:
             try:
-                status, body = _send(st)
+                status, body, denied = _send(st)
                 answers.append((st, status, body))
                 ok, misses = _expect_holds(st["expect"], status, body)
-                denied = "bh-gate: DENIED" in body
                 round_.append(
                     {
                         "name": st.get("name", ""),
