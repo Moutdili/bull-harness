@@ -130,7 +130,7 @@ Contrats à respecter : schémas 0.2 / 0.3 / 0.4. Un fichier = un propriétaire.
 
 | # | Action | Pourquoi | Quand |
 |---|---|---|---|
-| M1 | **Passkey / clé FIDO2 sur le compte Claude** | Defense exigera une MFA résistante au phishing à partir du **15 déc. 2026** | avant le 15/12 |
+| M1 | ~~Passkey / clé FIDO2 sur le compte Claude~~ ✅ passkey iPhone actif (vérifié le 2026-11-24). Reste conseillé : une 2ᵉ clé de secours (YubiKey) | Defense exigera une MFA résistante au phishing à partir du **15 déc. 2026** (source à retrouver) | fait |
 | M2 | Token personnel Intigriti (Paramètres → API Tokens) | H4 | avant Phase 3 |
 | M3 | Compte YesWeHack + secret TOTP exportable | H5 | avant Phase 3 |
 | M4 | Projet Google Cloud + Pub/Sub + OAuth Gmail | H7 | avant Phase 3 |
