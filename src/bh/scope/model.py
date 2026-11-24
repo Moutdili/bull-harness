@@ -72,7 +72,7 @@ class Scope:
     required_headers: dict[str, str] = field(default_factory=dict)
     user_agent: str | None = None
     automation_allowed: bool | None = None  # None = unknown -> todo humaine
-    scanners_allowed: bool | None = None  # False = program forbids automated scanners (ffuf, nuclei, sqlmap...)
+    scanners_allowed: bool | None = None  # None = unknown -> todo humaine; read it through scanners_on
     forbidden_vulns: tuple[str, ...] = ()
     identities: tuple[dict[str, str], ...] = ()  # {name, secret_ref}; never the secret
     source: str | None = None
@@ -86,6 +86,12 @@ class Scope:
             return None
         canon = canonical_vuln(vuln_class)
         return next((f for f in self.forbidden_vulns if canonical_vuln(f) == canon), None)
+
+    @property
+    def scanners_on(self) -> bool:
+        """Automated scanners (ffuf, nuclei, sqlmap, dalfox...) may run: only when the program allows them.
+        Unknown counts as forbidden (the runner refuses to start until a human decides), local labs excepted."""
+        return self.scanners_allowed is True or (self.scanners_allowed is None and self.platform == "local")
 
     @property
     def rate(self) -> float:

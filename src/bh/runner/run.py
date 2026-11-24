@@ -100,19 +100,30 @@ def run_lock() -> Iterator[None]:
         yield
 
 
+# program rules a human must have decided before any agent runs (None = not read yet). Local labs are exempt.
+HUMAN_DECISIONS = {
+    "automation_allowed": "is automation (an AI agent) allowed?",
+    "scanners_allowed": "are automated scanners (ffuf, nuclei, sqlmap, dalfox) allowed?",
+}
+
+
 def check_automation(board: Board, scope: Scope) -> None:
-    """Unknown automation rules = a human reads the program policy first. Local labs are exempt."""
+    """Unknown program rules = a human reads the program policy first; automation forbidden = never run."""
     if scope.automation_allowed is False:
         raise SystemExit(f"{scope.program}: automation_allowed is false — refusing to run an agent on it")
-    if scope.automation_allowed is None and scope.platform != "local":
+    if scope.platform == "local":
+        return
+    unknown = [f for f in HUMAN_DECISIONS if getattr(scope, f) is None]
+    for f in unknown:
         board.add_todo(
             "scope-question",
-            f"{scope.program}: is automation allowed?",
-            "read the program rules, then set automation_allowed: true/false in its scope file",
+            f"{scope.program}: {HUMAN_DECISIONS[f]}",
+            f"read the program rules, then set {f}: true/false in its scope file",
             program=scope.program,
-            dedup=f"{scope.program}:automation-unknown",
+            dedup=f"{scope.program}:{f}-unknown",
         )
-        raise SystemExit(f"{scope.program}: automation_allowed is unknown — set it in the scope file first")
+    if unknown:
+        raise SystemExit(f"{scope.program}: {', '.join(unknown)} unknown — set it in the scope file first")
 
 
 # ------------------------------------------------------------------ sandbox + gate state
@@ -163,7 +174,7 @@ def rotate_notes(program: str, run_id: int) -> Path:
 
 def phases_for(scope: Scope | None) -> tuple[str, ...]:
     """Tool-lock phases for this program: the light ones only when it forbids automated scanners."""
-    return c.required_phases(scope is None or scope.scanners_allowed is not False)
+    return c.required_phases(scope is None or scope.scanners_on)
 
 
 def frontier(board: Board, program: str, scope: Scope | None = None) -> str:
@@ -234,7 +245,7 @@ def agent_command(
         "BH_DIR": bh,
         "BH_PROGRAM": prog,
         "BH_RPS": f"{scope.rate:g}",
-        "BH_SCANNERS": "0" if scope.scanners_allowed is False else "1",
+        "BH_SCANNERS": "1" if scope.scanners_on else "0",
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
         **(extra_env or {}),

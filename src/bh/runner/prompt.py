@@ -86,7 +86,7 @@ def scope_block(scope: Scope, identities: list[str] | None = None) -> str:
     if scope.forbidden_vulns:
         lines.append("Excluded vulnerability types: " + ", ".join(scope.forbidden_vulns))
     lines.append(f"Rate limit: {scope.rate:g} req/s (enforced by the gate)")
-    if scope.scanners_allowed is False:
+    if not scope.scanners_on:
         lines.append(
             "This program FORBIDS automated scanners: bh-content, bh-scan, bh-params, bh-sqli, bh-xss and direct "
             "nuclei/sqlmap/ffuf/... are refused. Map with bh-recon and bh-crawl, then test by hand, few requests."

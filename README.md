@@ -51,8 +51,8 @@ Recreate only the agent (never the whole pod while the lab runs):
 ```sh
 uv run bh scope import ywh <slug> --username <your YWH username>   # public program -> scopes/ywh/<slug>.yaml
 ```
-The import never widens a scope and leaves `automation_allowed` to you; programs whose rules forbid
-automated scanners get `scanners_allowed: false`. Full checklist: `docs/premiere-cible-ywh.md`.
+The import never widens a scope and leaves `automation_allowed` and `scanners_allowed` to you (the runner
+refuses while either is null); programs whose rules plainly forbid scanners already get `scanners_allowed: false`. Full checklist: `docs/premiere-cible-ywh.md`.
 
 ## Running
 

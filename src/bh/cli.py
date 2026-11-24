@@ -83,7 +83,8 @@ def cmd_scope_import(args) -> int:
         print("rules lines about automation / rate / headers (read the full rules too):")
         print("  " + "\n  ".join(line[:200] for line in imp.rule_excerpts))
     print(
-        "next: set automation_allowed (true/false) after reading the rules; create test accounts with your "
+        "next: set automation_allowed and scanners_allowed (true/false) after reading the rules (the runner "
+        "refuses while either is null); create test accounts with your "
         "@yeswehack.ninja alias and store them as identities (UI > Todo or var/state/identities)."
     )
     return 0
