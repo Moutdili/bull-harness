@@ -58,3 +58,24 @@ def test_graph_from_sandbox_and_gate(tmp_path, monkeypatch):
     fid = b.add_finding("p", "IDOR", vuln_class="idor", url="https://a.t.test/api/Users/12")
     g.link("https://a.t.test/api/Users/12", "finding", fid)
     assert b.rows("SELECT COUNT(*) n FROM asset_links WHERE ref_kind='finding'")[0]["n"] == 1
+
+
+def test_forged_sandbox_files_do_not_count_as_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["*.t.test"]})
+    b = Board(tmp_path / "var" / "board.sqlite")
+    rid = b.run_start("p", "m")
+    o = "https://never.t.test:443"
+    d = tmp_path / "var" / "work" / "p" / ".bh"
+    _write(d / c.TOUCHED, [{"origin": o, "key": f"GET /api/x{i}", "via": "tool"} for i in range(200)])
+    c.write_json(d / c.COVERAGE, {o: {p: {"status": "ok"} for p in c.REQUIRED_PHASES}})
+    _write(tmp_path / "var" / "state" / "flows.jsonl", [])
+    g = Graph(b, scope)
+    g.sync(rid)
+    assert g.counts(c.REQUIRED_PHASES) == (0, 0)  # the gate saw nothing: claims are not progress
+    _write(
+        tmp_path / "var" / "state" / "flows.jsonl",
+        [{"run": rid, "class": "target", "method": "GET", "url": "https://never.t.test/api/x1", "ua": "sqlmap/1.9"}],
+    )
+    g.sync(rid)
+    assert g.counts(c.REQUIRED_PHASES) == (1, len(c.REQUIRED_PHASES))  # claim + gate traffic: counted

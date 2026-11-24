@@ -102,6 +102,27 @@ class Board:
         self.db.execute("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
         self.db.commit()
 
+    def new_lines(self, path: Path, key: str) -> list[dict]:
+        """JSON objects appended to the log `path` since the last call with the same cursor `key` (a log that
+        shrank was recreated: read from the start). Lines that are not JSON objects are skipped."""
+        if not path.exists():
+            return []
+        off = int(self.meta_get(key, "0"))
+        if path.stat().st_size < off:
+            off = 0
+        out = []
+        with open(path, "rb") as fh:
+            fh.seek(off)
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+            self.meta_set(key, str(fh.tell()))
+        return out
+
     def reset_program(self, program: str) -> dict[str, int]:
         """Forget everything about one program (training labs). Returns affected rows per table."""
         out = {t: self.db.execute(f"DELETE FROM {t} WHERE program=?", (program,)).rowcount for t in PROGRAM_TABLES}

@@ -23,30 +23,6 @@ from bh.text import one_line
 AUTH_TODO_THRESHOLD = 3
 
 
-def read_new_lines(board: Board, path: Path, key: str) -> list[dict]:
-    """JSON lines appended to `path` since the last call with the same `key`."""
-    if not path.exists():
-        return []
-    off = int(board.meta_get(key, "0"))
-    if path.stat().st_size < off:  # truncated / recreated
-        off = 0
-    out = []
-    with open(path, "rb") as fh:
-        fh.seek(off)
-        for line in fh:
-            try:
-                out.append(json.loads(line))
-            except ValueError:
-                continue
-        board.meta_set(key, str(fh.tell()))
-    return out
-
-
-def skip_existing(board: Board, path: Path, key: str) -> None:
-    """Move the cursor to the end of `path` (events produced outside any run)."""
-    board.meta_set(key, str(path.stat().st_size if path.exists() else 0))
-
-
 def notes(
     board: Board, program: str, run_id: int, notes_file: Path, scope: Scope | None = None
 ) -> tuple[int, int, int]:
@@ -138,7 +114,7 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
     blocked: dict[str, int] = {}
     auth: dict[tuple[str, str | None], int] = {}
     todos = 0
-    for e in read_new_lines(board, paths.events_log(), "gate-events"):
+    for e in board.new_lines(paths.events_log(), "gate-events"):
         if e.get("program") not in (program, "-"):
             continue
         match e.get("kind"):

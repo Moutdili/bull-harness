@@ -42,7 +42,11 @@ CREATE INDEX IF NOT EXISTS assets_prog ON assets(program, kind);
 """
 # User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
 MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
-EVIDENCE_RANK = {"gate": 3, "tool": 2, "literal": 1}  # gate-observed is authoritative
+# What makes an endpoint "tested". The gate's word ranks first: a hand-made request it saw ("gate") counts alone;
+# what the sandbox claims (touched.jsonl: "tool", "literal") counts only if the gate saw that endpoint asked at all
+# ("seen", any client). Same for coverage: a phase counts on an origin the gate saw traffic to.
+EVIDENCE_RANK = {"gate": 3, "tool": 2, "literal": 1, "seen": 0}
+_CLAIMS = {"tool", "literal"}
 
 
 def _text(e: dict, k: str) -> str | None:
@@ -119,7 +123,8 @@ class Graph:
     ) -> int:
         oid = self.origin(origin_, source)
         meta = {"params": sorted(set(params or []))} | ({"status": status} if status is not None else {})
-        return self._upsert("endpoint", f"{origin_} {key}", oid, source, meta=meta)
+        in_scope = check(self.scope, origin_ + "/").allowed  # an endpoint is in scope only where its origin is
+        return self._upsert("endpoint", f"{origin_} {key}", oid, source, in_scope=in_scope, meta=meta)
 
     def tested(self, origin_: str, key: str, evidence: str, run_id: int | None) -> None:
         eid = self.endpoint(origin_, c.family(key), evidence)
@@ -173,31 +178,35 @@ class Graph:
                 self.tested(o, key, "tool" if t.get("via") != "manual" else "literal", run_id)
                 n["tests"] += 1
         runs = self.b.run_ids(self.program)
-        for f in c.read_jsonl(paths.flows_log()):
-            if f.get("run") in runs and f.get("class") in (None, "target") and MANUAL_UA.match(f.get("ua") or ""):
-                if k := c.endpoint_key(f.get("url", ""), f.get("method", "GET")):
-                    self.tested(k[0], k[1], "gate", f.get("run"))
-                    n["tests"] += 1
-            elif f.get("run") in runs and f.get("class") in (None, "target"):
-                host = urlsplit(f.get("url", "")).hostname
-                if host:
-                    self.host(host, "gate")
+        for f in self.b.new_lines(paths.flows_log(), f"assets-flows:{self.program}"):  # incremental: a cursor
+            if f.get("run") not in runs or f.get("class") not in (None, "target"):
+                continue
+            url = f.get("url") if isinstance(f.get("url"), str) else ""
+            if host := urlsplit(url).hostname:
+                self.host(host, "gate")
+            if k := c.endpoint_key(url, str(f.get("method", "GET"))):
+                manual = MANUAL_UA.match(str(f.get("ua") or ""))
+                self.tested(k[0], k[1], "gate" if manual else "seen", f.get("run"))
+                n["tests"] += bool(manual)
         self.b.db.commit()
         return n
 
     # ------------------------------------------------------------------ reads
     def surface(self, phases: tuple[str, ...]) -> tuple[dict, list, dict]:
         """Same shapes as bh.agent.contract._surface_data, from the board (the host's authority)."""
-        eps, tested = {}, set()
+        eps, tested, seen_origins = {}, set(), set()
         for r in self.b.rows(
-            "SELECT a.id, a.key, a.source, a.meta, (SELECT COUNT(*) FROM tests t WHERE t.asset_id=a.id) AS n "
-            "FROM assets a WHERE a.program=? AND a.kind='endpoint' AND a.in_scope=1",
+            "SELECT a.id, a.key, a.source, a.meta, (SELECT GROUP_CONCAT(DISTINCT t.evidence) FROM tests t "
+            "WHERE t.asset_id=a.id) AS ev FROM assets a WHERE a.program=? AND a.kind='endpoint' AND a.in_scope=1",
             self.program,
         ):
             origin_, key = r["key"].split(" ", 1)
             meta = json.loads(r["meta"] or "{}")
             eps[(origin_, key)] = {"params": set(meta.get("params", [])), "sources": {r["source"] or "?"}}
-            if r["n"]:
+            ev = set((r["ev"] or "").split(",")) - {""}
+            if ev & {"gate", "seen"}:
+                seen_origins.add(origin_)
+            if "gate" in ev or (ev & _CLAIMS and "seen" in ev):
                 tested.add((origin_, key))
         untested = [(k, v) for k, v in eps.items() if k not in tested]
         untested.sort(
@@ -208,7 +217,8 @@ class Graph:
             "SELECT a.key, c.phase, c.status, c.ts FROM coverage c JOIN assets a ON a.id=c.asset_id WHERE a.program=?",
             self.program,
         ):
-            cov.setdefault(r["key"], {})[r["phase"]] = {"status": r["status"], "ts": r["ts"]}
+            status = r["status"] if r["key"] in seen_origins else "error: no traffic seen by the gate"
+            cov.setdefault(r["key"], {})[r["phase"]] = {"status": status, "ts": r["ts"]}
         return eps, untested, cov
 
     def counts(self, phases: tuple[str, ...]) -> tuple[int, int]:
