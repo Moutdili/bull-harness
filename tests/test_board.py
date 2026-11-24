@@ -16,3 +16,10 @@ def test_board_crud(tmp_path):
     f = b.frontier("demo")
     assert "F1 [verified/high]" in f and "httpx: 12 live hosts" in f and "T1 [auth]" in f
     assert len(f.splitlines()) <= 40
+
+
+def test_orphaned_run_closed_at_next_start(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    orphan = b.run_start("p", "m")  # never ended: crash / hard kill
+    b.run_start("p", "m")
+    assert b.rows("SELECT status FROM runs WHERE id=?", orphan)[0]["status"] == "stopped"

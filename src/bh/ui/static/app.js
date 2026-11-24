@@ -68,7 +68,7 @@ views.dash = async () => {
   const s = status.severity;
   fill($("#dash"),
     el("h2", {}, "Findings par sévérité"),
-    el("div", { class: "grid" }, ...["critical", "high", "medium", "low", "info"].map((k) =>
+    el("div", { class: "grid" }, ...Object.keys(s).map((k) =>
       el("div", { class: `card kpi ${k === "critical" ? "crit" : k}` }, el("div", { class: "v" }, s[k]), el("div", { class: "k" }, k)))),
     el("div", { class: "grid", style: "margin-top:12px" },
       kpi("À relire", status.findings_to_review), kpi("Todo humaine", status.open_todos),

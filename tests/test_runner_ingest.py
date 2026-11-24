@@ -54,3 +54,23 @@ def test_reset_program(tmp_path):
     b.meta_set("notes:p", "42")
     assert b.reset_program("p")["facts"] == 1
     assert b.meta_get("notes:p") == "" and len(b.rows("SELECT * FROM facts")) == 1
+
+
+def test_manual_requests_seen_by_the_gate_count_as_tested(tmp_path, monkeypatch):
+    from bh.agent import contract as c
+    from bh.runner.run import manually_tested
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    flows = tmp_path / "var" / "state" / "flows.jsonl"
+    _write(flows, [
+        {"program": "p", "method": "GET", "url": "http://h/api/Users/12", "ua": "curl/8.10.1"},
+        {"program": "p", "method": "GET", "url": "http://h/api/Cards", "ua": "Fuzz Faster U Fool v2.3.0"},
+        {"program": "other", "method": "GET", "url": "http://h/api/Feedbacks", "ua": "curl/8.10.1"},
+    ])
+    tested = manually_tested("p")
+    assert tested == {("http://h:80", "GET /api/Users")}
+    d = tmp_path / "bh"
+    c.append_jsonl(d / c.ENDPOINTS, *[{"origin": "http://h:80", "key": k, "params": p, "source": "js"}
+                                      for k, p in (("GET /api/Users", []), ("GET /api/Cards", []), ("GET /s", ["q"]))])
+    s = c.surface(d, also_tested=tested)
+    assert "1 tested, 2 untested" in s and "GET /s ?q  → bh-sqli / bh-xss" in s

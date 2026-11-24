@@ -338,7 +338,7 @@ def scan(job: Job, deep: bool) -> None:
         ["nuclei", *common, *generic, "-jsonl", "-o", str(job.raw / "generic.jsonl")], timeout=job.timeout - half
     )
     hits = c.read_jsonl(job.raw / "tech.jsonl") + c.read_jsonl(job.raw / "generic.jsonl")
-    order = {s: i for i, s in enumerate(["critical", "high", "medium", "low", "info"])}
+    order = {s: i for i, s in enumerate(c.SEVERITIES)}
     for h in sorted(hits, key=lambda h: order.get((h.get("info") or {}).get("severity"), 9)):
         info = h.get("info") or {}
         extra = ",".join(h.get("extracted-results") or [])[:60]

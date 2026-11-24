@@ -336,7 +336,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="stack, last runs, todo count").set_defaults(func=cmd_status)
 
     def run_opts(sp):
-        sp.add_argument("--model", default=os.environ.get("BH_MODEL", "sonnet"))
+        from bh.runner.run import DEFAULT_MODEL
+
+        sp.add_argument("--model", default=os.environ.get("BH_MODEL", DEFAULT_MODEL))
         sp.add_argument(
             "--effort", default=os.environ.get("BH_EFFORT"), choices=["low", "medium", "high", "xhigh", "max"]
         )

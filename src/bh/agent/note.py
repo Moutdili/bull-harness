@@ -21,7 +21,6 @@ from pathlib import Path
 from bh.agent import contract as c
 
 FACT_KINDS = ["fact", "recon", "handoff", "dead-end"]
-SEVERITIES = ["critical", "high", "medium", "low", "info"]
 
 
 def _emit(rec: dict) -> None:
@@ -43,7 +42,7 @@ def parser() -> argparse.ArgumentParser:
     d.add_argument("outcome")
     fi = sub.add_parser("finding")
     fi.add_argument("title")
-    fi.add_argument("--severity", required=True, choices=SEVERITIES)
+    fi.add_argument("--severity", required=True, choices=c.SEVERITIES)
     fi.add_argument("--class", dest="vuln_class", required=True)
     fi.add_argument("--url", required=True)
     fi.add_argument("--poc-file", required=True, help="script/curl that reproduces the issue")
@@ -71,7 +70,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     if a.op == "frontier":
         board = (d / c.FRONTIER).read_text() if (d / c.FRONTIER).exists() else "(no frontier yet)"
-        print(board + ("\n" + s if (s := c.surface(d)) else ""))
+        manual = {tuple(x) for x in c.read_json(d / c.MANUAL_TESTED, [])}
+        print(board + ("\n" + s if (s := c.surface(d, also_tested=manual)) else ""))
         return
     if a.op == "finding":
         poc = Path(a.poc_file)

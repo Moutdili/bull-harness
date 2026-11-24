@@ -19,6 +19,7 @@ from pathlib import Path
 from mitmproxy import ctx, http
 from mitmproxy.proxy import server_hooks
 
+from bh import paths
 from bh.agent.contract import IDENTITY_HEADER
 from bh.gate.policy import SYSTEM_IGNORE_REGEX, Policy, Verdict
 
@@ -48,8 +49,8 @@ class Gate:
         if "bh_state" not in updated and self.policy is not None:
             return  # another option changed: keep the policy and its rate-limit buckets
         self.state = Path(ctx.options.bh_state)
-        (self.state / "flows").mkdir(parents=True, exist_ok=True)
-        self.policy = Policy(self.state / "active-scope.yaml")
+        (self.state / paths.FLOWS_DIR).mkdir(parents=True, exist_ok=True)
+        self.policy = Policy(self.state / paths.ACTIVE_SCOPE)
         self.policy.reload()
         # Claude API traffic is tunnelled untouched (TLS passthrough), never decrypted by the gate.
         if SYSTEM_IGNORE_REGEX not in ctx.options.ignore_hosts:
@@ -81,7 +82,7 @@ class Gate:
 
     def _deny(self, flow: http.HTTPFlow, v: Verdict, where: str) -> None:
         self._log(
-            "events.jsonl",
+            paths.EVENTS,
             {
                 "kind": "blocked",
                 "where": where,
@@ -117,7 +118,7 @@ class Gate:
             v = self.policy.check_ip(host, ip)
             if not v.allowed:
                 self._log(
-                    "events.jsonl",
+                    paths.EVENTS,
                     {"kind": "blocked", "where": "resolve", "host": host, "ip": ip, "reason": v.reason, "rule": v.rule},
                 )
                 data.server.error = f"bh-gate: DENIED {host} -> {ip} ({v.reason})"
@@ -137,6 +138,7 @@ class Gate:
         bucket = self.policy.bucket(v.klass)
         if bucket is not None:
             flow.metadata["bh_wait"] = round(await bucket.take(), 3)
+        flow.metadata["bh_ua"] = req.headers.get("User-Agent", "")  # before the program UA override
         if v.klass == "target":
             scope = self.policy.scope
             for k, val in scope.required_headers.items():
@@ -152,11 +154,11 @@ class Gate:
     def _apply_identity(self, flow: http.HTTPFlow, name: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", name):
             return
-        path = self.state / "identities" / self.policy.program / f"{name}.json"
+        path = self.state / paths.IDENTITIES / self.policy.program / f"{name}.json"
         try:
             ident = json.loads(path.read_text())
         except (OSError, ValueError):
-            self._log("events.jsonl", {"kind": "identity-missing", "identity": name, "url": flow.request.pretty_url})
+            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": flow.request.pretty_url})
             return
         for k, val in (ident.get("headers") or {}).items():
             flow.request.headers[k] = val
@@ -179,8 +181,9 @@ class Gate:
             "len": len(body),
             "ctype": resp.headers.get("content-type", ""),
             "wait": flow.metadata.get("bh_wait", 0),
+            "ua": flow.metadata.get("bh_ua", "")[:120],
         }
-        self._log("flows.jsonl", rec)
+        self._log(paths.FLOWS, rec)
         full = {
             **rec,
             "request": {
@@ -192,7 +195,7 @@ class Gate:
                 "body": body[:MAX_BODY].decode("utf-8", "replace"),
             },
         }
-        (self.state / "flows" / f"{fid}.json").write_text(json.dumps(full, ensure_ascii=False))
+        (self.state / paths.FLOWS_DIR / f"{fid}.json").write_text(json.dumps(full, ensure_ascii=False))
         server = resp.headers.get("server", "").lower()
         if resp.status_code in (403, 429, 503) and (
             "cf-mitigated" in resp.headers
@@ -200,7 +203,7 @@ class Gate:
             or (resp.status_code == 403 and any(s in server for s in ("cloudflare", "akamai", "awselb")))
         ):
             self._log(
-                "events.jsonl",
+                paths.EVENTS,
                 {
                     "kind": "waf",
                     "host": req.pretty_host,
@@ -212,7 +215,7 @@ class Gate:
             )
         elif resp.status_code == 401:
             self._log(
-                "events.jsonl",
+                paths.EVENTS,
                 {
                     "kind": "auth",
                     "host": req.pretty_host,

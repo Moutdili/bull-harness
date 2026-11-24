@@ -91,6 +91,11 @@ class Board:
 
     # ---- runs
     def run_start(self, program: str, model: str) -> int:
+        # One agent at a time: a run still 'running' here was orphaned by a crash or a hard kill.
+        self.db.execute(
+            "UPDATE runs SET status='stopped', ended=?, note='orphaned (closed at next start)' WHERE status='running'",
+            (time.time(),),
+        )
         cur = self.db.execute(
             "INSERT INTO runs(program, model, started, status) VALUES (?,?,?, 'running')", (program, model, time.time())
         )
