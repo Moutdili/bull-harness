@@ -2,7 +2,7 @@
 id: 13
 title: "Sommeil quota calé sur l'heure de reset"
 labels: [P1, area:autonomy, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Sommeil quota calé sur l'heure de reset

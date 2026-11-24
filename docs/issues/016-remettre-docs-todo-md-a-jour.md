@@ -2,7 +2,7 @@
 id: 16
 title: "Remettre docs/TODO.md à jour"
 labels: [P1, area:docs, owner:claude]
-status: open
+status: closed
 ---
 
 # Remettre docs/TODO.md à jour

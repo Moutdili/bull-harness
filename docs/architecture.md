@@ -6,7 +6,7 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 
 | Contrainte | Valeur | Conséquence |
 |---|---|---|
-| CVP | tier **Defense** (individuel) | Source primaire : Defense est le tier prévu pour les bug bounty hunters, et couvre le triage et la validation de vulnérabilités. L'exploit dev et les outils offensifs relèvent de Red Team, **réservé aux organisations sur API/Enterprise**. Les refus restent possibles (faux positifs) : refus → todo humaine. Voir `cvp-red-team-dossier.md`. |
+| CVP | tier **Defense** (individuel) | Source primaire : Defense est le tier prévu pour les bug bounty hunters, et couvre le triage et la validation de vulnérabilités. L'exploit dev et les outils offensifs relèvent de Red Team, **réservé aux organisations sur API/Enterprise**. Les refus restent possibles (faux positifs) : refus → fait `blocker`, pause 6 h, puis programme parqué (jamais de reformulation). Voir `cvp-red-team-dossier.md`. |
 | Plan Claude | **Pro** | Fenêtre glissante de 5 h + plafond hebdo, partagés avec claude.ai. Pas de crédits API. → **1 agent à la fois**, superviseur qui dort jusqu'au reset, économie de tokens prioritaire. ⚠ Accès Opus sur Pro non confirmé : modèle configurable. |
 | Conteneurs | **Podman 5.8.9 rootless** + podman-compose 1.6.0 | Pas de socket root à monter, ce qui évite la classe de CVE-2026-14784. Le compose doit rester compatible docker compose. ⚠ Vérifier `internal: true` sous podman-compose. |
 | Plateformes | **YesWeHack, Intigriti** puis H1/Bugcrowd | Règles par programme : en-tête obligatoire (`X-Intigriti-Username`, `User-Agent: Intigriti-<user>`, `Infomaniak-YWH-Bugbounty`…) et plafond de requêtes (3 à 20 req/s selon le programme). |
@@ -17,7 +17,7 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 ```
  hôte Fedora (Mio / Claude orchestrateur)
  ├─ bh (CLI)  ─────────────┐
- ├─ ui (web, SSE)          │  SQLite board : facts / intents / hints / findings / todos / refusals
+ ├─ ui (web, SSE)          │  SQLite board : facts (+ blockers) / intents / findings / todos submit
                            ▼
  ┌────────── réseau "egress" ──────────┐
  │  gate  (mitmproxy + SOCKS5 + DNS)   │ ← seul conteneur avec Internet
@@ -41,7 +41,7 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 - Un fichier YAML par programme : `scopes/<platform>/<slug>.yaml`.
 - Champs : `in_scope[]` (hôtes, wildcards, CIDR, apps), `out_of_scope[]`, `required_headers{}`, `user_agent`, `max_rps`, `automation_allowed`, `forbidden_vulns[]`, `identities[]` (références vers des secrets, jamais les secrets eux-mêmes), `source`, `synced_at`, `hash`.
 - `enforce(url|host|ip) → allow|deny + raison` : **une seule fonction**, utilisée par le proxy, les builtins et `bh`. Un out-of-scope l'emporte toujours sur un in-scope.
-- Un actif découvert hors scope va dans la todo humaine (`scope-question`), **jamais** dans le scope.
+- Un actif découvert hors scope est consigné (fait `out-of-scope`, un par run), **jamais** ajouté au scope ni ciblé.
 - Sync : API researcher Intigriti (token personnel, bêta), API YesWeHack (bearer + TOTP, non documentée), `bounty-targets-data` pour le diff des programmes publics. Toute modification passe par un diff affiché à l'humain, puis une validation.
 
 ### 2. `gate/` — sortie réseau contrôlée
@@ -85,36 +85,50 @@ Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/age
 ### 7. `verify/` — vérificateur
 Contexte neuf, il ne reçoit que la PoC. Il rejoue via le gate. Un finding non reproduit n'atteint pas la todo `submit`.
 
-### 8. Todo humaine
+### 8. Pas d'humain pendant la chasse (2026-11-25)
+Mio n'intervient qu'**après le triage**, pour soumettre. Pendant un run, aucun composant n'attend un humain.
+Détail et audit : `research/11-autonomie-sans-humain.md`.
+
+Todo humaine (post-triage) :
 | Type | Déclencheur | Action humaine |
 |---|---|---|
-| `auth` | 401/403 répétés, page de login | Se connecter via le navigateur branché sur le gate en mode capture ; la session est stockée et injectée ensuite |
-| `waf` | challenge (Cloudflare, Akamai…) détecté par le gate | Résoudre le challenge une fois dans le navigateur de capture, ou marquer l'actif comme bloqué |
-| `account` | rôle manquant (2ᵉ compte pour les IDOR) | Créer le compte, l'enregistrer comme identité |
-| `scope-question` | actif découvert hors scope | Ajouter ou ignorer |
-| `refusal` | refus du modèle | Décider : reformuler, faire à la main, abandonner |
-| `submit` | finding vérifié | Relire la PoC, soumettre |
+| `submit` | finding vérifié par le juge (Opus, ou Mythos en escalade) | Relire la PoC, soumettre |
+
+Blocages pendant la chasse : fait `blocker` (`[raison] quoi`, montré 7 jours dans la frontière, `bh blockers`, onglet « Pistes bloquées ») :
+| Blocage | Traitement autonome |
+|---|---|
+| challenge WAF répété | le gate met l'hôte en pause 1 h (3 challenges en 10 min, règle `waf-cooldown`) ; ses endpoints sortent de la surface non testée |
+| session expirée (401 répétés sous identité) | identité marquée périmée, retirée du prompt et du juge jusqu'à réécriture de son fichier ; relance du login par l'hôte (à venir, issue 26) |
+| mur de login sans identité, 2ᵉ compte manquant | blocker `auth` / `account` ; comptes créés par l'hôte (à venir, issue 25) |
+| captcha, SMS, KYC, fonction payante, écriture sur un tiers, hors bande | blocker `captcha` / `sms` / `kyc` / `paid` / `write-needed` / `oob-needed` ; jamais de résolution de captcha |
+| actif hors scope | fait `out-of-scope` ; jamais d'élargissement |
+| refus du modèle | blocker `refusal` ; 1ᵉʳ refus : pause 6 h ; 2ᵉ dans la chasse : programme parqué ; 3 en 7 jours : exclu au préflight |
+| programme non prêt (`automation_allowed`, `scanners_allowed` inconnus) | exclu au préflight ; l'onboarding reste humain, hors chasse (autorisation légale) |
+| juge `inconclusive` | escalade unique vers Mythos ; s'il reste `inconclusive`, statut visible dans Findings, sans todo |
 
 ### 9. `notify/`
 Abandonné le 2026-11-25 (Gmail / Pub/Sub). La mise à jour des scopes sera déclenchée par un hook d'un autre type, le moment venu.
 
 ### 10. `ui/`
-Vue en direct du flux de l'agent, board, findings + PoC (requêtes HAR rejouables en `curl`), todo humaine. Écoute sur l'IP Tailscale (ou `127.0.0.1`), jamais `0.0.0.0` ; connexion par token (`secrets/ui.token`) puis cookie HttpOnly ; CSP stricte, rendu `textContent` uniquement.
+Vue en direct du flux de l'agent, board, findings + PoC (requêtes HAR rejouables en `curl`), todo de soumission, pistes bloquées, identités. Écoute sur l'IP Tailscale (ou `127.0.0.1`), jamais `0.0.0.0` ; connexion par token (`secrets/ui.token`) puis cookie HttpOnly ; CSP stricte, rendu `textContent` uniquement.
 
 ### 11. `bh` — CLI orchestrateur
-`bh scope add|sync|diff|check <url>` · `bh run [--program X] [--once]` · `bh todo [done <id>]` · `bh finding ls|show|verify` · `bh target local <url>` (cible perso : scope généré, en-têtes vides, débit libre) · `bh alias mine|compile|stats` · `bh ui`.
+`bh scope add|sync|diff|check <url>` · `bh run [--program X] [--once]` · `bh todo [done <id>]` (soumissions) · `bh blockers [programme] [--since H]` · `bh finding ls|show|verify` · `bh target local <url>` (cible perso : scope généré, en-têtes vides, débit libre) · `bh tokens calibrate|mine` (veille, alias abandonnés) · `bh ui`.
 C'est l'interface par laquelle Claude (cette session) pilote le harnais.
 
 ## Stack
 Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQLite pour le board : un agent à la fois, pas besoin de Postgres.
 
 ## Risques
-1. Tier Defense : refus sur l'exploitation. Mitigation : refus → todo, et dossier Red Team.
+1. Tier Defense : refus sur l'exploitation. Mitigation : refus → blocker, abandon chiffré, et dossier Red Team.
 2. Quota : plan Ultra depuis le 2026-11-24 (plus de fenêtre de 5 h). Mitigation conservée : Sonnet chasse, Opus juge, mesure du coût par finding vérifié.
 3. API YesWeHack non documentée : peut casser. Mitigation : fallback `bounty-targets-data` + édition manuelle du YAML.
 4. Gate HTTP seulement contournable par un outil qui ignore le proxy. Mitigation : l'agent n'a **aucune route** hors du réseau `sandbox`. Le gate est le seul chemin, pas une convention.
 
 ## Limites connues (après les deux revues hostiles du 2026-11-24)
+- **MCP** : la session de l'agent et celle du juge ne chargent aucun serveur MCP (`--strict-mcp-config` sans
+  `--mcp-config`), et un `.mcp.json` laissé dans le dossier de travail est effacé entre deux segments. Raison : les hooks
+  ne voient que `Bash`. Les outils tiers entrent comme builtins `bh-*` (`research/08-mcp-arsenal.md`).
 - **Jeton OAuth** : n'existe que dans le gate ; l'agent a un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081`.
   Le relais n'accepte que le conteneur agent (le gate est aussi sur le réseau du lab), que les deux appels que fait
   Claude Code (`POST /v1/messages`, `/v1/messages/count_tokens`, mesuré sur 2.1.330), seulement pendant un run, et

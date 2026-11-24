@@ -57,7 +57,7 @@ Légende : ✅ en place et vérifié · ◐ partiel · ✗ absent · 🔬 à mes
 | Traiter chaque rapport comme une hypothèse réfutable ; validation de conditions et de chemin | [VulAgent, arXiv:2509.11523](https://arxiv.org/abs/2509.11523) | ✅ `proof.json` + contrôle jumeau obligatoire |
 | Passes « kill » adverses, critique d'un **autre modèle**, validation empirique | [Refute-or-Promote, arXiv:2604.19049](https://arxiv.org/abs/2604.19049) | ✅ juge Opus ≠ chasseur Sonnet ; ✅ rejeu déterministe |
 | Un juge LLM se trompe avec un seul token (FPR jusqu'à 66,8 %) | [One Token to Fool LLM-as-a-Judge, arXiv:2507.08794](https://arxiv.org/abs/2507.08794) | ✅ `verified` exige aussi l'étage A déterministe ; ◐ le juge lit du texte de la cible (issue juge isolé) |
-| Les agents de filtrage écartent parfois de vrais positifs | [Sifting the Noise, arXiv:2601.22952](https://arxiv.org/abs/2601.22952) | ✅ `inconclusive` → todo humaine, jamais rejet faute de reproduction |
+| Les agents de filtrage écartent parfois de vrais positifs | [Sifting the Noise, arXiv:2601.22952](https://arxiv.org/abs/2601.22952) | ✅ `inconclusive` → second juge Mythos, puis statut visible ; jamais rejet faute de reproduction |
 | Plateformes : suspension de 30 jours pour soumissions IA non validées (Bugcrowd) ; YWH : l'humain décide toujours, aucune règle hunter publique sur l'IA trouvée | [Bugcrowd](https://www.bugcrowd.com/blog/bugcrowd-policy-changes-to-address-ai-slop-submissions/) ; [YWH, approche IA](https://www.yeswehack.com/product/ai-vulnerability-management) ; [YWH Claude Kit](https://www.yeswehack.com/learn-bug-bounty/triager-grade-reports-claude-code) | ✅ Mio soumet ; ✗ pas de métrique « taux de soumissions valides » ; 🔬 lire les CGU hunter YWH |
 
 ### Injection de prompt par la cible
@@ -76,7 +76,7 @@ Légende : ✅ en place et vérifié · ◐ partiel · ✗ absent · 🔬 à mes
 ## 3. Bonnes pratiques par phase (tirées de ce qui précède)
 
 - **Socle / scope** : une seule fonction de décision, testée par propriétés ; l'import ne fait jamais
-  qu'ajouter du refus ; tout cas douteux → todo humaine. Avant une cible réelle : un test HTTPS positif sur un nom.
+  qu'ajouter du refus ; tout cas douteux → refus et fait `blocker` (pas d'humain pendant la chasse). Avant une cible réelle : un test HTTPS positif sur un nom.
 - **Confinement** : les garanties dures vivent hors du modèle (gate, utilisateurs Unix, conteneurs). Toute
   règle de la doctrine qui compte doit avoir son équivalent au gate ; la doctrine n'est qu'une aide.
 - **Tokens** : mesurer avant d'optimiser (tableau `turns`). Ordre des leviers : sorties courtes à la source →

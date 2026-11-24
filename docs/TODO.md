@@ -5,7 +5,7 @@ Décisions figées (2026-11-22, plan Ultra depuis le 2026-11-24) : CVP **Defense
 Légende propriétaire : **C** = Claude (en direct, parties critiques) · **H** = Hermes (swarm) · **M** = Mio (humain).
 Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie que si le critère passe en sortie d'outil réelle.
 
-## État au 2026-11-24 (vérifié par tests ou run réel)
+## État au 2026-11-25 (vérifié par tests ; le live reste à faire, issue 27)
 
 | Phase | Fait | Reste |
 |---|---|---|
@@ -13,7 +13,7 @@ Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie qu
 | 1 Confinement | 1.1 gate HTTP (décision sur la destination réelle, fail-closed, TCP brut coupé, méthodes, backoff 429/503/WAF), 1.1b passifs (hôtes exacts, IP publiques), 1.4 réseaux, **1.5 suite d'évasion `tests/escape/escape_check.sh` : 29/29** (HTTPS par nom, raisons des refus vérifiées) | 1.2 DNS filtrant (aujourd'hui : aucune résolution externe), 1.3 SOCKS (volontairement absent), sources passives de subfinder |
 | 2 Tokens | 2.2 troncature, 2.3 `updatedToolOutput` vérifié, base par tour −62 % (`--tools Bash,Read`, sans slash commands), sessions neuves par défaut | 2.4 mineur et 2.5 calibrage faits (veille). **2.6 alias abandonnés** le 2026-11-25 : gain mesuré ~0,3 % d'un run (issue 017). 2.1 réécriture : idem, non prioritaire |
 | 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope (H7 Gmail abandonné) |
-| 4 Autonomie | 4.1 runner (stderr fichier, kill propre), 4.2 superviseur (progression réelle), 4.4 todos auth/waf/identity, **verrou d'outils + file de surface** | 4.2b rotation sur contexte, 4.5 capture de session, 4.6 skills (4.3 vérificateur : fait, F1 vérifié de bout en bout) |
+| 4 Autonomie | 4.1 runner, 4.2 superviseur (sommeil quota sur `resetsAt`), 4.3 vérificateur + **escalade Mythos**, **verrou d'outils + file de surface**, **4.4 remplacée : plus d'humain pendant la chasse** (faits `blocker`, pause WAF dans le gate, identités périmées, refus chiffrés, préflight), `q`/`qq`, aucun MCP chargé | 4.2b rotation sur contexte, 4.6 skills, 4.5 remplacée par les issues 25-26 (sessions par l'hôte) |
 | 5 CVE | — | tout |
 | 6 Runs réels | 6.0 lab Juice Shop (reset 2026-11-24 : 7 runs, 5 findings, cartographie 100 % arsenal) | 6.1 app perso, 6.2 premier programme, 6.3 premier CVE |
 
@@ -56,7 +56,7 @@ Reste ouvert :
 | 0.2b | Jokers en milieu de label (`api-*.example.com`), interdits dans les 2 derniers labels ; refuser les bases trop courtes (`*.co.uk`) via une liste de suffixes publics embarquée | `src/bh/scope/` | tests : `api-v2.example.com` OK, `api.example.com` KO pour `api-*`, `*.co.uk` → ScopeError |
 | 0.3 | **Contrat plugin** : schéma manifest YAML + loader + validation | `src/bh/plugins/schema.py` | un manifest invalide → erreur nommée ; `bh plugin ls` liste les exemples |
 | 0.4 | **Contrat board** : schéma SQLite (facts **titre/résumé/preuve**, intents, hints, findings, todos, refusals, runs, handoffs) + migrations | `src/bh/board/` | `bh board init` crée la DB ; tests CRUD verts ; `bh board frontier` rend ≤ 40 lignes |
-| 0.5 | CLI `bh` squelette : `scope`, `plugin`, `board`, `todo`, `run`, `ui`, `alias` | `src/bh/cli.py` | chaque sous-commande répond `--help` |
+| 0.5 | CLI `bh` squelette : `scope`, `plugin`, `board`, `todo`, `blockers`, `run`, `ui`, `tokens` | `src/bh/cli.py` | chaque sous-commande répond `--help` |
 
 ## Phase 1 — Confinement réseau (C)
 
@@ -103,7 +103,7 @@ Contrats à respecter : schémas 0.2 / 0.3 / 0.4. Un fichier = un propriétaire.
 | 4.2b | Rotation à saturation de contexte : au-delà du seuil, l'agent écrit un `handoff` (playbook) puis session neuve | `src/bh/runner/supervisor.py` | simulation seuil franchi → handoff écrit, nouvelle session le lit |
 | 4.3 | Vérificateur = **relecteur indépendant** : contexte neuf, rejoue la PoC via gate, gate 7 questions, dédup, section « non prouvé » obligatoire, verdict submit / submit-with-changes / don't-submit | `src/bh/verify/` | finding factice non reproductible → rejeté ; reproductible → todo `submit` ; doublon d'un finding existant → signalé |
 | 4.6 | Méthodo à la demande : sous-module Claude-BugHunter figé + **liste blanche** de skills relues, chargées selon l'empreinte de la cible | `vendor/`, `src/bh/skills/` | session sur cible GraphQL → seules les skills listées pour GraphQL sont chargées (vérifié dans le transcript) |
-| 4.4 | Détection todo : 401/403 répétés → `auth` ; challenge WAF → `waf` ; refus → `refusal` | `src/bh/gate/`, `src/bh/runner/` | fixtures → todos créées |
+| 4.4 | ~~Détection todo~~ → blocages autonomes (2026-11-25) : 401 répétés → identité périmée ou blocker `auth` ; 3 WAF en 10 min → pause 1 h dans le gate ; refus → pause 6 h puis parcage | `src/bh/gate/`, `src/bh/runner/`, `src/bh/board/` | fait : `grep add_todo src/bh` ne rend que `submit` ; tests verts |
 | 4.5 | Capture de session humaine via gate (mode capture) → injection | `src/bh/gate/capture.py` | login manuel sur app de test → requêtes agent authentifiées |
 
 ## Phase 5 — Mode CVE (C + H)
@@ -124,6 +124,30 @@ Contrats à respecter : schémas 0.2 / 0.3 / 0.4. Un fichier = un propriétaire.
 | 6.3 | Premier signalement CVE | M | rapport envoyé au mainteneur |
 
 ---
+
+## Phase 7 — Outils et sessions autonomes (2026-11-25)
+
+Recherches : `research/08-mcp-arsenal.md`, `09-vision-headless.md`, `10-sessions-anti-bot.md`, `11-autonomie-sans-humain.md`.
+Principe : pas de MCP dans l'agent (les hooks ne voient que `Bash`) ; chaque outil tiers entre comme builtin `bh-*` qui passe
+par le gate et rend ≤ 25 lignes.
+
+Décisions de Mio (2026-11-25) :
+- Gmail : notifications abandonnées ; **lecture seule** gardée pour les mails de confirmation des comptes de test.
+- `bh-browse` : ressources hors scope (CDN, polices) **bloquées localement** par défaut, comptées dans le résumé.
+- `bh-oob` : champ de scope `oob_allowed` par programme, `null` = interdit ; exige un serveur public hors du gate.
+- Juge `inconclusive` → second juge Mythos, une fois ; sinon statut visible sans todo.
+- Alias à un caractère abandonnés (gain mesuré ~0,3 % d'un run).
+
+| Issue | Tâche | Priorité |
+|---|---|---|
+| 27 | Validation live du swarm autonomie (gate redémarré, évasion 29/29, run lab, `.mcp.json` ignoré) | P0 |
+| 24 | `bh-browse` : Playwright dans l'agent, XSS confirmé, routes SPA | P0 |
+| 26 | Jarre de cookies et `session-dead` dans le gate | P0 |
+| 25 | `bh accounts` : inscription et login par l'hôte, conteneur `browser`, Gmail lecture seule, TOTP | P0 |
+| 28 | Mesures anti-bot sur le lab (empreinte du gate, rejeu de cookie de challenge) | P1 |
+| 29 | `bh-js` (REA CLI, après audit du paquet) | P1 |
+| 30 | `bh-sast`, `bh-deps` (mode CVE) | P2 |
+| 31 | `bh-oob` (`oob_allowed`) | P2 |
 
 ## Todo humaine (M) — à faire en parallèle
 
