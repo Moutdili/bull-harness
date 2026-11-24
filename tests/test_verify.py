@@ -199,3 +199,102 @@ def test_stage_b_keeps_only_the_verdict_carrying_its_nonce(tmp_path, monkeypatch
     verdict, reason = v.stage_b(board, scope, finding, {}, run_id=run_id, model="m", effort=None, say=print)
     assert (verdict, reason) == ("rejected", "own")
     assert seen["cmd"][seen["cmd"].index("--user") + 1] == stack.JUDGE
+
+
+# ------------------------------------------------------------------ escalation and errors (no container, no claude)
+@pytest.fixture
+def judged(tmp_path, monkeypatch):
+    """A finding with a proof, a stage A that reproduces, and a stage B scripted by `answers` (one per call)."""
+    from bh import stack
+    from bh import verify as v
+    from bh.runner import run as runner
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    board = Board(tmp_path / "b.sqlite")
+    fid = board.add_finding(
+        "p", "IDOR", vuln_class="idor", url="https://t.test/basket/7", proof=idor_proof("https://t.test")
+    )
+    run_id = board.run_start("p", "m")
+    for name in ("prepare_judge", "push_file"):
+        monkeypatch.setattr(stack, name, lambda *a, **k: None)
+    monkeypatch.setattr(runner, "clean_sandbox", lambda *a, **k: None)
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": True, "control_disproves": False})
+    calls, answers = [], []
+
+    def fake_b(board, scope, finding, replay, *, run_id, model, effort, say):
+        calls.append((model, effort))
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(v, "stage_b", fake_b)
+
+    def verify():
+        return v.verify_finding(board, scope, fid, run_id=run_id, model="opus", effort=None, say=lambda *a: None)
+
+    def state():
+        row = board.rows("SELECT status, verdict FROM findings WHERE id=?", fid)[0]
+        return row["status"], row["verdict"], [r["kind"] for r in board.rows("SELECT kind FROM todos")]
+
+    return verify, state, calls, answers, board, fid
+
+
+def test_inconclusive_escalates_to_the_second_judge_which_verifies(judged):
+    from bh.verify import ESCALATION_EFFORT, ESCALATION_MODEL
+
+    verify, state, calls, answers, *_ = judged
+    answers += [("inconclusive", "cannot tell"), ("confirmed", "reads another user's basket")]
+    assert verify() == "verified"
+    status, verdict, todos = state()
+    assert status == "verified" and todos == ["submit"]
+    assert calls == [("opus", None), (ESCALATION_MODEL, ESCALATION_EFFORT)]
+    assert verdict.startswith(f"[judge {ESCALATION_MODEL}]") and "[judge opus]" in verdict
+
+
+def test_two_inconclusive_judges_leave_it_inconclusive_without_todo(judged):
+    from bh.verify import ESCALATION_MODEL
+
+    verify, state, _calls, answers, *_ = judged
+    answers += [("inconclusive", "a"), ("inconclusive", "b")]
+    assert verify() == "inconclusive"
+    status, verdict, todos = state()
+    assert status == "inconclusive" and todos == []
+    assert verdict.startswith("neither judge decided") and "[judge opus]" in verdict and ESCALATION_MODEL in verdict
+
+
+def test_the_second_judge_can_reject(judged):
+    verify, state, _calls, answers, *_ = judged
+    answers += [("inconclusive", "a"), ("rejected", "public by design")]
+    assert verify() == "rejected"
+    assert state()[0] == "rejected" and state()[2] == []
+
+
+def test_a_finding_is_escalated_only_once(judged):
+    verify, state, calls, answers, board, fid = judged
+    answers += [("inconclusive", "a"), RuntimeError("container gone")]  # the crash hits the second judge
+    assert verify() == "new"
+    assert board.meta_get(f"escalated:F{fid}:p")
+    answers += [("inconclusive", "again")]
+    assert verify() == "inconclusive"
+    assert len(calls) == 3 and calls[-1][0] == "opus"  # no second escalation
+    assert state()[2] == []
+
+
+def test_one_error_puts_the_finding_back_in_the_queue(judged):
+    verify, state, _calls, answers, *_ = judged
+    answers += [RuntimeError("podman exec failed")]
+    assert verify() == "new"
+    status, verdict, todos = state()
+    assert status == "new" and "verification error 1/2" in verdict and todos == []
+
+
+def test_two_errors_end_inconclusive_without_escalation(judged):
+    verify, state, calls, answers, *_ = judged
+    answers += [RuntimeError("one"), RuntimeError("two")]
+    verify()
+    assert verify() == "inconclusive"
+    status, verdict, todos = state()
+    assert status == "inconclusive" and "verification error 2/2" in verdict and todos == []
+    assert [m for m, _ in calls] == ["opus", "opus"]

@@ -2,7 +2,9 @@
 
   new finding ──► dedup ──► stage A: deterministic replay of proof.json (2 rounds, through the gate)
                          ──► stage B: fresh claude session, verifier role, single requests, bounded
-                         ──► decision ──► verified (+ todo submit) | rejected | inconclusive (+ todo verify)
+                         ──► decision ──► verified (+ todo submit) | rejected | inconclusive
+                                      └─► inconclusive, never escalated: stage B once more with a second judge
+                                          (ESCALATION_MODEL, fresh context, new nonce), same stage A, same decision
                          └─► triager PoC generated from the proof (sessions as placeholders)
 
 Decision table (deterministic, B can only lower a deterministic success, never invent one):
@@ -10,6 +12,9 @@ Decision table (deterministic, B can only lower a deterministic success, never i
   B rejected                                         -> rejected
   A reproduced and B confirmed                       -> verified
   anything else                                      -> inconclusive
+
+No human verifies during the hunt: an inconclusive finding opens no todo, it stays visible in the Findings tab.
+A technical error sends the finding back to 'new' for a later pass; the second one leaves it inconclusive.
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ from bh.text import one_line
 VERIFIER_TURNS, VERIFIER_MINUTES = 8, 5
 # the judge is not the hunter's model (correlated errors); BH_VERIFIER_MODEL overrides
 VERIFIER_MODEL = os.environ.get("BH_VERIFIER_MODEL", "opus")
+# second judge for what the first one leaves inconclusive (decision of 2026-11-25), once per finding
+ESCALATION_MODEL = os.environ.get("BH_ESCALATION_MODEL", "claude-mythos-5-2")
+ESCALATION_EFFORT = "high"
+MAX_VERIFY_ERRORS = 2  # an error is a breakdown, not a doubt: retried on a later pass, never escalated
 REPLAY_TIMEOUT_S = 420
 # a new finding is a duplicate of these (a rejected one too: re-proposing it would cost a verifier session each time)
 ACTIVE = ("new", "verifying", "verified", "inconclusive", "submitted", "rejected")
@@ -215,17 +224,15 @@ def verify_finding(
     try:
         return _verify(board, scope, finding, run_id=run_id, model=model, effort=effort, say=say)
     except Exception as exc:  # noqa: BLE001 - never leave a finding stuck in 'verifying'
-        why = f"verification error: {exc!r}"[:500]
-        board.set_finding(fid, "inconclusive", why)
-        board.add_todo(
-            "verify",
-            f"F{fid} inconclusive: {finding['title']}",
-            why,
-            program=scope.program,
-            dedup=f"{scope.program}:verify:F{fid}",
-        )
-        say(f"  ↳ F{fid} inconclusive: {one_line(why, 200)}")
-        return "inconclusive"
+        key = f"verify-err:F{fid}:{scope.program}"
+        errors = int(board.meta_get(key, "0") or 0) + 1
+        board.meta_set(key, str(errors))
+        why = f"verification error {errors}/{MAX_VERIFY_ERRORS}: {exc!r}"[:500]
+        # below the bound the finding goes back in the queue: a later verify_pending retries it
+        status = "inconclusive" if errors >= MAX_VERIFY_ERRORS else "new"
+        board.set_finding(fid, status, why)
+        say(f"  ↳ F{fid} {status}: {one_line(why, 200)}")
+        return status
 
 
 def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: str, effort: str | None, say) -> str:
@@ -240,12 +247,19 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
     say(
         f"  ↳ F{fid} stage A: reproduced={replay.get('reproduced')} control_disproves={replay.get('control_disproves')}"
     )
+    board.finding_set(fid, replay=json.dumps(replay)[:200_000], poc_triager=triager_poc(scope, proof))
     if replay.get("control_disproves"):
-        verdict, reason = "rejected", "control answered like the attack"
+        status, why = decide(replay, "rejected", "control answered like the attack")
     else:
         verdict, reason = stage_b(board, scope, finding, replay, run_id=run_id, model=model, effort=effort, say=say)
-    status, why = decide(replay, verdict, reason)
-    board.finding_set(fid, replay=json.dumps(replay)[:200_000], poc_triager=triager_poc(scope, proof))
+        status, why = decide(replay, verdict, reason)
+        why = f"[judge {model}] {why}"
+        key = f"escalated:F{fid}:{scope.program}"
+        if status == "inconclusive" and not board.meta_get(key):
+            board.meta_set(key, ESCALATION_MODEL)  # before the call: a crash in it does not escalate again
+            status, why = _escalate(
+                board, scope, finding, proof=proof, replay=replay, home=home, first=why, run_id=run_id, say=say
+            )
     board.set_finding(fid, status, why)
     if status == "verified":
         board.add_todo(
@@ -255,16 +269,26 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
             program=scope.program,
             dedup=f"{scope.program}:submit:F{fid}",
         )
-    elif status == "inconclusive":
-        board.add_todo(
-            "verify",
-            f"F{fid} inconclusive: {finding['title']}",
-            why,
-            program=scope.program,
-            dedup=f"{scope.program}:verify:F{fid}",
-        )
     say(f"  ↳ F{fid} {status}: {one_line(why, 200)}")
     return status
+
+
+def _escalate(
+    board: Board, scope: Scope, finding: dict, *, proof: dict, replay: dict, home: str, first: str, run_id: int, say
+) -> tuple[str, str]:
+    """Stage B again with the second judge, recombined with the same stage A. Returns (status, verdict text)."""
+    fid, vdir = finding["id"], verify_dir(scope.program, finding["id"])
+    say(f"  ↳ F{fid} inconclusive for the first judge, second judge {ESCALATION_MODEL}")
+    # fresh context: the first judge's processes, HOME and work dir (its notes, its verdict) are gone
+    stack.prepare_judge(home, vdir)
+    stack.push_file(f"{vdir}/proof.json", json.dumps(proof), user=stack.JUDGE)
+    verdict, reason = stage_b(
+        board, scope, finding, replay, run_id=run_id, model=ESCALATION_MODEL, effort=ESCALATION_EFFORT, say=say
+    )
+    status, why = decide(replay, verdict, reason)
+    if status == "inconclusive":
+        return status, f"neither judge decided. {first} | [judge {ESCALATION_MODEL}] {why}"
+    return status, f"[judge {ESCALATION_MODEL}] {why} | first judge: {first}"
 
 
 def verify_pending(
