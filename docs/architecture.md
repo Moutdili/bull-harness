@@ -111,23 +111,26 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 
 ## Risques
 1. Tier Defense : refus sur l'exploitation. Mitigation : refus → todo, et dossier Red Team.
-2. Quota Pro : un agent en continu épuise la fenêtre de 5 h. Mitigation : économie de tokens, dormir au reset, modèle plus léger pour la recon.
+2. Quota : plan Ultra depuis le 2026-11-24 (plus de fenêtre de 5 h). Mitigation conservée : Sonnet chasse, Opus juge, mesure du coût par finding vérifié.
 3. API YesWeHack non documentée : peut casser. Mitigation : fallback `bounty-targets-data` + édition manuelle du YAML.
 4. Gate HTTP seulement contournable par un outil qui ignore le proxy. Mitigation : l'agent n'a **aucune route** hors du réseau `sandbox`. Le gate est le seul chemin, pas une convention.
 
-## Limites connues (revue hostile du 2026-11-24, non fermées)
-- ~~Jeton OAuth lisible par l'agent~~ **fermé** : l'agent n'a qu'un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081` ;
-  le gate (reverse proxy) injecte le vrai jeton, qui n'existe que dans son conteneur. Accès direct à l'API refusé.
-  Reste : l'agent peut lancer un `claude -p` imbriqué via le relais (consomme le quota, mais sans jeton à exfiltrer).
-- **Le verrou d'outils et la surface sont des aides, pas des frontières** : `coverage.json`, `touched.jsonl`,
-  `commands.jsonl` sont écrits dans le sandbox et modifiables par l'agent. Les garanties dures sont dans le gate.
-- **Exclusions** appliquées par le harnais : findings d'une classe exclue rejetés à l'ingestion (alias normalisés),
-  énumération d'ids refusée par le gate (> 4 ids distincts par route d'API ou requête authentifiée en 10 min),
-  corps > 1 Mio refusés. Non couvert : exclusions sans signature réseau (social engineering, physique : pas d'outil
-  pour), et le brute force reste interdit par doctrine (sqlmap sur un login lui ressemble trop pour un filtre au gate).
-- **Vérificateur indépendant (4.3) absent** : tout finding reste `new` jusqu'à la relecture humaine.
+## Limites connues (après les deux revues hostiles du 2026-11-24)
+- **Jeton OAuth** : n'existe que dans le gate ; l'agent a un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081`.
+  Le relais n'accepte que le conteneur agent (le gate est aussi sur le réseau du lab). Reste : tout chemin `/v1/`
+  est relayé, et un `claude -p` imbriqué consomme le quota (sans jeton à exfiltrer).
+- **Le sandbox n'est pas une frontière** : hooks, verrou d'outils et fichiers du contrat sont des aides. Les garanties
+  dures sont dans le gate (scope jugé sur le nom demandé, méthodes et overrides, identités existantes, ports web,
+  énumération sur la route normalisée, garde scanners par rafale de 404, websockets refusés, débit) et sur l'hôte
+  (ingestion typée, preuve revalidée, « testé » confirmé par le gate, secrets caviardés).
+- **Exclusions** : une entrée YWH n'exclut une classe entière que si elle la nomme ; les exclusions conditionnelles
+  restent à l'humain. Brute force interdit par la doctrine et, pour les programmes sans scanners, freiné par la garde
+  404 du gate. Exclusions sans signature réseau (social engineering, physique) : doctrine seulement.
+- **Vérificateur** : process du chasseur tués, HOME neuf, `python3 -I`, modèle différent (Opus). Reste : même
+  utilisateur Unix et même conteneur que le chasseur.
+- **Énumération** : les ids en query string, corps JSON ou GraphQL ne sont pas comptés.
 - **Coût du verrou sur une vraie cible** : crawl + content + scan par origine (~10 min chacun à 2 req/s).
 - **nuclei** : ~1,5 req/s via le gate, cause interne non trouvée ; borné par `--timeout`.
-- **CVP Defense** : piloter sqlmap/nuclei de façon autonome pourrait relever du tier Red Team selon
-  `docs/cvp-red-team-dossier.md` ; interprétation à faire valider auprès d'Anthropic.
-
+- **Rechargement du gate** : mitmdump recharge `addon.py` mais pas `policy.py` ; après une modification de la
+  politique, `podman restart bh-gate` (en attendant, le gate refuse : fail-closed).
+- Liste à jour des points ouverts : `docs/TODO.md`, section « Revue hostile du 2026-11-24 ».
