@@ -14,8 +14,6 @@ from bh import paths
 from bh.agent import contract as c
 from bh.board import Board
 
-# Facts that record bookkeeping, not progress: a segment that only writes these is stagnant.
-BOOKKEEPING_KINDS = ("handoff", "dead-end", "blocked")
 AUTH_TODO_THRESHOLD = 3
 
 
@@ -43,10 +41,20 @@ def skip_existing(board: Board, path: Path, key: str) -> None:
     board.meta_set(key, str(path.stat().st_size if path.exists() else 0))
 
 
-def notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple[int, int, int, int]:
-    """Returns (facts, findings, todos, progress)."""
-    facts = findings = todos = progress = 0
-    for n in read_new_lines(board, bh_dir / c.NOTES, f"notes:{program}"):
+def notes(board: Board, program: str, run_id: int, notes_file: Path) -> tuple[int, int, int]:
+    """Ingest one rotated notes file in full. Returns (facts, findings, todos).
+
+    The runner renames notes.jsonl at the end of each segment, so the agent can neither replay
+    old notes (truncate + rewrite) nor hide them behind a moved cursor.
+    Migration: before rotation existed, a byte cursor (meta `notes:<program>`) marked what the
+    single notes.jsonl had already given; it is honoured once, then dropped."""
+    legacy_key = f"notes:{program}"
+    skip = int(board.meta_get(legacy_key, "0"))
+    if skip:
+        board.db.execute("DELETE FROM meta WHERE k=?", (legacy_key,))
+        board.db.commit()
+    facts = findings = todos = 0
+    for n in c.read_jsonl(notes_file, offset=skip):
         match n.get("op"):
             case "fact":
                 kind = n.get("kind", "fact")
@@ -54,7 +62,6 @@ def notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple[int, i
                     program, n.get("title", ""), n.get("summary", ""), n.get("evidence", ""), kind=kind, run_id=run_id
                 )
                 facts += 1
-                progress += kind not in BOOKKEEPING_KINDS
             case "intent":
                 board.add_intent(program, n.get("title", ""), run_id=run_id)
             case "done":
@@ -71,7 +78,6 @@ def notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple[int, i
                     },
                 )
                 findings += 1
-                progress += 1
             case "todo":
                 todos += bool(
                     board.add_todo(
@@ -82,7 +88,7 @@ def notes(board: Board, program: str, run_id: int, bh_dir: Path) -> tuple[int, i
                         dedup=f"{program}:{n.get('kind')}:{n.get('title', '')[:120]}",
                     )
                 )
-    return facts, findings, todos, progress
+    return facts, findings, todos
 
 
 def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> int:

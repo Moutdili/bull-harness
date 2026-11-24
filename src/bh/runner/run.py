@@ -1,13 +1,15 @@
 """Run one segment of `claude -p` inside the agent container for one program.
 
 Host side only:
-  activate the scope for the gate -> push frontier / facts / doctrine into /work/<program>/.bh
-  -> podman exec claude -p (stream-json) -> live compact log + tool-usage metrics
-  -> ingest notes and gate events into the board.
+  lock (one agent at a time) -> activate the scope for the gate -> tag gate flows with the run
+  -> clean the sandbox (fresh HOME, no planted CLAUDE.md / .claude) -> push frontier / doctrine
+  -> podman exec claude -p (stream-json), nudged to continue in the same session when it stops early
+  -> rotate + ingest notes, gate events -> measured progress.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -16,9 +18,11 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 from bh import paths, stack
 from bh.agent import contract as c
@@ -29,11 +33,23 @@ from bh.scope import Scope, load_scope
 from bh.text import one_line
 
 DEFAULT_MODEL = "sonnet"  # alias resolved by Claude Code (claude-sonnet-5-5 on 2.1.330)
-QUOTA_RE = re.compile(r"(usage limit|limit reached|rate limit|resets? (at|in)|out of (extra )?usage)", re.I)
+# Claude usage-limit wording only: "rate limit" is everyday bug bounty vocabulary (false positives).
+QUOTA_RE = re.compile(r"(usage limit|limit reached|resets? at \d|out of (extra )?usage)", re.I)
 # Builtins run for minutes (ffuf, nuclei, sqlmap): the Bash tool's 2-minute default would kill them.
 BASH_TIMEOUT_MS = {"BASH_DEFAULT_TIMEOUT_MS": "330000", "BASH_MAX_TIMEOUT_MS": "900000"}
 # Token economy: every turn resends tool schemas + command listings; keep only what the hunt uses.
 AGENT_TOOLS = os.environ.get("BH_TOOLS", "Bash,Read")
+# The model ends its turn after one finding. Within a segment the same session is nudged to go on
+# (cheap: the context is still small), at most MAX_LEGS times, while less than EARLY_STOP of the
+# turn budget is used.
+MAX_LEGS, EARLY_STOP, MIN_LEFT_TURNS, MIN_LEFT_S = 3, 0.5, 5, 180
+CONTINUE_PROMPT = (
+    "Continue in this session: about {turns} turns and {minutes} minutes remain. Run `bh-note frontier`, "
+    "take the next untested endpoint or open intent, test it, record the outcome, and keep going. "
+    "Stop only when every lead on the board is a recorded dead end; then write the HANDOFF fact."
+)
+# User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
+MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
 
 
 @dataclass
@@ -42,22 +58,24 @@ class SegmentResult:
     run_id: int
     status: str = "error"  # ok | max_turns | timeout | quota | error | refusal | stopped
     session_id: str | None = None
+    legs: int = 0
     turns: int = 0
-    cost_usd: float | None = None
+    cost_usd: float = 0.0
     new_facts: int = 0
     new_findings: int = 0
     new_todos: int = 0
-    progress: int = 0  # findings + non-bookkeeping facts: what the supervisor calls progress
+    progress: int = 0  # findings + endpoints newly tested + phases newly covered (facts alone are not progress)
     tool_calls: int = 0
-    arsenal_calls: int = 0  # Bash commands running a bh-* builtin
+    arsenal_calls: int = 0  # Bash commands running a builtin or an arsenal tool
     manual_calls: int = 0  # Bash commands hand-crafting HTTP
     locked_calls: int = 0  # commands refused by the tool lock
     text: str = ""
     usage: dict = field(default_factory=dict)
 
 
+# ------------------------------------------------------------------ guards
 @contextmanager
-def signals_ignored():
+def signals_ignored() -> Iterator[None]:
     """Cleanup after Ctrl-C / SIGTERM must not be cut short by a second signal."""
     old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
@@ -67,6 +85,34 @@ def signals_ignored():
             signal.signal(s, handler)
 
 
+@contextmanager
+def run_lock() -> Iterator[None]:
+    """One agent at a time (CLI and UI share the Pro quota and the gate's active scope)."""
+    paths.var().mkdir(parents=True, exist_ok=True)
+    with open(paths.var() / "run.lock", "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("another bh run/hunt is in progress (var/run.lock)") from None
+        yield
+
+
+def check_automation(board: Board, scope: Scope) -> None:
+    """Unknown automation rules = a human reads the program policy first. Local labs are exempt."""
+    if scope.automation_allowed is False:
+        raise SystemExit(f"{scope.program}: automation_allowed is false — refusing to run an agent on it")
+    if scope.automation_allowed is None and scope.platform != "local":
+        board.add_todo(
+            "scope-question",
+            f"{scope.program}: is automation allowed?",
+            "read the program rules, then set automation_allowed: true/false in its scope file",
+            program=scope.program,
+            dedup=f"{scope.program}:automation-unknown",
+        )
+        raise SystemExit(f"{scope.program}: automation_allowed is unknown — set it in the scope file first")
+
+
+# ------------------------------------------------------------------ sandbox + gate state
 def activate_scope(scope_file: Path) -> None:
     """Atomically make this scope the gate's active scope (the gate hot-reloads on mtime)."""
     dst = paths.active_scope()
@@ -76,25 +122,62 @@ def activate_scope(scope_file: Path) -> None:
     os.replace(tmp, dst)
 
 
-# User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
-MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
+def set_active_run(run_id: int | None, program: str = "") -> None:
+    """Tag every gate flow with the run that caused it (operator traffic between runs stays untagged)."""
+    p = paths.active_run()
+    if run_id is None:
+        p.unlink(missing_ok=True)
+    else:
+        p.write_text(json.dumps({"run_id": run_id, "program": program}))
 
 
-def manually_tested(program: str) -> set[tuple[str, str]]:
-    """(origin, resource family) of every request the agent made by hand, as seen by the gate.
-    The gate sees the real URL, even when the command built it from shell variables."""
+def sandbox_home(run_id: int) -> str:
+    return f"/tmp/bh-home-{run_id}"
+
+
+def clean_sandbox(program: str, run_id: int) -> None:
+    """Nothing the agent wrote can configure the next session: fresh HOME (no ~/.claude settings or
+    memory), and no CLAUDE.md / .claude planted in the work tree."""
+    root = c.WORK_ROOT
+    stack.agent_sh(
+        'rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$2/CLAUDE.md" "$2/.claude" /tmp/bh-home-*; '
+        'mkdir -p "$3" && chown hunter:hunter "$3" && chmod 700 "$3"',
+        f"{root}/{program}",
+        root,
+        sandbox_home(run_id),
+        user="root",
+    )
+
+
+def rotate_notes(program: str, run_id: int) -> Path:
+    """Freeze this segment's notes under a per-run name; returns the host path to ingest."""
+    name = f"notes-{run_id}.jsonl"
+    stack.agent_sh(
+        'cd "$1" 2>/dev/null && [ -f notes.jsonl ] && mv notes.jsonl "$2"; true', c.sandbox_dir(program), name
+    )
+    return paths.work_bh(program) / name
+
+
+def manually_tested(board: Board, program: str) -> set[tuple[str, str]]:
+    """(origin, family) of every request the agent made by hand during this program's runs, as seen
+    by the gate (the real URL, even when the command built it from shell variables)."""
+    runs = board.run_ids(program)
     out = set()
     for f in c.read_jsonl(paths.flows_log()):
-        manual = f.get("program") == program and MANUAL_UA.match(f.get("ua") or "")
-        if manual and (k := c.endpoint_key(f.get("url", ""), f.get("method", "GET"))):
+        by_hand = f.get("run") in runs and MANUAL_UA.match(f.get("ua") or "")
+        if by_hand and (k := c.endpoint_key(f.get("url", ""), f.get("method", "GET"))):
             out.add((k[0], c.family(k[1])))
     return out
 
 
 def frontier(board: Board, program: str) -> str:
     """Board view + attack surface found by the tools, with what was tested by hand."""
-    surface = c.surface(paths.work_bh(program), also_tested=manually_tested(program))
+    surface = c.surface(paths.work_bh(program), also_tested=manually_tested(board, program))
     return board.frontier(program) + (f"\n{surface}" if surface else "")
+
+
+def coverage_counts(board: Board, program: str) -> tuple[int, int]:
+    return c.surface_counts(paths.work_bh(program), also_tested=manually_tested(board, program))
 
 
 def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
@@ -105,22 +188,23 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
     cbh = c.sandbox_dir(prog)
     # bh-note frontier = this board view + the surface recomputed live in the sandbox
     stack.push_file(f"{cbh}/{c.FRONTIER}", board.frontier(prog))
-    stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(manually_tested(prog))))
+    stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(manually_tested(board, prog))))
     stack.push_file(f"{cbh}/{c.FACTS}", (stage / c.FACTS).read_text())
     stack.push_file(f"{cbh}/{c.SYSTEM}", build_system_prompt(scope, paths.identities(prog)))
     stack.push_file(f"{cbh}/{c.SCOPE}", Path(scope_file).read_text())
 
 
+# ------------------------------------------------------------------ one claude process
 def agent_command(
-    scope: Scope, task: str, *, model: str, max_turns: int, effort: str | None, session: str | None
+    scope: Scope, task: str, *, run_id: int, model: str, max_turns: int, effort: str | None, session: str | None
 ) -> list[str]:
     prog = scope.program
     bh = c.sandbox_dir(prog)
     env = {
         "BH_DIR": bh,
         "BH_PROGRAM": prog,
-        "BH_RPS": f"{scope.max_rps or 5:g}",
-        "HOME": "/home/hunter",
+        "BH_RPS": f"{scope.rate:g}",
+        "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
     }
     cmd = [
@@ -171,73 +255,106 @@ def _tool_result_text(block: dict) -> str:
     return content if isinstance(content, str) else ""
 
 
-def consume_stream(proc: subprocess.Popen, log_path: Path, res: SegmentResult, say) -> dict | None:
-    """Mirror the stream to the run log (line-buffered: the UI tails it), update `res`, return the result event."""
+def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say) -> dict | None:
+    """Mirror the stream to the run log (the UI tails it), update `res`, return the result event."""
     result = None
-    with open(log_path, "w", buffering=1) as log:
-        for line in proc.stdout:
-            log.write(line)
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue
-            match ev.get("type"):
-                case "system" if ev.get("subtype") == "init":
-                    res.session_id = ev.get("session_id") or res.session_id
-                case "assistant":
-                    msg = ev.get("message", {})
-                    if msg.get("stop_reason") == "refusal":
-                        res.status = "refusal"
-                    for block in msg.get("content", []):
-                        if block.get("type") == "text" and block.get("text", "").strip():
-                            say(f"  💬 {one_line(block['text'], 220)}")
-                        elif block.get("type") == "tool_use":
-                            res.tool_calls += 1
-                            inp = block.get("input", {})
-                            cmd = inp.get("command") or ""
-                            res.arsenal_calls += c.uses_arsenal(cmd)
-                            res.manual_calls += c.uses_manual_http(cmd)
-                            say(f"  ⚙ {block.get('name')}: {one_line(cmd or inp.get('description') or inp)}")
-                case "user":
-                    for block in (ev.get("message") or {}).get("content") or []:
-                        if (
-                            isinstance(block, dict)
-                            and block.get("type") == "tool_result"
-                            and c.LOCK_MARK in _tool_result_text(block)
-                        ):
-                            res.locked_calls += 1
-                            say("  🔒 manual HTTP refused by the tool lock")
-                case "result":
-                    result = ev
+    for line in proc.stdout:
+        log.write(line)
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        match ev.get("type"):
+            case "system" if ev.get("subtype") == "init":
+                res.session_id = ev.get("session_id") or res.session_id
+            case "assistant":
+                msg = ev.get("message", {})
+                if msg.get("stop_reason") == "refusal":
+                    res.status = "refusal"
+                for block in msg.get("content", []):
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        say(f"  💬 {one_line(block['text'], 220)}")
+                    elif block.get("type") == "tool_use":
+                        res.tool_calls += 1
+                        inp = block.get("input", {})
+                        cmd = inp.get("command") or ""
+                        res.arsenal_calls += c.uses_arsenal(cmd)
+                        res.manual_calls += c.uses_manual_http(cmd)
+                        say(f"  ⚙ {block.get('name')}: {one_line(cmd or inp.get('description') or inp)}")
+            case "user":
+                for block in (ev.get("message") or {}).get("content") or []:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                        and c.LOCK_MARK in _tool_result_text(block)
+                    ):
+                        res.locked_calls += 1
+                        say("  🔒 manual HTTP refused by the tool lock")
+            case "result":
+                result = ev
     return result
 
 
-def apply_result(res: SegmentResult, result: dict | None, stderr: str, timed_out: bool) -> None:
-    if result:
-        res.session_id = result.get("session_id") or res.session_id
-        res.turns = result.get("num_turns") or 0
-        res.cost_usd = result.get("total_cost_usd")
-        res.usage = result.get("usage") or {}
-        res.text = result.get("result") or ""
-        if res.status != "refusal":
-            sub = result.get("subtype", "")
-            res.status = (
-                "ok"
-                if sub == "success" and not result.get("is_error")
-                else "max_turns"
-                if sub == "error_max_turns"
-                else "error"
-            )
-    if timed_out:
-        res.status = "timeout"
-    if res.status != "ok" and (QUOTA_RE.search(res.text) or QUOTA_RE.search(stderr)):
-        res.status = "quota"
+def run_leg(
+    cmd: list[str], log: IO[str], err_path: Path, res: SegmentResult, say, program: str, timeout_s: float
+) -> tuple[dict | None, bool]:
+    """One claude process. Returns (result event, timed out)."""
+    with open(err_path, "a") as err_fh:  # a pipe read only at the end can fill up and block claude
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_fh, text=True, bufsize=1)
+    timed_out = threading.Event()
+
+    def on_timeout() -> None:
+        timed_out.set()
+        stack.kill_agent(program)
+        time.sleep(5)
+        if proc.poll() is None:
+            proc.kill()
+
+    timer = threading.Timer(max(1.0, timeout_s), on_timeout)
+    timer.start()
+    try:
+        result = consume_stream(proc, log, res, say)
+    except BaseException:
+        with signals_ignored():
+            timer.cancel()
+            stack.kill_agent(program)
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        raise
+    finally:
+        timer.cancel()
+    proc.wait()
+    return result, timed_out.is_set()
 
 
-def finish(board: Board, res: SegmentResult, scope: Scope, model: str, effort: str | None, note: str) -> None:
+def merge_result(res: SegmentResult, result: dict | None) -> None:
+    if not result:
+        return
+    res.session_id = result.get("session_id") or res.session_id
+    res.turns += result.get("num_turns") or 0
+    res.cost_usd += result.get("total_cost_usd") or 0.0
+    for k, v in (result.get("usage") or {}).items():
+        if isinstance(v, int):
+            res.usage[k] = res.usage.get(k, 0) + v
+    res.text = result.get("result") or ""
+    if res.status != "refusal":
+        sub = result.get("subtype", "")
+        res.status = (
+            "ok"
+            if sub == "success" and not result.get("is_error")
+            else "max_turns"
+            if sub == "error_max_turns"
+            else "error"
+        )
+
+
+def finish(
+    board: Board, res: SegmentResult, scope: Scope, before: tuple[int, int], *, effort: str | None, note: str
+) -> None:
     prog = scope.program
-    res.new_facts, res.new_findings, res.new_todos, res.progress = ingest.notes(
-        board, prog, res.run_id, paths.work_bh(prog)
+    res.new_facts, res.new_findings, res.new_todos = ingest.notes(
+        board, prog, res.run_id, rotate_notes(prog, res.run_id)
     )
     res.new_todos += ingest.gate_events(board, prog, res.run_id, paths.identities(prog))
     if res.status == "refusal":
@@ -250,16 +367,19 @@ def finish(board: Board, res: SegmentResult, scope: Scope, model: str, effort: s
                 dedup=f"{prog}:refusal:{res.run_id}",
             )
         )
+    after = coverage_counts(board, prog)
+    res.progress = res.new_findings + max(0, after[0] - before[0]) + max(0, after[1] - before[1])
     u = res.usage
     board.run_end(
         res.run_id,
         status=res.status,
         session_id=res.session_id,
         turns=res.turns,
-        cost_usd=res.cost_usd,
+        cost_usd=res.cost_usd or None,
         input_tokens=u.get("input_tokens"),
         output_tokens=u.get("output_tokens"),
         cache_read=u.get("cache_read_input_tokens"),
+        cache_write=u.get("cache_creation_input_tokens"),
         effort=effort,
         arsenal_calls=res.arsenal_calls,
         manual_calls=res.manual_calls,
@@ -268,6 +388,7 @@ def finish(board: Board, res: SegmentResult, scope: Scope, model: str, effort: s
     )
 
 
+# ------------------------------------------------------------------ segment
 def run_segment(
     scope_file: Path,
     *,
@@ -281,25 +402,52 @@ def run_segment(
     effort: str | None = None,
 ) -> SegmentResult:
     scope = load_scope(scope_file)
-    if scope.automation_allowed is False:
-        raise SystemExit(f"{scope.program}: automation_allowed is false — refusing to run an agent on it")
+    board = board or Board()
+    check_automation(board, scope)
     for name in (stack.GATE, stack.AGENT):
         if not stack.container_running(name):
             raise SystemExit(f"container {name} is not running — start the stack with `bh up`")
-    board = board or Board()
+    with run_lock():
+        return _run_locked(
+            scope,
+            scope_file,
+            board,
+            model=model,
+            max_turns=max_turns,
+            minutes=minutes,
+            resume=resume,
+            quiet=quiet,
+            extra_task=extra_task,
+            effort=effort,
+        )
+
+
+def _run_locked(
+    scope: Scope,
+    scope_file: Path,
+    board: Board,
+    *,
+    model: str,
+    max_turns: int,
+    minutes: float,
+    resume: bool,
+    quiet: bool,
+    extra_task: str,
+    effort: str | None,
+) -> SegmentResult:
     prog = scope.program
     activate_scope(scope_file)
-    prepare_workdir(board, scope, scope_file)
-
     session = board.last_session(prog) if resume else None
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)
+    run_id = board.run_start(prog, model)  # closes a run orphaned by a crash (we hold the lock)
+    clean_sandbox(prog, run_id)
+    prepare_workdir(board, scope, scope_file)
+    before = coverage_counts(board, prog)
     task = build_task(frontier(board, prog), first=first, max_turns=max_turns)
     if extra_task:
         task += "\n\nOperator instruction for this segment: " + extra_task
-    run_id = board.run_start(prog, model)
     log_path = paths.run_log(run_id, prog)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-
     res = SegmentResult(program=prog, run_id=run_id, session_id=session)
     say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     say(
@@ -307,44 +455,58 @@ def run_segment(
         f"max {max_turns} turns / {minutes:g} min" + (f" · resume {session[:8]}" if session else "")
     )
 
-    cmd = agent_command(scope, task, model=model, max_turns=max_turns, effort=effort, session=session)
-    # stderr goes to a file: a pipe read only at the end can fill up and block claude.
-    err_path = log_path.with_suffix(".stderr")
-    with open(err_path, "w") as err_fh:  # the child keeps its own descriptor
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_fh, text=True, bufsize=1)
-    timed_out = threading.Event()
-
-    def on_timeout() -> None:
-        timed_out.set()
-        stack.kill_agent(prog)
-        time.sleep(5)
-        if proc.poll() is None:
-            proc.kill()
-
-    timer = threading.Timer(minutes * 60, on_timeout)
-    timer.start()
+    deadline = time.monotonic() + minutes * 60
+    prompt, timed_out = task, False
+    set_active_run(run_id, prog)
     try:
-        result = consume_stream(proc, log_path, res, say)
-    except BaseException:  # Ctrl-C / SIGTERM: kill the agent in the container, keep what it already wrote
+        with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
+            while res.legs < MAX_LEGS:
+                res.legs += 1
+                cmd = agent_command(
+                    scope,
+                    prompt,
+                    run_id=run_id,
+                    model=model,
+                    max_turns=max_turns - res.turns,
+                    effort=effort,
+                    session=res.session_id if res.legs > 1 else session,
+                )
+                result, timed_out = run_leg(
+                    cmd, log, log_path.with_suffix(".stderr"), res, say, prog, deadline - time.monotonic()
+                )
+                merge_result(res, result)
+                left_turns, left_s = max_turns - res.turns, deadline - time.monotonic()
+                if (
+                    timed_out
+                    or res.status != "ok"
+                    or res.turns >= max_turns * EARLY_STOP
+                    or left_turns < MIN_LEFT_TURNS
+                    or left_s < MIN_LEFT_S
+                ):
+                    break
+                say(f"  ↻ stopped early ({res.turns}/{max_turns} turns): nudging the same session to continue")
+                prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
+    except BaseException as exc:  # Ctrl-C / SIGTERM, or a harness error: record what the agent already wrote
         with signals_ignored():
-            timer.cancel()
-            board.run_end(run_id, status="stopped", note="stopped by operator")
+            stopped = isinstance(exc, KeyboardInterrupt)
+            res.status = "stopped" if stopped else "error"
+            note = "stopped by operator" if stopped else f"harness error: {exc!r}"
+            board.run_end(run_id, status=res.status, note=one_line(note, 500))
+            set_active_run(None)
             stack.kill_agent(prog)
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
-            res.status = "stopped"
-            finish(board, res, scope, model, effort, "stopped by operator")
-            say(f"■ run {run_id} stopped by operator (agent killed in {stack.AGENT})")
+            finish(board, res, scope, before, effort=effort, note=note)
+            say(f"■ run {run_id} {res.status}: {one_line(note, 200)}")
         raise
-    finally:
-        timer.cancel()
-    proc.wait()
-    stderr = err_path.read_text(errors="replace")
-    apply_result(res, result, stderr, timed_out.is_set())
-    finish(board, res, scope, model, effort, res.text or stderr)
+    with signals_ignored():
+        set_active_run(None)
+        stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
+        if timed_out:
+            res.status = "timeout"
+        if res.status != "ok" and (QUOTA_RE.search(res.text) or QUOTA_RE.search(stderr)):
+            res.status = "quota"
+        finish(board, res, scope, before, effort=effort, note=res.text or stderr)
     say(
-        f"■ run {run_id} {res.status} · {res.turns} turns · {res.tool_calls} tools "
+        f"■ run {run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · {res.tool_calls} tools "
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "
         f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_todos} todos (progress {res.progress})"
         + (f" · ${res.cost_usd:.2f} eq." if res.cost_usd else "")

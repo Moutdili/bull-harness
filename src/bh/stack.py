@@ -57,16 +57,32 @@ def push_file(container_path: str, text: str) -> None:
 
 
 def wipe_program(program: str) -> None:
-    agent_sh('rm -rf -- "$1"', f"{c.WORK_ROOT}/{program}")
+    """Delete the program's sandbox work dir, through the agent or, when it is down, from the host
+    (`podman unshare`: the files belong to the container's subuid)."""
+    if container_running(AGENT):
+        agent_sh('rm -rf -- "$1"', f"{c.WORK_ROOT}/{program}", user="root")
+    else:
+        subprocess.run(["podman", "unshare", "rm", "-rf", "--", str(paths.var() / "work" / program)], check=False)
+
+
+# The pid file lives in the agent's writable work dir: only a `claude` process owned by hunter is
+# accepted as a target (the agent must not be able to aim this root-run kill at anything else).
+# Descendants (bash, nuclei, sqlmap...) are collected first: once claude dies they are reparented.
+_KILL_SCRIPT = r"""
+p=$(cat "$1" 2>/dev/null) || exit 0
+case "$p" in ''|*[!0-9]*) exit 0 ;; esac
+case "$(cat /proc/$p/comm 2>/dev/null)" in claude*) ;; *) exit 0 ;; esac
+[ "$(stat -c %U /proc/$p 2>/dev/null)" = hunter ] || exit 0
+desc() { for k in $(pgrep -P "$1"); do desc "$k"; echo "$k"; done; }
+all="$(desc "$p") $p"
+kill -INT "$p"; i=0
+while kill -0 "$p" 2>/dev/null && [ $i -lt "$2" ]; do sleep 0.5; i=$((i+1)); done
+kill -KILL $all 2>/dev/null; rm -f "$1"; true
+"""
 
 
 def kill_agent(program: str, grace: float = 8.0) -> None:
-    """Stop the claude process of `program` (pid written by the launch wrapper). podman exec
-    does not forward signals: killing the host-side process alone would leave an orphan."""
+    """Stop the claude process of `program` and everything it started. podman exec does not
+    forward signals: killing the host-side process alone would leave an orphan."""
     pidfile = f"{c.sandbox_dir(program)}/{c.AGENT_PID}"
-    script = (
-        'p=$(cat "$1" 2>/dev/null) || exit 0; kill -0 "$p" 2>/dev/null || exit 0; kill -INT "$p"; i=0; '
-        f'while kill -0 "$p" 2>/dev/null && [ $i -lt {int(grace * 2)} ]; do sleep 0.5; i=$((i+1)); done; '
-        'pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; rm -f "$1"; true'
-    )
-    agent_sh(script, pidfile, user="root", timeout=grace + 20)
+    agent_sh(_KILL_SCRIPT, pidfile, str(int(grace * 2)), user="root", timeout=grace + 20)

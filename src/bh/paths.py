@@ -10,8 +10,9 @@ import os
 from pathlib import Path
 
 # File names inside the state dir, shared with the gate (which sees that dir as /state).
-ACTIVE_SCOPE, EVENTS, FLOWS, FLOWS_DIR, IDENTITIES = (
+ACTIVE_SCOPE, ACTIVE_RUN, EVENTS, FLOWS, FLOWS_DIR, IDENTITIES = (
     "active-scope.yaml",
+    "active-run.json",
     "events.jsonl",
     "flows.jsonl",
     "flows",
@@ -34,6 +35,11 @@ def state() -> Path:
 
 def active_scope() -> Path:
     return state() / ACTIVE_SCOPE
+
+
+def active_run() -> Path:
+    """{run_id, program} of the segment in progress, so the gate can tag every flow with it."""
+    return state() / ACTIVE_RUN
 
 
 def events_log() -> Path:

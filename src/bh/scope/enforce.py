@@ -41,6 +41,13 @@ def _path_under(prefix: str, path: str) -> bool:
     return base == "" or path == base or path.startswith(base + "/")
 
 
+def _path_hits_exclusion(prefix: str, path: str) -> bool:
+    """Out-of-scope prefix test, deliberately wide: case-insensitive, and `/checkout/` also
+    covers `/checkout;x`, `/checkout.json`, `/checkout%..`."""
+    base, p = prefix.rstrip("/").lower(), path.lower()
+    return base == "" or p == base or (p.startswith(base) and p[len(base)] in "/;.%")
+
+
 def _match(rule: Rule, t: Target, *, out: bool) -> bool:
     match rule.type:
         case RuleType.DOMAIN | RuleType.WILDCARD:
@@ -63,9 +70,10 @@ def _match(rule: Rule, t: Target, *, out: bool) -> bool:
                 # host-level check (DNS / SOCKS): an in-scope URL authorizes its host;
                 # an out-of-scope URL with a path does not ban the whole host.
                 return not out or rule.path == "/"
+            variants = t.paths or (t.path,)
             if out:
-                return _path_under(rule.path, t.path) or _path_under(rule.path, t.path_raw)
-            return _path_under(rule.path, t.path)
+                return any(_path_hits_exclusion(rule.path, p) for p in variants)
+            return all(_path_under(rule.path, p) for p in variants)
         case _:
             return False
 

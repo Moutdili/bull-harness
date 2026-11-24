@@ -114,3 +114,17 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 2. Quota Pro : un agent en continu épuise la fenêtre de 5 h. Mitigation : économie de tokens, dormir au reset, modèle plus léger pour la recon.
 3. API YesWeHack non documentée : peut casser. Mitigation : fallback `bounty-targets-data` + édition manuelle du YAML.
 4. Gate HTTP seulement contournable par un outil qui ignore le proxy. Mitigation : l'agent n'a **aucune route** hors du réseau `sandbox`. Le gate est le seul chemin, pas une convention.
+
+## Limites connues (revue hostile du 2026-11-24, non fermées)
+- **Jeton OAuth Pro lisible par l'agent** : `claude` et l'outil Bash tournent sous le même uid ; le jeton est dans
+  l'environnement de `claude` (`/proc/<pid>/environ`). Seul `api.anthropic.com:443` est joignable avec ; un `claude -p`
+  imbriqué reste possible et invisible (passthrough TLS). Risque accepté tant que l'agent est un seul process.
+- **Le verrou d'outils et la surface sont des aides, pas des frontières** : `coverage.json`, `touched.jsonl`,
+  `commands.jsonl` sont écrits dans le sandbox et modifiables par l'agent. Les garanties dures sont dans le gate.
+- **Exclusions de vulnérabilités (`forbidden_vulns`) et énumération d'ids** : doctrine seulement, non appliquées par le gate.
+- **Vérificateur indépendant (4.3) absent** : tout finding reste `new` jusqu'à la relecture humaine.
+- **Coût du verrou sur une vraie cible** : crawl + content + scan par origine (~10 min chacun à 2 req/s).
+- **nuclei** : ~1,5 req/s via le gate, cause interne non trouvée ; borné par `--timeout`.
+- **CVP Defense** : piloter sqlmap/nuclei de façon autonome pourrait relever du tier Red Team selon
+  `docs/cvp-red-team-dossier.md` ; interprétation à faire valider auprès d'Anthropic.
+

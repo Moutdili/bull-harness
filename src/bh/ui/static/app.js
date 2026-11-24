@@ -26,7 +26,7 @@ const sev = (s) => el("span", { class: `badge sev-${s || "info"}` }, s || "?");
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-BH": "1" }, body: JSON.stringify(body) };
   const r = await fetch(path, opt);
-  if (r.status === 401) { document.body.replaceChildren(el("p", { class: "empty" }, "Session expirée : ouvre /login?token=… (secrets/ui.token)")); throw new Error("401"); }
+  if (r.status === 401) { document.body.replaceChildren(el("p", { class: "empty" }, "Session expirée : recharge la page et colle le token (secrets/ui.token)")); throw new Error("401"); }
   const j = await r.json();
   if (!r.ok || j.error) throw new Error(j.error || r.status);
   return j;

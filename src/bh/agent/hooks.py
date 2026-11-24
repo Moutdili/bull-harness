@@ -31,7 +31,7 @@ def lock_decision(cmd: str) -> str | None:
         return None
     d = c.bh_dir()
     missing: dict[str, list[str]] = {}
-    for url in c.URL_RE.findall(cmd):
+    for url in c.urls_in(cmd):
         o = c.origin(url)
         if o is None or c.is_passive(c.host_of(url)):
             continue
@@ -71,7 +71,7 @@ def pre_tool_use(ev: dict) -> dict | None:
             }
         }
     if c.uses_manual_http(cmd):
-        c.record_touched(d, c.URL_RE.findall(cmd), via="manual")
+        c.record_touched(d, c.urls_in(cmd), via="manual")
     return None
 
 

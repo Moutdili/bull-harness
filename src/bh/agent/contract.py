@@ -29,29 +29,25 @@ from urllib.parse import parse_qsl, urlsplit
 REQUIRED_PHASES = ("crawl", "content", "scan")
 ALL_PHASES = ("recon", *REQUIRED_PHASES, "params", "sqli", "xss")
 
-# Third-party recon sources: never targets, never locked. The gate imports this list too.
-PASSIVE_SUFFIXES = (
+# Third-party recon sources: never targets, never locked. The gate imports these too.
+# Exact hosts only (no subdomains), GET/HEAD only; services that fetch arbitrary URLs or run tools
+# server-side, serve arbitrary content (raw.githubusercontent.com) or sit on lapsed/personal domains
+# are deliberately absent: each one is an exfiltration or injection channel.
+PASSIVE_HOSTS = (
     "web.archive.org",
-    "archive.org",
     "index.commoncrawl.org",
     "otx.alienvault.com",
     "urlscan.io",
     "crt.sh",
     "api.certspotter.com",
-    "dns.bufferover.run",
-    "api.hackertarget.com",
-    "rapiddns.io",
-    "jldc.me",
-    "api.subdomain.center",
-    "sonar.omnisint.io",
-    "raw.githubusercontent.com",
-    "api.github.com",
-    "nvd.nist.gov",
     "osv.dev",
     "api.osv.dev",
-    "cve.mitre.org",
+    "nvd.nist.gov",
+    "services.nvd.nist.gov",
     "cveawg.mitre.org",
 )
+# Paths refused even on a passive host (server-side fetch of an arbitrary URL).
+PASSIVE_DENY_PATHS = {"web.archive.org": ("/save",)}
 
 IDENTITY_HEADER = "X-BH-Identity"
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
@@ -103,8 +99,7 @@ def rps() -> float:
 
 # ------------------------------------------------------------------ URLs
 def is_passive(host: str) -> bool:
-    host = host.lower().rstrip(".")
-    return any(host == s or host.endswith("." + s) for s in PASSIVE_SUFFIXES)
+    return host.lower().rstrip(".") in PASSIVE_HOSTS
 
 
 def host_of(url: str) -> str:
@@ -134,9 +129,10 @@ def path_key(path: str) -> str:
 
 
 def family(key: str) -> str:
-    """Resource family of an endpoint key: trailing ids and slashes dropped, so the JS literal
-    `/rest/basket/` (id concatenated at runtime) and a tested `/rest/basket/7` are one resource."""
-    return re.sub(r"(/\{id\})+$", "", key.split("?")[0].rstrip("/")) or key
+    """Comparable form of an endpoint key. A JS literal ending in `/` (`"/rest/basket/" + id`) is the
+    item route `/rest/basket/{id}`; the collection `/api/Users` stays distinct from `/api/Users/{id}`."""
+    k = key.split("?")[0]
+    return k + "{id}" if k.endswith("/") and not k.endswith(" /") else k
 
 
 def endpoint_key(url: str, method: str = "GET") -> tuple[str, str] | None:
@@ -190,10 +186,11 @@ def tail_jsonl(path: Path, n: int, window: int = 400_000) -> list[dict]:
     return out
 
 
-def read_jsonl(path: Path) -> list[dict]:
+def read_jsonl(path: Path, offset: int = 0) -> list[dict]:
     out: list[dict] = []
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
             for line in fh:
                 try:
                     out.append(json.loads(line))
@@ -211,14 +208,21 @@ def record_phase(d: Path, origin_: str, phase: str, *, status: str, count: int, 
     write_json(d / COVERAGE, cov)
 
 
+def phase_done(entry: dict | None) -> bool:
+    """A phase counts once its tool ran to the end or to its time budget; a tool error does not."""
+    return bool(entry) and not str(entry.get("status", "")).startswith("error")
+
+
 def missing_phases(d: Path, origin_: str) -> list[str]:
     done = read_json(d / COVERAGE, {}).get(origin_, {})
-    return [p for p in REQUIRED_PHASES if p not in done]
+    return [p for p in REQUIRED_PHASES if not phase_done(done.get(p))]
 
 
 def record_touched(d: Path, urls: list[str], via: str, method: str = "GET") -> None:
     recs = []
     for u in urls:
+        if "$" in u:  # unresolved shell variable: not a real endpoint
+            continue
         k = endpoint_key(u, method)
         if k:
             recs.append({"origin": k[0], "key": k[1], "via": via})
@@ -227,11 +231,18 @@ def record_touched(d: Path, urls: list[str], via: str, method: str = "GET") -> N
 
 
 # ------------------------------------------------------------------ surface (host + sandbox)
-def surface(d: Path, limit: int = 12, also_tested: set[tuple[str, str]] | None = None) -> str:
-    """Frontier block: what the tools found and what nobody tested yet.
+def _phase_mark(entry: dict | None) -> str:
+    if not phase_done(entry):
+        return "✗"
+    return "✔" if entry.get("status") == "ok" else "~"
 
-    Tested = touched by a builtin or a literal URL in a command (touched.jsonl), or requested by
-    hand as seen by the gate (`also_tested`: (origin, family) pairs computed on the host)."""
+
+Tested = set[tuple[str, str]]
+
+
+def _surface_data(d: Path, also_tested: Tested | None) -> tuple[dict, list, dict]:
+    """(endpoints, untested endpoints sorted by value, coverage). Tested = touched by a builtin or a
+    literal URL in a command (touched.jsonl), or requested by hand as seen by the gate (`also_tested`)."""
     eps: dict[tuple[str, str], dict] = {}
     for e in read_jsonl(d / ENDPOINTS):
         k = (e.get("origin", ""), e.get("key", ""))
@@ -240,17 +251,29 @@ def surface(d: Path, limit: int = 12, also_tested: set[tuple[str, str]] | None =
         cur = eps.setdefault(k, {"params": set(), "sources": set(), "status": e.get("status")})
         cur["params"].update(e.get("params") or [])
         cur["sources"].add(e.get("source", "?"))
-    cov = read_json(d / COVERAGE, {})
-    if not eps and not cov:
-        return ""
     touched = {(t.get("origin"), family(t.get("key", ""))) for t in read_jsonl(d / TOUCHED)} | (also_tested or set())
     untested = [(k, v) for k, v in eps.items() if (k[0], family(k[1])) not in touched]
     untested.sort(
         key=lambda kv: (-len(kv[1]["params"]), not re.search(r"/(api|rest|graphql|v\d)/", kv[0][1]), kv[0][1])
     )
+    return eps, untested, read_json(d / COVERAGE, {})
+
+
+def surface_counts(d: Path, also_tested: Tested | None = None) -> tuple[int, int]:
+    """(endpoints tested, required phases done across origins): the runner's progress measure."""
+    eps, untested, cov = _surface_data(d, also_tested)
+    phases = sum(phase_done(ph.get(p)) for ph in cov.values() for p in REQUIRED_PHASES)
+    return len(eps) - len(untested), phases
+
+
+def surface(d: Path, limit: int = 12, also_tested: Tested | None = None) -> str:
+    """Frontier block: what the tools found and what nobody tested yet."""
+    eps, untested, cov = _surface_data(d, also_tested)
+    if not eps and not cov:
+        return ""
     out = ["## attack surface (from your tools)"]
     for o, phases in cov.items():
-        state = " ".join(f"{p}{'✔' if p in phases else '✗'}" for p in REQUIRED_PHASES)
+        state = " ".join(f"{p}{_phase_mark(phases.get(p))}" for p in REQUIRED_PHASES)
         extra = " ".join(p for p in phases if p not in REQUIRED_PHASES)
         out.append(f"- {o}: {state}" + (f" · also {extra}" if extra else ""))
     with_params = sum(1 for v in eps.values() if v["params"])
@@ -265,8 +288,35 @@ def surface(d: Path, limit: int = 12, also_tested: set[tuple[str, str]] | None =
 
 
 # ------------------------------------------------------------------ command classification (metrics)
-_ARSENAL = re.compile(r"(^|[\s;&|(])bh-(recon|crawl|content|scan|params|sqli|xss)(?=\s|$)")
+_ARSENAL = re.compile(
+    r"(^|[\s;&|(])(bh-(recon|crawl|content|scan|params|sqli|xss)|nuclei|sqlmap|ffuf|katana|dalfox|arjun|"
+    r"httpx-toolkit|subfinder|feroxbuster|gobuster|dirsearch|nikto|wpscan|commix)(?=\s|$)"
+)
 _MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh)(?=\s|$)")
+_HTTP_CLIENT = re.compile(r"^(curl|wget)$")
+_BARE_TARGET = re.compile(r"^([a-z0-9-]+(\.[a-z0-9-]+)+|\[[0-9a-f:]+\])(:\d+)?(/\S*)?$", re.I)
+
+
+def urls_in(cmd: str) -> list[str]:
+    """URLs a command talks to: literal http(s) URLs, plus scheme-less `host[:port]/path` arguments
+    of curl/wget (curl defaults them to http)."""
+    urls = URL_RE.findall(cmd)
+    in_client = False
+    for tok in re.findall(r"[;&|()\n]|[^\s;&|()]+", cmd):
+        word = tok.strip("'\"")
+        if tok in ";&|()\n":
+            in_client = False
+        elif _HTTP_CLIENT.match(word):
+            in_client = True
+        elif (
+            in_client
+            and not word.startswith("-")
+            and "://" not in word
+            and _BARE_TARGET.match(word)
+            and ("/" in word or ":" in word)
+        ):
+            urls.append("http://" + word)
+    return urls
 
 
 def uses_arsenal(cmd: str) -> bool:
@@ -274,4 +324,4 @@ def uses_arsenal(cmd: str) -> bool:
 
 
 def uses_manual_http(cmd: str) -> bool:
-    return bool(_MANUAL.search(cmd)) and bool(URL_RE.search(cmd))
+    return bool(_MANUAL.search(cmd)) and bool(urls_in(cmd))

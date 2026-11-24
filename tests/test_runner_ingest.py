@@ -9,27 +9,20 @@ def _write(path, recs):
     path.write_text("".join(json.dumps(r) + "\n" for r in recs))
 
 
-def test_handoff_and_dead_ends_are_not_progress(tmp_path):
+def test_notes_are_read_from_the_rotated_file(tmp_path):
     b = Board(tmp_path / "b.sqlite")
+    f = tmp_path / "notes-1.jsonl"
     _write(
-        tmp_path / "notes.jsonl",
+        f,
         [
             {"op": "fact", "title": "HANDOFF: nothing new", "kind": "handoff"},
-            {"op": "fact", "title": "alg none rejected", "kind": "dead-end"},
-        ],
-    )
-    facts, findings, _todos, progress = ingest.notes(b, "p", 1, tmp_path)
-    assert (facts, findings, progress) == (2, 0, 0)
-    _write(
-        tmp_path / "notes.jsonl",
-        [
-            {"op": "fact", "title": "HANDOFF: nothing new", "kind": "handoff"},
-            {"op": "fact", "title": "alg none rejected", "kind": "dead-end"},
-            {"op": "fact", "title": "/metrics exposed", "kind": "fact"},
             {"op": "finding", "title": "IDOR", "severity": "high"},
+            {"op": "todo", "kind": "auth", "title": "need a session"},
+            {"op": "intent", "title": "test /api/x"},
         ],
     )
-    assert ingest.notes(b, "p", 2, tmp_path)[3] == 2  # only the 2 appended lines are read
+    assert ingest.notes(b, "p", 1, f) == (1, 1, 1)
+    assert ingest.notes(b, "p", 2, tmp_path / "missing.jsonl") == (0, 0, 0)
 
 
 def test_auth_todos(tmp_path, monkeypatch):
@@ -61,16 +54,49 @@ def test_manual_requests_seen_by_the_gate_count_as_tested(tmp_path, monkeypatch)
     from bh.runner.run import manually_tested
 
     monkeypatch.setenv("BH_HOME", str(tmp_path))
-    flows = tmp_path / "var" / "state" / "flows.jsonl"
-    _write(flows, [
-        {"program": "p", "method": "GET", "url": "http://h/api/Users/12", "ua": "curl/8.10.1"},
-        {"program": "p", "method": "GET", "url": "http://h/api/Cards", "ua": "Fuzz Faster U Fool v2.3.0"},
-        {"program": "other", "method": "GET", "url": "http://h/api/Feedbacks", "ua": "curl/8.10.1"},
-    ])
-    tested = manually_tested("p")
-    assert tested == {("http://h:80", "GET /api/Users")}
+    b = Board(tmp_path / "b.sqlite")
+    rid = b.run_start("p", "m")
+    other = b.run_start("q", "m")
+    _write(
+        tmp_path / "var" / "state" / "flows.jsonl",
+        [
+            {"run": rid, "method": "GET", "url": "http://h/api/Users/12", "ua": "curl/8.10.1"},
+            {"run": rid, "method": "GET", "url": "http://h/api/Cards", "ua": "Fuzz Faster U Fool v2.3.0"},
+            {"run": other, "method": "GET", "url": "http://h/api/Feedbacks", "ua": "curl/8.10.1"},
+            {
+                "run": None,
+                "method": "GET",
+                "url": "http://h/api/Quantitys",
+                "ua": "curl/8.10.1",
+            },  # operator, between runs
+        ],
+    )
+    tested = manually_tested(b, "p")
+    assert tested == {("http://h:80", "GET /api/Users/{id}")}
     d = tmp_path / "bh"
-    c.append_jsonl(d / c.ENDPOINTS, *[{"origin": "http://h:80", "key": k, "params": p, "source": "js"}
-                                      for k, p in (("GET /api/Users", []), ("GET /api/Cards", []), ("GET /s", ["q"]))])
+    c.append_jsonl(
+        d / c.ENDPOINTS,
+        *[
+            {"origin": "http://h:80", "key": k, "params": p, "source": "js"}
+            for k, p in (("GET /api/Users/", []), ("GET /api/Cards", []), ("GET /s", ["q"]))
+        ],
+    )
     s = c.surface(d, also_tested=tested)
     assert "1 tested, 2 untested" in s and "GET /s ?q  → bh-sqli / bh-xss" in s
+    assert c.surface_counts(d, also_tested=tested) == (1, 0)
+    for phase in c.REQUIRED_PHASES:
+        c.record_phase(d, "http://h:80", phase, status="error rc=1" if phase == "scan" else "ok", count=0, raw="")
+    assert c.surface_counts(d, also_tested=tested) == (1, 2)  # a tool error is not coverage
+
+
+def test_legacy_cursor_is_honoured_once(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    f = tmp_path / "notes-9.jsonl"
+    _write(f, [{"op": "finding", "title": "old", "severity": "low"}])
+    old_size = f.stat().st_size
+    with open(f, "a") as fh:
+        fh.write('{"op": "fact", "title": "new"}\n')
+    b.meta_set("notes:p", str(old_size))  # what the pre-rotation cursor had already ingested
+    assert ingest.notes(b, "p", 9, f) == (1, 0, 0)
+    assert b.meta_get("notes:p") == ""
+    assert ingest.notes(b, "p", 10, f) == (1, 1, 0)  # no cursor any more: a new file is read in full

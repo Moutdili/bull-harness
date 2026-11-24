@@ -10,6 +10,7 @@ Security model:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -31,11 +32,11 @@ from bh.text import clip
 STATIC = Path(__file__).parent / "static"
 COOKIE = "bh_ui"
 COOKIE_ATTRS = "HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
-# No inline style/script: the CSP below forbids them. GET form -> existing /login?token= handler.
+# POST form: the token never lands in a URL (history, logs, Referer). No inline style/script (CSP).
 LOGIN_PAGE = (
     b'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-    b'<title>bull-harness login</title><link rel="stylesheet" href="/static/app.css">'
-    b'<form action="/login" method="get"><p>bull-harness - paste secrets/ui.token</p>'
+    b"<title>bull-harness login</title>"
+    b'<form action="/login" method="post"><p>bull-harness - paste secrets/ui.token</p>'
     b'<input name="token" type="password" autocomplete="current-password" autofocus required> '
     b'<button type="submit">login</button></form>'
 )
@@ -60,6 +61,19 @@ def ui_token() -> str:
         p.write_text(secrets.token_urlsafe(24))
         p.chmod(0o600)
     return p.read_text().strip()
+
+
+def new_session(token: str) -> str:
+    """Stateless session cookie: random nonce + HMAC(token, nonce). The cookie is never the token itself,
+    survives UI restarts, and every session dies when secrets/ui.token is rotated."""
+    nonce = secrets.token_urlsafe(18)
+    return f"{nonce}.{hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()}"
+
+
+def session_valid(cookie: str, token: str) -> bool:
+    nonce, _, mac = cookie.partition(".")
+    expected = hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+    return bool(nonce) and hmac.compare_digest(mac, expected)
 
 
 def default_host() -> str:
@@ -158,7 +172,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authed(self) -> bool:
         cookies = dict(c.strip().split("=", 1) for c in self.headers.get("Cookie", "").split(";") if "=" in c)
-        return hmac.compare_digest(cookies.get(COOKIE, ""), self.server.token)
+        return session_valid(cookies.get(COOKIE, ""), self.server.token)
+
+    def _login(self) -> None:
+        n = min(int(self.headers.get("Content-Length") or 0), 4096)
+        form = {k: v[-1] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
+        if not hmac.compare_digest(form.get("token", ""), self.server.token):
+            return self._send(403, b"bad token", "text/plain")
+        cookie = f"{COOKIE}={new_session(self.server.token)}; {COOKIE_ATTRS}"
+        return self._send(303, b"", "text/plain", {"Set-Cookie": cookie, "Location": "/"})
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -170,18 +192,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         q = {k: v[-1] for k, v in parse_qs(u.query).items()}
-        if u.path == "/login":
-            if hmac.compare_digest(q.get("token", ""), self.server.token):
-                return self._send(
-                    302,
-                    b"",
-                    "text/plain",
-                    {
-                        "Set-Cookie": f"{COOKIE}={self.server.token}; {COOKIE_ATTRS}",
-                        "Location": "/",
-                    },
-                )
-            return self._send(403, b"bad token", "text/plain")
         if not self._authed():
             return self._send(401, LOGIN_PAGE, "text/html; charset=utf-8")
         if u.path in ("/", "/index.html"):
@@ -200,6 +210,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if u.path == "/login":
+            return self._login()
         if not self._authed() or self.headers.get("X-BH") != "1":
             return self._send(403, b"forbidden", "text/plain")
         try:
@@ -430,5 +442,5 @@ def serve(host: str | None = None, port: int = 7340) -> None:
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.token = ui_token()
     srv.daemon_threads = True
-    print(f"bh ui on http://{host}:{port}/  (first visit: /login?token=… from secrets/ui.token)", flush=True)
+    print(f"bh ui on http://{host}:{port}/  (log in with the token in secrets/ui.token)", flush=True)
     srv.serve_forever()

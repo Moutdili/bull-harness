@@ -145,3 +145,41 @@ def test_digest_changes_with_content():
     a = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["a.com"]})
     b = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["b.com"]})
     assert a.digest != b.digest
+
+
+def test_malformed_url_rules_are_scope_errors():
+    import pytest
+
+    from bh.scope import ScopeError, scope_from_dict
+
+    for bad in ("https://[::1", "https://[::1]:x/", "https://a.example.com:99999/", "https://a.example.com:0/"):
+        with pytest.raises(ScopeError):
+            scope_from_dict({"program": "p", "platform": "x", "in_scope": [bad]})
+
+
+def test_path_exclusion_variants():
+    from bh.scope import check, scope_from_dict
+
+    s = scope_from_dict(
+        {
+            "program": "p",
+            "platform": "x",
+            "in_scope": ["www.example.com", "https://api.example.com/v2/"],
+            "out_of_scope": ["https://www.example.com/checkout/"],
+        }
+    )
+    for p in (
+        "/checkout/x",
+        "/checkout;x/",
+        "/CHECKOUT/",
+        "/;/checkout/",
+        "/checkout%252f",
+        "/checkout.json",
+        "/checkout",
+        "/x/..;/checkout/",
+    ):
+        assert not check(s, "https://www.example.com" + p).allowed, p
+    assert check(s, "https://www.example.com/checkouts-help").allowed  # not the excluded prefix
+    for p in ("/v2/..;/admin", "/v2%2f..%2fadmin", "/v2/%2e%2e/admin"):
+        assert not check(s, "https://api.example.com" + p).allowed, p
+    assert check(s, "https://api.example.com/v2/users;jsessionid=1").allowed
