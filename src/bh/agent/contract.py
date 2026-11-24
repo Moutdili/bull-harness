@@ -316,10 +316,74 @@ def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases:
 
 
 # ------------------------------------------------------------------ command classification (metrics)
-_ARSENAL = re.compile(
-    r"(^|[\s;&|(])(bh-(recon|crawl|content|scan|params|sqli|xss)|nuclei|sqlmap|ffuf|katana|dalfox|arjun|"
-    r"httpx-toolkit|subfinder|feroxbuster|gobuster|dirsearch|nikto|wpscan|commix)(?=\s|$)"
+# The one table of tools: hooks (program rules, verifier), metrics and builtins all read it.
+MAPPERS = ("bh-recon", "bh-crawl", "katana", "subfinder", "httpx-toolkit", "httpx")
+SCANNERS = (
+    "bh-content",
+    "bh-scan",
+    "bh-params",
+    "bh-sqli",
+    "bh-xss",
+    "nuclei",
+    "sqlmap",
+    "ghauri",
+    "ffuf",
+    "wfuzz",
+    "feroxbuster",
+    "gobuster",
+    "dirsearch",
+    "dirb",
+    "nikto",
+    "wpscan",
+    "dalfox",
+    "xsstrike",
+    "arjun",
+    "commix",
+    "hydra",
+    "medusa",
+    "patator",
+    "nmap",
+    "masscan",
+    "naabu",
+    "whatweb",
+    "wapiti",
+    "skipfish",
+    "zaproxy",
+    "zap.sh",
+    "jaeles",
+    "x8",
+    "paramspider",
+    "crlfuzz",
 )
+_BUILTIN_SCANS = "|".join(t.removeprefix("bh-") for t in SCANNERS if t.startswith("bh-"))
+
+
+def _words(names: tuple[str, ...]) -> re.Pattern:
+    # a tool name as a word, also after a path (/usr/bin/x), an assignment (n=x) or a quote ('x', bash -c 'x')
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    return re.compile(rf"(?<![\w.-])({alt})(?![\w.-])", re.I)
+
+
+_SCANNER_WORDS = _words(SCANNERS)
+_MAPPER_WORDS = _words(MAPPERS)
+# builtins called through the entry point, a deep crawl, httpx probing a wordlist of paths: scans too
+_SCANNER_EXTRA = re.compile(
+    rf"bh-agent\s+({_BUILTIN_SCANS})\b|katana\b[^;&|]*\s-d\s*[4-9]|httpx(-toolkit)?\b[^;&|]*\s-paths?\b"
+)
+
+
+def runs_scanner(cmd: str) -> bool:
+    """Enforcement (fail closed): quotes are removed, not their content, so 'nuclei' or bash -c 'ffuf ...' count;
+    a note that merely names a scanner is refused too, which is the safe side."""
+    bare = cmd.replace("'", " ").replace('"', " ").replace("\\", "")
+    return bool(_SCANNER_WORDS.search(bare) or _SCANNER_EXTRA.search(bare))
+
+
+def runs_mapper(cmd: str) -> bool:
+    bare = cmd.replace("'", " ").replace('"', " ")
+    return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl)\b", bare))
+
+
 _MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh)(?=\s|$)")
 _HTTP_CLIENT = re.compile(r"^(curl|wget)$")
 _BARE_TARGET = re.compile(r"^([a-z0-9-]+(\.[a-z0-9-]+)+|\[[0-9a-f:]+\])(:\d+)?(/\S*)?$", re.I)
@@ -348,7 +412,8 @@ def urls_in(cmd: str) -> list[str]:
 
 
 def uses_arsenal(cmd: str) -> bool:
-    return bool(_ARSENAL.search(cmd))
+    """Metrics: one of our tools ran (callers drop quoted text first, a note naming sqlmap is not a run)."""
+    return runs_scanner(cmd) or runs_mapper(cmd)
 
 
 def uses_manual_http(cmd: str) -> bool:

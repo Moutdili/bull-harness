@@ -333,6 +333,7 @@ class Gate:
             return
         resp = flow.response
         url, host = self._named(flow)
+        self.policy.note_answer(url, resp.status_code)
         body = resp.raw_content or b""
         server = resp.headers.get("server", "").lower()
         waf = resp.status_code in (403, *PUSHBACK_STATUS) and bool(
