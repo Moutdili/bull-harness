@@ -151,12 +151,21 @@ def sandbox_home(session: int | str) -> str:
 
 def clean_sandbox(program: str, home: str) -> None:
     """Nothing the agent wrote can configure the next session: no process of the previous one alive, fresh
-    HOME (no ~/.claude settings or memory), and no CLAUDE.md / .claude planted in the work tree."""
-    root = c.WORK_ROOT
+    HOME (no ~/.claude settings or memory), no CLAUDE.md / .claude planted in the work tree. And the agent
+    reaches only this program's work dir: /work is root's, every other program's dir is closed (root, 700),
+    so notes, endpoints or coverage of program B cannot be written from a segment on program A."""
     stack.reset_agent_user(home)
-    stack.agent_sh(
-        'rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$2/CLAUDE.md" "$2/.claude"', f"{root}/{program}", root, user="root"
-    )
+    stack.agent_sh(_WORK_SCRIPT, f"{c.WORK_ROOT}/{program}", c.WORK_ROOT, user="root")
+
+
+_WORK_SCRIPT = r"""
+rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$2/CLAUDE.md" "$2/.claude"
+chown root:root "$2" && chmod 755 "$2"
+for d in "$2"/*/ "$2"/.[!.]*/; do
+  d=${d%/}; [ -d "$d" ] && [ "$d" != "$1" ] && chown root:root "$d" && chmod 700 "$d"
+done
+mkdir -p "$1" && chown hunter:hunter "$1" && chmod 755 "$1"  # 755: the host reads it (another uid)
+"""
 
 
 def rotate_notes(program: str, run_id: int) -> Path:
