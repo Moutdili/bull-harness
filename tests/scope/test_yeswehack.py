@@ -86,3 +86,11 @@ def test_text_exclusions_never_remove_a_listed_asset():
     assert imp.doc["out_of_scope"] == ["blog.shop.example"]
     assert len(imp.conflicts) == 2
     assert _web_rule("https://edge.blablacar.fr)/") is None
+
+
+def test_rate_in_markdown_bold_and_the_template_without_a_number():
+    from bh.scope.yeswehack import _max_rps
+
+    assert _max_rps("limit yourself about **30** requests per second") == 30
+    assert _max_rps("limit yourself about requests per second") is None
+    assert _max_rps("max 10 requests per second, 120 requests per minute") == 2

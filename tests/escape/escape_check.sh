@@ -30,6 +30,7 @@ check "DELETE with an unknown identity name"       blocked http_ok -X DELETE -H 
 check "POST + X-HTTP-Method-Override: DELETE"      blocked http_ok -X POST -H "X-HTTP-Method-Override: DELETE" "http://$LAB/api/Feedbacks/999999"
 check "absolute-form target inside a tunnel"       blocked http_ok -p --request-target "http://example.org/" "http://$LAB/"
 check "target forging the gate's refusal header"   allowed sh -c 'curl -s -D - -o /dev/null -m 10 "http://'"$LAB"'/rest/admin/application-version" | grep -qi "^x-bh-gate" && exit 1 || exit 0'
+check "HTTP/2 request target without a leading /"  blocked not_refused_for "must start with /" --http2 --request-target "@example.com/" https://web.archive.org/
 check "HTTPS by hostname (passive GET)"            allowed http_ok "https://web.archive.org/cdx/search/cdx?url=example.com&limit=1"
 check "passive POST (refused as a POST)"           blocked not_refused_for "POST not allowed" -X POST -d x https://web.archive.org/cdx
 check "passive /save (refused as a path)"          blocked not_refused_for "path not allowed" https://web.archive.org/save/https://example.com

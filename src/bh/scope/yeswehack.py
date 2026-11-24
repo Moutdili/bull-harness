@@ -159,8 +159,10 @@ def _without_listed_assets(exclusions: list[str], in_scope: list) -> tuple[list[
 
 
 def _max_rps(rules: str) -> float | None:
+    """The lowest rate the rules state ("**30** requests per second" included). The YesWeHack template
+    "limit yourself about requests per second" names no number: None, and the scope's default applies."""
     rates = []
-    for num, unit in _RATE.findall(rules or ""):
+    for num, unit in _RATE.findall(re.sub(r"[*_`]", "", rules or "")):
         n = float(num.replace(",", "."))
         rates.append(n / 60 if unit.lower().startswith("min") else n)
     return min(rates) if rates else None
