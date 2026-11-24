@@ -1,0 +1,47 @@
+# runtime / glue
+nodejs
+npm
+python3-pip
+pipx
+python3-yaml
+jq
+curl
+git
+ca-certificates
+proxychains4
+dnsutils
+util-linux
+# recon (ProjectDiscovery and friends)
+subfinder
+httpx-toolkit
+dnsx
+katana
+nuclei
+naabu
+assetfinder
+amass
+getallurls
+hakrawler
+gospider
+# content discovery / fuzzing
+ffuf
+feroxbuster
+gobuster
+dirsearch
+arjun
+seclists
+# vuln classes
+sqlmap
+dalfox
+commix
+wafw00f
+whatweb
+nikto
+wpscan
+# secrets / source (JS endpoints: bh-crawl extracts them itself)
+trufflehog
+gitleaks
+# tls / misc
+sslscan
+testssl.sh
+nmap
