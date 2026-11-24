@@ -14,15 +14,17 @@ absolute request URL), never on the Host header alone.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
+import json
 import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
-from bh.agent.contract import API_PATH, PASSIVE_DENY_PATHS, is_passive, origin, path_key
+from bh.agent.contract import API_PATH, ID_SEGMENT, PASSIVE_DENY_PATHS, is_passive, origin, path_key
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
@@ -43,6 +45,11 @@ ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 4, 600, 5000
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
 # (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
 MISS_LIMIT, MISS_WINDOW_S = 25, 300
+# An id can also travel outside the path: ?id=7, {"orderId": 7}, GraphQL variables or `user(id: 7)`.
+# A parameter counts when its name names an id and its value looks like one.
+ID_KEY = re.compile(r"^(pk|key|ref|no|num|number)$|(id|uuid|_no|_number)$", re.I)
+_GRAPHQL_ARG = re.compile(r'\b(\w+)\s*:\s*\\?"?([\w-]+)')
+BODY_SCAN_BYTES = 64 << 10
 
 
 def is_system(host: str) -> bool:
@@ -161,6 +168,7 @@ class Policy:
         host_header: str | None = None,
         identity: str | None = None,
         body_len: int = 0,
+        body: bytes | None = None,
         authenticated: bool = False,
     ) -> Verdict:
         """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent."""
@@ -181,7 +189,7 @@ class Policy:
                 return deny(f"{method} only as one of your identities (X-BH-Identity)")
             if body_len > MAX_BODY_BYTES:
                 return deny(f"request body over {MAX_BODY_BYTES} bytes")
-            return self._scanning(url) or self._enumeration(url, authenticated or bool(identity)) or v
+            return self._scanning(url) or self._enumeration(url, authenticated or bool(identity), body) or v
         if v is not None:
             return v
         if is_passive(host):
@@ -215,26 +223,38 @@ class Policy:
             )
         return None
 
-    def _enumeration(self, url: str, authenticated: bool) -> Verdict | None:
+    def _enumeration(self, url: str, authenticated: bool, body: bytes | None = None) -> Verdict | None:
         """Deny the (ID_LIMIT+1)-th distinct object id on one route within the window. The route is the path as
-        the server's router sees it: case, //, a trailing slash, ;params and %xx do not make a new route."""
+        the server's router sees it: case, //, a trailing slash, ;params and %xx do not make a new route.
+        Ids carried by a parameter (query string, form or JSON body, GraphQL) count on "path ?name"."""
         path = _route_path(urlsplit(url).path)
-        key = path_key(path)
-        if "{id}" not in key or not (authenticated or API_PATH.search(path)):
+        if not (authenticated or API_PATH.search(path)):
             return None
-        ids = "/".join(seg for seg, k in zip(path.split("/"), key.split("/"), strict=False) if k == "{id}")
-        route = f"{origin(url)} {key}"
+        key = path_key(path)
+        routes: list[tuple[str, str]] = []
+        if "{id}" in key:
+            ids = "/".join(seg for seg, k in zip(path.split("/"), key.split("/"), strict=False) if k == "{id}")
+            routes.append((key, ids))
+        base = "/".join("{id}" if k == "{id}" else seg for seg, k in zip(path.split("/"), key.split("/"), strict=False))
+        routes += [(f"{base} ?{name}", value) for name, value in sorted(id_params(url, body))]
+        if not routes:
+            return None
         now = time.time()
-        seen_q = self.ids_seen.setdefault(route, deque())
-        while seen_q and seen_q[0][0] < now - ID_WINDOW_S:
-            seen_q.popleft()
-        seen = {i for _, i in seen_q}
-        if ids not in seen and len(seen) >= ID_LIMIT:
-            return deny(
-                f"id enumeration on {key}: over {ID_LIMIT} distinct ids in {ID_WINDOW_S // 60} min "
-                "(prove access control with your own identities' objects)"
-            )
-        seen_q.append((now, ids))
+        wanted: dict[str, set[str]] = {}
+        for route_key, ids in routes:
+            wanted.setdefault(route_key, set()).add(ids)
+        for route_key, ids in wanted.items():  # a batch of ids in one request counts like as many requests
+            seen_q = self.ids_seen.setdefault(f"{origin(url)} {route_key}", deque())
+            while seen_q and seen_q[0][0] < now - ID_WINDOW_S:
+                seen_q.popleft()
+            seen = {i for _, i in seen_q}
+            if not ids <= seen and len(seen | ids) > ID_LIMIT:
+                return deny(
+                    f"id enumeration on {route_key}: over {ID_LIMIT} distinct ids in {ID_WINDOW_S // 60} min "
+                    "(prove access control with your own identities' objects)"
+                )
+        for route_key, ids in wanted.items():  # recorded only once every id of the request is allowed
+            self.ids_seen[f"{origin(url)} {route_key}"].extend((now, i) for i in ids)
         if len(self.ids_seen) > ROUTES_MAX:  # bounded memory: forget routes idle for a whole window
             for r in [r for r, q in self.ids_seen.items() if not q or q[-1][0] < now - ID_WINDOW_S]:
                 del self.ids_seen[r]
@@ -288,6 +308,52 @@ def _port(url: str) -> int:
         return u.port or (443 if u.scheme == "https" else 80)
     except ValueError:
         return -1
+
+
+def id_params(url: str, body: bytes | None) -> set[tuple[str, str]]:
+    """(name, value) pairs that carry an object id: query string, form or JSON body, GraphQL query text."""
+    found: set[tuple[str, str]] = set()
+
+    def add(name, value) -> None:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return
+        v = str(value).strip()
+        if ID_KEY.search(str(name)) and ID_SEGMENT.match(v):
+            found.add((str(name).lower(), v.lower()))
+
+    def walk(obj, depth=0) -> None:
+        if depth > 8:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
+                elif k == "query" and isinstance(v, str):
+                    for name, value in _GRAPHQL_ARG.findall(v):
+                        add(name, value)
+                else:
+                    add(k, v)
+        elif isinstance(obj, list):
+            for v in obj[:200]:
+                walk(v, depth + 1)
+
+    for k, v in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        if k == "query":
+            walk({"query": v})
+        elif k == "variables":
+            with contextlib.suppress(ValueError):
+                walk(json.loads(v))
+        else:
+            add(k, v)
+    if body:
+        text = body[:BODY_SCAN_BYTES].decode("utf-8", "replace")
+        try:
+            walk(json.loads(text))
+        except ValueError:
+            if "=" in text and "\n" not in text.strip():
+                for k, v in parse_qsl(text, keep_blank_values=True):
+                    add(k, v)
+    return found
 
 
 def _route_path(path: str) -> str:

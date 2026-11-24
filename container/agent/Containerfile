@@ -1,6 +1,8 @@
 # bull-harness agent sandbox — Kali rolling + headless metapackage + web bug bounty arsenal.
 # Network at RUNTIME is confined by the gate (sandbox network is internal); the build itself has normal network.
-FROM docker.io/kalilinux/kali-rolling:latest
+# Base pinned by digest (kali-rolling of 2026-11-22). The apt packages below still follow the rolling repo:
+# a rebuild gets today's tool versions. To move the base: podman pull kali-rolling:latest, then update the digest.
+FROM docker.io/kalilinux/kali-rolling@sha256:55f4755c54407ec7104d2287e869b3420d788a680ab5d1da70fa798a54c46d02
 
 ARG CLAUDE_CODE_VERSION=2.1.330
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
@@ -25,7 +27,7 @@ RUN mkdir -p /opt/bh && apt-get update \
 RUN npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
 
 # 4. Python tools not packaged by Kali.
-RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install semgrep
+RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install semgrep==1.186.0
 
 # 5. Unprivileged hunter user (claude refuses bypassPermissions as root).
 RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work

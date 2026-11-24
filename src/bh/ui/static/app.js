@@ -334,7 +334,7 @@ async function refresh() {
   if (busy) return; busy = true;
   try { await loadStatus(); await views[current](); } catch (e) { if (e.message !== "401") console.error(e); } finally { busy = false; }
 }
-window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (views[t] && t !== current) show(t); });
+window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (Object.hasOwn(views, t) && t !== current) show(t); });
 const start = (location.hash || "#dash").slice(1);
-show(views[start] ? start : "dash");
+show(Object.hasOwn(views, start) ? start : "dash");
 setInterval(() => { if (["dash", "live", "todo", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);

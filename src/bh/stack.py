@@ -48,10 +48,10 @@ def agent_sh(
     )
 
 
-def push_file(container_path: str, text: str) -> None:
-    """Write a file inside the agent as `hunter`. Rootless podman maps hunter to a host subuid,
+def push_file(container_path: str, text: str, user: str = "hunter") -> None:
+    """Write a file inside the agent as `user`. Rootless podman maps the sandbox users to host subuids,
     so the host cannot write the agent's /work directly."""
-    r = agent_sh('mkdir -p "$(dirname "$1")" && cat > "$1"', container_path, stdin=text)
+    r = agent_sh('mkdir -p "$(dirname "$1")" && cat > "$1"', container_path, stdin=text, user=user)
     if r.returncode != 0:
         raise SystemExit(f"cannot write {container_path} in {AGENT}: {r.stderr.strip()}")
 
@@ -65,14 +65,14 @@ def wipe_program(program: str) -> None:
         subprocess.run(["podman", "unshare", "rm", "-rf", "--", str(paths.var() / "work" / program)], check=False)
 
 
-# The pid file lives in the agent's writable work dir: only a `claude` process owned by hunter is
+# The pid file lives in the agent's writable work dir: only a `claude` process owned by a sandbox user is
 # accepted as a target (the agent must not be able to aim this root-run kill at anything else).
 # Descendants (bash, nuclei, sqlmap...) are collected first: once claude dies they are reparented.
 _KILL_SCRIPT = r"""
 p=$(cat "$1" 2>/dev/null) || exit 0
 case "$p" in ''|*[!0-9]*) exit 0 ;; esac
 case "$(cat /proc/$p/comm 2>/dev/null)" in claude*) ;; *) exit 0 ;; esac
-[ "$(stat -c %U /proc/$p 2>/dev/null)" = hunter ] || exit 0
+case "$(stat -c %U /proc/$p 2>/dev/null)" in hunter|judge) ;; *) exit 0 ;; esac
 desc() { for k in $(pgrep -P "$1"); do desc "$k"; echo "$k"; done; }
 all="$(desc "$p") $p"
 kill -INT "$p"; i=0
@@ -86,10 +86,30 @@ kill -KILL $all 2>/dev/null; rm -f "$1"; true
 # started or planted (background job, usercustomize.py, ~/.claude) survives into the next session.
 _RESET_SCRIPT = r"""
 keep=" $(for r in $(pgrep -u root -x runuser); do pgrep -P "$r"; done | tr '\n' ' ') "
-for p in $(pgrep -u hunter); do case "$keep" in *" $p "*) ;; *) kill -KILL "$p" 2>/dev/null ;; esac; done
+for p in $(pgrep -u hunter; pgrep -u judge 2>/dev/null); do
+  case "$keep" in *" $p "*) ;; *) kill -KILL "$p" 2>/dev/null ;; esac
+done
 rm -rf /tmp/bh-home-* /home/hunter/.local /home/hunter/.claude /home/hunter/.config/claude
 mkdir -p "$1" && chown hunter:hunter "$1" && chmod 700 "$1"
 """
+
+
+# The verifier's own Unix user (created on first use: the image needs no rebuild). Its work dir and HOME belong
+# to it, so nothing running as hunter can write the verdict or the judge's configuration.
+JUDGE = "judge"
+_JUDGE_SCRIPT = r"""
+id judge >/dev/null 2>&1 || useradd --no-create-home --home-dir /nonexistent --shell /bin/sh judge || exit 1
+pkill -KILL -u judge 2>/dev/null
+rm -rf -- "$1" "$2"
+mkdir -p "$1" "$2" && chown judge:judge "$1" "$2" && chmod 700 "$1" && chmod 755 "$2"
+"""
+
+
+def prepare_judge(home: str, work_dir: str) -> None:
+    """Fresh HOME (700) and work dir (755: the host reads the verdict) for the verifier, owned by `judge`."""
+    r = agent_sh(_JUDGE_SCRIPT, home, work_dir, user="root", timeout=30)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot prepare the verifier user in {AGENT}: {r.stderr.strip()}")
 
 
 def reset_agent_user(home: str) -> None:

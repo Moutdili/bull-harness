@@ -109,4 +109,7 @@ def main(argv: list[str] | None = None) -> None:
             }
         )
         return
-    _emit({k: v for k, v in vars(a).items() if v is not None})
+    rec = {k: v for k, v in vars(a).items() if v is not None}
+    if a.op == "verdict":  # the host gave this nonce to the verifier's process only: a planted verdict lacks it
+        rec["nonce"] = os.environ.get("BH_VERDICT_NONCE", "")
+    _emit(rec)

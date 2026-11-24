@@ -214,13 +214,15 @@ def cmd_run(args) -> int:
 def cmd_verify(args) -> int:
     """Re-verify findings of a program (default: every finding still 'new')."""
     from bh.board import Board
-    from bh.runner.run import run_lock
+    from bh.runner.run import activate_scope, run_lock, set_active_run
     from bh.verify import verify_finding, verify_pending
 
     scope = _load_scope_or_exit(args.scope)
     board = Board()
     with run_lock():
         run_id = board.run_start(scope.program, args.model)
+        activate_scope(Path(args.scope))  # the replays go through the gate under this program's rules
+        set_active_run(run_id, scope.program)  # tags the replays, and the gate relays the judge's calls
         try:
             if args.findings:
                 for f in args.findings:
@@ -232,6 +234,7 @@ def cmd_verify(args) -> int:
                     verify_pending(board, scope, run_id=run_id, model=args.model, effort=args.effort, limit=args.limit)
                 )
         finally:
+            set_active_run(None)
             board.run_end(run_id, status="ok", note="verification")
     return 0
 
@@ -353,6 +356,16 @@ def cmd_flows(args) -> int:
             continue
         t = time.strftime("%H:%M:%S", time.localtime(f["ts"]))
         print(f"{t} {f['status']} {f['method']:6} {f['len']:>7}B {f['url'][:140]}  ({f['id']})")
+    return 0
+
+
+def cmd_prune(args) -> int:
+    from bh import retention
+    from bh.runner.run import run_lock
+
+    with run_lock():  # never while a segment reads or the gate writes for it
+        out = retention.prune(days=retention.FLOW_DAYS if args.days is None else args.days)
+    print(", ".join(f"{k}: {v}" for k, v in out.items()))
     return 0
 
 
@@ -505,6 +518,10 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("-n", type=int, default=30)
     fl.add_argument("--grep")
     fl.set_defaults(func=cmd_flows)
+
+    pr = sub.add_parser("prune", help="delete gate flow files older than --days, rotate large gate logs")
+    pr.add_argument("--days", type=float, default=None, help="default: BH_FLOW_DAYS or 14")
+    pr.set_defaults(func=cmd_prune)
     return p
 
 

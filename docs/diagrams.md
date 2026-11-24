@@ -29,7 +29,7 @@ flowchart LR
   end
   subgraph GATE["Conteneur gate · mitmproxy · seul sur egress"]
     POL["policy · scope · méthodes<br/>ports · ids · débit · scanners"]
-    REL["relais :8081<br/>jeton OAuth, agent seul"]
+    REL["relais :8081<br/>jeton OAuth, agent seul<br/>pendant un run, budget"]
   end
   RUN -- "podman exec" --> CC
   CC -- "proxy :8080" --> POL
@@ -77,7 +77,7 @@ sequenceDiagram
 ```mermaid
 flowchart TD
   IN["requête de l'agent"] --> RELAY{"port 8081 ?"}
-  RELAY -- oui --> PEER{"client = conteneur agent<br/>et chemin /v1/ ?"}
+  RELAY -- oui --> PEER{"client = conteneur agent,<br/>POST /v1/messages,<br/>run actif, budget restant ?"}
   PEER -- non --> D["403 X-BH-Gate"]
   PEER -- oui --> TOK["injecte le jeton OAuth"] --> ANT(["Anthropic"])
   RELAY -- non --> CONN["CONNECT : hôte + port jugés"]
@@ -94,7 +94,7 @@ flowchart TD
   RULES -- refus --> D
   RULES -- ok --> SCAN{"programme sans scanners :<br/>≥ 25 réponses 404 en 5 min ?"}
   SCAN -- oui --> D
-  SCAN -- non --> ENUM{"plus de 4 ids distincts<br/>sur la route normalisée ?"}
+  SCAN -- non --> ENUM{"plus de 4 ids distincts sur la route<br/>normalisée ou un paramètre id<br/>(query, corps, GraphQL) ?"}
   ENUM -- oui --> D
   ENUM -- non --> RATE["seau de débit · backoff 429/503/WAF"]
   RATE --> INJ["en-têtes programme · identité"] --> UP(["serveur, IP vérifiée"])
@@ -114,10 +114,10 @@ flowchart LR
   EXC -- oui --> REJ["rejected"]
   EXC -- non --> DUP{"même classe + ressource<br/>qu'un finding actif ou rejeté ?"}
   DUP -- oui --> DUPS["duplicate"]
-  DUP -- non --> RESET["process du chasseur tués<br/>HOME neuf · python -I"]
+  DUP -- non --> RESET["process du chasseur tués<br/>utilisateur judge · HOME neuf<br/>python -I · nonce"]
   RESET --> A["étage A · rejeu x2 via le gate<br/>contrôle qui satisfait l'attaque = réfuté"]
   A --> B["étage B · juge Opus<br/>session neuve, 8 tours"]
-  B --> DEC{"A reproduit is True<br/>et B confirme ?"}
+  B --> DEC{"A reproduit is True<br/>et B confirme avec le nonce ?"}
   DEC -- oui --> OK["verified<br/>PoC triager caviardée<br/>todo submit"]
   DEC -- "B rejette ou contrôle = attaque" --> REJ
   DEC -- sinon --> INC["inconclusive<br/>todo verify"]

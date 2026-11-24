@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -24,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
 
-from bh import classes, paths, stack
+from bh import classes, paths, retention, stack
 from bh.assets import Graph
 from bh.agent import contract as c
 from bh.board import Board
@@ -136,13 +137,22 @@ def activate_scope(scope_file: Path) -> None:
     os.replace(tmp, dst)
 
 
-def set_active_run(run_id: int | None, program: str = "") -> None:
-    """Tag every gate flow with the run that caused it (operator traffic between runs stays untagged)."""
+def relay_budget(max_turns: int) -> int:
+    """Claude API requests the gate relays for one segment: one per turn (measured), x3 for retries and legs."""
+    return 3 * max_turns + 30
+
+
+def set_active_run(run_id: int | None, program: str = "", relay_max: int | None = None) -> None:
+    """Tag every gate flow with the run that caused it (operator traffic between runs stays untagged). The gate
+    relays Claude API calls only while a run is active, at most `relay_max` of them (gate default otherwise)."""
     p = paths.active_run()
     if run_id is None:
         p.unlink(missing_ok=True)
     else:
-        p.write_text(json.dumps({"run_id": run_id, "program": program}))
+        rec = {"run_id": run_id, "program": program}
+        if relay_max is not None:
+            rec["relay_max"] = relay_max
+        p.write_text(json.dumps(rec))
 
 
 def sandbox_home(session: int | str) -> str:
@@ -241,9 +251,10 @@ def agent_command(
     session: str | None,
     bh_dir: str | None = None,
     extra_env: dict[str, str] | None = None,
+    user: str = "hunter",
 ) -> list[str]:
-    """claude -p inside the agent for this program. `bh_dir`/`extra_env` let the verifier reuse it with its own
-    work dir and role."""
+    """claude -p inside the agent for this program. `bh_dir`/`extra_env`/`user` let the verifier reuse it with
+    its own work dir, role and Unix user."""
     prog = scope.program
     bh = bh_dir or c.sandbox_dir(prog)
     env = {
@@ -260,7 +271,7 @@ def agent_command(
         "exec",
         "-i",
         "--user",
-        "hunter",
+        user,
         "-w",
         f"{c.WORK_ROOT}/{prog}",
         *[x for k, v in env.items() for x in ("-e", f"{k}={v}")],
@@ -553,6 +564,10 @@ def _run_locked(
     effort: str | None,
 ) -> SegmentResult:
     prog = scope.program
+    try:  # under the lock, before the gate sees this segment: every log consumer is up to date
+        retention.prune()
+    except OSError as exc:
+        print(f"retention: {exc}", file=sys.stderr)
     activate_scope(scope_file)
     session = board.last_session(prog) if resume else None
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)
@@ -579,7 +594,7 @@ def _run_locked(
 
     deadline = time.monotonic() + minutes * 60
     prompt, timed_out = task, False
-    set_active_run(run_id, prog)
+    set_active_run(run_id, prog, relay_budget(max_turns))
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             while res.legs < MAX_LEGS:

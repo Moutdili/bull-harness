@@ -77,7 +77,7 @@ FRONTIER, FACTS, SYSTEM, SCOPE, AGENT_PID, RAW, MANUAL_TESTED = (
 
 STATIC_EXT = re.compile(r"\.(js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|otf|mp4|webm|mp3|pdf)$", re.I)
 URL_RE = re.compile(r"https?://[^\s'\"<>|;)`\\]+")
-_ID_SEGMENT = re.compile(r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,})$", re.I)
+ID_SEGMENT = re.compile(r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,})$", re.I)
 
 
 # ------------------------------------------------------------------ locations
@@ -146,7 +146,7 @@ def origin(url: str) -> str | None:
 
 def path_key(path: str) -> str:
     """Path template: ids collapse so /basket/1 and /basket/7 are one endpoint."""
-    segs = [("{id}" if _ID_SEGMENT.match(s) else s) for s in (path or "/").split("?")[0].split("/")]
+    segs = [("{id}" if ID_SEGMENT.match(s) else s) for s in (path or "/").split("?")[0].split("/")]
     return "/".join(segs) or "/"
 
 
