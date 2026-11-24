@@ -11,11 +11,12 @@ to the full evidence. The frontier shown to the agent is titles only.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
+
+from bh import paths
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -46,28 +47,53 @@ CREATE INDEX IF NOT EXISTS findings_prog ON findings(program, status);
 CREATE INDEX IF NOT EXISTS todos_status ON todos(status);
 """
 
+# Columns added after v0: (table, column, type). Applied idempotently at open.
+MIGRATIONS = (
+    ("runs", "effort", "TEXT"),
+    ("runs", "arsenal_calls", "INTEGER"),
+    ("runs", "manual_calls", "INTEGER"),
+    ("runs", "locked_calls", "INTEGER"),
+)
+PROGRAM_TABLES = ("facts", "intents", "findings", "todos", "runs")
+
 TODO_KINDS = {"auth", "waf", "account", "scope-question", "refusal", "submit", "quota", "other"}
 FINDING_STATUS = {"new", "verifying", "verified", "rejected", "submitted", "duplicate"}
 
 
-def default_board_path() -> Path:
-    return Path(os.environ.get("BH_HOME", Path.cwd())) / "var" / "board.sqlite"
-
-
 class Board:
     def __init__(self, path: str | Path | None = None):
-        self.path = Path(path) if path else default_board_path()
+        self.path = Path(path) if path else paths.board_db()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        for table, col, typ in MIGRATIONS:
+            if col not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.db.commit()
+
+    # ---- meta (cursors, flags)
+    def meta_get(self, key: str, default: str = "") -> str:
+        row = self.db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        return row["v"] if row else default
+
+    def meta_set(self, key: str, value: str) -> None:
+        self.db.execute("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+        self.db.commit()
+
+    def reset_program(self, program: str) -> dict[str, int]:
+        """Forget everything about one program (training labs). Returns deleted rows per table."""
+        out = {t: self.db.execute(f"DELETE FROM {t} WHERE program=?", (program,)).rowcount for t in PROGRAM_TABLES}
+        self.db.execute("DELETE FROM meta WHERE k LIKE ?", (f"%:{program}",))
+        self.db.commit()
+        return out
 
     # ---- runs
     def run_start(self, program: str, model: str) -> int:
-        cur = self.db.execute("INSERT INTO runs(program, model, started, status) VALUES (?,?,?, 'running')",
-                              (program, model, time.time()))
+        cur = self.db.execute(
+            "INSERT INTO runs(program, model, started, status) VALUES (?,?,?, 'running')", (program, model, time.time())
+        )
         self.db.commit()
         return int(cur.lastrowid)
 
@@ -78,28 +104,42 @@ class Board:
         self.db.commit()
 
     def last_session(self, program: str) -> str | None:
-        row = self.db.execute("SELECT session_id FROM runs WHERE program=? AND session_id IS NOT NULL "
-                              "ORDER BY id DESC LIMIT 1", (program,)).fetchone()
+        row = self.db.execute(
+            "SELECT session_id FROM runs WHERE program=? AND session_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (program,),
+        ).fetchone()
         return row["session_id"] if row else None
 
     # ---- facts / intents
-    def add_fact(self, program: str, title: str, summary: str = "", evidence: str = "",
-                 kind: str = "fact", run_id: int | None = None) -> int:
+    def add_fact(
+        self,
+        program: str,
+        title: str,
+        summary: str = "",
+        evidence: str = "",
+        kind: str = "fact",
+        run_id: int | None = None,
+    ) -> int:
         cur = self.db.execute(
             "INSERT INTO facts(program, run_id, kind, title, summary, evidence, created) VALUES (?,?,?,?,?,?,?)",
-            (program, run_id, kind, title[:300], summary[:2000], evidence[:500], time.time()))
+            (program, run_id, kind, title[:300], summary[:2000], evidence[:500], time.time()),
+        )
         self.db.commit()
         return int(cur.lastrowid)
 
     def add_intent(self, program: str, title: str, run_id: int | None = None) -> int:
-        cur = self.db.execute("INSERT INTO intents(program, run_id, title, created) VALUES (?,?,?,?)",
-                              (program, run_id, title[:300], time.time()))
+        cur = self.db.execute(
+            "INSERT INTO intents(program, run_id, title, created) VALUES (?,?,?,?)",
+            (program, run_id, title[:300], time.time()),
+        )
         self.db.commit()
         return int(cur.lastrowid)
 
     def close_intent(self, intent_id: int, outcome: str) -> None:
-        self.db.execute("UPDATE intents SET status='closed', closed=?, outcome=? WHERE id=?",
-                        (time.time(), outcome[:500], intent_id))
+        self.db.execute(
+            "UPDATE intents SET status='closed', closed=?, outcome=? WHERE id=?",
+            (time.time(), outcome[:500], intent_id),
+        )
         self.db.commit()
 
     # ---- findings
@@ -109,26 +149,31 @@ class Board:
         cols = ["program", "run_id", "title", "created", *data]
         cur = self.db.execute(
             f"INSERT INTO findings({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-            (program, run_id, title[:300], time.time(), *data.values()))
+            (program, run_id, title[:300], time.time(), *data.values()),
+        )
         self.db.commit()
         return int(cur.lastrowid)
 
     def set_finding(self, fid: int, status: str, verdict: str | None = None) -> None:
         if status not in FINDING_STATUS:
             raise ValueError(f"bad status {status}")
-        self.db.execute("UPDATE findings SET status=?, verdict=COALESCE(?, verdict), updated=? WHERE id=?",
-                        (status, verdict, time.time(), fid))
+        self.db.execute(
+            "UPDATE findings SET status=?, verdict=COALESCE(?, verdict), updated=? WHERE id=?",
+            (status, verdict, time.time(), fid),
+        )
         self.db.commit()
 
     # ---- todos
-    def add_todo(self, kind: str, title: str, detail: str = "", program: str | None = None,
-                 dedup: str | None = None) -> int | None:
+    def add_todo(
+        self, kind: str, title: str, detail: str = "", program: str | None = None, dedup: str | None = None
+    ) -> int | None:
         if kind not in TODO_KINDS:
             kind = "other"
         try:
             cur = self.db.execute(
                 "INSERT INTO todos(program, kind, title, detail, dedup, created) VALUES (?,?,?,?,?,?)",
-                (program, kind, title[:300], detail[:4000], dedup, time.time()))
+                (program, kind, title[:300], detail[:4000], dedup, time.time()),
+            )
         except sqlite3.IntegrityError:
             return None  # same dedup key already open/closed
         self.db.commit()
@@ -144,12 +189,14 @@ class Board:
 
     def frontier(self, program: str, max_facts: int = 25) -> str:
         """Compact context for the agent: titles only, newest first. Target <= ~40 lines."""
-        facts = self.rows("SELECT id, kind, title FROM facts WHERE program=? ORDER BY id DESC LIMIT ?",
-                          program, max_facts)
+        facts = self.rows(
+            "SELECT id, kind, title FROM facts WHERE program=? ORDER BY id DESC LIMIT ?", program, max_facts
+        )
         intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)
-        todos = self.rows("SELECT id, kind, title FROM todos WHERE status='open' AND (program=? OR program IS NULL)",
-                          program)
+        todos = self.rows(
+            "SELECT id, kind, title FROM todos WHERE status='open' AND (program=? OR program IS NULL)", program
+        )
         out: list[str] = []
         if findings:
             out.append("## findings")
@@ -167,7 +214,9 @@ class Board:
 
     def export_facts(self, program: str, path: Path) -> None:
         """Read-only snapshot for the agent (bh-note show)."""
-        data = {r["id"]: dict(r) for r in self.rows(
-            "SELECT id, kind, title, summary, evidence FROM facts WHERE program=?", program)}
+        data = {
+            r["id"]: dict(r)
+            for r in self.rows("SELECT id, kind, title, summary, evidence FROM facts WHERE program=?", program)
+        }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False))

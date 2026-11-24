@@ -19,7 +19,8 @@ from pathlib import Path
 from mitmproxy import ctx, http
 from mitmproxy.proxy import server_hooks
 
-from bh.gate.policy import Policy, Verdict
+from bh.agent.contract import IDENTITY_HEADER
+from bh.gate.policy import SYSTEM_IGNORE_REGEX, Policy, Verdict
 
 MAX_BODY = 16_384
 WAF_MARKERS = re.compile(
@@ -28,7 +29,6 @@ WAF_MARKERS = re.compile(
     rb"Request blocked\..{0,100}(AWS|CloudFront)|Sucuri WebSite Firewall|captcha-delivery\.com|px-captcha)",
     re.I | re.S,
 )
-IDENTITY_HEADER = "X-BH-Identity"
 
 
 def _now() -> float:
@@ -45,10 +45,15 @@ class Gate:
         loader.add_option("bh_state", str, "/state", "bull-harness state dir")
 
     def configure(self, updated) -> None:
+        if "bh_state" not in updated and self.policy is not None:
+            return  # another option changed: keep the policy and its rate-limit buckets
         self.state = Path(ctx.options.bh_state)
         (self.state / "flows").mkdir(parents=True, exist_ok=True)
         self.policy = Policy(self.state / "active-scope.yaml")
         self.policy.reload()
+        # Claude API traffic is tunnelled untouched (TLS passthrough), never decrypted by the gate.
+        if SYSTEM_IGNORE_REGEX not in ctx.options.ignore_hosts:
+            ctx.options.update(ignore_hosts=[*ctx.options.ignore_hosts, SYSTEM_IGNORE_REGEX])
 
     def running(self) -> None:
         """Publish only the public CA cert for the agent; the CA key stays in the gate's confdir."""
@@ -75,8 +80,17 @@ class Gate:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def _deny(self, flow: http.HTTPFlow, v: Verdict, where: str) -> None:
-        self._log("events.jsonl", {"kind": "blocked", "where": where, "url": flow.request.pretty_url,
-                                   "method": flow.request.method, "reason": v.reason, "rule": v.rule})
+        self._log(
+            "events.jsonl",
+            {
+                "kind": "blocked",
+                "where": where,
+                "url": flow.request.pretty_url,
+                "method": flow.request.method,
+                "reason": v.reason,
+                "rule": v.rule,
+            },
+        )
         body = f"bh-gate: DENIED ({v.reason}{' / ' + v.rule if v.rule else ''})\n".encode()
         flow.response = http.Response.make(403, body, {"Content-Type": "text/plain", "X-BH-Gate": "denied"})
 
@@ -102,8 +116,10 @@ class Gate:
             ip = info[4][0]
             v = self.policy.check_ip(host, ip)
             if not v.allowed:
-                self._log("events.jsonl", {"kind": "blocked", "where": "resolve", "host": host, "ip": ip,
-                                           "reason": v.reason, "rule": v.rule})
+                self._log(
+                    "events.jsonl",
+                    {"kind": "blocked", "where": "resolve", "host": host, "ip": ip, "reason": v.reason, "rule": v.rule},
+                )
                 data.server.error = f"bh-gate: DENIED {host} -> {ip} ({v.reason})"
                 return
 
@@ -140,8 +156,7 @@ class Gate:
         try:
             ident = json.loads(path.read_text())
         except (OSError, ValueError):
-            self._log("events.jsonl", {"kind": "identity-missing", "identity": name,
-                                       "url": flow.request.pretty_url})
+            self._log("events.jsonl", {"kind": "identity-missing", "identity": name, "url": flow.request.pretty_url})
             return
         for k, val in (ident.get("headers") or {}).items():
             flow.request.headers[k] = val
@@ -156,28 +171,56 @@ class Gate:
         n = next(self.seq)
         fid = f"{int(time.time())}-{os.getpid()}-{n}"
         body = resp.raw_content or b""
-        rec = {"id": fid, "method": req.method, "url": req.pretty_url, "status": resp.status_code,
-               "len": len(body), "ctype": resp.headers.get("content-type", ""),
-               "wait": flow.metadata.get("bh_wait", 0)}
+        rec = {
+            "id": fid,
+            "method": req.method,
+            "url": req.pretty_url,
+            "status": resp.status_code,
+            "len": len(body),
+            "ctype": resp.headers.get("content-type", ""),
+            "wait": flow.metadata.get("bh_wait", 0),
+        }
         self._log("flows.jsonl", rec)
         full = {
             **rec,
-            "request": {"headers": list(req.headers.items(multi=True)),
-                        "body": (req.raw_content or b"")[:MAX_BODY].decode("utf-8", "replace")},
-            "response": {"headers": list(resp.headers.items(multi=True)),
-                         "body": body[:MAX_BODY].decode("utf-8", "replace")},
+            "request": {
+                "headers": list(req.headers.items(multi=True)),
+                "body": (req.raw_content or b"")[:MAX_BODY].decode("utf-8", "replace"),
+            },
+            "response": {
+                "headers": list(resp.headers.items(multi=True)),
+                "body": body[:MAX_BODY].decode("utf-8", "replace"),
+            },
         }
         (self.state / "flows" / f"{fid}.json").write_text(json.dumps(full, ensure_ascii=False))
         server = resp.headers.get("server", "").lower()
         if resp.status_code in (403, 429, 503) and (
-            "cf-mitigated" in resp.headers or WAF_MARKERS.search(body[:65536])
+            "cf-mitigated" in resp.headers
+            or WAF_MARKERS.search(body[:65536])
             or (resp.status_code == 403 and any(s in server for s in ("cloudflare", "akamai", "awselb")))
         ):
-            self._log("events.jsonl", {"kind": "waf", "host": req.pretty_host, "url": req.pretty_url,
-                                       "status": resp.status_code, "server": server, "flow": fid})
+            self._log(
+                "events.jsonl",
+                {
+                    "kind": "waf",
+                    "host": req.pretty_host,
+                    "url": req.pretty_url,
+                    "status": resp.status_code,
+                    "server": server,
+                    "flow": fid,
+                },
+            )
         elif resp.status_code == 401:
-            self._log("events.jsonl", {"kind": "auth", "host": req.pretty_host, "url": req.pretty_url,
-                                       "flow": fid, "identity": flow.metadata.get("bh_identity")})
+            self._log(
+                "events.jsonl",
+                {
+                    "kind": "auth",
+                    "host": req.pretty_host,
+                    "url": req.pretty_url,
+                    "flow": fid,
+                    "identity": flow.metadata.get("bh_identity"),
+                },
+            )
 
 
 addons = [Gate()]

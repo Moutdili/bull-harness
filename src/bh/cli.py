@@ -3,51 +3,51 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from bh import __version__
+from bh import __version__, paths, stack
 
-COMPOSE = ["podman-compose", "-f", "container/compose.yaml"]
-
-
-def _home() -> Path:
-    return Path(os.environ.get("BH_HOME", Path.cwd()))
+UI_PORT = 7340
+NUCLEI_TEMPLATES_REPO = "https://github.com/projectdiscovery/nuclei-templates.git"
+NUCLEI_TEMPLATES_TAG = "v10.5.2"  # pinned: bump deliberately, the scan profile depends on the layout
 
 
 def _board():
     from bh.board import Board
+
     return Board()
 
 
-# ---------------------------------------------------------------- scope
-def _cmd_scope_check(args) -> int:
-    from bh.scope import ScopeError, check, load_scope
+def _load_scope_or_exit(file: str):
+    from bh.scope import ScopeError, load_scope
+
     try:
-        scope = load_scope(args.file)
+        return load_scope(file)
     except ScopeError as exc:
-        print(f"ERR {exc}", file=sys.stderr)
-        return 2
+        raise SystemExit(f"ERR {exc}") from exc
+
+
+# ---------------------------------------------------------------- scope
+def cmd_scope_check(args) -> int:
+    from bh.scope import check
+
+    scope = _load_scope_or_exit(args.file)
     denied = 0
     for target in args.targets:
         d = check(scope, target)
         denied += not d.allowed
-        rule = f" [{d.rule}]" if d.rule else ""
-        print(f"{'ALLOW' if d.allowed else 'DENY '} {target} — {d.reason}{rule}")
+        print(f"{'ALLOW' if d.allowed else 'DENY '} {target} — {d.reason}" + (f" [{d.rule}]" if d.rule else ""))
     return 1 if denied else 0
 
 
-def _cmd_scope_show(args) -> int:
-    from bh.scope import ScopeError, load_scope
-    try:
-        s = load_scope(args.file)
-    except ScopeError as exc:
-        print(f"ERR {exc}", file=sys.stderr)
-        return 2
+def cmd_scope_show(args) -> int:
+    s = _load_scope_or_exit(args.file)
     print(f"{s.platform}/{s.program}  digest={s.digest[:12]}  rps={s.max_rps}  automation={s.automation_allowed}")
     for label, rules in (("in", s.in_scope), ("out", s.out_of_scope)):
         for r in rules:
@@ -58,42 +58,64 @@ def _cmd_scope_show(args) -> int:
 
 
 # ---------------------------------------------------------------- stack
-def _cmd_up(args) -> int:
-    home = _home()
-    env = home / "secrets" / "agent.env"
-    if not env.exists():
-        print("missing secrets/agent.env — create it with:\n"
-              "  mkdir -p secrets && claude setup-token   # in YOUR terminal, then:\n"
-              "  printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' '<token>' > secrets/agent.env && chmod 600 secrets/agent.env",
-              file=sys.stderr)
+def cmd_up(args) -> int:
+    if not (paths.secrets_dir() / "agent.env").exists():
+        print(
+            "missing secrets/agent.env — create it with:\n"
+            "  claude setup-token   # in YOUR terminal, then:\n"
+            "  printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' '<token>' > secrets/agent.env && chmod 600 secrets/agent.env",
+            file=sys.stderr,
+        )
         return 2
-    for d in ("var/gate/conf", "var/state/identities", "var/gate-ca", "var/work", "var/runs"):
-        (home / d).mkdir(parents=True, exist_ok=True)
-    cmd = COMPOSE + ["up", "-d"] + (["--build"] if args.build else [])
-    rc = subprocess.call(cmd, cwd=home)
+    if not (paths.tools_dir() / "nuclei-templates").is_dir():
+        print("nuclei templates missing: run `bh tools fetch` first", file=sys.stderr)
+        return 2
+    for d in (
+        paths.var() / "gate" / "conf",
+        paths.state() / "identities",
+        paths.var() / "gate-ca",
+        paths.var() / "work",
+        paths.runs_dir(),
+    ):
+        d.mkdir(parents=True, exist_ok=True)
+    rc = stack.compose("up", "-d", *(["--build"] if args.build else []))
     if rc == 0 and not args.no_ui:
-        _ui_start_daemon(None, 7340)
+        ui_start_daemon(None, UI_PORT)
     return rc
 
 
-def _cmd_down(args) -> int:
-    return subprocess.call(COMPOSE + ["down"], cwd=_home())
+def cmd_down(args) -> int:
+    return stack.compose("down")
 
 
-def _cmd_status(args) -> int:
-    from bh.runner.run import AGENT, GATE, container_running
-    for c in (GATE, AGENT):
-        print(f"{c:9} {'running' if container_running(c) else 'DOWN'}")
-    active = _home() / "var" / "state" / "active-scope.yaml"
-    if active.exists():
-        from bh.scope import load_scope
-        s = load_scope(active)
+def cmd_tools_fetch(args) -> int:
+    """Host-side downloads the sandbox cannot do (the gate blocks GitHub)."""
+    dst = paths.tools_dir() / "nuclei-templates"
+    if dst.is_dir():
+        print(f"{dst} already present (delete it to refetch {NUCLEI_TEMPLATES_TAG})")
+        return 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    return subprocess.call(
+        ["git", "clone", "-q", "--depth", "1", "--branch", NUCLEI_TEMPLATES_TAG, NUCLEI_TEMPLATES_REPO, str(dst)]
+    )
+
+
+def cmd_status(args) -> int:
+    for name in (stack.GATE, stack.AGENT):
+        print(f"{name:9} {'running' if stack.container_running(name) else 'DOWN'}")
+    if paths.active_scope().exists():
+        s = _load_scope_or_exit(str(paths.active_scope()))
         print(f"active scope: {s.platform}/{s.program} (rps {s.max_rps})")
     b = _board()
-    for r in b.rows("SELECT id, program, status, turns, cost_usd, datetime(started,'unixepoch','localtime') AS t "
-                    "FROM runs ORDER BY id DESC LIMIT 5"):
-        print(f"run {r['id']:>4} {r['t']} {r['program']:20} {r['status']:9} {r['turns'] or 0:>3} turns"
-              + (f"  ${r['cost_usd']:.2f} eq." if r['cost_usd'] else ""))
+    for r in b.rows(
+        "SELECT id, program, status, turns, cost_usd, arsenal_calls, manual_calls, locked_calls, "
+        "datetime(started,'unixepoch','localtime') AS t FROM runs ORDER BY id DESC LIMIT 5"
+    ):
+        print(
+            f"run {r['id']:>4} {r['t']} {r['program']:20} {r['status']:9} {r['turns'] or 0:>3} turns"
+            f"  arsenal/manual/locked {r['arsenal_calls'] or 0}/{r['manual_calls'] or 0}/{r['locked_calls'] or 0}"
+            + (f"  ${r['cost_usd']:.2f} eq." if r["cost_usd"] else "")
+        )
     n_todo = b.rows("SELECT COUNT(*) AS n FROM todos WHERE status='open'")[0]["n"]
     n_find = b.rows("SELECT COUNT(*) AS n FROM findings WHERE status IN ('new','verified')")[0]["n"]
     print(f"open todos: {n_todo} · findings to review: {n_find}")
@@ -101,24 +123,39 @@ def _cmd_status(args) -> int:
 
 
 # ---------------------------------------------------------------- runs
-def _cmd_run(args) -> int:
+def cmd_run(args) -> int:
     from bh.runner.run import run_segment
-    res = run_segment(Path(args.scope), model=args.model, max_turns=args.max_turns, minutes=args.minutes,
-                      resume=args.resume, extra_task=args.task or "", effort=args.effort)
+
+    res = run_segment(
+        Path(args.scope),
+        model=args.model,
+        max_turns=args.max_turns,
+        minutes=args.minutes,
+        resume=args.resume,
+        extra_task=args.task or "",
+        effort=args.effort,
+    )
     if res.text:
         print("\n" + res.text.strip())
     return 0 if res.status in ("ok", "max_turns", "timeout") else 1
 
 
-def _cmd_hunt(args) -> int:
+def cmd_hunt(args) -> int:
     from bh.runner.supervisor import hunt
-    hunt([Path(f) for f in args.scopes], hours=args.hours, minutes=args.minutes, model=args.model,
-         max_turns=args.max_turns, effort=args.effort)
+
+    hunt(
+        [Path(f) for f in args.scopes],
+        hours=args.hours,
+        minutes=args.minutes,
+        model=args.model,
+        max_turns=args.max_turns,
+        effort=args.effort,
+    )
     return 0
 
 
 # ---------------------------------------------------------------- board views
-def _cmd_todo(args) -> int:
+def cmd_todo(args) -> int:
     b = _board()
     if args.done:
         for t in args.done:
@@ -135,34 +172,52 @@ def _cmd_todo(args) -> int:
     return 0
 
 
-def _cmd_finding(args) -> int:
+def cmd_finding(args) -> int:
     b = _board()
     if args.id is None:
         for r in b.rows("SELECT id, program, status, severity, vuln_class, title FROM findings ORDER BY id"):
-            print(f"F{r['id']:<4} {r['status']:9} {r['severity'] or '?':8} {r['program']:16} [{r['vuln_class']}] {r['title']}")
+            sev = r["severity"] or "?"
+            print(f"F{r['id']:<4} {r['status']:9} {sev:8} {r['program']:16} [{r['vuln_class']}] {r['title']}")
         return 0
     fid = int(str(args.id).lstrip("F"))
     if args.set:
         b.set_finding(fid, args.set, args.verdict)
         print(f"F{fid} -> {args.set}")
         return 0
-    r = b.rows("SELECT * FROM findings WHERE id=?", fid)
-    if not r:
+    rows = b.rows("SELECT * FROM findings WHERE id=?", fid)
+    if not rows:
         print("unknown finding", file=sys.stderr)
         return 1
-    r = dict(r[0])
-    for k in ("title", "program", "status", "severity", "vuln_class", "url", "summary", "not_proven", "verdict", "evidence"):
+    r = dict(rows[0])
+    for k in (
+        "title",
+        "program",
+        "status",
+        "severity",
+        "vuln_class",
+        "url",
+        "summary",
+        "not_proven",
+        "verdict",
+        "evidence",
+    ):
         print(f"{k:11}: {r.get(k)}")
     print("poc:\n" + (r.get("poc") or ""))
     return 0
 
 
-def _cmd_board(args) -> int:
+def cmd_board(args) -> int:
     b = _board()
     if args.what == "frontier":
-        print(b.frontier(args.program))
+        from bh.runner.run import frontier
+
+        print(frontier(b, args.program))
+    elif args.what == "reset":
+        return board_reset(b, args.program, args.yes)
     else:
-        for r in b.rows("SELECT id, kind, title, summary, evidence FROM facts WHERE program=? ORDER BY id", args.program):
+        for r in b.rows(
+            "SELECT id, kind, title, summary, evidence FROM facts WHERE program=? ORDER BY id", args.program
+        ):
             print(f"{r['id']:>4} ({r['kind']}) {r['title']}")
             if args.verbose:
                 if r["summary"]:
@@ -172,14 +227,28 @@ def _cmd_board(args) -> int:
     return 0
 
 
-def _cmd_flows(args) -> int:
-    path = _home() / "var" / "state" / "flows.jsonl"
-    if not path.exists():
-        print("no flows yet")
-        return 0
-    lines = path.read_text().splitlines()[-args.n:]
-    for line in lines:
-        f = json.loads(line)
+def board_reset(b, program: str, yes: bool) -> int:
+    """Training labs: back up the board, forget the program, wipe its sandbox work dir."""
+    if not yes:
+        print(
+            f"this deletes every fact, finding, todo and run of '{program}' and its /work dir; add --yes",
+            file=sys.stderr,
+        )
+        return 2
+    backup = paths.var() / f"board-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
+    b.db.execute("VACUUM INTO ?", (str(backup),))
+    deleted = b.reset_program(program)
+    if stack.container_running(stack.AGENT):
+        stack.wipe_program(program)
+    shutil.rmtree(paths.stage(program), ignore_errors=True)
+    print(f"backup {backup}; deleted {deleted}")
+    return 0
+
+
+def cmd_flows(args) -> int:
+    from bh.agent.contract import tail_jsonl
+
+    for f in tail_jsonl(paths.flows_log(), args.n):
         if args.grep and args.grep not in f.get("url", ""):
             continue
         t = time.strftime("%H:%M:%S", time.localtime(f["ts"]))
@@ -187,60 +256,54 @@ def _cmd_flows(args) -> int:
     return 0
 
 
-def _ui_pidfile() -> Path:
-    return _home() / "var" / "ui.pid"
+# ---------------------------------------------------------------- UI daemon
+def ui_pidfile() -> Path:
+    return paths.var() / "ui.pid"
 
 
-def _ui_alive() -> int | None:
-    try:
-        pid = int(_ui_pidfile().read_text())
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError):
-        return None
-
-
-def _ui_start_daemon(host: str | None, port: int) -> int:
-    pid = _ui_alive()
-    if pid:
+def ui_start_daemon(host: str | None, port: int) -> int:
+    if pid := stack.pid_alive(ui_pidfile()):
         print(f"ui already running (pid {pid})")
         return 0
-    (_home() / "var").mkdir(exist_ok=True)
-    log = open(_home() / "var" / "ui.log", "a")
-    cmd = [sys.executable, "-m", "bh.cli", "ui", "--foreground", "--port", str(port)] + (["--host", host] if host else [])
-    p = subprocess.Popen(cmd, cwd=_home(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                         env={**os.environ, "BH_HOME": str(_home())})
-    _ui_pidfile().write_text(str(p.pid))
+    paths.var().mkdir(exist_ok=True)
+    cmd = [sys.executable, "-m", "bh.cli", "ui", "--foreground", "--port", str(port)] + (
+        ["--host", host] if host else []
+    )
+    with open(paths.var() / "ui.log", "a") as log:  # the child keeps its own descriptor
+        p = subprocess.Popen(
+            cmd,
+            cwd=paths.home(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env={**os.environ, "BH_HOME": str(paths.home())},
+        )
+    ui_pidfile().write_text(str(p.pid))
     time.sleep(1.5)
     if p.poll() is not None:
         print("ui failed to start, see var/ui.log", file=sys.stderr)
         return 1
     from bh.ui.server import default_host
-    print(f"ui: http://{host or default_host()}:{port}/login?token=$(cat secrets/ui.token)")
+
+    print(f"ui: http://{host or default_host()}:{port}/  (login with the token in secrets/ui.token)")
     return 0
 
 
-def _cmd_ui(args) -> int:
+def cmd_ui(args) -> int:
     if args.stop:
-        pid = _ui_alive()
-        if pid:
-            os.kill(pid, 15)
+        if pid := stack.pid_alive(ui_pidfile()):
+            os.kill(pid, signal.SIGTERM)
             print(f"ui stopped (pid {pid})")
         return 0
     if args.foreground:
         from bh.ui.server import serve
+
         serve(args.host, args.port)
         return 0
-    return _ui_start_daemon(args.host, args.port)
+    return ui_start_daemon(args.host, args.port)
 
 
-def _todo_stub(name: str):
-    def run(_) -> int:
-        print(f"bh {name}: not implemented yet (see docs/TODO.md)", file=sys.stderr)
-        return 3
-    return run
-
-
+# ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bh", description="bull-harness CLI")
     p.add_argument("--version", action="version", version=f"bh {__version__}")
@@ -248,56 +311,79 @@ def build_parser() -> argparse.ArgumentParser:
 
     scope = sub.add_parser("scope", help="hard scope files").add_subparsers(dest="scmd", required=True)
     c = scope.add_parser("check", help="decide targets against a scope file (rc 1 if any DENY)")
-    c.add_argument("file"); c.add_argument("targets", nargs="+"); c.set_defaults(func=_cmd_scope_check)
+    c.add_argument("file")
+    c.add_argument("targets", nargs="+")
+    c.set_defaults(func=cmd_scope_check)
     s = scope.add_parser("show", help="print a parsed scope file")
-    s.add_argument("file"); s.set_defaults(func=_cmd_scope_show)
+    s.add_argument("file")
+    s.set_defaults(func=cmd_scope_show)
 
-    u = sub.add_parser("up", help="start gate + agent containers (+ web UI)"); u.add_argument("--build", action="store_true")
+    u = sub.add_parser("up", help="start gate + agent containers (+ web UI)")
+    u.add_argument("--build", action="store_true")
     u.add_argument("--no-ui", action="store_true")
-    u.set_defaults(func=_cmd_up)
-    sub.add_parser("down", help="stop the stack").set_defaults(func=_cmd_down)
+    u.set_defaults(func=cmd_up)
+    sub.add_parser("down", help="stop the stack").set_defaults(func=cmd_down)
+    tools = sub.add_parser("tools", help="host-side tool data").add_subparsers(dest="tcmd", required=True)
+    tools.add_parser("fetch", help=f"clone nuclei-templates {NUCLEI_TEMPLATES_TAG} into var/tools").set_defaults(
+        func=cmd_tools_fetch
+    )
     ui = sub.add_parser("ui", help="web UI (daemon by default; binds the Tailscale IP)")
-    ui.add_argument("--host"); ui.add_argument("--port", type=int, default=7340)
-    ui.add_argument("--foreground", action="store_true"); ui.add_argument("--stop", action="store_true")
-    ui.set_defaults(func=_cmd_ui)
-    sub.add_parser("status", help="stack, last runs, todo count").set_defaults(func=_cmd_status)
+    ui.add_argument("--host")
+    ui.add_argument("--port", type=int, default=UI_PORT)
+    ui.add_argument("--foreground", action="store_true")
+    ui.add_argument("--stop", action="store_true")
+    ui.set_defaults(func=cmd_ui)
+    sub.add_parser("status", help="stack, last runs, todo count").set_defaults(func=cmd_status)
 
     def run_opts(sp):
         sp.add_argument("--model", default=os.environ.get("BH_MODEL", "sonnet"))
+        sp.add_argument(
+            "--effort", default=os.environ.get("BH_EFFORT"), choices=["low", "medium", "high", "xhigh", "max"]
+        )
         sp.add_argument("--max-turns", type=int, default=60)
         sp.add_argument("--minutes", type=float, default=30)
-        sp.add_argument("--effort", default=os.environ.get("BH_EFFORT"),
-                        choices=["low", "medium", "high", "xhigh", "max"])
 
     r = sub.add_parser("run", help="one agent segment on one program")
-    r.add_argument("scope"); run_opts(r)
-    r.add_argument("--resume", action="store_true", help="resume the last session instead of a fresh one "
-                   "(fresh is the default: cheaper, the board + HANDOFF carry the state)")
+    r.add_argument("scope")
+    run_opts(r)
+    r.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume the last session instead of a fresh one "
+        "(fresh is the default: cheaper, the board + HANDOFF carry the state)",
+    )
     r.add_argument("--task", help="extra operator instruction for this segment")
-    r.set_defaults(func=_cmd_run)
+    r.set_defaults(func=cmd_run)
 
     h = sub.add_parser("hunt", help="autonomous supervisor rotating over programs")
-    h.add_argument("scopes", nargs="+"); run_opts(h); h.add_argument("--hours", type=float, default=8)
-    h.set_defaults(func=_cmd_hunt)
+    h.add_argument("scopes", nargs="+")
+    run_opts(h)
+    h.add_argument("--hours", type=float, default=8)
+    h.set_defaults(func=cmd_hunt)
 
     t = sub.add_parser("todo", help="human todo")
-    t.add_argument("--done", nargs="+", metavar="ID"); t.add_argument("--all", action="store_true")
-    t.add_argument("-v", "--verbose", action="store_true"); t.set_defaults(func=_cmd_todo)
+    t.add_argument("--done", nargs="+", metavar="ID")
+    t.add_argument("--all", action="store_true")
+    t.add_argument("-v", "--verbose", action="store_true")
+    t.set_defaults(func=cmd_todo)
 
     f = sub.add_parser("finding", help="list / show / triage findings")
-    f.add_argument("id", nargs="?"); f.add_argument("--set", choices=sorted(
-        ["new", "verifying", "verified", "rejected", "submitted", "duplicate"]))
-    f.add_argument("--verdict"); f.set_defaults(func=_cmd_finding)
+    f.add_argument("id", nargs="?")
+    f.add_argument("--set", choices=sorted(["new", "verifying", "verified", "rejected", "submitted", "duplicate"]))
+    f.add_argument("--verdict")
+    f.set_defaults(func=cmd_finding)
 
-    b = sub.add_parser("board", help="facts / frontier of a program")
-    b.add_argument("what", choices=["frontier", "facts"]); b.add_argument("program")
-    b.add_argument("-v", "--verbose", action="store_true"); b.set_defaults(func=_cmd_board)
+    b = sub.add_parser("board", help="facts / frontier of a program, or reset it (labs)")
+    b.add_argument("what", choices=["frontier", "facts", "reset"])
+    b.add_argument("program")
+    b.add_argument("-v", "--verbose", action="store_true")
+    b.add_argument("--yes", action="store_true", help="confirm `reset`")
+    b.set_defaults(func=cmd_board)
 
     fl = sub.add_parser("flows", help="last requests seen by the gate (targets only)")
-    fl.add_argument("-n", type=int, default=30); fl.add_argument("--grep"); fl.set_defaults(func=_cmd_flows)
-
-    for name, helptext in (("plugin", "plugin manifests"), ("alias", "token-saving aliases")):
-        sub.add_parser(name, help=helptext).set_defaults(func=_todo_stub(name))
+    fl.add_argument("-n", type=int, default=30)
+    fl.add_argument("--grep")
+    fl.set_defaults(func=cmd_flows)
     return p
 
 
@@ -306,7 +392,6 @@ def _sigterm(signum, frame):  # SIGTERM behaves like Ctrl-C: runners kill the in
 
 
 def main(argv: list[str] | None = None) -> int:
-    import signal
     signal.signal(signal.SIGTERM, _sigterm)
     args = build_parser().parse_args(argv)
     return args.func(args)

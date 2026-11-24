@@ -71,9 +71,20 @@ class Scope:
 
 
 _TOP_KEYS = {
-    "schema", "program", "platform", "in_scope", "out_of_scope", "max_rps",
-    "required_headers", "user_agent", "automation_allowed", "forbidden_vulns",
-    "identities", "source", "synced_at", "notes",
+    "schema",
+    "program",
+    "platform",
+    "in_scope",
+    "out_of_scope",
+    "max_rps",
+    "required_headers",
+    "user_agent",
+    "automation_allowed",
+    "forbidden_vulns",
+    "identities",
+    "source",
+    "synced_at",
+    "notes",
 }
 _RULE_KEYS = {"type", "value", "note"}
 
@@ -164,13 +175,11 @@ def _parse_url_rule(value: str, note: str, ctx: str) -> Rule:
     ip = parse_ip(host_s)
     if ip is not None:
         raise ScopeError(f"{ctx}: URL rules need a hostname; use a 'cidr' rule for {host_s}")
-    if host_s.startswith("*."):
-        host = "*." + norm_host(host_s[2:])
-    else:
-        host = norm_host(host_s)
+    host = "*." + norm_host(host_s[2:]) if host_s.startswith("*.") else norm_host(host_s)
     normalized, _ = norm_path(path)
-    return Rule(RuleType.URL, value, note, host=host, scheme=scheme,
-                port=port or DEFAULT_PORTS[scheme], path=normalized)
+    return Rule(
+        RuleType.URL, value, note, host=host, scheme=scheme, port=port or DEFAULT_PORTS[scheme], path=normalized
+    )
 
 
 def _canonical_digest(doc: dict[str, Any]) -> str:

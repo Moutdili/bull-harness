@@ -5,6 +5,23 @@ Décisions figées (2026-11-22) : CVP **Defense** (individuel, Pro) · Podman ro
 Légende propriétaire : **C** = Claude (en direct, parties critiques) · **H** = Hermes (swarm) · **M** = Mio (humain).
 Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie que si le critère passe en sortie d'outil réelle.
 
+## État au 2026-11-24 (vérifié par tests ou run réel)
+
+| Phase | Fait | Reste |
+|---|---|---|
+| 0 Socle | 0.1, 0.2 (scope + 80+ tests), 0.4 board (+ migrations, reset), 0.5 CLI | 0.2b jokers mi-label / PSL. 0.3 remplacé par les builtins `bh.agent.tools` (pas de manifests YAML) |
+| 1 Confinement | 1.1 gate HTTP, 1.1b passifs (liste partagée `bh.agent.contract`), 1.4 réseaux (évasion testée) | 1.2 DNS, 1.3 SOCKS (le non-HTTP est coupé), 1.5 suite d'évasion, élargir les sources passives de subfinder |
+| 2 Tokens | 2.2 troncature, 2.3 `updatedToolOutput` vérifié, base par tour −62 % (`--tools Bash,Read`, sans slash commands), sessions neuves par défaut | 2.1 réécriture, 2.4 mineur, 2.5 calibrage, 2.6 alias |
+| 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope, H7 Gmail |
+| 4 Autonomie | 4.1 runner (stderr fichier, kill propre), 4.2 superviseur (progression réelle), 4.4 todos auth/waf/identity, **verrou d'outils + file de surface** | 4.2b rotation sur contexte, 4.3 vérificateur, 4.5 capture de session, 4.6 skills |
+| 5 CVE | — | tout |
+| 6 Runs réels | 6.0 lab Juice Shop (13 runs, 11 findings connus) | 6.1 app perso, 6.2 premier programme, 6.3 premier CVE |
+
+Arsenal (`bh-recon/crawl/content/scan/params/sqli/xss`) : chaque builtin passe par le gate au débit du
+programme, garde le brut sur disque, rend ≤ 25 lignes et enregistre sa couverture. Mesures sur Juice Shop
+(20 req/s) : crawl 12 s / 91 endpoints (extracteur JS maison, katana seul n'en trouve aucun),
+content 4 min, sqli niveau 3 ≈ 3 min, scan borné par `--timeout` (nuclei lent, cause interne non résolue).
+
 ---
 
 ## Phase 0 — Socle et contrats (C) — bloque tout le reste

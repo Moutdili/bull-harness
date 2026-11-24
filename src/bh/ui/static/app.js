@@ -84,10 +84,11 @@ const kpi = (k, v) => el("div", { class: "card kpi" }, el("div", { class: "v" },
 
 function runTable(runs) {
   if (!runs.length) return el("div", { class: "empty" }, "Aucun run. Lance-en un depuis Programmes.");
-  return el("table", {}, el("tr", {}, ...["#", "programme", "statut", "modèle", "tours", "coût éq.", "début", "note"].map((h) => el("th", {}, h))),
+  const tools = (r) => r.arsenal_calls == null ? "—" : `${r.arsenal_calls} / ${r.manual_calls} / ${r.locked_calls}`;
+  return el("table", {}, el("tr", {}, ...["#", "programme", "statut", "modèle", "tours", "arsenal / manuel / 🔒", "coût éq.", "début", "note"].map((h) => el("th", {}, h))),
     ...runs.map((r) => el("tr", { class: "click", onclick: () => { liveRun = r.id; liveRunId = null; show("live"); } },
       el("td", {}, r.id), el("td", {}, r.program), el("td", {}, el("span", { class: "badge" }, r.status)), el("td", {}, r.model),
-      el("td", {}, r.turns ?? "—"), el("td", {}, r.cost_usd ? `$${r.cost_usd.toFixed(2)}` : "—"),
+      el("td", {}, r.turns ?? "—"), el("td", { class: "small" }, tools(r)), el("td", {}, r.cost_usd ? `$${r.cost_usd.toFixed(2)}` : "—"),
       el("td", { class: "small" }, time(r.started)), el("td", { class: "small muted" }, (r.note || "").slice(0, 120)))));
 }
 
@@ -186,16 +187,17 @@ function todoTable(t, actions) {
       el("td", {}, actions && x.status === "open" ? el("button", { class: "btn", onclick: async (e) => { e.stopPropagation(); await api(`/api/todos/${x.id}/done`, {}); toast(`T${x.id} fait`); refresh(); } }, "Fait") : ""))));
 }
 function openTodo(x) {
-  const name = el("input", { placeholder: "nom de l'identité (ex: user-a)", value: x.kind === "account" ? "user-b" : "user-a" });
+  const name = el("input", { placeholder: "nom de l'identité (ex: user-c)" });
+  const overwrite = el("input", { type: "checkbox" });
   const hdr = el("textarea", { placeholder: "Cookie: session=...\nAuthorization: Bearer ..." });
   const needsIdentity = ["auth", "account", "waf"].includes(x.kind) && x.program;
   drawer(el("h3", {}, `T${x.id} · ${x.title}`), el("p", { class: `k-${x.kind}` }, x.kind),
     el("p", { class: "muted" }, TODO_HELP[x.kind] || ""), x.detail ? el("pre", {}, x.detail) : null,
     needsIdentity ? el("div", {}, el("h2", {}, `Enregistrer une identité pour ${x.program}`),
       el("p", { class: "small muted" }, "Une ligne « En-tête: valeur » par ligne. Stocké côté hôte (var/state/identities, chmod 600), injecté par le gate quand l'agent envoie X-BH-Identity. L'agent ne voit jamais la valeur."),
-      el("div", { class: "row" }, name), hdr,
+      el("div", { class: "row" }, name, el("label", { class: "small muted" }, overwrite, " remplacer si elle existe")), hdr,
       el("div", { class: "row" }, el("button", { class: "btn primary", onclick: async () => {
-        try { const r = await api("/api/identities", { program: x.program, name: name.value, headers: hdr.value, todo_id: x.id }); toast(`identité ${r.identity} enregistrée`); $("#drawer").classList.add("hidden"); refresh(); }
+        try { const r = await api("/api/identities", { program: x.program, name: name.value, headers: hdr.value, overwrite: overwrite.checked, todo_id: x.id }); toast(`identité ${r.identity} enregistrée`); $("#drawer").classList.add("hidden"); refresh(); }
         catch (e) { toast(`erreur: ${e.message}`); } } }, "Enregistrer et clore la todo"))) : null,
     x.status === "open" ? el("div", { class: "row" }, el("button", { class: "btn", onclick: async () => { await api(`/api/todos/${x.id}/done`, {}); toast("fait"); $("#drawer").classList.add("hidden"); refresh(); } }, "Marquer comme fait")) : null);
 }
@@ -263,9 +265,10 @@ function programCard(p, busy) {
   const minutes = el("input", { type: "number", value: 20, style: "width:80px" });
   const turns = el("input", { type: "number", value: 40, style: "width:80px" });
   const model = el("select", {}, ...["sonnet", "opus", "haiku"].map((m) => el("option", { value: m }, m)));
+  const effort = el("select", {}, ...["medium", "low", "high", "xhigh", "max"].map((e) => el("option", { value: e }, `effort ${e}`)));
   const task = el("input", { placeholder: "consigne pour ce segment (optionnel)", style: "flex:1;min-width:240px" });
   const launch = (mode) => async () => {
-    try { await api("/api/run", { scope: p.file, mode, minutes: minutes.value, max_turns: turns.value, model: model.value, task: task.value, hours: 4 }); toast(`${mode} lancé sur ${p.program}`); liveRun = "latest"; liveRunId = null; setTimeout(refresh, 1500); }
+    try { await api("/api/run", { scope: p.file, mode, minutes: minutes.value, max_turns: turns.value, model: model.value, effort: effort.value, task: task.value, hours: 4 }); toast(`${mode} lancé sur ${p.program}`); liveRun = "latest"; liveRunId = null; setTimeout(refresh, 1500); }
     catch (e) { toast(`erreur: ${e.message}`); }
   };
   return el("div", { class: "card", style: "margin-bottom:10px" },
@@ -275,7 +278,7 @@ function programCard(p, busy) {
     el("div", { class: "small" }, el("span", { class: "muted" }, "in: "), p.in_scope.join(", ")),
     p.out_of_scope.length ? el("div", { class: "small" }, el("span", { class: "muted" }, "out: "), p.out_of_scope.join(", ")) : null,
     el("div", { class: "small muted" }, `en-têtes: ${Object.entries(p.headers).map(([k, v]) => `${k}: ${v}`).join(" · ") || "—"} · identités: ${p.identities.join(", ") || "—"}`),
-    el("div", { class: "row" }, "minutes", minutes, "tours", turns, model, task,
+    el("div", { class: "row" }, "minutes", minutes, "tours", turns, model, effort, task,
       el("button", { class: "btn primary", disabled: busy || p.automation === false, onclick: launch("run") }, "Lancer un segment"),
       el("button", { class: "btn", disabled: busy || p.automation === false, onclick: launch("hunt") }, "Hunt 4 h")));
 }
