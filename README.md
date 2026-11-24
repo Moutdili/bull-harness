@@ -43,11 +43,11 @@ the module map.
 | Scope | gate | `bh.scope.check()` on the hostname the client asked for. The pinned IP is mapped back to the name it was vetted for, and the Host header is checked too. Out-of-scope requests get a `403 X-BH-Gate`. |
 | Network escape | containers | The agent sits on an internal network. It has no DNS and no route out except the gate. Raw TCP and websockets are refused. |
 | Writes | gate | PUT, PATCH and DELETE (method overrides included) go through only as one of *your* identities, and that identity's file must exist. |
-| Program rules | gate + host | Rate limit with backoff on 429, 503 and WAF answers. Enumeration is capped (more than 4 ids on one normalized route in 10 min). Bodies are capped at 1 MiB. Where a program forbids scanners, 25 not-found answers in 5 min pause the origin. |
-| Credentials | gate | The Claude OAuth token exists only in the gate, and only the agent container may use the relay. Identity sessions are injected by the gate. Logs and PoCs are redacted by `bh.redact`. |
+| Program rules | gate + host | Rate limit with backoff on 429, 503 and WAF answers. Enumeration is capped: more than 4 ids in 10 min on one normalized route, or in one id parameter (query string, form, JSON, GraphQL). Bodies are capped at 1 MiB. Where a program forbids scanners, 25 not-found answers in 5 min pause the origin. |
+| Credentials and quota | gate | The Claude OAuth token exists only in the gate. The relay serves only the agent container, only the calls Claude Code makes, only while a run is active, and at most a request budget per segment. Identity sessions are injected by the gate. Logs and PoCs are redacted by `bh.redact`. |
 | Unknown rules | runner | A real program runs only once a human has set `automation_allowed` and `scanners_allowed` in its scope file. |
 | Method | sandbox hooks (an aid) | Hand-made HTTP to an origin is refused until the mapping tools have run on it. One tool table serves the scanner ban and the metrics. |
-| False positives | host verifier | Stage A replays the structured `proof.json` twice through the gate. The control must be the attack's twin, and an answer to it that satisfies the attack disproves the proof. Stage B runs a fresh Opus judge with a clean HOME, after every hunter process has been killed. `verified` requires both stages. |
+| False positives | host verifier | Stage A replays the structured `proof.json` twice through the gate. The control must be the attack's twin, and an answer to it that satisfies the attack disproves the proof. Stage B runs a fresh Opus judge as its own Unix user, with a clean HOME, after every hunter process has been killed. Its verdict counts only with a nonce given to that process alone. `verified` requires both stages. |
 | Isolation between runs | runner | Each session starts with no process, HOME or CLAUDE.md from the previous one. A segment reaches only its own program's work directory. |
 
 ```mermaid
@@ -83,7 +83,7 @@ flowchart LR
 | `src/bh/paths.py`, `stack.py`, `text.py` | Filesystem layout, podman operations, text helpers |
 | `container/` | Compose file, agent and gate images, hook settings, `bh-agent` entry point (`python3 -I`) |
 | `scopes/` | One YAML file per program (`scopes/lab/juiceshop.yaml` is the training lab) |
-| `tests/` | Unit tests, and `tests/escape/escape_check.sh` (25 checks against the live gate) |
+| `tests/` | Unit tests, and `tests/escape/escape_check.sh` (29 checks against the live gate) |
 
 ## First start
 
@@ -121,6 +121,7 @@ uv run bh hunt scopes/x.yaml scopes/y.yaml --hours 4 --effort medium            
 uv run bh verify scopes/x.yaml F12        # re-verify one finding (judge: BH_VERIFIER_MODEL, default opus)
 uv run bh status · bh todo · bh finding [ID] · bh board frontier <program>
 uv run bh board reset <program> --yes    # labs only: backup, forget the program, wipe its /work
+uv run bh prune [--days 14]              # gate flow files past the retention, rotation of large gate logs
 ```
 
 Each segment is a fresh `claude -p` session; the board and the HANDOFF fact carry the state from one
@@ -131,7 +132,7 @@ the agent inside the container.
 
 ```sh
 uv run pytest                                                                  # unit tests
-podman exec -i --user hunter bh-agent bash -s < tests/escape/escape_check.sh   # live escape suite (25 checks)
+podman exec -i --user hunter bh-agent bash -s < tests/escape/escape_check.sh   # live escape suite (29 checks)
 uvx ruff@0.14.0 check src tests
 ```
 
@@ -140,4 +141,4 @@ request refused for the wrong reason counts as a failure.
 
 ## Status
 
-The two hostile reviews of 2026-11-24 are fixed and tested. The second one was by an independent model; its open items are listed in [`docs/TODO.md`](docs/TODO.md). Known limits are in [`docs/architecture.md`](docs/architecture.md).
+The two hostile reviews of 2026-11-24 are fixed and tested, open items included (see [`docs/TODO.md`](docs/TODO.md)). Known limits are in [`docs/architecture.md`](docs/architecture.md).
