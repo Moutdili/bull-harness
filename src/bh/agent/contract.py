@@ -57,6 +57,25 @@ LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
 RULES_MARK = "[bh-rules]"  # prefix of a denial imposed by the program's rules
 SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
 WORK_ROOT = "/work"  # the agent's work volume (var/work on the host)
+# Fact kinds the agent may write. "blocker" is not one: the host writes it from `bh-note blocked` and gate events.
+FACT_KINDS = ("fact", "recon", "handoff", "dead-end")
+# Why a lead is blocked. Nobody unblocks the agent during the hunt: a blocker closes the lead, it pages no one.
+BLOCKER_REASONS = (
+    "auth",
+    "account",
+    "waf",
+    "captcha",
+    "challenge",
+    "sms",
+    "kyc",
+    "login-failed",
+    "paid",
+    "write-needed",
+    "oob-needed",
+    "refusal",
+    "other",
+)
+BLOCKER_TTL_S = 7 * 86400  # older blockers leave the frontier: the obstacle may have gone
 
 NOTES, COVERAGE, ENDPOINTS, TOUCHED, COMMANDS = (
     "notes.jsonl",
@@ -153,7 +172,7 @@ def path_key(path: str) -> str:
 def family(key: str) -> str:
     """Comparable form of an endpoint key. A JS literal ending in `/` (`"/rest/basket/" + id`) is the
     item route `/rest/basket/{id}`; the collection `/api/Users` stays distinct from `/api/Users/{id}`."""
-    k = key.split("?")[0]
+    k = key.split("?", maxsplit=1)[0]
     return k + "{id}" if k.endswith("/") and not k.endswith(" /") else k
 
 

@@ -6,7 +6,7 @@
   bh-note finding "title" --severity high --class idor --url URL --proof proof.json \\
           --summary "..." --not-proven "..." [--poc-file poc.sh]
   bh-note verdict F12 confirmed|rejected|inconclusive "reason"     # verifier only
-  bh-note todo auth|waf|account|scope-question|refusal|other "title" [-d detail]
+  bh-note blocked auth|account|waf|captcha|...|other "what is blocked" [-d detail] [--intent I3] [--host H]
   bh-note show 42          # full summary/evidence of fact 42
   bh-note frontier         # current board view (+ attack surface)
 """
@@ -22,8 +22,6 @@ from pathlib import Path
 from bh.agent import contract as c
 from bh.agent import proof
 
-FACT_KINDS = ["fact", "recon", "handoff", "dead-end"]
-
 
 def _emit(rec: dict) -> None:
     c.append_jsonl(c.bh_dir() / c.NOTES, {**rec, "program": os.environ.get("BH_PROGRAM", "")})
@@ -37,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     f.add_argument("title")
     f.add_argument("-s", "--summary", default="")
     f.add_argument("-e", "--evidence", default="")
-    f.add_argument("-k", "--kind", default="fact", choices=FACT_KINDS)
+    f.add_argument("-k", "--kind", default="fact", choices=c.FACT_KINDS)
     sub.add_parser("intent").add_argument("title")
     d = sub.add_parser("done")
     d.add_argument("intent_id")
@@ -55,10 +53,12 @@ def parser() -> argparse.ArgumentParser:
     v.add_argument("finding_id")
     v.add_argument("verdict", choices=["confirmed", "rejected", "inconclusive"])
     v.add_argument("reason")
-    t = sub.add_parser("todo")
-    t.add_argument("kind")
-    t.add_argument("title")
-    t.add_argument("-d", "--detail", default="")
+    b = sub.add_parser("blocked", help="a lead you cannot finish: recorded and closed, nobody unblocks it")
+    b.add_argument("reason", choices=c.BLOCKER_REASONS)
+    b.add_argument("title")
+    b.add_argument("-d", "--detail", default="")
+    b.add_argument("--intent", help="the intent (I<n>) this blocker closes")
+    b.add_argument("--host")
     sub.add_parser("show").add_argument("fact_id")
     sub.add_parser("frontier")
     return p
@@ -106,6 +106,18 @@ def main(argv: list[str] | None = None) -> None:
                 "proof": proof_doc,
                 "summary": a.summary,
                 "not_proven": a.not_proven,
+            }
+        )
+        return
+    if a.op == "blocked":
+        _emit(
+            {
+                "op": "blocked",
+                "reason": a.reason,
+                "title": a.title,
+                "detail": a.detail,
+                "intent": a.intent or "",
+                "host": a.host or "",
             }
         )
         return

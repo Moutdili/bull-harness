@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from bh import paths, redact
@@ -20,13 +22,23 @@ from bh.classes import canonical
 from bh.scope import Scope
 from bh.text import one_line
 
-AUTH_TODO_THRESHOLD = 3
+AUTH_THRESHOLD = 3  # 401 answers on one host (and identity) before it counts as a wall, not a probe
+INTENT_ID = re.compile(r"I?(\d{1,12})")
+
+
+@dataclass
+class GateOutcome:
+    """What the gate events of one segment left for the runner to act on."""
+
+    blockers: int = 0  # blocker facts added
+    waf_hosts: set[str] = field(default_factory=set)  # hosts that answered with a WAF challenge
+    stale: set[str] = field(default_factory=set)  # identities whose session looks expired
 
 
 def notes(
     board: Board, program: str, run_id: int, notes_file: Path, scope: Scope | None = None
 ) -> tuple[int, int, int]:
-    """Ingest one rotated notes file in full. Returns (facts, findings, todos).
+    """Ingest one rotated notes file in full. Returns (facts, findings, blockers).
 
     The runner renames notes.jsonl at the end of each segment, so the agent can neither replay
     old notes (truncate + rewrite) nor hide them behind a moved cursor.
@@ -37,7 +49,7 @@ def notes(
     if skip:
         board.db.execute("DELETE FROM meta WHERE k=?", (legacy_key,))
         board.db.commit()
-    facts = findings = todos = 0
+    facts = findings = blockers = 0
     for n in c.read_jsonl(notes_file, offset=skip):
         if not isinstance(n, dict):
             continue  # the sandbox writes this file: a malformed line is skipped, never fatal
@@ -48,8 +60,8 @@ def notes(
                 program, "malformed note skipped", f"{exc!r}: {one_line(n, 300)}", kind="harness", run_id=run_id
             )
             continue
-        facts, findings, todos = facts + f, findings + fi, todos + t
-    return facts, findings, todos
+        facts, findings, blockers = facts + f, findings + fi, blockers + t
+    return facts, findings, blockers
 
 
 def _s(value, n: int = 2000) -> str:
@@ -58,7 +70,7 @@ def _s(value, n: int = 2000) -> str:
 
 
 def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None) -> tuple[int, int, int]:
-    """One note -> (facts, findings, todos) added."""
+    """One note -> (facts, findings, blockers) added."""
     match n.get("op"):
         case "fact":
             board.add_fact(
@@ -73,7 +85,7 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
         case "intent":
             board.add_intent(program, _s(n.get("title"), 300), run_id=run_id)
         case "done":
-            if m := re.fullmatch(r"I?(\d{1,12})", _s(n.get("intent_id"), 20)):
+            if m := INTENT_ID.fullmatch(_s(n.get("intent_id"), 20)):
                 board.close_intent(int(m.group(1)), _s(n.get("outcome")))
         case "finding":
             fields = {k: n.get(k) for k in FINDING_FIELDS if k not in ("vuln_class", "proof")}
@@ -96,24 +108,41 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
                 board.set_finding(fid, "rejected", f"excluded by program policy (forbidden_vulns: {excluded})")
                 return 0, 0, 0
             return 0, 1, 0
-        case "todo":
-            kind, title = _s(n.get("kind") or "other", 40), _s(n.get("title"), 300)
-            added = board.add_todo(
-                kind, title, _s(n.get("detail")), program=program, dedup=f"{program}:{kind}:{title[:120]}"
+        case "blocked":
+            reason = _s(n.get("reason"), 40)
+            board.add_blocker(
+                program,
+                reason,
+                _s(n.get("title"), 300),
+                _s(n.get("detail")),
+                run_id=run_id,
+                host=_s(n.get("host"), 255) or None,
             )
-            return 0, 0, int(bool(added))
+            if m := INTENT_ID.fullmatch(_s(n.get("intent"), 20)):
+                board.close_intent(int(m.group(1)), f"blocked: {reason}")
+            return 0, 0, 1
+        case "todo":  # written by an agent of the old doctrine: nobody answers todos during the hunt any more
+            kind, title = _s(n.get("kind") or "other", 40), _s(n.get("title"), 300)
+            if kind == "scope-question":  # a scope is never widened from the hunt: kept as a fact
+                board.add_fact(program, title, _s(n.get("detail")), kind="out-of-scope", run_id=run_id)
+                return 1, 0, 0
+            board.add_blocker(program, kind, title, _s(n.get("detail")), run_id=run_id)  # unknown kind -> other
+            return 0, 0, 1
     return 0, 0, 0
 
 
-def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> int:
-    """One summary fact for denials + human todos (WAF, 401). Returns the number of new todos.
+def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> GateOutcome:
+    """One summary fact for denials, blocker facts for walls (WAF, 401) and missing identities.
 
-    401 sent WITH an identity -> that session probably expired (todo per identity and run).
-    401 sent WITHOUT one -> todo only if the program has no identity at all: an agent probing
-    unauthenticated access control on purpose must not page the human."""
+    401 sent WITH an identity -> that session probably expired: meta `identity-stale:<ident>:<program>`
+    is set (the runner drops the identity until its file is refreshed) and a blocker is recorded.
+    401 sent WITHOUT one -> blocker only if the program has no identity at all: an agent probing
+    unauthenticated access control on purpose has hit no wall."""
+    out = GateOutcome()
     blocked: dict[str, int] = {}
-    auth: dict[tuple[str, str | None], int] = {}
-    todos = 0
+    auth: dict[tuple[str, str], int] = {}
+    missing: set[str] = set()
+    now = time.time()
     for e in board.new_lines(paths.events_log(), "gate-events"):
         if e.get("program") not in (program, "-"):
             continue
@@ -122,51 +151,56 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                 host = re.sub(r"https?://([^/]+).*", r"\1", e.get("url") or e.get("host") or "?")
                 blocked[host] = blocked.get(host, 0) + 1
             case "waf":
-                todos += bool(
-                    board.add_todo(
+                host = _s(e.get("host") or "?", 255)
+                if host not in out.waf_hosts:
+                    out.waf_hosts.add(host)
+                    board.add_blocker(
+                        program,
                         "waf",
-                        f"WAF challenge on {e.get('host')}",
+                        f"{host} answers with a WAF challenge",
                         f"status {e.get('status')} server={e.get('server')} url={e.get('url')} flow={e.get('flow')}",
-                        program=program,
-                        dedup=f"{program}:waf:{e.get('host')}",
+                        run_id=run_id,
+                        host=host,
                     )
-                )
+                    out.blockers += 1
             case "auth":
-                key = (e.get("host", "?"), e.get("identity"))
+                key = (_s(e.get("host") or "?", 255), _s(e.get("identity"), 80))
                 auth[key] = auth.get(key, 0) + 1
             case "identity-missing":
-                todos += bool(
-                    board.add_todo(
-                        "account",
-                        f"identity '{e.get('identity')}' requested but not configured",
-                        f"create var/state/identities/{program}/{e.get('identity')}.json",
-                        program=program,
-                        dedup=f"{program}:identity:{e.get('identity')}",
+                ident = _s(e.get("identity"), 80)
+                if ident not in missing:
+                    missing.add(ident)
+                    board.add_fact(
+                        program,
+                        f"identity '{ident}' requested but not configured",
+                        f"no var/state/identities/{program}/{ident}.json",
+                        kind="harness",
+                        run_id=run_id,
                     )
-                )
     for (host, ident), n in auth.items():
-        if n < AUTH_TODO_THRESHOLD:
+        if n < AUTH_THRESHOLD:
             continue
         if ident:
-            todos += bool(
-                board.add_todo(
+            board.meta_set(f"identity-stale:{ident}:{program}", str(now))
+            if ident not in out.stale:
+                out.stale.add(ident)
+                board.add_blocker(
+                    program,
                     "auth",
-                    f"identity '{ident}' gets 401 on {host} ({n}x): session expired?",
-                    f"refresh var/state/identities/{program}/{ident}.json",
-                    program=program,
-                    dedup=f"{program}:auth:{host}:{ident}:{run_id}",
+                    f"identity '{ident}' gets 401 on {host} ({n}x): session expired",
+                    f"left out until var/state/identities/{program}/{ident}.json is refreshed",
+                    run_id=run_id,
+                    host=host,
                 )
-            )
+                out.blockers += 1
         elif not identities:
-            todos += bool(
-                board.add_todo(
-                    "auth",
-                    f"{host} answers 401 ({n}x): session needed",
-                    "log in through the gate capture flow and store an identity",
-                    program=program,
-                    dedup=f"{program}:auth:{host}",
-                )
-            )
+            # once per host while the blocker is visible; past its TTL the wall is reported again if still there
+            key = f"auth-wall:{host}:{program}"
+            if now - float(board.meta_get(key, "0") or 0) < c.BLOCKER_TTL_S:
+                continue
+            board.meta_set(key, str(now))
+            board.add_blocker(program, "auth", f"{host} requires a session ({n}x 401)", run_id=run_id, host=host)
+            out.blockers += 1
     if blocked:
         top = sorted(blocked.items(), key=lambda kv: -kv[1])[:8]
         board.add_fact(
@@ -176,4 +210,4 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
             kind="blocked",
             run_id=run_id,
         )
-    return todos
+    return out

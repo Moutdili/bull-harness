@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from bh import paths
+from bh.agent.contract import BLOCKER_REASONS, BLOCKER_TTL_S
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -71,11 +72,13 @@ MIGRATIONS = (
     ("findings", "proof", "TEXT"),  # proof.json written by the agent (steps: setup / attack / control)
     ("findings", "replay", "TEXT"),  # verifier stage A: deterministic replay result (JSON)
     ("findings", "poc_triager", "TEXT"),  # PoC generated from the replayed proof, sessions as placeholders
+    ("runs", "blockers", "INTEGER"),  # blocker facts the segment recorded
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
 
-TODO_KINDS = {"auth", "waf", "account", "scope-question", "refusal", "submit", "verify", "quota", "other"}
+# The only human step left: submitting a verified finding. Anything that blocks the hunt is a blocker fact.
+TODO_KINDS = {"submit"}
 FINDING_STATUS = {"new", "verifying", "verified", "inconclusive", "rejected", "submitted", "duplicate"}
 FINDING_FIELDS = ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven", "proof")
 
@@ -91,6 +94,15 @@ class Board:
         for table, col, typ in MIGRATIONS:
             if col not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        if not self.meta_get("todos-v2"):
+            # Todos of the old model (auth, waf, ...) waited on a human who is no longer in the loop.
+            # They are marked obsolete, not deleted: the history stays readable.
+            self.db.execute(
+                "UPDATE todos SET status='obsolete', closed=? WHERE status='open' AND kind NOT IN "
+                f"({', '.join('?' * len(TODO_KINDS))})",
+                (time.time(), *sorted(TODO_KINDS)),
+            )
+            self.meta_set("todos-v2", str(time.time()))
         self.db.commit()
 
     # ---- meta (cursors, flags)
@@ -215,6 +227,7 @@ class Board:
         title: str,
         summary: str = "",
         evidence: str = "",
+        *,
         kind: str = "fact",
         run_id: int | None = None,
     ) -> int:
@@ -224,6 +237,29 @@ class Board:
         )
         self.db.commit()
         return int(cur.lastrowid)
+
+    def add_blocker(
+        self,
+        program: str,
+        reason: str,
+        title: str,
+        detail: str = "",
+        *,
+        run_id: int | None = None,
+        host: str | None = None,
+    ) -> int:
+        """A lead the agent cannot finish without a human: recorded, never waited on.
+        Fact kind 'blocker', title "[reason] title"; the host (if any) is kept as evidence "host:<name>"."""
+        if reason not in BLOCKER_REASONS:
+            reason = "other"
+        return self.add_fact(
+            program,
+            f"[{reason}] {title}",
+            detail,
+            f"host:{host}" if host else "",
+            kind="blocker",
+            run_id=run_id,
+        )
 
     def add_intent(self, program: str, title: str, run_id: int | None = None) -> int:
         cur = self.db.execute(
@@ -275,7 +311,7 @@ class Board:
         self, kind: str, title: str, detail: str = "", program: str | None = None, dedup: str | None = None
     ) -> int | None:
         if kind not in TODO_KINDS:
-            kind = "other"
+            raise ValueError(f"todo kind {kind!r} is not post-triage work (blockers go through add_blocker)")
         try:
             cur = self.db.execute(
                 "INSERT INTO todos(program, kind, title, detail, dedup, created) VALUES (?,?,?,?,?,?)",
@@ -297,20 +333,24 @@ class Board:
     def frontier(self, program: str, max_facts: int = 25) -> str:
         """Compact context for the agent: titles only, newest first. Target <= ~40 lines."""
         # Bookkeeping facts repeat every segment (one HANDOFF, one "gate denied" per run): only the latest
-        # of each kind is worth resending; every other fact stays, newest first.
+        # of each kind is worth resending; every other fact stays, newest first. Blockers have their own section.
         facts = self.rows(
-            "SELECT id, kind, title FROM facts WHERE program=? AND (kind NOT IN ('handoff', 'blocked') OR id IN "
+            "SELECT id, kind, title FROM facts WHERE program=? AND kind != 'blocker' AND "
+            "(kind NOT IN ('handoff', 'blocked') OR id IN "
             "(SELECT MAX(id) FROM facts WHERE program=? AND kind IN ('handoff', 'blocked') GROUP BY kind)) "
             "ORDER BY id DESC LIMIT ?",
             program,
             program,
             max_facts,
         )
+        # Past the TTL a blocker is dropped from view: the wall may be gone, the lead is worth a new look.
+        blockers = self.rows(
+            "SELECT id, title FROM facts WHERE program=? AND kind='blocker' AND created>=? ORDER BY id DESC LIMIT 10",
+            program,
+            time.time() - BLOCKER_TTL_S,
+        )
         intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)
-        todos = self.rows(
-            "SELECT id, kind, title FROM todos WHERE status='open' AND (program=? OR program IS NULL)", program
-        )
         out: list[str] = []
         if findings:
             out.append("## findings")
@@ -321,9 +361,9 @@ class Board:
         if facts:
             out.append(f"## facts (latest {len(facts)}; details: bh-note show <id>)")
             out += [f"- {r['id']} ({r['kind']}) {r['title']}" for r in reversed(facts)]
-        if todos:
-            out.append("## waiting on human")
-            out += [f"- T{r['id']} [{r['kind']}] {r['title']}" for r in todos]
+        if blockers:
+            out.append("## blocked (do not retry)")
+            out += [f"- {r['id']} {r['title']}" for r in reversed(blockers)]
         return "\n".join(out) if out else "(board empty: first session on this program)"
 
     def export_facts(self, program: str, path: Path) -> None:
