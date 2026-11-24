@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 
-from bh import paths
+from bh import paths, redact
 from bh.agent import contract as c
+from bh.agent import proof
 from bh.board import Board
 from bh.board.db import FINDING_FIELDS
 from bh.classes import canonical
 from bh.scope import Scope
+from bh.text import one_line
 
 AUTH_TODO_THRESHOLD = 3
 
@@ -60,42 +63,70 @@ def notes(
         board.db.commit()
     facts = findings = todos = 0
     for n in c.read_jsonl(notes_file, offset=skip):
-        match n.get("op"):
-            case "fact":
-                kind = n.get("kind", "fact")
-                board.add_fact(
-                    program, n.get("title", ""), n.get("summary", ""), n.get("evidence", ""), kind=kind, run_id=run_id
-                )
-                facts += 1
-            case "intent":
-                board.add_intent(program, n.get("title", ""), run_id=run_id)
-            case "done":
-                if m := re.fullmatch(r"I?(\d+)", str(n.get("intent_id", ""))):
-                    board.close_intent(int(m.group(1)), n.get("outcome", ""))
-            case "finding":
-                fid = board.add_finding(
-                    program,
-                    n.get("title", ""),
-                    run_id=run_id,
-                    **{k: n.get(k) for k in FINDING_FIELDS if k != "vuln_class"},
-                    vuln_class=canonical(n.get("vuln_class") or "unknown"),
-                )
-                if scope is not None and (excluded := scope.excludes(n.get("vuln_class"))):
-                    # the program does not pay for this class: rejected by the harness, not by the model's judgment
-                    board.set_finding(fid, "rejected", f"excluded by program policy (forbidden_vulns: {excluded})")
-                else:
-                    findings += 1
-            case "todo":
-                todos += bool(
-                    board.add_todo(
-                        n.get("kind", "other"),
-                        n.get("title", ""),
-                        n.get("detail", ""),
-                        program=program,
-                        dedup=f"{program}:{n.get('kind')}:{n.get('title', '')[:120]}",
-                    )
-                )
+        if not isinstance(n, dict):
+            continue  # the sandbox writes this file: a malformed line is skipped, never fatal
+        try:
+            f, fi, t = _note(board, program, run_id, n, scope)
+        except (TypeError, ValueError, OverflowError, sqlite3.Error) as exc:
+            board.add_fact(
+                program, "malformed note skipped", f"{exc!r}: {one_line(n, 300)}", kind="harness", run_id=run_id
+            )
+            continue
+        facts, findings, todos = facts + f, findings + fi, todos + t
     return facts, findings, todos
+
+
+def _s(value, n: int = 2000) -> str:
+    """A sandbox-written field as text (null, numbers, lists... are coerced, never trusted as typed)."""
+    return "" if value is None else (value if isinstance(value, str) else json.dumps(value))[:n]
+
+
+def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None) -> tuple[int, int, int]:
+    """One note -> (facts, findings, todos) added."""
+    match n.get("op"):
+        case "fact":
+            board.add_fact(
+                program,
+                _s(n.get("title"), 300),
+                _s(n.get("summary")),
+                _s(n.get("evidence")),
+                kind=_s(n.get("kind") or "fact", 40),
+                run_id=run_id,
+            )
+            return 1, 0, 0
+        case "intent":
+            board.add_intent(program, _s(n.get("title"), 300), run_id=run_id)
+        case "done":
+            if m := re.fullmatch(r"I?(\d{1,12})", _s(n.get("intent_id"), 20)):
+                board.close_intent(int(m.group(1)), _s(n.get("outcome")))
+        case "finding":
+            fields = {k: n.get(k) for k in FINDING_FIELDS if k not in ("vuln_class", "proof")}
+            fields = {k: _s(v, 20000) for k, v in fields.items()}
+            fields["poc"] = redact.text(fields.get("poc", ""))
+            doc = n.get("proof")
+            if doc is not None and proof.validate(doc):  # re-checked on the host: the sandbox check is advisory
+                fields["not_proven"] = (fields.get("not_proven", "") + " [proof refused by the host]").strip()
+                doc = None
+            fid = board.add_finding(
+                program,
+                _s(n.get("title"), 300) or "(untitled)",
+                run_id=run_id,
+                proof=doc,
+                **fields,
+                vuln_class=canonical(_s(n.get("vuln_class"), 80) or "unknown"),
+            )
+            if scope is not None and (excluded := scope.excludes(_s(n.get("vuln_class"), 80))):
+                # the program does not pay for this class: rejected by the harness, not by the model's judgment
+                board.set_finding(fid, "rejected", f"excluded by program policy (forbidden_vulns: {excluded})")
+                return 0, 0, 0
+            return 0, 1, 0
+        case "todo":
+            kind, title = _s(n.get("kind") or "other", 40), _s(n.get("title"), 300)
+            added = board.add_todo(
+                kind, title, _s(n.get("detail")), program=program, dedup=f"{program}:{kind}:{title[:120]}"
+            )
+            return 0, 0, int(bool(added))
+    return 0, 0, 0
 
 
 def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> int:

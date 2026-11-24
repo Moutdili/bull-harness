@@ -45,6 +45,16 @@ MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|nod
 EVIDENCE_RANK = {"gate": 3, "tool": 2, "literal": 1}  # gate-observed is authoritative
 
 
+def _text(e: dict, k: str) -> str | None:
+    v = e.get(k)
+    return v[:2000] if isinstance(v, str) and v else None
+
+
+def _origin(e) -> str | None:
+    """A sandbox-written origin, normalized (scheme://host:port), or None when it is not one."""
+    return c.origin(e["origin"]) if isinstance(e, dict) and isinstance(e.get("origin"), str) else None
+
+
 def ensure(board: Board) -> None:
     board.db.executescript(SCHEMA)
 
@@ -127,17 +137,30 @@ class Graph:
 
     # ------------------------------------------------------------------ sync from the sandbox and the gate
     def sync(self, run_id: int | None) -> dict[str, int]:
+        """The sandbox writes these files: every entry is checked, a malformed one is skipped (never fatal)."""
         d = paths.work_bh(self.program)
-        n = {"endpoints": 0, "coverage": 0, "tests": 0}
+        n = {"endpoints": 0, "coverage": 0, "tests": 0, "skipped": 0}
         for e in c.read_jsonl(d / c.ENDPOINTS):
-            if e.get("origin") and e.get("key") and not c.STATIC_EXT.search(e["key"]):
-                self.endpoint(
-                    e["origin"], c.family(e["key"]), e.get("source", "tool"), e.get("params"), e.get("status")
-                )
-                n["endpoints"] += 1
-        for origin_, phases in (c.read_json(d / c.COVERAGE, {}) or {}).items():
-            oid = self.origin(origin_, "tool")
+            o, key = _origin(e), _text(e, "key") if isinstance(e, dict) else None
+            if not o or not key or c.STATIC_EXT.search(key):
+                n["skipped"] += isinstance(e, dict) and not c.STATIC_EXT.search(key or "")
+                continue
+            params = (
+                [p for p in e.get("params") or [] if isinstance(p, str)] if isinstance(e.get("params"), list) else []
+            )
+            status = e.get("status") if isinstance(e.get("status"), int) else None
+            self.endpoint(o, c.family(key), _text(e, "source") or "tool", params, status)
+            n["endpoints"] += 1
+        coverage = c.read_json(d / c.COVERAGE, {})
+        for origin_, phases in (coverage if isinstance(coverage, dict) else {}).items():
+            if not (o := c.origin(str(origin_))) or not isinstance(phases, dict):
+                n["skipped"] += 1
+                continue
+            oid = self.origin(o, "tool")
             for phase, entry in phases.items():
+                if not isinstance(entry, dict):
+                    n["skipped"] += 1
+                    continue
                 self.b.db.execute(
                     "INSERT INTO coverage(asset_id, phase, status, ts, raw) VALUES (?,?,?,?,?) "
                     "ON CONFLICT(asset_id, phase) DO UPDATE SET "
@@ -146,8 +169,8 @@ class Graph:
                 )
                 n["coverage"] += 1
         for t in c.read_jsonl(d / c.TOUCHED):
-            if t.get("origin") and t.get("key"):
-                self.tested(t["origin"], t["key"], "tool" if t.get("via") != "manual" else "literal", run_id)
+            if (o := _origin(t)) and (key := _text(t, "key")):
+                self.tested(o, key, "tool" if t.get("via") != "manual" else "literal", run_id)
                 n["tests"] += 1
         runs = self.b.run_ids(self.program)
         for f in c.read_jsonl(paths.flows_log()):

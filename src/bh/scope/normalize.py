@@ -154,7 +154,17 @@ def _make(raw: str, host_s: str, scheme: str | None, port: int | None, path: str
 
 
 def parse_target(raw: str) -> Target:
-    """Parse a URL, host, IP, or host:port into a Target."""
+    """Parse a URL, host, IP, or host:port into a Target. Anything unparseable raises TargetError (the stdlib's
+    ValueError / UnicodeError from urlsplit, idna or ipaddress included): callers refuse, they never crash."""
+    try:
+        return _parse_target(raw)
+    except TargetError:
+        raise
+    except (ValueError, UnicodeError, TypeError, AttributeError) as exc:
+        raise TargetError(f"unparseable target {str(raw)[:120]!r}: {exc}") from exc
+
+
+def _parse_target(raw: str) -> Target:
     s = raw.strip()
     if not s:
         raise TargetError("empty target")

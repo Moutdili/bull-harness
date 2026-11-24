@@ -83,3 +83,26 @@ def test_findings_of_excluded_classes_are_rejected_by_the_harness(tmp_path):
     rows = {r["title"]: (r["status"], r["verdict"]) for r in b.rows("SELECT title, status, verdict FROM findings")}
     assert rows["slow regex"][0] == "rejected" and "forbidden_vulns: DoS" in rows["slow regex"][1]
     assert rows["IDOR"][0] == "new"
+
+
+def test_malformed_notes_never_stop_the_host(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    f = tmp_path / "notes-9.jsonl"
+    f.write_text(
+        "\n".join(
+            [
+                "[1, 2]",
+                '"text"',
+                json.dumps({"op": "finding", "title": None, "vuln_class": [1], "severity": {"x": 1}, "proof": [1]}),
+                json.dumps({"op": "todo", "title": 5, "kind": None}),
+                json.dumps({"op": "done", "intent_id": "9" * 30}),
+                json.dumps({"op": "finding", "title": "ok", "poc": "curl -H 'Cookie: sid=s3cr3t' https://h/"}),
+            ]
+        )
+        + "\n"
+    )
+    _, findings, todos = ingest.notes(b, "p", 9, f)
+    assert findings == 2 and todos == 1
+    pocs = [r["poc"] for r in b.rows("SELECT poc FROM findings")]
+    assert all("s3cr3t" not in (p or "") for p in pocs)
+    assert all(r["proof"] is None for r in b.rows("SELECT proof FROM findings"))  # a list is no proof

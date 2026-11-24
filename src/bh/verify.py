@@ -17,10 +17,11 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import time
 from pathlib import Path
 
-from bh import classes, paths, stack
+from bh import classes, paths, redact, stack
 from bh.agent import contract as c
 from bh.board import Board
 from bh.runner import prompt as prompts
@@ -68,7 +69,10 @@ def stage_a(program: str, fid: int, proof: dict) -> dict:
     """Deterministic replay inside the agent container (so it goes through the gate like the hunter did)."""
     path = f"{verify_dir(program, fid)}/proof.json"
     stack.push_file(path, json.dumps(proof))
-    r = stack.agent_sh('/opt/bh/bin/bh-agent replay "$1"', path, timeout=REPLAY_TIMEOUT_S)
+    try:
+        r = stack.agent_sh('/opt/bh/bin/bh-agent replay "$1"', path, timeout=REPLAY_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return {"reproduced": False, "control_disproves": False, "error": f"replay over {REPLAY_TIMEOUT_S}s"}
     try:
         return json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -145,25 +149,31 @@ def _misses(replay: dict) -> str:
 
 
 def triager_poc(scope: Scope, proof: dict) -> str:
-    """curl commands a triager can run outside the harness: program headers included, sessions as placeholders."""
-    lines = [f"# {scope.platform}/{scope.program} — generated from the replayed proof", "set -u"]
-    for i, st in enumerate(proof.get("steps") or [], 1):
+    """curl commands a triager can run outside the harness: program headers included, sessions and every
+    credential or personal value as placeholders (bh.redact). Robust to a malformed stored proof."""
+    lines = [
+        f"# {scope.platform}/{scope.program} — generated from the replayed proof",
+        "# credentials and personal data are <redacted:...>: put your own test-account values back before running",
+        "set -u",
+    ]
+    for i, st in enumerate(s for s in (proof.get("steps") or []) if isinstance(s, dict)):
         hdrs = dict(scope.required_headers)
         if scope.user_agent:
             hdrs["User-Agent"] = scope.user_agent
-        hdrs.update({str(k): str(v) for k, v in (st.get("headers") or {}).items()})
+        raw_headers = st.get("headers") if isinstance(st.get("headers"), dict) else {}
+        hdrs.update({str(k): redact.header(str(k), str(v)) for k, v in raw_headers.items()})
         if st.get("as"):
             for name in _identity_headers(scope.program, str(st["as"])):
                 hdrs[name] = f"<{name} of account {st['as']}>"
-        parts = ["curl", "-sk", "-i", "-X", str(st.get("method", "GET")).upper(), str(st["url"])]
+        parts = ["curl", "-sk", "-i", "-X", str(st.get("method", "GET")).upper(), redact.url(str(st.get("url", "")))]
         for k, v in hdrs.items():
             parts += ["-H", f"{k}: {v}"]
         if st.get("body") is not None:
-            body = st["body"]
+            body = redact.body(st["body"])
             parts += ["--data-raw", json.dumps(body) if isinstance(body, (dict, list)) else str(body)]
         lines += [
             "",
-            f"# step {i} ({st.get('role')}): {st.get('name', '')}",
+            f"# step {i + 1} ({st.get('role')}): {st.get('name', '')}",
             f"# expect: {json.dumps(st.get('expect'))}",
             shlex.join(parts),
         ]
@@ -194,6 +204,24 @@ def verify_finding(
         say(f"  ↳ F{fid} duplicate of F{dup}")
         return "duplicate"
     board.set_finding(fid, "verifying")
+    try:
+        return _verify(board, scope, finding, run_id=run_id, model=model, effort=effort, say=say)
+    except Exception as exc:  # noqa: BLE001 - never leave a finding stuck in 'verifying'
+        why = f"verification error: {exc!r}"[:500]
+        board.set_finding(fid, "inconclusive", why)
+        board.add_todo(
+            "verify",
+            f"F{fid} inconclusive: {finding['title']}",
+            why,
+            program=scope.program,
+            dedup=f"{scope.program}:verify:F{fid}",
+        )
+        say(f"  ↳ F{fid} inconclusive: {one_line(why, 200)}")
+        return "inconclusive"
+
+
+def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: str, effort: str | None, say) -> str:
+    fid = finding["id"]
     proof = json.loads(finding["proof"])
     # nothing of the hunter survives into the verification: its processes, HOME, user site, the old verdicts
     runner.clean_sandbox(scope.program, runner.sandbox_home(f"{run_id}-F{fid}"))
@@ -235,7 +263,9 @@ def verify_pending(
     """Verify the unverified findings that carry a proof, newest first (bounded: each one costs a claude session)."""
     out: dict[str, int] = {}
     for r in board.rows(
-        "SELECT id FROM findings WHERE program=? AND status='new' AND proof IS NOT NULL ORDER BY id DESC LIMIT ?",
+        # 'verifying' = a verification that died with the process: picked up again
+        "SELECT id FROM findings WHERE program=? AND status IN ('new', 'verifying') AND proof IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
         scope.program,
         limit,
     ):
