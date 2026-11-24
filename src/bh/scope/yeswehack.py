@@ -63,6 +63,7 @@ class Imported:
     doc: dict[str, Any]
     skipped: list[str] = field(default_factory=list)  # in-scope entries the human must translate by hand
     excluded_from_text: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)  # text exclusions that would remove a listed asset
     rule_excerpts: list[str] = field(default_factory=list)
 
 
@@ -110,6 +111,8 @@ def _own_host(host: str) -> bool:
     name = host.lower().lstrip("*.").split(":")[0].strip("[]").rstrip(".")
     if re.fullmatch(r"[\d.]+(/\d+)?|[0-9a-f:]+(/\d+)?", name):
         return True
+    if not re.fullmatch(r"[a-z0-9.-]+", name):  # "edge.blablacar.fr)" from a broken alternation
+        return False
     return "." in name and not any(name == p or name.endswith("." + p) for p in SHARED_PLATFORMS)
 
 
@@ -134,6 +137,25 @@ def _exclusions(texts: list[str]) -> list[str]:
             if not templated and not file_like and _check(host):
                 out.append(host.lower())
     return sorted(set(out))
+
+
+def _without_listed_assets(exclusions: list[str], in_scope: list) -> tuple[list[str], list[str]]:
+    """Exclusions picked from free text that would remove an asset the program LISTS in scope ("www.otto.de" cited in
+    a sentence about one of its paths, "*.dana.id" over a listed "m.dana.id") are not applied: they go to the human.
+    Excluding more stays the safe direction for everything else."""
+    from bh.scope import check, scope_from_dict
+
+    listed = []
+    for r in in_scope:
+        if isinstance(r, dict) and r.get("type") != "other":
+            v = r["value"]
+            listed.append(v if "://" in v else ("https://" + v.removeprefix("*.")))
+    keep, conflicts = [], []
+    for ex in exclusions:
+        probe = scope_from_dict({"schema": 1, "program": "probe", "platform": "local", "in_scope": [ex]}, origin="ywh")
+        hits = [v for v in listed if check(probe, v).allowed]
+        (conflicts if hits else keep).append(f"{ex} (covers {', '.join(hits[:3])})" if hits else ex)
+    return keep, conflicts
 
 
 def _max_rps(rules: str) -> float | None:
@@ -164,7 +186,7 @@ def convert(program: dict, username: str | None) -> Imported:
         raise ScopeError(f"{slug}: no in-scope web asset can be expressed exactly; write the scope by hand")
 
     oos_text = [str(x) for x in program.get("out_of_scope") or []]
-    imp.excluded_from_text = _exclusions(oos_text)
+    imp.excluded_from_text, imp.conflicts = _without_listed_assets(_exclusions(oos_text), in_scope)
     ua = program.get("user_agent") or None
     if ua and "<" in ua:
         if not username:
@@ -178,6 +200,10 @@ def convert(program: dict, username: str | None) -> Imported:
         "Accounts: " + re.sub(r"\s+", " ", program.get("account_access") or "not specified")[:400],
         "Out of scope (program text): " + " | ".join(oos_text)[:1500],
     ]
+    if imp.conflicts:
+        notes.append(
+            "Out-of-scope text names LISTED in-scope assets, NOT applied (read it): " + " | ".join(imp.conflicts)
+        )
     if imp.skipped:
         notes.append("In-scope entries NOT enforced (translate by hand if needed): " + " | ".join(imp.skipped))
     imp.doc = {

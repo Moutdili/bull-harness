@@ -77,3 +77,12 @@ def test_import_never_builds_a_rule_from_free_text_or_shared_platforms():
 def test_import_refuses_a_program_with_nothing_exact():
     with pytest.raises(ScopeError):
         convert(_prog(("Source Code", "other"), ("github.com/x/y", "web-application")), "mio")
+
+
+def test_text_exclusions_never_remove_a_listed_asset():
+    prog = _prog(("www.shop.example", "web-application"), ("m.pay.example", "web-application"))
+    prog["out_of_scope"] = ["Third-party pages on www.shop.example/partners", "*.pay.example", "blog.shop.example"]
+    imp = convert(prog, "mio")
+    assert imp.doc["out_of_scope"] == ["blog.shop.example"]
+    assert len(imp.conflicts) == 2
+    assert _web_rule("https://edge.blablacar.fr)/") is None
