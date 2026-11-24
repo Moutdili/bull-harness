@@ -64,7 +64,7 @@ class SegmentResult:
     cost_usd: float = 0.0
     new_facts: int = 0
     new_findings: int = 0
-    new_todos: int = 0
+    new_blockers: int = 0
     progress: int = 0  # findings + endpoints newly tested + phases newly covered (facts alone are not progress)
     tool_calls: int = 0
     arsenal_calls: int = 0  # Bash commands running a builtin or an arsenal tool
@@ -117,30 +117,91 @@ def run_lock() -> Iterator[None]:
         yield
 
 
-# program rules a human must have decided before any agent runs (None = not read yet). Local labs are exempt.
-HUMAN_DECISIONS = {
+# Program rules decided at onboarding, out of the hunt (None = not read yet): they are the legal authorisation
+# to test, which an agent cannot grant itself. Local labs are exempt.
+ONBOARDING_DECISIONS = {
     "automation_allowed": "is automation (an AI agent) allowed?",
     "scanners_allowed": "are automated scanners (ffuf, nuclei, sqlmap, dalfox) allowed?",
 }
 
 
-def check_automation(board: Board, scope: Scope) -> None:
-    """Unknown program rules = a human reads the program policy first; automation forbidden = never run."""
+class ProgramNotReady(SystemExit):
+    """The program cannot be hunted until its onboarding is done. A SystemExit, so `bh run` still exits with the
+    message; the supervisor catches it and parks the program instead of stopping the hunt."""
+
+    def __init__(self, program: str, fields: list[str], message: str):
+        super().__init__(message)
+        self.program, self.fields = program, fields
+
+
+def check_automation(scope: Scope) -> None:
+    """Unknown program rules = onboarding not done; automation forbidden = never run. Nobody is asked mid-hunt."""
     if scope.automation_allowed is False:
-        raise SystemExit(f"{scope.program}: automation_allowed is false — refusing to run an agent on it")
+        raise ProgramNotReady(
+            scope.program,
+            ["automation_allowed"],
+            f"{scope.program}: automation_allowed is false — refusing to run an agent on it",
+        )
     if scope.platform == "local":
         return
-    unknown = [f for f in HUMAN_DECISIONS if getattr(scope, f) is None]
-    for f in unknown:
-        board.add_todo(
-            "scope-question",
-            f"{scope.program}: {HUMAN_DECISIONS[f]}",
-            f"read the program rules, then set {f}: true/false in its scope file",
-            program=scope.program,
-            dedup=f"{scope.program}:{f}-unknown",
+    if unknown := [f for f in ONBOARDING_DECISIONS if getattr(scope, f) is None]:
+        raise ProgramNotReady(
+            scope.program,
+            unknown,
+            f"{scope.program}: {', '.join(unknown)} unknown — read the program rules and set it in the scope file",
         )
-    if unknown:
-        raise SystemExit(f"{scope.program}: {', '.join(unknown)} unknown — set it in the scope file first")
+
+
+# ------------------------------------------------------------------ hunt-time memory (board meta)
+REFUSAL_WINDOW_S = 7 * 86400
+WAF_PAUSE_S = 3600  # same length as the gate's waf-cooldown
+
+
+def live_identities(board: Board, program: str, also: list[str] | tuple[str, ...] = ()) -> list[str]:
+    """Identity names (files, plus `also`) minus those the gate saw expire: an `identity-stale` mark newer than
+    the identity file. Rewriting the file lifts the mark."""
+    out = []
+    for name in sorted(set(paths.identities(program)) | set(also)):
+        f = paths.identities_dir(program) / f"{name}.json"
+        try:
+            stale = float(board.meta_get(f"identity-stale:{name}:{program}", "0") or 0)
+        except ValueError:
+            stale = 0.0
+        if stale <= (f.stat().st_mtime if f.exists() else 0.0):
+            out.append(name)
+    return out
+
+
+def recent_refusals(board: Board, program: str, now: float | None = None) -> list[float]:
+    """Timestamps of this program's model refusals within the last 7 days (meta `refusals:<program>`)."""
+    now = time.time() if now is None else now
+    try:
+        stamps = json.loads(board.meta_get(f"refusals:{program}", "[]") or "[]")
+    except ValueError:
+        stamps = []
+    if not isinstance(stamps, list):
+        return []
+    return [float(t) for t in stamps if isinstance(t, (int, float)) and now - REFUSAL_WINDOW_S < t <= now]
+
+
+def record_refusal(board: Board, program: str, now: float | None = None) -> int:
+    """Add a refusal to the sliding window; returns how many it now holds."""
+    now = time.time() if now is None else now
+    stamps = [*recent_refusals(board, program, now), now]
+    board.meta_set(f"refusals:{program}", json.dumps(stamps))
+    return len(stamps)
+
+
+def last_refusal(board: Board, program: str, run_id: int) -> str:
+    """The command the previous run of this program was refused on ('' if it did not end on a refusal)."""
+    rows = board.rows(
+        "SELECT summary FROM facts WHERE program=? AND kind='blocker' AND title LIKE '[refusal]%' "
+        "AND run_id=(SELECT MAX(id) FROM runs WHERE program=? AND id<?) ORDER BY id DESC LIMIT 1",
+        program,
+        program,
+        run_id,
+    )
+    return (rows[0]["summary"] or "").split("\n", 1)[0] if rows else ""
 
 
 # ------------------------------------------------------------------ sandbox + gate state
@@ -252,7 +313,7 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
     )
     stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(r["key"].split(" ", 1) for r in tested)))
     stack.push_file(f"{cbh}/{c.FACTS}", (stage / c.FACTS).read_text())
-    stack.push_file(f"{cbh}/{c.SYSTEM}", build_system_prompt(scope, paths.identities(prog)))
+    stack.push_file(f"{cbh}/{c.SYSTEM}", build_system_prompt(scope, live_identities(board, prog)))
     stack.push_file(f"{cbh}/{c.SCOPE}", Path(scope_file).read_text())
 
 
@@ -269,17 +330,20 @@ def agent_command(
     bh_dir: str | None = None,
     extra_env: dict[str, str] | None = None,
     user: str = "hunter",
+    identities: list[str] | None = None,
 ) -> list[str]:
     """claude -p inside the agent for this program. `bh_dir`/`extra_env`/`user` let the verifier reuse it with
-    its own work dir, role and Unix user."""
+    its own work dir, role and Unix user. `identities`: the names offered to the agent (default: every one)."""
     prog = scope.program
     bh = bh_dir or c.sandbox_dir(prog)
+    if identities is None:
+        identities = sorted({i["name"] for i in scope.identities} | set(paths.identities(prog)))
     env = {
         "BH_DIR": bh,
         "BH_PROGRAM": prog,
         "BH_RPS": f"{scope.rate:g}",
         "BH_SCANNERS": "1" if scope.scanners_on else "0",
-        "BH_IDENTITIES": ",".join(sorted({i["name"] for i in scope.identities} | set(paths.identities(prog)))),
+        "BH_IDENTITIES": ",".join(identities),
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
         **(extra_env or {}),
@@ -494,27 +558,43 @@ def gate_counts(board: Board, run_id: int) -> dict[str, int]:
 def finish(
     board: Board, res: SegmentResult, scope: Scope, before: tuple[int, int], *, effort: str | None, note: str
 ) -> None:
+    """Ingest what the segment left and act on its walls without anyone: a refusal closes its lead, WAF hosts are
+    set aside, new out-of-scope hosts are recorded once."""
     prog = scope.program
-    res.new_facts, res.new_findings, res.new_todos = ingest.notes(
+    res.new_facts, res.new_findings, res.new_blockers = ingest.notes(
         board, prog, res.run_id, rotate_notes(prog, res.run_id), scope
     )
-    res.new_todos += ingest.gate_events(board, prog, res.run_id, paths.identities(prog))
+    outcome = ingest.gate_events(board, prog, res.run_id, live_identities(board, prog))
+    res.new_blockers += outcome.blockers
     if res.status == "refusal":
-        res.new_todos += bool(
-            board.add_todo(
-                "refusal",
-                f"model refused during run {res.run_id}",
-                f"see {paths.run_log(res.run_id, prog)}",
-                program=prog,
-                dedup=f"{prog}:refusal:{res.run_id}",
-            )
+        # never rephrased: the next task names the command as a closed lead (last_refusal reads the first line)
+        last = next((t["cmd"] for t in reversed(res.tool_log) if t.get("cmd")), "") or "(no command recorded)"
+        board.add_blocker(
+            prog,
+            "refusal",
+            f"run {res.run_id}",
+            f"{one_line(last, 200)}\nlog: {paths.run_log(res.run_id, prog)}",
+            run_id=res.run_id,
         )
+        res.new_blockers += 1
+        record_refusal(board, prog)
     board.record_metrics(res.run_id, res.turn_log, res.tool_log)
-    board.run_set(res.run_id, **gate_counts(board, res.run_id))
+    board.run_set(res.run_id, blockers=res.new_blockers, **gate_counts(board, res.run_id))
     graph = Graph(board, scope)
     graph.sync(res.run_id)
     for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
         graph.link(r["url"], "finding", r["id"])
+    until = time.time() + WAF_PAUSE_S
+    for host in sorted(outcome.waf_hosts - {"?", ""}):
+        graph.mark_blocked(host, "waf", until)
+    if graph.new_out_of_scope:  # read at the next onboarding review, never added to the scope
+        board.add_fact(
+            prog,
+            f"{len(graph.new_out_of_scope)} new out-of-scope host(s)",
+            ", ".join(graph.new_out_of_scope),
+            kind="out-of-scope",
+            run_id=res.run_id,
+        )
     board.db.commit()
     after = coverage_counts(board, scope)
     res.progress = res.new_findings + max(0, after[0] - before[0]) + max(0, after[1] - before[1])
@@ -537,6 +617,14 @@ def finish(
     )
 
 
+def pending_findings(board: Board, program: str) -> int:
+    """Findings with a proof still waiting for the judge ('verifying' = a verification that died mid-way)."""
+    return board.rows(
+        "SELECT COUNT(*) AS n FROM findings WHERE program=? AND status IN ('new', 'verifying') AND proof IS NOT NULL",
+        program,
+    )[0]["n"]
+
+
 # ------------------------------------------------------------------ segment
 def run_segment(
     scope_file: Path,
@@ -552,7 +640,7 @@ def run_segment(
 ) -> SegmentResult:
     scope = load_scope(scope_file)
     board = board or Board()
-    check_automation(board, scope)
+    check_automation(scope)
     for name in (stack.GATE, stack.AGENT):
         if not stack.container_running(name):
             raise SystemExit(f"container {name} is not running — start the stack with `bh up`")
@@ -598,7 +686,13 @@ def _run_locked(
     prepare_workdir(board, scope, scope_file)
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
-    task = build_task(frontier(board, prog, scope), first=first, max_turns=max_turns, cards=classes.cards_block(cards))
+    task = build_task(
+        frontier(board, prog, scope),
+        first=first,
+        max_turns=max_turns,
+        cards=classes.cards_block(cards),
+        refused=last_refusal(board, prog, run_id),
+    )
     if extra_task:
         task += "\n\nOperator instruction for this segment: " + extra_task
     log_path = paths.run_log(run_id, prog)
@@ -615,6 +709,7 @@ def _run_locked(
 
     deadline = time.monotonic() + minutes * 60
     prompt, timed_out = task, False
+    identities = live_identities(board, prog, also=[i["name"] for i in scope.identities])
     set_active_run(run_id, prog, relay_budget(max_turns))
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
@@ -629,6 +724,7 @@ def _run_locked(
                     max_turns=max_turns - res.turns,
                     effort=effort,
                     session=res.session_id if res.legs > 1 else session,
+                    identities=identities,
                 )
                 result, timed_out = run_leg(
                     cmd, log, log_path.with_suffix(".stderr"), res, say, prog, deadline - time.monotonic()
@@ -671,10 +767,12 @@ def _run_locked(
         ):
             res.status = "quota"
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
-    if res.new_findings and res.status not in ("quota", "refusal"):
+    # every finding waiting with a proof, not only this segment's: one left 'new' by an earlier stop is picked up
+    # here, and a refused segment's findings are verified too (the refusal closes a lead, not the findings)
+    if res.status != "quota" and (pending := pending_findings(board, prog)):
         from bh.verify import VERIFIER_MODEL, verify_pending
 
-        say(f"▶ verifying {res.new_findings} new finding(s) with {VERIFIER_MODEL}")
+        say(f"▶ verifying {pending} finding(s) with {VERIFIER_MODEL}")
         set_active_run(run_id, prog)  # the verifier's requests are this run's traffic too
         try:
             verify_pending(board, scope, run_id=run_id, model=VERIFIER_MODEL, effort=effort, say=say)
@@ -683,7 +781,7 @@ def _run_locked(
     say(
         f"■ run {run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · {res.tool_calls} tools "
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "
-        f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_todos} todos (progress {res.progress})"
+        f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_blockers} blockers (progress {res.progress})"
         + (f" · ${res.cost_usd:.2f} eq." if res.cost_usd else "")
         + quota_line(res.rate_limit)
     )

@@ -1,6 +1,7 @@
 """Zero-strategy supervisor (sapper-v2 watchdog pattern): keeps segments running, rotates
 programs on stagnation, sleeps on quota, starts a fresh session (handoff) when a session
-has been resumed too many times. It never decides what to test — the agent does."""
+has been resumed too many times. It never decides what to test — the agent does — and it
+never waits on a human: a program that cannot go on is paused or parked, the others go on."""
 
 from __future__ import annotations
 
@@ -10,11 +11,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bh.board import Board
-from bh.runner.run import SegmentResult, run_segment
+from bh.runner.run import ProgramNotReady, SegmentResult, check_automation, recent_refusals, run_segment
 from bh.scope import load_scope
 
 STAGNANT_LIMIT = 2  # segments without a new fact/finding before cooldown
 COOLDOWN_S = 2 * 3600
+# A refusal is never rephrased (CVP account): 1st -> pause, 2nd in the same hunt -> parked until it ends,
+# REFUSAL_LIMIT within 7 days -> excluded at preflight until someone reviews it out of the hunt.
+REFUSAL_COOLDOWN_S = 6 * 3600
+REFUSALS_TO_PARK = 2
+REFUSAL_LIMIT = 3
 QUOTA_SLEEP_S = 30 * 60  # when the stream gave no reset time
 QUOTA_MARGIN_S = 120
 # Resuming re-reads the whole session history every turn: lab runs 5-7 cost $0.13-0.20 for 3-10 turns,
@@ -30,6 +36,8 @@ class ProgState:
     cooldown_until: float = 0.0
     last_run: float = 0.0
     resumes: int = 0
+    refusals: int = 0  # in this hunt
+    parked: bool = False  # never picked again in this hunt
 
 
 def quota_wake(res: SegmentResult, now: float) -> float:
@@ -45,18 +53,52 @@ def _fmt(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
+    """The programs this hunt may run: onboarding done and fewer than REFUSAL_LIMIT refusals in 7 days."""
+    ready = []
+    for f in scope_files:
+        scope = load_scope(f)
+        try:
+            check_automation(scope)
+        except ProgramNotReady as exc:
+            print(f"{scope.program}: excluded ({exc})")
+            continue
+        if (n := len(recent_refusals(board, scope.program, time.time()))) >= REFUSAL_LIMIT:
+            print(f"{scope.program}: excluded ({n} model refusals in 7 days: review its [refusal] blockers)")
+            continue
+        ready.append(ProgState(f, scope.program))
+    return ready
+
+
+def _after_refusal(p: ProgState) -> None:
+    p.refusals += 1
+    if p.refusals >= REFUSALS_TO_PARK:
+        p.parked = True
+        print(f"{p.program}: parked until the end of the hunt ({p.refusals} refusals)")
+    else:
+        p.cooldown_until = time.time() + REFUSAL_COOLDOWN_S
+        print(f"{p.program}: paused until {_fmt(p.cooldown_until)} (refusal)")
+
+
 def hunt(
     scope_files: list[Path], *, hours: float, minutes: float, model: str, max_turns: int, effort: str | None = None
 ) -> None:
     board = Board()
-    progs = [ProgState(f, load_scope(f).program) for f in scope_files]
+    progs = preflight(board, scope_files)
+    if not progs:
+        print("hunt: no program is ready: nothing to do")
+        return
     deadline = time.time() + hours * 3600
     print(f"hunt: {len(progs)} program(s) until {_fmt(deadline)} · segments of {minutes:g} min / {max_turns} turns")
     while time.time() < deadline:
         now = time.time()
-        ready = [p for p in progs if p.cooldown_until <= now]
+        active = [p for p in progs if not p.parked]
+        if not active:
+            print("every program is parked: stopping")
+            break
+        ready = [p for p in active if p.cooldown_until <= now]
         if not ready:
-            wake = min(p.cooldown_until for p in progs)
+            wake = min(p.cooldown_until for p in active)
             if wake >= deadline:
                 print("every program is cooling down past the deadline: nothing left to do")
                 break
@@ -66,15 +108,20 @@ def hunt(
         p = min(ready, key=lambda x: x.last_run)
         resume = p.resumes < MAX_RESUMES
         p.last_run = time.time()
-        res: SegmentResult = run_segment(
-            p.file,
-            model=model,
-            max_turns=max_turns,
-            minutes=minutes,
-            resume=resume,
-            board=board,
-            effort=effort,
-        )
+        try:
+            res: SegmentResult = run_segment(
+                p.file,
+                model=model,
+                max_turns=max_turns,
+                minutes=minutes,
+                resume=resume,
+                board=board,
+                effort=effort,
+            )
+        except ProgramNotReady as exc:  # its scope file changed mid-hunt; any other SystemExit stops the hunt
+            p.parked = True
+            print(f"{p.program}: parked until the end of the hunt ({exc})")
+            continue
         p.resumes = p.resumes + 1 if resume else 0
         if res.status == "quota":
             wake = quota_wake(res, time.time())
@@ -84,11 +131,14 @@ def hunt(
             print(f"quota reached; sleeping until {_fmt(wake)}")
             time.sleep(max(30, wake - time.time()))
             continue
+        if res.status == "refusal":
+            _after_refusal(p)
+            continue
         if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1
         else:
             p.stagnant = 0
-        if p.stagnant >= STAGNANT_LIMIT or res.status in ("refusal", "error"):
+        if p.stagnant >= STAGNANT_LIMIT or res.status == "error":
             p.cooldown_until = time.time() + COOLDOWN_S
             p.stagnant = 0
             print(f"{p.program}: cooldown until {_fmt(p.cooldown_until)} ({res.status})")

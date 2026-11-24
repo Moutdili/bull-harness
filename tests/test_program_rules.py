@@ -1,4 +1,4 @@
-"""Program rules a human must decide before an agent runs (automation, scanners): unknown = refuse."""
+"""Program rules decided at onboarding before an agent runs (automation, scanners): unknown = refuse."""
 
 import pytest
 
@@ -34,13 +34,15 @@ def test_scanners_on_fails_closed(platform, scanners, on):
 
 def test_runner_refuses_unknown_scanner_rule(tmp_path):
     b = Board(tmp_path / "b.sqlite")
-    with pytest.raises(SystemExit, match="scanners_allowed"):
-        run.check_automation(b, _scope(scanners=None))
-    assert [r["title"] for r in b.rows("SELECT title FROM todos")] == ["p: " + run.HUMAN_DECISIONS["scanners_allowed"]]
-    run.check_automation(b, _scope(scanners=False))  # decided: runs (light phases only)
-    run.check_automation(b, _scope("local", scanners=None))  # lab exempt
+    with pytest.raises(run.ProgramNotReady, match="scanners_allowed") as exc:
+        run.check_automation(_scope(scanners=None))
+    assert exc.value.fields == ["scanners_allowed"] and isinstance(exc.value, SystemExit)
+    assert b.rows("SELECT * FROM todos") == []  # onboarding is not asked mid-hunt
+    assert set(run.ONBOARDING_DECISIONS) == {"automation_allowed", "scanners_allowed"}
+    run.check_automation(_scope(scanners=False))  # decided: runs (light phases only)
+    run.check_automation(_scope("local", scanners=None))  # lab exempt
 
 
-def test_runner_refuses_forbidden_automation(tmp_path):
-    with pytest.raises(SystemExit, match="automation_allowed is false"):
-        run.check_automation(Board(tmp_path / "b.sqlite"), _scope(automation=False, scanners=True))
+def test_runner_refuses_forbidden_automation():
+    with pytest.raises(run.ProgramNotReady, match="automation_allowed is false"):
+        run.check_automation(_scope(automation=False, scanners=True))
