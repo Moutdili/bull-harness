@@ -238,8 +238,7 @@ def board_reset(b, program: str, yes: bool) -> int:
     backup = paths.var() / f"board-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
     b.db.execute("VACUUM INTO ?", (str(backup),))
     deleted = b.reset_program(program)
-    if stack.container_running(stack.AGENT):
-        stack.wipe_program(program)
+    stack.wipe_program(program)
     shutil.rmtree(paths.stage(program), ignore_errors=True)
     print(f"backup {backup}; deleted {deleted}")
     return 0

@@ -18,3 +18,11 @@ def test_identity_save_is_private_and_never_silently_overwritten(tmp_path, monke
     assert json.loads(p.read_text())["headers"] == {"Cookie": "s=2"}
     with pytest.raises(ValueError):
         Handler._save_identity(None, {**body, "name": "../x"})
+
+
+def test_session_cookie_is_not_the_token():
+    from bh.ui.server import new_session, session_valid
+
+    s = new_session("tok")
+    assert "tok" not in s and session_valid(s, "tok")
+    assert not session_valid(s, "other-token") and not session_valid("tok", "tok") and not session_valid("", "tok")

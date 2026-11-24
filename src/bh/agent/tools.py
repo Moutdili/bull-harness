@@ -8,7 +8,7 @@ output under raw/, prints at most ~30 lines, and records what it covered:
   bh-content <url>          content discovery, auto-calibrated                 ffuf + seclists
   bh-scan    <url>          template scan, tech-aware, no intrusive templates   nuclei
   bh-params  <url>          hidden parameter discovery                         arjun
-  bh-sqli    <url> [--data] SQL injection test, level 1 / risk 1               sqlmap
+  bh-sqli    <url> [--data] SQL injection test, level 3 / risk 1, BEU only     sqlmap
   bh-xss     <url>          reflected XSS test                                 dalfox
 
 Common options: --as <identity> (authenticated, header injected by the gate),
@@ -103,6 +103,15 @@ class Job:
         if len(self.lines) > SUMMARY_LINES:
             print(f"  ... {len(self.lines) - SUMMARY_LINES} more")
         print(f"raw: {self.raw}/")
+
+
+def _safe_technique(value: str) -> str:
+    """sqlmap techniques allowed on a bug bounty target: Boolean, Error, Union. Time-based heavy
+    queries stall targets (measured on Juice Shop), stacked queries can write."""
+    v = value.upper()
+    if not v or set(v) - set("BEU"):
+        raise argparse.ArgumentTypeError("only B, E and U are allowed")
+    return v
 
 
 def _rate_int() -> int:
@@ -498,7 +507,12 @@ def main(phase: str, argv: list[str] | None = None) -> None:
         p.add_argument("--data", help="POST body, e.g. 'email=a&password=b' or JSON")
         p.add_argument("-p", "--param", help="parameters to test (default: those of the URL/body)")
         p.add_argument("--level", type=int, default=3, choices=[1, 2, 3])
-        p.add_argument("--technique", default="BEU", help="sqlmap techniques (default BEU: no time-based, no stacked)")
+        p.add_argument(
+            "--technique",
+            default="BEU",
+            type=_safe_technique,
+            help="subset of B, E, U (time-based and stacked queries are never allowed)",
+        )
     a = p.parse_args(argv)
     url = a.target if "://" in a.target else f"https://{a.target}"
     job = Job(phase, url, a.identity, a.timeout)

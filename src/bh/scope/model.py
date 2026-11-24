@@ -17,9 +17,11 @@ from typing import Any
 
 import yaml
 
-from bh.scope.normalize import DEFAULT_PORTS, TargetError, norm_host, norm_path, parse_ip
+from bh.scope.normalize import DEFAULT_PORTS, norm_host, norm_path, parse_ip
 
 SCHEMA_VERSION = 1
+# Rate used when a program publishes none: conservative, the gate and the builtins both apply it.
+DEFAULT_RPS = 2.0
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -68,6 +70,11 @@ class Scope:
     synced_at: str | None = None
     notes: str = ""
     digest: str = ""  # sha256 of the canonical source document
+
+    @property
+    def rate(self) -> float:
+        """Effective request rate towards targets (req/s)."""
+        return self.max_rps or DEFAULT_RPS
 
 
 _TOP_KEYS = {
@@ -146,7 +153,9 @@ def parse_rule(entry: Any, ctx: str) -> Rule:
                 return _parse_url_rule(value, note, ctx)
             case RuleType.REPO | RuleType.OTHER:
                 return Rule(rtype, value, note)
-    except TargetError as exc:
+    except ScopeError:
+        raise
+    except ValueError as exc:  # TargetError and any parser error: a broken scope must fail closed, loudly
         raise ScopeError(f"{ctx}: {exc}") from exc
     raise ScopeError(f"{ctx}: unhandled rule type {rtype}")  # pragma: no cover
 
@@ -163,15 +172,21 @@ def _parse_url_rule(value: str, note: str, ctx: str) -> Rule:
     _check_wildcard_shape(authority, ctx)
     host_s, port = authority, None
     if authority.startswith("["):
-        end = authority.index("]")
+        end = authority.find("]")
+        if end == -1:
+            raise ScopeError(f"{ctx}: bad IPv6 literal in {value!r}")
         host_s, tail = authority[: end + 1], authority[end + 1 :]
         if tail:
-            port = int(tail.lstrip(":"))
+            if not tail.startswith(":") or not tail[1:].isdigit():
+                raise ScopeError(f"{ctx}: bad port in {value!r}")
+            port = int(tail[1:])
     elif ":" in authority:
         host_s, p = authority.rsplit(":", 1)
         if not p.isdigit():
             raise ScopeError(f"{ctx}: bad port in {value!r}")
         port = int(p)
+    if port is not None and not 0 < port < 65536:
+        raise ScopeError(f"{ctx}: port out of range in {value!r}")
     ip = parse_ip(host_s)
     if ip is not None:
         raise ScopeError(f"{ctx}: URL rules need a hostname; use a 'cidr' rule for {host_s}")

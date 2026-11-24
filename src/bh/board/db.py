@@ -53,8 +53,10 @@ MIGRATIONS = (
     ("runs", "arsenal_calls", "INTEGER"),
     ("runs", "manual_calls", "INTEGER"),
     ("runs", "locked_calls", "INTEGER"),
+    ("runs", "cache_write", "INTEGER"),
 )
-PROGRAM_TABLES = ("facts", "intents", "findings", "todos", "runs")
+# Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
+PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
 
 TODO_KINDS = {"auth", "waf", "account", "scope-question", "refusal", "submit", "quota", "other"}
 FINDING_STATUS = {"new", "verifying", "verified", "rejected", "submitted", "duplicate"}
@@ -83,8 +85,12 @@ class Board:
         self.db.commit()
 
     def reset_program(self, program: str) -> dict[str, int]:
-        """Forget everything about one program (training labs). Returns deleted rows per table."""
+        """Forget everything about one program (training labs). Returns affected rows per table."""
         out = {t: self.db.execute(f"DELETE FROM {t} WHERE program=?", (program,)).rowcount for t in PROGRAM_TABLES}
+        archived = f"{program}~{time.strftime('%Y%m%d-%H%M%S')}"
+        out["runs (archived)"] = self.db.execute(
+            "UPDATE runs SET program=? WHERE program=?", (archived, program)
+        ).rowcount
         self.db.execute("DELETE FROM meta WHERE k LIKE ?", (f"%:{program}",))
         self.db.commit()
         return out
@@ -107,6 +113,9 @@ class Board:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(f"UPDATE runs SET {cols} WHERE id=?", (*fields.values(), run_id))
         self.db.commit()
+
+    def run_ids(self, program: str) -> set[int]:
+        return {r["id"] for r in self.db.execute("SELECT id FROM runs WHERE program=?", (program,))}
 
     def last_session(self, program: str) -> str | None:
         row = self.db.execute(

@@ -38,6 +38,8 @@ class Target:
     port: int | None  # explicit or scheme default; None if unknown
     path: str | None  # normalized path, None for bare host
     path_raw: str | None  # percent-decoded, not dot-normalized
+    # every reading of the path a server might apply (see path_variants); () for bare hosts
+    paths: tuple[str, ...] = ()
 
     @property
     def name(self) -> str:
@@ -125,6 +127,21 @@ def _port(p: str, raw: str) -> int:
     return int(p)
 
 
+_MATRIX = re.compile(r";[^/]*")
+
+
+def path_variants(path: str) -> tuple[str, ...]:
+    """The path as different servers may read it: raw, decoded once and twice (%252f), with
+    matrix parameters dropped (`/a;x/b`, `/..;/`), dot-normalized or not. Out-of-scope rules
+    must match ANY reading, in-scope rules must hold for ALL of them."""
+    once = unquote(path)
+    out: set[str] = set()
+    for p in {path, once, unquote(once)}:
+        for q in {p, _MATRIX.sub("", p)}:
+            out.update(norm_path(q))
+    return tuple(sorted(out))
+
+
 def _make(raw: str, host_s: str, scheme: str | None, port: int | None, path: str | None) -> Target:
     ip = parse_ip(host_s)
     host = None if ip is not None else norm_host(host_s)
@@ -133,7 +150,7 @@ def _make(raw: str, host_s: str, scheme: str | None, port: int | None, path: str
     if path is None:
         return Target(raw, host, ip, scheme, port, None, None)
     normalized, decoded = norm_path(path)
-    return Target(raw, host, ip, scheme, port, normalized, decoded)
+    return Target(raw, host, ip, scheme, port, normalized, decoded, path_variants(path))
 
 
 def parse_target(raw: str) -> Target:

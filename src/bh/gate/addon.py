@@ -1,27 +1,34 @@
 """mitmproxy addon: `mitmdump -s addon.py --set bh_state=/state`.
 
-Enforces bh.gate.policy on every CONNECT, request and upstream connection,
-rate-limits, injects program headers and identities, and writes compact JSONL
-logs that the runner turns into board facts / human todos.
+Enforces bh.gate.policy on every CONNECT, TLS handshake, request and upstream connection,
+rate-limits (with backoff when the target pushes back), injects program headers and identities,
+and writes compact JSONL logs that the runner turns into board facts / human todos.
+
+Fail closed: mitmproxy only logs exceptions raised by addons and lets the flow continue, so every
+hook here catches its own errors and denies.
 """
 
 from __future__ import annotations
 
+import functools
+import inspect
 import itertools
 import json
 import os
 import re
+import secrets
 import socket
 import threading
 import time
 from pathlib import Path
 
-from mitmproxy import ctx, http
+from mitmproxy import ctx, http, tcp, tls, udp
+from mitmproxy.net.http.url import parse_authority
 from mitmproxy.proxy import server_hooks
 
 from bh import paths
 from bh.agent.contract import IDENTITY_HEADER
-from bh.gate.policy import SYSTEM_IGNORE_REGEX, Policy, Verdict
+from bh.gate.policy import SYSTEM_PORT, Policy, Verdict, deny, is_system
 
 MAX_BODY = 16_384
 WAF_MARKERS = re.compile(
@@ -30,10 +37,52 @@ WAF_MARKERS = re.compile(
     rb"Request blocked\..{0,100}(AWS|CloudFront)|Sucuri WebSite Firewall|captcha-delivery\.com|px-captcha)",
     re.I | re.S,
 )
+PUSHBACK_STATUS = (429, 503)
+os.umask(0o077)  # logs and flow files hold target data and redacted sessions: owner-only
 
 
 def _now() -> float:
     return round(time.time(), 3)
+
+
+def _deny_response(v: Verdict) -> http.Response:
+    body = f"bh-gate: DENIED ({v.reason}{' / ' + v.rule if v.rule else ''})\n".encode()
+    return http.Response.make(403, body, {"Content-Type": "text/plain", "X-BH-Gate": "denied"})
+
+
+def fail_closed(hook):
+    """Any exception in a hook denies the flow instead of letting mitmproxy continue it."""
+
+    def on_error(hook_name: str, arg, exc: Exception) -> None:
+        ctx.log.error(f"bh-gate: {hook_name} failed, denying: {exc!r}")
+        if isinstance(arg, http.HTTPFlow):
+            arg.response = _deny_response(deny(f"gate error in {hook_name}"))
+        elif isinstance(arg, (tcp.TCPFlow, udp.UDPFlow)):
+            arg.kill()
+        elif isinstance(arg, server_hooks.ServerConnectionHookData):
+            arg.server.error = "bh-gate: denied (gate error)"
+
+    if inspect.iscoroutinefunction(hook):
+
+        @functools.wraps(hook)
+        async def async_wrapper(self, arg, *rest):
+            try:
+                return await hook(self, arg, *rest)
+            except Exception as exc:  # noqa: BLE001 - deny on anything
+                on_error(hook.__name__, arg, exc)
+                return None
+
+        return async_wrapper
+
+    @functools.wraps(hook)
+    def wrapper(self, arg, *rest):
+        try:
+            return hook(self, arg, *rest)
+        except Exception as exc:  # noqa: BLE001 - deny on anything
+            on_error(hook.__name__, arg, exc)
+            return None
+
+    return wrapper
 
 
 class Gate:
@@ -41,6 +90,11 @@ class Gate:
         self.policy: Policy | None = None
         self.state = Path("/state")
         self.seq = itertools.count(1)
+        self._run: dict = {}
+        self._run_mtime = -1.0
+        # server connection id -> hostname asked for. server_connect pins the address to a vetted IP,
+        # and with the eager connection strategy that happens before the TLS / TCP hooks run.
+        self._dest: dict[str, str] = {}
 
     def load(self, loader) -> None:
         loader.add_option("bh_state", str, "/state", "bull-harness state dir")
@@ -52,9 +106,8 @@ class Gate:
         (self.state / paths.FLOWS_DIR).mkdir(parents=True, exist_ok=True)
         self.policy = Policy(self.state / paths.ACTIVE_SCOPE)
         self.policy.reload()
-        # Claude API traffic is tunnelled untouched (TLS passthrough), never decrypted by the gate.
-        if SYSTEM_IGNORE_REGEX not in ctx.options.ignore_hosts:
-            ctx.options.update(ignore_hosts=[*ctx.options.ignore_hosts, SYSTEM_IGNORE_REGEX])
+        if ctx.options.rawtcp:
+            ctx.options.update(rawtcp=False)  # non-HTTP bytes are not relayed (tcp hooks below kill the rest)
 
     def running(self) -> None:
         """Publish only the public CA cert for the agent; the CA key stays in the gate's confdir."""
@@ -65,7 +118,9 @@ class Gate:
             for _ in range(60):
                 try:
                     dst_dir.mkdir(parents=True, exist_ok=True)
-                    (dst_dir / "mitmproxy-ca-cert.pem").write_bytes(src.read_bytes())
+                    dst = dst_dir / "mitmproxy-ca-cert.pem"
+                    dst.write_bytes(src.read_bytes())
+                    dst.chmod(0o644)  # public certificate, read by the agent's entrypoint
                     return
                 except OSError:
                     time.sleep(0.5)
@@ -74,45 +129,106 @@ class Gate:
         threading.Thread(target=publish, daemon=True).start()
 
     # ---- logging
+    def _active_run(self) -> dict:
+        """{run_id, program} of the segment in progress (written by the runner), {} between runs."""
+        p = self.state / paths.ACTIVE_RUN
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            self._run, self._run_mtime = {}, -1.0
+            return self._run
+        if mtime != self._run_mtime:
+            self._run_mtime = mtime
+            try:
+                self._run = json.loads(p.read_text())
+            except (OSError, ValueError):
+                self._run = {}
+        return self._run
+
     def _log(self, name: str, rec: dict) -> None:
         rec.setdefault("ts", _now())
         rec.setdefault("program", self.policy.program if self.policy else "-")
-        with open(self.state / name, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        rec.setdefault("run", self._active_run().get("run_id"))
+        try:
+            with open(self.state / name, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as exc:  # logging must never decide a flow
+            ctx.log.error(f"bh-gate: cannot write {name}: {exc}")
 
     def _deny(self, flow: http.HTTPFlow, v: Verdict, where: str) -> None:
+        flow.response = _deny_response(v)  # first: a failing log write must not let the request through
         self._log(
             paths.EVENTS,
             {
                 "kind": "blocked",
                 "where": where,
-                "url": flow.request.pretty_url,
+                "url": flow.request.url,
                 "method": flow.request.method,
                 "reason": v.reason,
                 "rule": v.rule,
             },
         )
-        body = f"bh-gate: DENIED ({v.reason}{' / ' + v.rule if v.rule else ''})\n".encode()
-        flow.response = http.Response.make(403, body, {"Content-Type": "text/plain", "X-BH-Gate": "denied"})
 
-    # ---- hooks
+    # ---- connection-level hooks
+    @fail_closed
     def http_connect(self, flow: http.HTTPFlow) -> None:
-        host, port = flow.request.host, flow.request.port
-        v = self.policy.classify(f"{host}:{port}" if ":" not in host else f"[{host}]:{port}", host)
+        v = self.policy.classify_connect(flow.request.host, flow.request.port)
         flow.metadata["bh_class"] = v.klass
         if not v.allowed:
             self._deny(flow, v, "connect")
 
+    def _destination(self, server) -> tuple[str | None, int | None]:
+        """(hostname asked for, port) of a server connection, even after the address was pinned to an IP."""
+        if not server.address:
+            return None, None
+        return self._dest.get(server.id, server.address[0]), server.address[1]
+
+    def _is_claude_api(self, server) -> bool:
+        host, port = self._destination(server)
+        return bool(host) and is_system(host) and port == SYSTEM_PORT
+
+    @fail_closed
+    def tls_clienthello(self, data: tls.ClientHelloData) -> None:
+        """TLS passthrough only when BOTH the CONNECT target and the SNI are the Claude API."""
+        host, _ = self._destination(data.context.server)
+        if self._is_claude_api(data.context.server) and data.client_hello.sni in (None, host):
+            data.ignore_connection = True
+
+    @fail_closed
+    def tcp_start(self, flow: tcp.TCPFlow) -> None:
+        """Raw TCP (non-HTTP bytes in a tunnel, CRLF tricks, other ports) never leaves, except the
+        Claude API passthrough decided in tls_clienthello."""
+        if self._is_claude_api(flow.server_conn):
+            return
+        flow.kill()
+        host, port = self._destination(flow.server_conn)
+        self._log(
+            paths.EVENTS,
+            {"kind": "blocked", "where": "tcp", "host": host, "port": port, "reason": "raw TCP is not allowed"},
+        )
+
+    @fail_closed
+    def tcp_message(self, flow: tcp.TCPFlow) -> None:
+        """kill() in tcp_start does not stop the first message: drop every byte of a refused tunnel."""
+        if not self._is_claude_api(flow.server_conn):
+            flow.messages[-1].content = b""
+            flow.kill()
+
+    def server_disconnected(self, data: server_hooks.ServerConnectionHookData) -> None:
+        self._dest.pop(data.server.id, None)
+
+    @fail_closed
+    def udp_start(self, flow: udp.UDPFlow) -> None:
+        flow.kill()
+
+    @fail_closed
     def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
-        """Resolve and vet every upstream IP before mitmproxy connects (rebinding / internal pivot)."""
+        """Resolve and vet every upstream IP, then pin the connection to a vetted IP (no rebinding
+        between this check and mitmproxy's own resolution)."""
         if not data.server.address:
             return
         host, port = data.server.address
-        try:
-            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-        except OSError as exc:
-            data.server.error = f"bh-gate: resolve failed: {exc}"
-            return
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
         for info in infos:
             ip = info[4][0]
             v = self.policy.check_ip(host, ip)
@@ -123,15 +239,24 @@ class Gate:
                 )
                 data.server.error = f"bh-gate: DENIED {host} -> {ip} ({v.reason})"
                 return
+        if data.server.sni is None and not re.fullmatch(r"[0-9.]+|\[?[0-9a-fA-F:]+\]?", host):
+            data.server.sni = host  # keep the name for TLS (virtual hosting) once the address is an IP
+        self._dest[data.server.id] = host
+        data.server.address = (infos[0][4][0], port)
 
+    # ---- HTTP hooks
+    @fail_closed
     async def request(self, flow: http.HTTPFlow) -> None:
         if flow.response is not None:  # already denied at CONNECT
             return
         req = flow.request
-        v = self.policy.classify(req.pretty_url, req.pretty_host, req.method)
-        flow.metadata["bh_class"] = v.klass
         identity = req.headers.pop(IDENTITY_HEADER, None)
         flow.metadata["bh_identity"] = identity
+        host_header = parse_authority(req.host_header, check=False)[0] if req.host_header else None
+        v = self.policy.classify_request(
+            req.url, req.host, req.method, host_header=host_header, identity=identity, has_body=bool(req.raw_content)
+        )
+        flow.metadata["bh_class"] = v.klass
         if not v.allowed:
             self._deny(flow, v, "request")
             return
@@ -158,56 +283,39 @@ class Gate:
         try:
             ident = json.loads(path.read_text())
         except (OSError, ValueError):
-            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": flow.request.pretty_url})
+            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": flow.request.url})
             return
-        for k, val in (ident.get("headers") or {}).items():
+        injected = ident.get("headers") or {}
+        for k, val in injected.items():
             flow.request.headers[k] = val
+        flow.metadata["bh_redact"] = {k.lower(): f"<identity:{name}>" for k in injected}
 
+    @fail_closed
     def response(self, flow: http.HTTPFlow) -> None:
         if flow.response is None or flow.response.headers.get("X-BH-Gate") == "denied":
             return
-        klass = flow.metadata.get("bh_class", "?")
-        if klass != "target":
+        if flow.metadata.get("bh_class") not in ("target", "passive"):
+            return
+        fid = self._record(flow, flow.response.status_code)
+        if flow.metadata.get("bh_class") != "target":
             return
         req, resp = flow.request, flow.response
-        n = next(self.seq)
-        fid = f"{int(time.time())}-{os.getpid()}-{n}"
         body = resp.raw_content or b""
-        rec = {
-            "id": fid,
-            "method": req.method,
-            "url": req.pretty_url,
-            "status": resp.status_code,
-            "len": len(body),
-            "ctype": resp.headers.get("content-type", ""),
-            "wait": flow.metadata.get("bh_wait", 0),
-            "ua": flow.metadata.get("bh_ua", "")[:120],
-        }
-        self._log(paths.FLOWS, rec)
-        full = {
-            **rec,
-            "request": {
-                "headers": list(req.headers.items(multi=True)),
-                "body": (req.raw_content or b"")[:MAX_BODY].decode("utf-8", "replace"),
-            },
-            "response": {
-                "headers": list(resp.headers.items(multi=True)),
-                "body": body[:MAX_BODY].decode("utf-8", "replace"),
-            },
-        }
-        (self.state / paths.FLOWS_DIR / f"{fid}.json").write_text(json.dumps(full, ensure_ascii=False))
         server = resp.headers.get("server", "").lower()
-        if resp.status_code in (403, 429, 503) and (
+        waf = resp.status_code in (403, *PUSHBACK_STATUS) and bool(
             "cf-mitigated" in resp.headers
             or WAF_MARKERS.search(body[:65536])
             or (resp.status_code == 403 and any(s in server for s in ("cloudflare", "akamai", "awselb")))
-        ):
+        )
+        if waf or resp.status_code in PUSHBACK_STATUS:
+            self.policy.penalize()
+        if waf:
             self._log(
                 paths.EVENTS,
                 {
                     "kind": "waf",
-                    "host": req.pretty_host,
-                    "url": req.pretty_url,
+                    "host": req.host,
+                    "url": req.url,
                     "status": resp.status_code,
                     "server": server,
                     "flow": fid,
@@ -218,12 +326,61 @@ class Gate:
                 paths.EVENTS,
                 {
                     "kind": "auth",
-                    "host": req.pretty_host,
-                    "url": req.pretty_url,
+                    "host": req.host,
+                    "url": req.url,
                     "flow": fid,
                     "identity": flow.metadata.get("bh_identity"),
                 },
             )
+
+    @fail_closed
+    def error(self, flow: http.HTTPFlow) -> None:
+        """Requests that never got a response (timeouts, resets) are part of the audit trail too."""
+        if flow.metadata.get("bh_class") in ("target", "passive") and flow.response is None:
+            self._record(flow, "error", str(flow.error)[:200] if flow.error else "error")
+
+    def _record(self, flow: http.HTTPFlow, status, error: str | None = None) -> str:
+        """One line in flows.jsonl (+ the full exchange for targets, identity values redacted)."""
+        req, resp = flow.request, flow.response
+        fid = f"{int(time.time())}-{secrets.token_hex(3)}-{next(self.seq)}"
+        body = (resp.raw_content or b"") if resp is not None else b""
+        rec = {
+            "id": fid,
+            "class": flow.metadata.get("bh_class"),
+            "method": req.method,
+            "url": req.url,
+            "status": status,
+            "len": len(body),
+            "ctype": resp.headers.get("content-type", "") if resp else "",
+            "wait": flow.metadata.get("bh_wait", 0),
+            "ua": flow.metadata.get("bh_ua", "")[:120],
+            "identity": flow.metadata.get("bh_identity"),
+        }
+        if req.host_header and parse_authority(req.host_header, check=False)[0] != req.host:
+            rec["host_header"] = req.host_header
+        if error:
+            rec["error"] = error
+        self._log(paths.FLOWS, rec)
+        if rec["class"] == "target":
+            redact = flow.metadata.get("bh_redact") or {}
+            full = {
+                **rec,
+                "request": {
+                    "headers": [(k, redact.get(k.lower(), v)) for k, v in req.headers.items(multi=True)],
+                    "body": (req.raw_content or b"")[:MAX_BODY].decode("utf-8", "replace"),
+                },
+                "response": {
+                    "headers": list(resp.headers.items(multi=True)) if resp else [],
+                    "body": body[:MAX_BODY].decode("utf-8", "replace"),
+                },
+            }
+            try:
+                fd = os.open(self.state / paths.FLOWS_DIR / f"{fid}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(json.dumps(full, ensure_ascii=False))
+            except OSError as exc:
+                ctx.log.error(f"bh-gate: cannot write flow {fid}: {exc}")
+        return fid
 
 
 addons = [Gate()]
