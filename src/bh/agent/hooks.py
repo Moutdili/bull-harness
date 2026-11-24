@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 
@@ -26,21 +25,12 @@ HEAD, TAIL = 30, 12
 
 
 # ------------------------------------------------------------------ PreToolUse
-_SCANNER = re.compile(
-    r"(^|[\s;&|(/])(bh-(content|scan|params|sqli|xss)|nuclei|sqlmap|ffuf|feroxbuster|gobuster|dirsearch|nikto|"
-    r"wpscan|dalfox|arjun|commix|wfuzz|katana -d [4-9])(?=\s|$)"
-)
-
-
-_ANY_TOOL = re.compile(r"(^|[\s;&|(/])(bh-(recon|crawl)|katana|subfinder|httpx-toolkit)(?=\s|$)")
-
-
 def rules_decision(cmd: str) -> str | None:
     """Program rules the harness enforces in the sandbox: no automated scanner when the program forbids them,
     and the verifier re-tests by hand only (no scanners, no mapping tools)."""
-    if c.is_verifier() and (_SCANNER.search(cmd) or _ANY_TOOL.search(cmd)):
+    if c.is_verifier() and (c.runs_scanner(cmd) or c.runs_mapper(cmd)):
         return f"{c.RULES_MARK} the verifier re-tests with single requests (curl / bh-agent replay), no tools."
-    if not c.scanners_allowed() and _SCANNER.search(cmd):
+    if not c.scanners_allowed() and c.runs_scanner(cmd):
         return (
             f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
             "hand-made requests at a low rate; do not try another scanner."

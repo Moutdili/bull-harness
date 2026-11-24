@@ -40,6 +40,9 @@ MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a 
 # Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
 # authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S.
 ID_LIMIT, ID_WINDOW_S = 4, 600
+# programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
+# (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
+MISS_LIMIT, MISS_WINDOW_S = 25, 300
 _API_PATH = re.compile(r"/(api|rest|graphql|v\d+)(/|$)", re.I)
 
 
@@ -100,6 +103,7 @@ class Policy:
     buckets: dict[str, TokenBucket] = field(default_factory=dict)
     backoff_until: float = 0.0  # target rate is reduced until then (429 / 503 / WAF seen)
     ids_seen: dict[str, deque] = field(default_factory=dict)  # "origin route" -> deque[(ts, ids)]
+    misses: dict[str, deque] = field(default_factory=dict)  # origin -> deque[ts of 404 answers]
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -118,6 +122,7 @@ class Policy:
         self.buckets.pop("target", None)
         self.backoff_until = 0.0
         self.ids_seen.clear()
+        self.misses.clear()
 
     @property
     def program(self) -> str:
@@ -177,7 +182,7 @@ class Policy:
                 return deny(f"{method} only as one of your identities (X-BH-Identity)")
             if body_len > MAX_BODY_BYTES:
                 return deny(f"request body over {MAX_BODY_BYTES} bytes")
-            return self._enumeration(url, authenticated or bool(identity)) or v
+            return self._scanning(url) or self._enumeration(url, authenticated or bool(identity)) or v
         if v is not None:
             return v
         if is_passive(host):
@@ -190,6 +195,26 @@ class Policy:
                 return deny(f"passive source {host}: path not allowed")
             return Verdict(True, "passive", f"passive source {host}")
         return deny(self.scope_error or "not in scope")
+
+    def note_answer(self, url: str, status: int) -> None:
+        """Target answers feed the scanner guard (only where the program forbids scanners)."""
+        if status == 404 and self.scope is not None and not self.scope.scanners_on:
+            self.misses.setdefault(origin(url) or "?", deque()).append(time.time())
+
+    def _scanning(self, url: str) -> Verdict | None:
+        if self.scope is None or self.scope.scanners_on:
+            return None
+        q = self.misses.get(origin(url) or "?")
+        if not q:
+            return None
+        while q and q[0] < time.time() - MISS_WINDOW_S:
+            q.popleft()
+        if len(q) >= MISS_LIMIT:
+            return deny(
+                f"scanner signature: {len(q)} not-found answers in {MISS_WINDOW_S // 60} min and this program "
+                "forbids automated scanners; stop guessing paths, test what the crawl found"
+            )
+        return None
 
     def _enumeration(self, url: str, authenticated: bool) -> Verdict | None:
         """Deny the (ID_LIMIT+1)-th distinct object id on one route within the window."""

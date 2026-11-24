@@ -145,3 +145,22 @@ def test_id_enumeration_is_refused(tmp_path):
 def test_body_size_cap(tmp_path):
     p = _policy(tmp_path)
     assert not req(p, "https://a.example.com/up", "a.example.com", "POST", body_len=pol.MAX_BODY_BYTES + 1).allowed
+
+
+def test_scanner_guard_when_the_program_forbids_scanners(tmp_path):
+    p = _policy(tmp_path)
+    p.scope_path.write_text(DEMO.read_text() + "\nscanners_allowed: false\n")
+    p.scope_mtime = -2  # force the reload
+    url = "https://a.example.com/guess-{}"
+    for i in range(pol.MISS_LIMIT):
+        assert req(p, url.format(i), "a.example.com").allowed, i
+        p.note_answer(url.format(i), 404)
+    v = req(p, "https://a.example.com/api/me", "a.example.com")
+    assert not v.allowed and "scanner signature" in v.reason
+
+
+def test_scanner_guard_off_when_scanners_are_allowed(tmp_path):
+    p = _policy(tmp_path)  # demo scope: scanners not forbidden
+    for i in range(pol.MISS_LIMIT * 2):
+        p.note_answer(f"https://a.example.com/g{i}", 404)
+    assert req(p, "https://a.example.com/api/me", "a.example.com").allowed

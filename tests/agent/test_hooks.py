@@ -56,3 +56,21 @@ def test_builtin_refuses_when_scanners_are_forbidden(monkeypatch, capsys):
     monkeypatch.setenv("BH_SCANNERS", "0")
     with pytest.raises(SystemExit, match="forbids automated scanners"):
         tools.main("scan", ["http://h"])
+
+
+def test_scanner_detection_sees_through_quotes_paths_and_the_entry_point():
+    for cmd in (
+        "'nuclei' -u http://h",
+        "bash -c 'ffuf -u http://h/FUZZ -w w'",
+        "/usr/bin/nuclei -u http://h",
+        "n=nuclei; $n -u http://h",
+        "/opt/bh/bin/bh-agent content http://h",
+        "hydra -l a -P p h http-post-form x",
+        "nmap --script vuln h",
+        "dirb http://h",
+        "httpx-toolkit -l hosts -path words.txt",
+        "katana -u http://h -d 6",
+    ):
+        assert c.runs_scanner(cmd), cmd
+    for cmd in ("bh-crawl http://h", "katana -u http://h -d 3", "curl -s http://h/api", "bh-note fact 'mapped /api'"):
+        assert not c.runs_scanner(cmd), cmd
