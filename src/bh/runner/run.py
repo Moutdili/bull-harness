@@ -137,13 +137,22 @@ def activate_scope(scope_file: Path) -> None:
     os.replace(tmp, dst)
 
 
-def set_active_run(run_id: int | None, program: str = "") -> None:
-    """Tag every gate flow with the run that caused it (operator traffic between runs stays untagged)."""
+def relay_budget(max_turns: int) -> int:
+    """Claude API requests the gate relays for one segment: one per turn (measured), x3 for retries and legs."""
+    return 3 * max_turns + 30
+
+
+def set_active_run(run_id: int | None, program: str = "", relay_max: int | None = None) -> None:
+    """Tag every gate flow with the run that caused it (operator traffic between runs stays untagged). The gate
+    relays Claude API calls only while a run is active, at most `relay_max` of them (gate default otherwise)."""
     p = paths.active_run()
     if run_id is None:
         p.unlink(missing_ok=True)
     else:
-        p.write_text(json.dumps({"run_id": run_id, "program": program}))
+        rec = {"run_id": run_id, "program": program}
+        if relay_max is not None:
+            rec["relay_max"] = relay_max
+        p.write_text(json.dumps(rec))
 
 
 def sandbox_home(session: int | str) -> str:
@@ -584,7 +593,7 @@ def _run_locked(
 
     deadline = time.monotonic() + minutes * 60
     prompt, timed_out = task, False
-    set_active_run(run_id, prog)
+    set_active_run(run_id, prog, relay_budget(max_turns))
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             while res.legs < MAX_LEGS:

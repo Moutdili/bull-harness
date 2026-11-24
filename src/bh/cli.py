@@ -214,13 +214,15 @@ def cmd_run(args) -> int:
 def cmd_verify(args) -> int:
     """Re-verify findings of a program (default: every finding still 'new')."""
     from bh.board import Board
-    from bh.runner.run import run_lock
+    from bh.runner.run import activate_scope, run_lock, set_active_run
     from bh.verify import verify_finding, verify_pending
 
     scope = _load_scope_or_exit(args.scope)
     board = Board()
     with run_lock():
         run_id = board.run_start(scope.program, args.model)
+        activate_scope(Path(args.scope))  # the replays go through the gate under this program's rules
+        set_active_run(run_id, scope.program)  # tags the replays, and the gate relays the judge's calls
         try:
             if args.findings:
                 for f in args.findings:
@@ -232,6 +234,7 @@ def cmd_verify(args) -> int:
                     verify_pending(board, scope, run_id=run_id, model=args.model, effort=args.effort, limit=args.limit)
                 )
         finally:
+            set_active_run(None)
             board.run_end(run_id, status="ok", note="verification")
     return 0
 

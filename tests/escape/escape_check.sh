@@ -39,6 +39,8 @@ check "Claude API direct (bypassing the relay)"    blocked reaches https://api.a
 check "Claude API on a non-443 port"               blocked reaches -p https://api.anthropic.com:22/
 check "real OAuth token absent from the agent"     blocked sh -c 'env | grep -q "^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-[A-Za-z0-9_-]\{80,\}$" || grep -rqs "sk-ant-oat01-[A-Za-z0-9_-]\{80,\}" /proc/[0-9]*/environ /work /home /tmp 2>/dev/null'
 check "relay refuses non-API paths"                blocked http_ok http://gate:8081/
+check "relay: an API path Claude Code never calls" blocked not_refused_for "not a call Claude Code makes" http://gate:8081/v1/models
+check "relay: no run in progress"                  blocked not_refused_for "no run in progress" -X POST -d '{}' http://gate:8081/v1/messages
 check "external DNS resolution"                    blocked getent hosts example.com
 check "id enumeration on an API route (5th id)"    blocked sh -c 'for i in 900001 900002 900003 900004; do curl -s -o /dev/null -m 8 http://'"$LAB"'/api/Feedbacks/$i; done; curl -s -m 8 http://'"$LAB"'/api/Feedbacks/900005 | grep -vq "bh-gate: DENIED"'
 check "id enumeration through path variants"      blocked sh -c 'for v in 900006/ 9000%307 "900008;x=1"; do curl -s -m 8 "http://'"$LAB"'/API//Feedbacks/$v" | grep -q "bh-gate: DENIED" || exit 0; done; exit 1'
