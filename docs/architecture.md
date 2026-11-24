@@ -18,7 +18,6 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
  hôte Fedora (Mio / Claude orchestrateur)
  ├─ bh (CLI)  ─────────────┐
  ├─ ui (web, SSE)          │  SQLite board : facts / intents / hints / findings / todos / refusals
- └─ notify (Gmail pull)    │
                            ▼
  ┌────────── réseau "egress" ──────────┐
  │  gate  (mitmproxy + SOCKS5 + DNS)   │ ← seul conteneur avec Internet
@@ -97,7 +96,7 @@ Contexte neuf, il ne reçoit que la PoC. Il rejoue via le gate. Un finding non r
 | `submit` | finding vérifié | Relire la PoC, soumettre |
 
 ### 9. `notify/`
-Gmail API → Pub/Sub en **pull** (pas d'endpoint public), `watch` renouvelé tous les 6 jours. Un mail YWH/Intigriti de mise à jour de programme déclenche `bh scope sync <programme>`. Le diff est affiché dans l'UI et dans la todo.
+Abandonné le 2026-11-25 (Gmail / Pub/Sub). La mise à jour des scopes sera déclenchée par un hook d'un autre type, le moment venu.
 
 ### 10. `ui/`
 Vue en direct du flux de l'agent, board, findings + PoC (requêtes HAR rejouables en `curl`), todo humaine. Écoute sur l'IP Tailscale (ou `127.0.0.1`), jamais `0.0.0.0` ; connexion par token (`secrets/ui.token`) puis cookie HttpOnly ; CSP stricte, rendu `textContent` uniquement.

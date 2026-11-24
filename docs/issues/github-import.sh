@@ -59,9 +59,8 @@ iss "Parallélisme dans le quota" "P2,area:autonomy,owner:claude,build" \
   "2 segments simultanés sans conflit de gate ni de board" "ARTEMIS : avantage de l'exploitation parallèle."
 iss "Mode CVE : analyse de variantes de patchs récents" "P2,area:cve,owner:claude,build" \
   "un repo fixture -> finding dans le board" "CyberGym (arXiv:2506.02548) : 17-18 patchs incomplets trouvés."
-iss "Connecteur Intigriti (H4) et notifications Gmail (H7)" "P2,area:scope,owner:hermes,build" "critères de docs/TODO.md" "Phase 3."
+iss "Connecteur Intigriti (H4)" "P2,area:scope,owner:hermes,build" "critères de docs/TODO.md" "Phase 3."
 iss "Capture de session humaine via le gate (4.5)" "P2,area:gate,owner:claude,build" \
   "login manuel sur l'app de test -> requêtes agent authentifiées" "Phase 4."
 iss "Comparer notre PoC triager au YWH Claude Kit" "P2,area:verify,owner:claude,research-check" "écarts listés" \
   "https://www.yeswehack.com/learn-bug-bounty/triager-grade-reports-claude-code"
-iss "Deuxième clé FIDO2 de secours (YubiKey)" "P2,area:ops,owner:mio" "clé enregistrée et testée" "M1 fait (passkey iPhone)."

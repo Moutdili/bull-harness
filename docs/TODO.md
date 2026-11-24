@@ -9,10 +9,10 @@ Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie qu
 
 | Phase | Fait | Reste |
 |---|---|---|
-| 0 Socle | 0.1, 0.2 (scope + 80+ tests), 0.4 board (+ migrations, reset), 0.5 CLI | 0.2b jokers mi-label / PSL. 0.3 remplacé par les builtins `bh.agent.tools` (pas de manifests YAML) |
+| 0 Socle | 0.1, 0.2 (scope + 80+ tests), 0.4 board (+ migrations, reset), 0.5 CLI | 0.2b fait le 2026-11-25 (jokers mi-label, PSL embarquée, testés). 0.3 remplacé par les builtins `bh.agent.tools` (pas de manifests YAML) |
 | 1 Confinement | 1.1 gate HTTP (décision sur la destination réelle, fail-closed, TCP brut coupé, méthodes, backoff 429/503/WAF), 1.1b passifs (hôtes exacts, IP publiques), 1.4 réseaux, **1.5 suite d'évasion `tests/escape/escape_check.sh` : 29/29** (HTTPS par nom, raisons des refus vérifiées) | 1.2 DNS filtrant (aujourd'hui : aucune résolution externe), 1.3 SOCKS (volontairement absent), sources passives de subfinder |
-| 2 Tokens | 2.2 troncature, 2.3 `updatedToolOutput` vérifié, base par tour −62 % (`--tools Bash,Read`, sans slash commands), sessions neuves par défaut | 2.1 réécriture, 2.4 mineur, 2.5 calibrage, 2.6 alias |
-| 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope, H7 Gmail |
+| 2 Tokens | 2.2 troncature, 2.3 `updatedToolOutput` vérifié, base par tour −62 % (`--tools Bash,Read`, sans slash commands), sessions neuves par défaut | 2.4 mineur et 2.5 calibrage faits (veille). **2.6 alias abandonnés** le 2026-11-25 : gain mesuré ~0,3 % d'un run (issue 017). 2.1 réécriture : idem, non prioritaire |
+| 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope (H7 Gmail abandonné) |
 | 4 Autonomie | 4.1 runner (stderr fichier, kill propre), 4.2 superviseur (progression réelle), 4.4 todos auth/waf/identity, **verrou d'outils + file de surface** | 4.2b rotation sur contexte, 4.5 capture de session, 4.6 skills (4.3 vérificateur : fait, F1 vérifié de bout en bout) |
 | 5 CVE | — | tout |
 | 6 Runs réels | 6.0 lab Juice Shop (reset 2026-11-24 : 7 runs, 5 findings, cartographie 100 % arsenal) | 6.1 app perso, 6.2 premier programme, 6.3 premier CVE |
@@ -92,7 +92,6 @@ Contrats à respecter : schémas 0.2 / 0.3 / 0.4. Un fichier = un propriétaire.
 | H4 | Connecteur **Intigriti** (API researcher, PAT) → YAML scope | `src/bh/scope/sync/intigriti.py` | sur fixture JSON → YAML valide 0.2 ; diff détecté entre 2 fixtures | 3 |
 | H5 | Connecteur **YesWeHack** (bearer + TOTP) → YAML scope | `src/bh/scope/sync/yeswehack.py` | idem | 3 |
 | H6 | Connecteur `bounty-targets-data` (diff programmes publics) | `src/bh/scope/sync/btd.py` | idem | 3 |
-| H7 | Notifier Gmail (Pub/Sub **pull**, renouvellement `watch` 6 j) → `bh scope sync` | `src/bh/notify/gmail.py` | mail de test → appel `sync` loggé | 4 |
 | H8 | UI : flux live (SSE), board, findings + PoC `curl`, todo humaine ; `127.0.0.1` uniquement | `src/bh/ui/` | `bh ui` → page servie ; todo cochée en UI → statut DB changé | 5 |
 
 ## Phase 4 — Autonomie (C)
@@ -128,12 +127,15 @@ Contrats à respecter : schémas 0.2 / 0.3 / 0.4. Un fichier = un propriétaire.
 
 ## Todo humaine (M) — à faire en parallèle
 
+Doctrine du 2026-11-25 : **aucune intervention humaine pendant la chasse.** Pendant un run, la todo humaine
+ne sert qu'à remplir et soumettre les PoC après le triage. Les lignes ci-dessous sont de la mise en place, hors run.
+
+
 | # | Action | Pourquoi | Quand |
 |---|---|---|---|
-| M1 | ~~Passkey / clé FIDO2 sur le compte Claude~~ ✅ passkey iPhone actif (vérifié le 2026-11-24). Reste conseillé : une 2ᵉ clé de secours (YubiKey) | Defense exigera une MFA résistante au phishing à partir du **15 déc. 2026** (source à retrouver) | fait |
+| M1 | ~~Passkey / clé FIDO2 sur le compte Claude~~ ✅ passkey iPhone actif (vérifié le 2026-11-24) | Defense exigera une MFA résistante au phishing à partir du **15 déc. 2026** (source à retrouver) | fait |
 | M2 | Token personnel Intigriti (Paramètres → API Tokens) | H4 | avant Phase 3 |
 | M3 | Compte YesWeHack + secret TOTP exportable | H5 | avant Phase 3 |
-| M4 | Projet Google Cloud + Pub/Sub + OAuth Gmail | H7 | avant Phase 3 |
 | M5 | Choisir l'app perso pour 6.1 | 6.1 | avant Phase 6 |
 | M6 | `claude setup-token` pour l'agent en conteneur (⚠ à vérifier que la commande existe) | 4.1 | avant Phase 4 |
 

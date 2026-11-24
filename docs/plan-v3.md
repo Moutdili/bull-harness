@@ -117,10 +117,9 @@ après la mesure tokens et l'isolation du juge, avec ce document en entrée.
 | P1 | Réévaluer la phase 2 (alias, calibrage, mineur) : les commandes pèsent peu face aux observations | C | décision écrite, chiffres de la mesure P0 à l'appui |
 | P2 | Parallélisme : plusieurs origines ou programmes en même temps dans le quota | C | 2 segments simultanés sans conflit de gate ni de board |
 | P2 | Mode CVE (5.1–5.3), en commençant par l'analyse de variantes de patchs récents | C | un repo fixture → finding dans le board |
-| P2 | Connecteur Intigriti (H4), notifications Gmail (H7) | H | critères de la TODO |
+| P2 | Connecteur Intigriti (H4) | H | critères de la TODO |
 | P2 | Capture de session humaine via le gate (4.5) | C | login manuel sur l'app de test → requêtes agent authentifiées |
 | P2 | Comparer notre PoC triager au YWH Claude Kit | C | écarts listés |
-| M | Deuxième clé FIDO2 de secours (YubiKey) | M | clé enregistrée et testée |
 
 ## 5. Labels
 

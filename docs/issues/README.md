@@ -29,9 +29,9 @@ nature `measure` (mesurer avant de décider), `build`, `research-check` (doctrin
 | 12 | [Routage de modèle par segment (cartographie légère, exploitation forte)](012-routage-de-modele-par-segment-cartographie-legere.md) | `area:tokens` `owner:claude` `build` | open |
 | 13 | [Sommeil quota calé sur l'heure de reset](013-sommeil-quota-cale-sur-l-heure-de-reset.md) | `area:autonomy` `owner:claude` `build` | open |
 | 14 | [Métrique « soumissions valides »](014-metrique-soumissions-valides.md) | `area:verify` `owner:claude` `build` | open |
-| 15 | [Jokers en milieu de label et suffixes publics (0.2b)](015-jokers-en-milieu-de-label-et-suffixes-publics-0-2b.md) | `area:scope` `owner:claude` `build` | open |
+| 15 | [Jokers en milieu de label et suffixes publics (0.2b)](015-jokers-en-milieu-de-label-et-suffixes-publics-0-2b.md) | `area:scope` `owner:claude` `build` | closed |
 | 16 | [Remettre docs/TODO.md à jour](016-remettre-docs-todo-md-a-jour.md) | `area:docs` `owner:claude` | open |
-| 17 | [Réévaluer la phase 2 (alias, calibrage, mineur)](017-reevaluer-la-phase-2-alias-calibrage-mineur.md) | `area:tokens` `owner:claude` `research-check` | open |
+| 17 | [Réévaluer la phase 2 (alias, calibrage, mineur)](017-reevaluer-la-phase-2-alias-calibrage-mineur.md) | `area:tokens` `owner:claude` `research-check` | closed |
 
 ## P2
 
@@ -39,7 +39,6 @@ nature `measure` (mesurer avant de décider), `build`, `research-check` (doctrin
 |---|---|---|---|
 | 18 | [Parallélisme dans le quota](018-parallelisme-dans-le-quota.md) | `area:autonomy` `owner:claude` `build` | open |
 | 19 | [Mode CVE : analyse de variantes de patchs récents](019-mode-cve-analyse-de-variantes-de-patchs-recents.md) | `area:cve` `owner:claude` `build` | open |
-| 20 | [Connecteur Intigriti (H4) et notifications Gmail (H7)](020-connecteur-intigriti-h4-et-notifications-gmail-h7.md) | `area:scope` `owner:hermes` `build` | open |
+| 20 | [Connecteur Intigriti (H4)](020-connecteur-intigriti-h4.md) | `area:scope` `owner:hermes` `build` | open |
 | 21 | [Capture de session humaine via le gate (4.5)](021-capture-de-session-humaine-via-le-gate-4-5.md) | `area:gate` `owner:claude` `build` | open |
 | 22 | [Comparer notre PoC triager au YWH Claude Kit](022-comparer-notre-poc-triager-au-ywh-claude-kit.md) | `area:verify` `owner:claude` `research-check` | open |
-| 23 | [Deuxième clé FIDO2 de secours (YubiKey)](023-deuxieme-cle-fido2-de-secours-yubikey.md) | `area:ops` `owner:mio` | open |
