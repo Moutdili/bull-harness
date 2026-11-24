@@ -27,7 +27,6 @@ from urllib.parse import parse_qsl, urlsplit
 
 # Phases a builtin must have run on an origin before the agent may hand-craft requests to it.
 REQUIRED_PHASES = ("crawl", "content", "scan")
-ALL_PHASES = ("recon", *REQUIRED_PHASES, "params", "sqli", "xss")
 # Phases that are "automated scanners" in the sense of program rules. When a program forbids them
 # (scope `scanners_allowed: false` -> BH_SCANNERS=0), only these remain usable and required:
 LIGHT_PHASES = ("recon", "crawl")
@@ -110,11 +109,14 @@ def required_phases(scanners: bool | None = None) -> tuple[str, ...]:
     return REQUIRED_PHASES if allowed else tuple(p for p in REQUIRED_PHASES if p in LIGHT_PHASES)
 
 
+DEFAULT_RPS = 2.0  # req/s towards targets when the program states none (the scope and the gate use this one)
+
+
 def rps() -> float:
     try:
-        return max(0.2, float(os.environ.get("BH_RPS", "5")))
+        return max(0.2, float(os.environ.get("BH_RPS", DEFAULT_RPS)))
     except ValueError:
-        return 5.0
+        return DEFAULT_RPS
 
 
 # ------------------------------------------------------------------ URLs
@@ -273,20 +275,18 @@ def _surface_data(d: Path, also_tested: Tested | None) -> tuple[dict, list, dict
         cur["sources"].add(e.get("source", "?"))
     touched = {(t.get("origin"), family(t.get("key", ""))) for t in read_jsonl(d / TOUCHED)} | (also_tested or set())
     untested = [(k, v) for k, v in eps.items() if (k[0], family(k[1])) not in touched]
-    untested.sort(
-        key=lambda kv: (-len(kv[1]["params"]), not re.search(r"/(api|rest|graphql|v\d)/", kv[0][1]), kv[0][1])
-    )
+    untested.sort(key=frontier_order)
     return eps, untested, read_json(d / COVERAGE, {})
 
 
-def surface_counts(
-    d: Path, also_tested: Tested | None = None, phases: tuple[str, ...] | None = None
-) -> tuple[int, int]:
-    """(endpoints tested, required phases done across origins): the runner's progress measure."""
-    eps, untested, cov = _surface_data(d, also_tested)
-    req = phases or required_phases()
-    phases_done = sum(phase_done(ph.get(p)) for ph in cov.values() for p in req)
-    return len(eps) - len(untested), phases_done
+# API-looking routes: the gate's enumeration guard and the frontier order both use this one definition
+API_PATH = re.compile(r"/(api|rest|graphql|v\d+)(/|$)", re.I)
+
+
+def frontier_order(item: tuple[tuple[str, str], dict]) -> tuple:
+    """Untested endpoints first by number of parameters, then API routes, then path."""
+    (_, key), info = item
+    return -len(info["params"]), not API_PATH.search(key), key
 
 
 def format_surface(eps: dict, untested: list, cov: dict, phases: tuple[str, ...], limit: int = 12) -> str:

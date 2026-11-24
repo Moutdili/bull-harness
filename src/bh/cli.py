@@ -514,6 +514,7 @@ def _sigterm(signum, frame):  # SIGTERM behaves like Ctrl-C: runners kill the in
 
 def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGHUP, _sigterm)  # terminal / SSH closed: same clean stop, the agent is killed
     args = build_parser().parse_args(argv)
     return args.func(args)
 

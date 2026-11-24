@@ -10,6 +10,7 @@ hook here catches its own errors and denies.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import itertools
@@ -46,7 +47,23 @@ def _now() -> float:
 
 
 # headers that make a framework run another method than the request line's (POST + override = DELETE)
+AGENT_HOST = os.environ.get("BH_AGENT_HOST", "agent")
 METHOD_OVERRIDES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
+
+
+_AGENT_IPS: tuple[float, frozenset[str]] = (0.0, frozenset())
+
+
+def _agent_ips() -> frozenset[str]:
+    """Addresses of the agent container (compose service name), cached a minute."""
+    global _AGENT_IPS
+    if time.time() - _AGENT_IPS[0] > 60:
+        try:
+            ips = frozenset(i[4][0] for i in socket.getaddrinfo(AGENT_HOST, 0))
+        except OSError:
+            ips = frozenset()
+        _AGENT_IPS = (time.time(), ips)
+    return _AGENT_IPS[1]
 
 
 def refuse(flow: http.HTTPFlow, v: Verdict) -> None:
@@ -229,13 +246,15 @@ class Gate:
         flow.kill()
 
     @fail_closed
-    def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
+    async def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
         """Resolve and vet every upstream IP, then pin the connection to a vetted IP (no rebinding
         between this check and mitmproxy's own resolution)."""
         if not data.server.address:
             return
         host, port = data.server.address
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, proto=socket.IPPROTO_TCP
+        )  # no event-loop freeze
         for info in infos:
             ip = info[4][0]
             v = self.policy.check_ip(host, ip)
@@ -258,6 +277,10 @@ class Gate:
 
     def _relay(self, flow: http.HTTPFlow) -> None:
         flow.metadata["bh_class"] = "relay"
+        peer = (flow.client_conn.peername or ("?",))[0]
+        if peer not in _agent_ips():  # the gate also sits on the lab network: a target must not reach the token
+            self._deny(flow, deny(f"relay: only the agent container may use it (not {peer})"), "relay")
+            return
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
         if not flow.request.path.startswith("/v1/") or not token:
             self._deny(flow, deny("relay: Claude API /v1/ only" if token else "relay: no token in the gate"), "relay")
@@ -290,6 +313,9 @@ class Gate:
         flow.metadata["bh_identity"] = identity
         if not req.path.startswith("/"):  # "@other.host/x" would re-parse as another destination
             self._deny(flow, deny("the request target must start with /"), "request")
+            return
+        if req.headers.get("upgrade", "").lower() == "websocket":  # frames after the handshake are not judged
+            self._deny(flow, deny("websockets are not allowed: the gate cannot judge their frames"), "request")
             return
         if req.authority and not (req.is_http2 or req.is_http3):  # absolute form inside a tunnel: sent unjudged
             self._deny(flow, deny("absolute-form request target inside a tunnel"), "request")
