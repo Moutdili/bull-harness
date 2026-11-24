@@ -51,3 +51,8 @@ def test_program_exclusions_remove_a_class_only_when_they_name_it():
         assert exclusion(narrow) is None, narrow
     assert exclusion("Race condition") == "race-condition"  # and business-logic stays payable
     assert canonical("XSS (stored)") == "xss" and canonical("self-xss") == "self-xss"  # the hunter's own naming
+
+
+def test_blind_ssrf_is_a_blocker_not_a_lead_for_someone():
+    text = classes.BY_ID["ssrf"].evidence
+    assert 'bh-note blocked oob-needed "' in text and "human" not in text

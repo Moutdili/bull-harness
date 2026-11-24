@@ -8,7 +8,8 @@
 Authority: the gate's observations (flows tagged with the run, hand-made User-Agents) rank above what
 the sandbox writes (endpoints.jsonl, coverage.json, touched.jsonl can be edited by the agent; they feed
 the map, they never widen the scope). Every host is checked against the hard scope when it enters the
-graph: an out-of-scope host is kept as such (in_scope=0) and raises a scope-question todo, never a target.
+graph: an out-of-scope host is kept as such (in_scope=0): it is recorded, never a target. A host the gate cools
+down (WAF) is marked blocked until a deadline: its untested endpoints leave the agent's list until then.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ class Graph:
 
     # ------------------------------------------------------------------ upserts
     def _upsert(
-        self, kind: str, key: str, parent: int | None, source: str, in_scope: bool = True, meta: dict | None = None
+        self, kind: str, key: str, parent: int | None, source: str, *, in_scope: bool = True, meta: dict | None = None
     ) -> int:
         now = time.time()
         row = self.b.db.execute(
@@ -99,14 +100,24 @@ class Graph:
         hid = self._upsert("host", name, None, source, in_scope=allowed)
         if not allowed and not exists:
             self.new_out_of_scope.append(name)
-            self.b.add_todo(
-                "scope-question",
-                f"{name} discovered, not in scope",
-                f"found by {source}; add it to the scope file only if the program lists it",
-                program=self.program,
-                dedup=f"{self.program}:oos-host:{name}",
-            )
         return hid
+
+    def mark_blocked(self, name: str, reason: str, until: float) -> None:
+        """Set a host aside until `until` (epoch seconds); the latest mark wins."""
+        self.host(name, "gate")
+        self._upsert("host", name.lower().rstrip("."), None, "gate", meta={"blocked": reason, "until": until})
+        self.b.db.commit()
+
+    def blocked(self) -> dict[str, tuple[str, float]]:
+        """Hosts blocked right now: host -> (reason, until). An expired mark is ignored."""
+        now, out = time.time(), {}
+        for r in self.b.rows(
+            "SELECT key, meta FROM assets WHERE program=? AND kind='host' AND meta LIKE '%\"blocked\"%'", self.program
+        ):
+            meta = json.loads(r["meta"] or "{}")
+            if isinstance(until := meta.get("until"), int | float) and until > now:
+                out[r["key"]] = (str(meta.get("blocked")), float(until))
+        return out
 
     def origin(self, origin_: str, source: str) -> int:
         host = origin_.split("://", 1)[1].rsplit(":", 1)[0].strip("[]")
@@ -208,6 +219,9 @@ class Graph:
                 seen_origins.add(origin_)
             if "gate" in ev or (ev & _CLAIMS and "seen" in ev):
                 tested.add((origin_, key))
+        # An untested endpoint of a blocked host is set aside (neither counted nor listed): retrying it wastes turns.
+        blocked = self.blocked()
+        eps = {k: v for k, v in eps.items() if k in tested or urlsplit(k[0]).hostname not in blocked}
         untested = [(k, v) for k, v in eps.items() if k not in tested]
         untested.sort(key=c.frontier_order)
         cov: dict[str, dict] = {}
@@ -232,7 +246,16 @@ class Graph:
                 self.program,
             )
         ]
-        block = c.format_surface(eps, untested, cov, phases, limit)
+        lines = c.format_surface(eps, untested, cov, phases, limit).split("\n")
+        for host, (reason, until) in self.blocked().items():
+            mark = f"blocked ({reason}) until {time.strftime('%H:%M', time.localtime(until))}, do not retry"
+            hits = [
+                i for i, ln in enumerate(lines) if ln[:2] == "- " and urlsplit(ln[2:].split(": ")[0]).hostname == host
+            ]
+            for i in hits:
+                lines[i] += f" · {mark}"
+            if not hits:
+                lines.append(f"- {host}: {mark}")
         if oos:
-            block += "\n- discovered, NOT in scope (never touch, a human decides): " + ", ".join(oos)
-        return block
+            lines.append("- discovered, NOT in scope (never touch): " + ", ".join(oos))
+        return "\n".join(ln for ln in lines if ln)

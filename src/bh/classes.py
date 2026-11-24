@@ -111,7 +111,7 @@ CLASSES: tuple[VulnClass, ...] = (
         (r"url|uri|link|src|source|dest|redirect_uri|callback|webhook|image(_?url)?|feed|proxy|fetch|host"),
         "The target's server fetched a URL we chose and returned or acted on internal content (cloud metadata, an "
         "internal-only host). The sandbox has no out-of-band listener: a blind SSRF cannot be proven here; record "
-        "it as a lead for the human.",
+        '`bh-note blocked oob-needed "<url and parameter>"`.',
         True,
     ),
     VulnClass(
