@@ -23,3 +23,14 @@ def test_orphaned_run_closed_at_next_start(tmp_path):
     orphan = b.run_start("p", "m")  # never ended: crash / hard kill
     b.run_start("p", "m")
     assert b.rows("SELECT status FROM runs WHERE id=?", orphan)[0]["status"] == "stopped"
+
+
+def test_frontier_keeps_only_the_latest_bookkeeping_fact(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    for i in range(5):
+        b.add_fact("p", f"HANDOFF {i}", kind="handoff")
+        b.add_fact("p", f"gate denied {i}", kind="blocked")
+    b.add_fact("p", "real fact")
+    f = b.frontier("p")
+    assert "HANDOFF 4" in f and "HANDOFF 3" not in f and "gate denied 4" in f and "gate denied 0" not in f
+    assert "real fact" in f
