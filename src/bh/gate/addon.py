@@ -22,13 +22,13 @@ import threading
 import time
 from pathlib import Path
 
-from mitmproxy import ctx, http, tcp, tls, udp
+from mitmproxy import ctx, http, tcp, udp
 from mitmproxy.net.http.url import parse_authority
-from mitmproxy.proxy import server_hooks
+from mitmproxy.proxy import mode_specs, server_hooks
 
 from bh import paths
 from bh.agent.contract import IDENTITY_HEADER
-from bh.gate.policy import SYSTEM_PORT, Policy, Verdict, deny, is_system
+from bh.gate.policy import SYSTEM_HOSTS, Policy, Verdict, deny
 
 MAX_BODY = 16_384
 WAF_MARKERS = re.compile(
@@ -183,23 +183,9 @@ class Gate:
             return None, None
         return self._dest.get(server.id, server.address[0]), server.address[1]
 
-    def _is_claude_api(self, server) -> bool:
-        host, port = self._destination(server)
-        return bool(host) and is_system(host) and port == SYSTEM_PORT
-
-    @fail_closed
-    def tls_clienthello(self, data: tls.ClientHelloData) -> None:
-        """TLS passthrough only when BOTH the CONNECT target and the SNI are the Claude API."""
-        host, _ = self._destination(data.context.server)
-        if self._is_claude_api(data.context.server) and data.client_hello.sni in (None, host):
-            data.ignore_connection = True
-
     @fail_closed
     def tcp_start(self, flow: tcp.TCPFlow) -> None:
-        """Raw TCP (non-HTTP bytes in a tunnel, CRLF tricks, other ports) never leaves, except the
-        Claude API passthrough decided in tls_clienthello."""
-        if self._is_claude_api(flow.server_conn):
-            return
+        """Raw TCP (non-HTTP bytes in a tunnel, CRLF tricks, other ports) never leaves."""
         flow.kill()
         host, port = self._destination(flow.server_conn)
         self._log(
@@ -209,10 +195,9 @@ class Gate:
 
     @fail_closed
     def tcp_message(self, flow: tcp.TCPFlow) -> None:
-        """kill() in tcp_start does not stop the first message: drop every byte of a refused tunnel."""
-        if not self._is_claude_api(flow.server_conn):
-            flow.messages[-1].content = b""
-            flow.kill()
+        """kill() in tcp_start does not stop the first message: drop every byte of the tunnel."""
+        flow.messages[-1].content = b""
+        flow.kill()
 
     def server_disconnected(self, data: server_hooks.ServerConnectionHookData) -> None:
         self._dest.pop(data.server.id, None)
@@ -244,17 +229,47 @@ class Gate:
         self._dest[data.server.id] = host
         data.server.address = (infos[0][4][0], port)
 
+    # ---- Claude API relay (reverse listener): the OAuth token exists only here
+    @staticmethod
+    def _is_relay(flow: http.HTTPFlow) -> bool:
+        return isinstance(flow.client_conn.proxy_mode, mode_specs.ReverseMode)
+
+    def _relay(self, flow: http.HTTPFlow) -> None:
+        flow.metadata["bh_class"] = "relay"
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if not flow.request.path.startswith("/v1/") or not token:
+            self._deny(flow, deny("relay: Claude API /v1/ only" if token else "relay: no token in the gate"), "relay")
+            return
+        flow.request.headers.pop("x-api-key", None)
+        flow.request.headers["Authorization"] = f"Bearer {token}"
+        # reverse mode derives Host from the server address, which server_connect pinned to an IP
+        flow.request.host_header = SYSTEM_HOSTS[0]
+
+    @fail_closed
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        if flow.metadata.get("bh_class") == "relay":
+            flow.response.stream = True  # server-sent events: relay as they come, never buffered or logged
+
     # ---- HTTP hooks
     @fail_closed
     async def request(self, flow: http.HTTPFlow) -> None:
         if flow.response is not None:  # already denied at CONNECT
+            return
+        if self._is_relay(flow):
+            self._relay(flow)
             return
         req = flow.request
         identity = req.headers.pop(IDENTITY_HEADER, None)
         flow.metadata["bh_identity"] = identity
         host_header = parse_authority(req.host_header, check=False)[0] if req.host_header else None
         v = self.policy.classify_request(
-            req.url, req.host, req.method, host_header=host_header, identity=identity, has_body=bool(req.raw_content)
+            req.url,
+            req.host,
+            req.method,
+            host_header=host_header,
+            identity=identity,
+            body_len=len(req.raw_content or b""),
+            authenticated=bool(identity or "authorization" in req.headers or "cookie" in req.headers),
         )
         flow.metadata["bh_class"] = v.klass
         if not v.allowed:

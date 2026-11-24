@@ -21,11 +21,14 @@ def req(policy, url, host, method="GET", **kw):
     return policy.classify_request(url, host, method, **kw)
 
 
-def test_system_only_the_claude_api_on_443(tmp_path):
+def test_claude_api_only_through_the_relay(tmp_path):
     p = _policy(tmp_path, with_scope=False)
-    assert p.classify_connect("api.anthropic.com", 443).klass == "system"
-    assert not p.classify_connect("api.anthropic.com", 22).allowed
+    for port in (443, 22):
+        v = p.classify_connect("api.anthropic.com", port)
+        assert not v.allowed and "relay" in v.reason
+    assert not req(p, "http://api.anthropic.com/v1/messages", "api.anthropic.com", "POST").allowed
     assert not p.classify_connect("claude.ai", 443).allowed
+    assert p.check_ip("api.anthropic.com", "160.79.104.10").allowed  # the relay's own upstream
     v = req(p, "https://a.example.com/", "a.example.com")
     assert not v.allowed and "no active scope" in v.reason
 
@@ -64,7 +67,7 @@ def test_passive_sources(tmp_path):
     assert req(p, "https://web.archive.org/cdx?url=example.com", "web.archive.org").klass == "passive"
     assert not req(p, "https://web.archive.org/save/https://evil.test", "web.archive.org").allowed
     assert not req(p, "https://web.archive.org/cdx", "web.archive.org", "POST").allowed
-    assert not req(p, "https://web.archive.org/cdx", "web.archive.org", has_body=True).allowed
+    assert not req(p, "https://web.archive.org/cdx", "web.archive.org", body_len=3).allowed
     assert not req(p, "https://x.web.archive.org/", "x.web.archive.org").allowed  # exact hosts only
     for host in ("api.hackertarget.com", "raw.githubusercontent.com", "jldc.me", "archive.org"):
         assert not req(p, f"https://{host}/", host).allowed, host
@@ -125,3 +128,20 @@ def test_token_bucket_rate():
         return time.monotonic() - t0
 
     assert asyncio.run(go()) >= (30 - 20) / 20 * 0.9
+
+
+def test_id_enumeration_is_refused(tmp_path):
+    p = _policy(tmp_path)
+    url = "https://a.example.com/api/baskets/{}"
+    for i in range(1, 5):
+        assert req(p, url.format(i), "a.example.com", authenticated=True).allowed, i
+    v = req(p, url.format(5), "a.example.com", authenticated=True)
+    assert not v.allowed and "enumeration" in v.reason
+    assert req(p, url.format(2), "a.example.com", authenticated=True).allowed  # an id already seen
+    for i in range(1, 9):  # public, non-API pages (blog posts, products) are not limited
+        assert req(p, f"https://a.example.com/blog/{i}", "a.example.com").allowed
+
+
+def test_body_size_cap(tmp_path):
+    p = _policy(tmp_path)
+    assert not req(p, "https://a.example.com/up", "a.example.com", "POST", body_len=pol.MAX_BODY_BYTES + 1).allowed

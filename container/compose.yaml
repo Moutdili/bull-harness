@@ -24,11 +24,16 @@ services:
     container_name: bh-gate
     command:
       - mitmdump
-      - --listen-port=8080
+      - --mode=regular@8080
+      # Claude API relay: the agent talks to gate:8081 with a placeholder token, the gate swaps in the
+      # real OAuth token (which exists only in this container) and forwards to api.anthropic.com
+      - --mode=reverse:https://api.anthropic.com@8081
       - --set=bh_state=/state
       - --set=flow_detail=0
       - -s
       - /opt/bh/src/bh/gate/addon.py
+    env_file:
+      - ../secrets/agent.env  # CLAUDE_CODE_OAUTH_TOKEN: gate only, never the agent
     environment:
       PYTHONPATH: /opt/bh/src
       BH_CA_PUB: /gate-ca
@@ -58,15 +63,16 @@ services:
     cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
     pids_limit: 2048
     mem_limit: 6g
-    env_file:
-      - ../secrets/agent.env
     environment:
+      # placeholder only: the gate relay injects the real token (src/bh/gate/addon.py, RELAY_PORT)
+      CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-bh-relay-placeholder-the-real-token-lives-in-the-gate-only
+      ANTHROPIC_BASE_URL: http://gate:8081
       HTTP_PROXY: http://gate:8080
       HTTPS_PROXY: http://gate:8080
       http_proxy: http://gate:8080
       https_proxy: http://gate:8080
-      NO_PROXY: localhost,127.0.0.1
-      no_proxy: localhost,127.0.0.1
+      NO_PROXY: localhost,127.0.0.1,gate
+      no_proxy: localhost,127.0.0.1,gate
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
       NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
       REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt

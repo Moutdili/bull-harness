@@ -100,3 +100,26 @@ def test_legacy_cursor_is_honoured_once(tmp_path):
     assert ingest.notes(b, "p", 9, f) == (1, 0, 0)
     assert b.meta_get("notes:p") == ""
     assert ingest.notes(b, "p", 10, f) == (1, 1, 0)  # no cursor any more: a new file is read in full
+
+
+def test_findings_of_excluded_classes_are_rejected_by_the_harness(tmp_path):
+    from bh.scope import canonical_vuln, scope_from_dict
+
+    assert canonical_vuln("Denial of Service") == canonical_vuln("DDoS") == "dos"
+    assert canonical_vuln("Missing_Security headers") == "missing-headers"
+    scope = scope_from_dict(
+        {"program": "p", "platform": "x", "in_scope": ["a.test"], "forbidden_vulns": ["DoS", "self-xss"]}
+    )
+    b = Board(tmp_path / "b.sqlite")
+    f = tmp_path / "notes-1.jsonl"
+    _write(
+        f,
+        [
+            {"op": "finding", "title": "slow regex", "severity": "high", "vuln_class": "denial-of-service"},
+            {"op": "finding", "title": "IDOR", "severity": "high", "vuln_class": "idor"},
+        ],
+    )
+    assert ingest.notes(b, "p", 1, f, scope) == (0, 1, 0)
+    rows = {r["title"]: (r["status"], r["verdict"]) for r in b.rows("SELECT title, status, verdict FROM findings")}
+    assert rows["slow regex"][0] == "rejected" and "forbidden_vulns: DoS" in rows["slow regex"][1]
+    assert rows["IDOR"][0] == "new"

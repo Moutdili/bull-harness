@@ -354,7 +354,7 @@ def finish(
 ) -> None:
     prog = scope.program
     res.new_facts, res.new_findings, res.new_todos = ingest.notes(
-        board, prog, res.run_id, rotate_notes(prog, res.run_id)
+        board, prog, res.run_id, rotate_notes(prog, res.run_id), scope
     )
     res.new_todos += ingest.gate_events(board, prog, res.run_id, paths.identities(prog))
     if res.status == "refusal":

@@ -13,6 +13,7 @@ from pathlib import Path
 from bh import paths
 from bh.agent import contract as c
 from bh.board import Board
+from bh.scope import Scope
 
 AUTH_TODO_THRESHOLD = 3
 
@@ -41,7 +42,9 @@ def skip_existing(board: Board, path: Path, key: str) -> None:
     board.meta_set(key, str(path.stat().st_size if path.exists() else 0))
 
 
-def notes(board: Board, program: str, run_id: int, notes_file: Path) -> tuple[int, int, int]:
+def notes(
+    board: Board, program: str, run_id: int, notes_file: Path, scope: Scope | None = None
+) -> tuple[int, int, int]:
     """Ingest one rotated notes file in full. Returns (facts, findings, todos).
 
     The runner renames notes.jsonl at the end of each segment, so the agent can neither replay
@@ -68,7 +71,7 @@ def notes(board: Board, program: str, run_id: int, notes_file: Path) -> tuple[in
                 if m := re.fullmatch(r"I?(\d+)", str(n.get("intent_id", ""))):
                     board.close_intent(int(m.group(1)), n.get("outcome", ""))
             case "finding":
-                board.add_finding(
+                fid = board.add_finding(
                     program,
                     n.get("title", ""),
                     run_id=run_id,
@@ -77,7 +80,11 @@ def notes(board: Board, program: str, run_id: int, notes_file: Path) -> tuple[in
                         for k in ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven")
                     },
                 )
-                findings += 1
+                if scope is not None and (excluded := scope.excludes(n.get("vuln_class"))):
+                    # the program does not pay for this class: rejected by the harness, not by the model's judgment
+                    board.set_finding(fid, "rejected", f"excluded by program policy (forbidden_vulns: {excluded})")
+                else:
+                    findings += 1
             case "todo":
                 todos += bool(
                     board.add_todo(

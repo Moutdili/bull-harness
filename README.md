@@ -62,6 +62,10 @@ Each segment is a fresh `claude -p` session (the board and the HANDOFF fact carr
 ## How the agent is kept honest
 
 - **Scope**: the gate refuses anything `bh.scope.check()` does not allow; the sandbox has no other route.
+  Raw TCP, exotic methods, unauthenticated writes, id enumeration and oversized bodies are refused too
+  (`tests/escape/escape_check.sh` runs every bypass against the live gate).
+- **Credentials**: the Claude OAuth token lives only in the gate, which relays the API on `gate:8081`;
+  the agent holds a placeholder. Identity sessions are injected by the gate and redacted in its logs.
 - **Tool lock**: hand-made HTTP to an origin is refused (PreToolUse hook) until `bh-crawl`,
   `bh-content` and `bh-scan` ran on it; the attack surface they find is put on the board as a work queue.
 - **Data safety**: doctrine forbids state changes on objects not owned by our identities.
@@ -72,5 +76,6 @@ Each segment is a fresh `claude -p` session (the board and the HANDOFF fact carr
 
 ```sh
 uv run pytest            # scope, gate policy, board, ingestion, sandbox contract, hooks, builtins parsing
+podman exec -i --user hunter bh-agent bash -s < tests/escape/escape_check.sh   # live escape suite
 uvx ruff check src tests
 ```

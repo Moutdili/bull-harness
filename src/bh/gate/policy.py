@@ -1,7 +1,9 @@
 """Gate policy, independent of mitmproxy so it can be unit-tested.
 
 Classes of destination:
-- system  : the Claude API. TLS passthrough (never decrypted), no headers injected.
+- system  : the Claude API. Reached ONLY through the gate's relay listener (reverse proxy on RELAY_PORT,
+            which injects the OAuth token); a direct CONNECT from the sandbox is denied, so the token
+            never exists in the sandbox and no other credential can be used from it.
 - passive : third-party recon sources (archives, CT logs). GET/HEAD without body only, no program
             headers, no identities, own rate limit, public IPs only. Never a target.
 - target  : decided by bh.scope.check / check_resolved. Program headers, identities, rate limit.
@@ -13,16 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from bh.agent.contract import PASSIVE_DENY_PATHS, is_passive
+from bh.agent.contract import PASSIVE_DENY_PATHS, is_passive, origin, path_key
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
 
-# Only what `claude -p` needs (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
+# Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
 SYSTEM_HOSTS = ("api.anthropic.com",)
-SYSTEM_PORT = 443
+RELAY_PORT = 8081  # gate listener: --mode=reverse:https://api.anthropic.com@8081 (container/compose.yaml)
 PASSIVE_RPS = 2.0
 # Ports a domain/wildcard rule authorizes; a CIDR rule (explicit IP range, e.g. a lab) authorizes any port.
 WEB_PORTS = frozenset({80, 443, 8000, 8008, 8080, 8443, 8888})
@@ -31,6 +36,11 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 IDENTITY_ONLY_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 ALLOWED_METHODS = SAFE_METHODS | {"POST"} | IDENTITY_ONLY_METHODS
 BACKOFF_FACTOR, BACKOFF_SECONDS, MIN_RPS = 0.5, 300.0, 0.2
+MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a proof
+# Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
+# authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S.
+ID_LIMIT, ID_WINDOW_S = 4, 600
+_API_PATH = re.compile(r"/(api|rest|graphql|v\d+)(/|$)", re.I)
 
 
 def is_system(host: str) -> bool:
@@ -89,6 +99,7 @@ class Policy:
     scope_error: str | None = None
     buckets: dict[str, TokenBucket] = field(default_factory=dict)
     backoff_until: float = 0.0  # target rate is reduced until then (429 / 503 / WAF seen)
+    ids_seen: dict[str, deque] = field(default_factory=dict)  # "origin route" -> deque[(ts, ids)]
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -106,6 +117,7 @@ class Policy:
             self.scope, self.scope_error = None, f"invalid active scope: {exc}"
         self.buckets.pop("target", None)
         self.backoff_until = 0.0
+        self.ids_seen.clear()
 
     @property
     def program(self) -> str:
@@ -127,7 +139,7 @@ class Policy:
     def classify_connect(self, host: str, port: int) -> Verdict:
         """CONNECT host:port, before any byte of the tunnel is seen."""
         if is_system(host):
-            return Verdict(port == SYSTEM_PORT, "system" if port == SYSTEM_PORT else "deny", "claude api")
+            return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         v = self._target(authority)
         if v is not None:
@@ -146,12 +158,13 @@ class Policy:
         *,
         host_header: str | None = None,
         identity: str | None = None,
-        has_body: bool = False,
+        body_len: int = 0,
+        authenticated: bool = False,
     ) -> Verdict:
         """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent."""
         method = method.upper()
         if is_system(host):
-            return Verdict(True, "system", "claude api")
+            return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         v = self._target(url)
         if v is not None and v.allowed:
             if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
@@ -162,19 +175,42 @@ class Policy:
                 return deny(f"method {method} not allowed")
             if method in IDENTITY_ONLY_METHODS and not identity:
                 return deny(f"{method} only as one of your identities (X-BH-Identity)")
-            return v
+            if body_len > MAX_BODY_BYTES:
+                return deny(f"request body over {MAX_BODY_BYTES} bytes")
+            return self._enumeration(url, authenticated or bool(identity)) or v
         if v is not None:
             return v
         if is_passive(host):
             if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
                 return deny("passive source with a different Host header")
-            if method not in ("GET", "HEAD") or has_body:
+            if method not in ("GET", "HEAD") or body_len:
                 return deny(f"passive source {host}: {method} not allowed")
             path = url.split("://", 1)[-1].partition("/")[2]
             if any(("/" + path).startswith(p) for p in PASSIVE_DENY_PATHS.get(host.lower(), ())):
                 return deny(f"passive source {host}: path not allowed")
             return Verdict(True, "passive", f"passive source {host}")
         return deny(self.scope_error or "not in scope")
+
+    def _enumeration(self, url: str, authenticated: bool) -> Verdict | None:
+        """Deny the (ID_LIMIT+1)-th distinct object id on one route within the window."""
+        path = urlsplit(url).path
+        key = path_key(path)
+        if "{id}" not in key or not (authenticated or _API_PATH.search(path)):
+            return None
+        ids = "/".join(seg for seg, k in zip(path.split("/"), key.split("/"), strict=False) if k == "{id}")
+        route = f"{origin(url)} {key}"
+        now = time.time()
+        seen_q = self.ids_seen.setdefault(route, deque())
+        while seen_q and seen_q[0][0] < now - ID_WINDOW_S:
+            seen_q.popleft()
+        seen = {i for _, i in seen_q}
+        if ids not in seen and len(seen) >= ID_LIMIT:
+            return deny(
+                f"id enumeration on {key}: over {ID_LIMIT} distinct ids in {ID_WINDOW_S // 60} min "
+                "(prove access control with your own identities' objects)"
+            )
+        seen_q.append((now, ids))
+        return None
 
     def check_ip(self, host: str, ip: str) -> Verdict:
         """After resolution, before connecting. Non-targets must resolve to public addresses."""
