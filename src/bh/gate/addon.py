@@ -2,7 +2,7 @@
 
 Enforces bh.gate.policy on every CONNECT, TLS handshake, request and upstream connection,
 rate-limits (with backoff when the target pushes back), injects program headers and identities,
-and writes compact JSONL logs that the runner turns into board facts / human todos.
+and writes compact JSONL logs that the runner turns into board facts.
 
 Fail closed: mitmproxy only logs exceptions raised by addons and lets the flow continue, so every
 hook here catches its own errors and denies.
@@ -426,7 +426,7 @@ class Gate:
             or (resp.status_code == 403 and any(s in server for s in ("cloudflare", "akamai", "awselb")))
         )
         if waf or resp.status_code in PUSHBACK_STATUS:
-            self.policy.penalize()
+            self.policy.penalize(host, waf=waf)  # repeated WAF answers pause the host (policy.WAF_LIMIT)
         if waf:
             self._log(
                 paths.EVENTS,

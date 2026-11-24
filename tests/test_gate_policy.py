@@ -229,3 +229,49 @@ def test_id_enumeration_in_a_form_body_when_authenticated(tmp_path):
         ).allowed
     v = req(p, "https://a.example.com/account/show", "a.example.com", "POST", body=b"account_id=5", authenticated=True)
     assert not v.allowed and "?account_id" in v.reason
+
+
+def _waf_policy(tmp_path, monkeypatch, clock):
+    f = tmp_path / "active-scope.yaml"
+    f.write_text("program: p\nplatform: x\nin_scope: [a.t, b.t]\n")
+    monkeypatch.setattr(pol, "_now", lambda: clock[0])
+    return Policy(f)
+
+
+def test_repeated_waf_pauses_only_that_host(tmp_path, monkeypatch):
+    clock = [1_000_000.0]
+    p = _waf_policy(tmp_path, monkeypatch, clock)
+    for _ in range(pol.WAF_LIMIT - 1):
+        p.penalize("a.t", waf=True)
+        clock[0] += 10
+    assert req(p, "https://a.t/", "a.t").allowed  # two challenges: slowed down, not paused
+    p.penalize("A.T.", waf=True)
+    v = req(p, "https://a.t/x", "a.t")
+    assert not v.allowed and v.reason.startswith("waf-cooldown: a.t until ") and v.rule == "waf-cooldown"
+    assert not req(p, "https://a.t/u/1", "a.t", "DELETE", identity="user-a").allowed  # an identity changes nothing
+    assert not p.classify_connect("a.t", 443).allowed
+    assert req(p, "https://b.t/", "b.t").allowed
+    clock[0] += pol.WAF_COOLDOWN_S + 1
+    assert req(p, "https://a.t/", "a.t").allowed and p.classify_connect("a.t", 443).allowed
+
+
+def test_waf_answers_spread_over_the_window_do_not_pause(tmp_path, monkeypatch):
+    clock = [1_000_000.0]
+    p = _waf_policy(tmp_path, monkeypatch, clock)
+    for _ in range(2 * pol.WAF_LIMIT):
+        p.penalize("a.t", waf=True)
+        clock[0] += pol.WAF_WINDOW_S / (pol.WAF_LIMIT - 1) + 1
+    assert req(p, "https://a.t/", "a.t").allowed
+    for _ in range(pol.WAF_LIMIT):
+        p.penalize("a.t")  # 429 / 503 without a challenge: global slowdown only
+    assert req(p, "https://a.t/", "a.t").allowed
+    assert p.target_rps() == max(pol.MIN_RPS, p.scope.rate * pol.BACKOFF_FACTOR)
+
+
+def test_waf_pause_never_touches_passive_or_system_hosts(tmp_path, monkeypatch):
+    p = _waf_policy(tmp_path, monkeypatch, [1_000_000.0])
+    for host in ("web.archive.org", "api.anthropic.com"):
+        for _ in range(pol.WAF_LIMIT):
+            p.penalize(host, waf=True)
+    assert not p.host_blocked_until
+    assert req(p, "https://web.archive.org/cdx?url=a.t", "web.archive.org").allowed

@@ -38,6 +38,9 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 IDENTITY_ONLY_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 ALLOWED_METHODS = SAFE_METHODS | {"POST"} | IDENTITY_ONLY_METHODS
 BACKOFF_FACTOR, BACKOFF_SECONDS, MIN_RPS = 0.5, 300.0, 0.2
+# A host that keeps answering with a WAF challenge is paused, not retried: WAF_LIMIT challenges within
+# WAF_WINDOW_S deny the host for WAF_COOLDOWN_S. Nobody solves challenges during a hunt.
+WAF_LIMIT, WAF_WINDOW_S, WAF_COOLDOWN_S = 3, 600.0, 3600.0
 MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a proof
 # Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
 # authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S.
@@ -50,6 +53,15 @@ MISS_LIMIT, MISS_WINDOW_S = 25, 300
 ID_KEY = re.compile(r"^(pk|key|ref|no|num|number)$|(id|uuid|_no|_number)$", re.I)
 _GRAPHQL_ARG = re.compile(r'\b(\w+)\s*:\s*\\?"?([\w-]+)')
 BODY_SCAN_BYTES = 64 << 10
+
+
+def _now() -> float:
+    """Wall clock of the rate and WAF decisions (tests replace it)."""
+    return time.time()
+
+
+def _host_key(host: str) -> str:
+    return host.lower().rstrip(".")
 
 
 def is_system(host: str) -> bool:
@@ -110,6 +122,9 @@ class Policy:
     backoff_until: float = 0.0  # target rate is reduced until then (429 / 503 / WAF seen)
     ids_seen: dict[str, deque] = field(default_factory=dict)  # "origin route" -> deque[(ts, ids)]
     misses: dict[str, deque] = field(default_factory=dict)  # origin -> deque[ts of 404 answers]
+    # In memory only: a gate restart lifts every pause (acceptable, the window is one hour).
+    waf_seen: dict[str, deque] = field(default_factory=dict)  # host -> deque[ts of WAF answers]
+    host_blocked_until: dict[str, float] = field(default_factory=dict)  # host -> end of its WAF cooldown
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -129,6 +144,7 @@ class Policy:
         self.backoff_until = 0.0
         self.ids_seen.clear()
         self.misses.clear()
+        # WAF pauses survive a scope reload: a new run on the same program must not hit the challenge again.
 
     @property
     def program(self) -> str:
@@ -154,7 +170,7 @@ class Policy:
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         v = self._target(authority)
         if v is not None:
-            return _web_port(v, port) or v
+            return _web_port(v, port) or self._waf_cooldown(host, v) or v
         if is_passive(host):
             return Verdict(port == 443, "passive" if port == 443 else "deny", f"passive source {host}")
         return deny(self.scope_error or "not in scope")
@@ -177,6 +193,8 @@ class Policy:
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         v = self._target(url)
         if v is not None and v.allowed:
+            if paused := self._waf_cooldown(host, v):
+                return paused
             if bad_port := _web_port(v, _port(url)):
                 return bad_port
             if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
@@ -277,13 +295,43 @@ class Policy:
         if self.scope is None:
             return None
         rps = self.scope.rate
-        if time.time() < self.backoff_until:
+        if _now() < self.backoff_until:
             rps = max(MIN_RPS, rps * BACKOFF_FACTOR)
         return rps
 
-    def penalize(self) -> None:
-        """The target pushed back (429, 503, WAF): slow down for a while."""
-        self.backoff_until = time.time() + BACKOFF_SECONDS
+    def penalize(self, host: str | None = None, waf: bool = False) -> None:
+        """The target pushed back (429, 503, WAF): slow down for a while. A WAF answer also counts against
+        its host, which is paused after WAF_LIMIT of them within WAF_WINDOW_S."""
+        now = _now()
+        self.backoff_until = now + BACKOFF_SECONDS
+        if not (waf and host) or is_system(host) or is_passive(host):  # only targets are ever paused
+            return
+        key = _host_key(host)
+        for h in [h for h, until in self.host_blocked_until.items() if until <= now]:  # bounded memory
+            del self.host_blocked_until[h]
+        q = self.waf_seen.setdefault(key, deque())
+        q.append(now)
+        while q[0] <= now - WAF_WINDOW_S:
+            q.popleft()
+        if len(q) >= WAF_LIMIT:
+            self.host_blocked_until[key] = now + WAF_COOLDOWN_S
+            del self.waf_seen[key]
+
+    def _waf_cooldown(self, host: str, v: Verdict) -> Verdict | None:
+        """Deny an allowed target while its host is paused; whatever else the request carries (identity...)."""
+        if not v.allowed:
+            return None
+        key = _host_key(host)
+        until = self.host_blocked_until.get(key)
+        if until is None:
+            return None
+        if until <= _now():
+            del self.host_blocked_until[key]
+            return None
+        hhmm = time.strftime("%H:%M", time.gmtime(until))
+        return deny(
+            f"waf-cooldown: {key} until {hhmm} UTC (repeated WAF challenges; test another host)", "waf-cooldown"
+        )
 
     def bucket(self, klass: str) -> TokenBucket | None:
         rps = PASSIVE_RPS if klass == "passive" else self.target_rps() if klass == "target" else None
