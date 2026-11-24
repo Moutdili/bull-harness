@@ -177,7 +177,8 @@ def sandbox_home(session: int | str) -> str:
 
 def clean_sandbox(program: str, home: str) -> None:
     """Nothing the agent wrote can configure the next session: no process of the previous one alive, fresh
-    HOME (no ~/.claude settings or memory), no CLAUDE.md / .claude planted in the work tree. And the agent
+    HOME (no ~/.claude settings or memory), no CLAUDE.md / .claude / .mcp.json planted in the work tree (claude -p
+    would load a project .mcp.json, whose tools the Bash-only hooks never see). And the agent
     reaches only this program's work dir: /work is root's, every other program's dir is closed (root, 700),
     so notes, endpoints or coverage of program B cannot be written from a segment on program A."""
     stack.reset_agent_user(home)
@@ -185,7 +186,7 @@ def clean_sandbox(program: str, home: str) -> None:
 
 
 _WORK_SCRIPT = r"""
-rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$2/CLAUDE.md" "$2/.claude"
+rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$1/.mcp.json" "$2/CLAUDE.md" "$2/.claude" "$2/.mcp.json"
 chown root:root "$2" && chmod 755 "$2"
 for d in "$2"/*/ "$2"/.[!.]*/; do
   d=${d%/}; [ -d "$d" ] && [ "$d" != "$1" ] && chown root:root "$d" && chmod 700 "$d"
@@ -314,6 +315,7 @@ def agent_command(
         "--disable-slash-commands",
         "--settings",
         "/opt/bh/hooks/settings.json",
+        "--strict-mcp-config",  # no --mcp-config: no MCP server at all, whatever the work tree holds
         "--append-system-prompt-file",
         f"{bh}/{c.SYSTEM}",
     ]
