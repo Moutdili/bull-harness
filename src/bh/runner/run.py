@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -24,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
 
-from bh import classes, paths, stack
+from bh import classes, paths, retention, stack
 from bh.assets import Graph
 from bh.agent import contract as c
 from bh.board import Board
@@ -553,6 +554,10 @@ def _run_locked(
     effort: str | None,
 ) -> SegmentResult:
     prog = scope.program
+    try:  # under the lock, before the gate sees this segment: every log consumer is up to date
+        retention.prune()
+    except OSError as exc:
+        print(f"retention: {exc}", file=sys.stderr)
     activate_scope(scope_file)
     session = board.last_session(prog) if resume else None
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)

@@ -103,24 +103,30 @@ class Board:
         self.db.commit()
 
     def new_lines(self, path: Path, key: str) -> list[dict]:
-        """JSON objects appended to the log `path` since the last call with the same cursor `key` (a log that
-        shrank was recreated: read from the start). Lines that are not JSON objects are skipped."""
+        """JSON objects appended to the log `path` since the last call with the same cursor `key`. The cursor
+        is "inode:offset": a log that was rotated (another inode) or that shrank is read from the start.
+        Lines that are not JSON objects are skipped; a partial last line is left for the next call."""
         if not path.exists():
             return []
-        off = int(self.meta_get(key, "0"))
-        if path.stat().st_size < off:
+        ino, _, off_s = self.meta_get(key, "").rpartition(":")
+        st = path.stat()
+        off = int(off_s) if off_s.isdigit() else 0
+        if (ino and ino != str(st.st_ino)) or st.st_size < off:
             off = 0
         out = []
         with open(path, "rb") as fh:
             fh.seek(off)
             for line in fh:
+                if not line.endswith(b"\n"):
+                    break  # the gate is still writing it
+                off += len(line)
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue
                 if isinstance(rec, dict):
                     out.append(rec)
-            self.meta_set(key, str(fh.tell()))
+        self.meta_set(key, f"{st.st_ino}:{off}")
         return out
 
     def reset_program(self, program: str) -> dict[str, int]:

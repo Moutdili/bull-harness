@@ -356,6 +356,16 @@ def cmd_flows(args) -> int:
     return 0
 
 
+def cmd_prune(args) -> int:
+    from bh import retention
+    from bh.runner.run import run_lock
+
+    with run_lock():  # never while a segment reads or the gate writes for it
+        out = retention.prune(days=retention.FLOW_DAYS if args.days is None else args.days)
+    print(", ".join(f"{k}: {v}" for k, v in out.items()))
+    return 0
+
+
 # ---------------------------------------------------------------- UI daemon
 def ui_pidfile() -> Path:
     return paths.var() / "ui.pid"
@@ -505,6 +515,10 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("-n", type=int, default=30)
     fl.add_argument("--grep")
     fl.set_defaults(func=cmd_flows)
+
+    pr = sub.add_parser("prune", help="delete gate flow files older than --days, rotate large gate logs")
+    pr.add_argument("--days", type=float, default=None, help="default: BH_FLOW_DAYS or 14")
+    pr.set_defaults(func=cmd_prune)
     return p
 
 
