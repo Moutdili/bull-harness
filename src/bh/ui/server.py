@@ -31,7 +31,8 @@ from bh.text import clip
 
 STATIC = Path(__file__).parent / "static"
 COOKIE = "bh_ui"
-COOKIE_ATTRS = "HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
+SESSION_S = 30 * 86400
+COOKIE_ATTRS = f"HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_S}"
 # POST form: the token never lands in a URL (history, logs, Referer). No inline style/script (CSP).
 LOGIN_PAGE = (
     b'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
@@ -63,17 +64,46 @@ def ui_token() -> str:
     return p.read_text().strip()
 
 
-def new_session(token: str) -> str:
-    """Stateless session cookie: random nonce + HMAC(token, nonce). The cookie is never the token itself,
-    survives UI restarts, and every session dies when secrets/ui.token is rotated."""
-    nonce = secrets.token_urlsafe(18)
+def new_session(token: str, now: float | None = None) -> str:
+    """Stateless session cookie: issue time + random nonce + HMAC(token, both). The cookie is never the token
+    itself, survives UI restarts, expires after SESSION_S, and every session dies when secrets/ui.token rotates."""
+    nonce = f"{int(time.time() if now is None else now)}-{secrets.token_urlsafe(18)}"
     return f"{nonce}.{hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()}"
 
 
-def session_valid(cookie: str, token: str) -> bool:
+def session_valid(cookie: str, token: str, now: float | None = None) -> bool:
     nonce, _, mac = cookie.partition(".")
     expected = hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
-    return bool(nonce) and hmac.compare_digest(mac, expected)
+    if not nonce or not hmac.compare_digest(mac, expected):
+        return False
+    issued = nonce.split("-", 1)[0]
+    age = (time.time() if now is None else now) - int(issued) if issued.isdigit() else -1
+    return 0 <= age <= SESSION_S
+
+
+def content_length(headers, limit: int) -> int:
+    """A Content-Length the handler may read: absent = 0; negative, garbage or over `limit` = refused
+    (read(-1) would block until the client closes the connection)."""
+    raw = headers.get("Content-Length") or "0"
+    if not raw.isdigit() or int(raw) > limit:
+        raise ValueError("bad or oversized Content-Length")
+    return int(raw)
+
+
+def bounded(value, default: float, lo: float, hi: float) -> float:
+    """A number from a request, finite and within [lo, hi]."""
+    x = float(value) if value not in (None, "") else default
+    if not lo <= x <= hi:  # also false for nan; inf is out of range
+        raise ValueError(f"{value!r} is not within [{lo:g}, {hi:g}]")
+    return x
+
+
+def is_ui_run(pid: int) -> bool:
+    """The pid file may outlive its run and the pid be reused: signal only a bh CLI process."""
+    try:
+        return b"bh.cli" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
 
 
 def default_host() -> str:
@@ -148,6 +178,7 @@ def run_events(run_id: int, after: int = 0) -> dict:
 class Handler(BaseHTTPRequestHandler):
     server_version = "bh-ui"
     sys_version = ""
+    timeout = 30  # a client that stops sending does not hold a thread forever
 
     def log_message(self, fmt, *args):  # quiet, but keep errors (everything with BH_UI_DEBUG=1)
         if os.environ.get("BH_UI_DEBUG") or (len(args) > 1 and str(args[1]).startswith(("4", "5"))):
@@ -175,7 +206,10 @@ class Handler(BaseHTTPRequestHandler):
         return session_valid(cookies.get(COOKIE, ""), self.server.token)
 
     def _login(self) -> None:
-        n = min(int(self.headers.get("Content-Length") or 0), 4096)
+        try:
+            n = content_length(self.headers, 4096)
+        except ValueError:
+            return self._send(400, b"bad request", "text/plain")
         form = {k: v[-1] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
         if not hmac.compare_digest(form.get("token", ""), self.server.token):
             return self._send(403, b"bad token", "text/plain")
@@ -183,10 +217,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(303, b"", "text/plain", {"Set-Cookie": cookie, "Location": "/"})
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 200_000:
-            raise ValueError("body too large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        body = json.loads(self.rfile.read(content_length(self.headers, 200_000)) or b"{}")
+        if not isinstance(body, dict):
+            raise ValueError("the body must be a JSON object")
+        return body
 
     # -- routes
     def do_GET(self):
@@ -299,7 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             data["run"] = dict(b.rows("SELECT * FROM runs WHERE id=?", int(rid))[0])
             return data
         if path == "/api/flows":
-            n = min(int(q.get("n", 200)), 2000)
+            n = int(bounded(q.get("n"), 200, 1, 2000))
             flows = tail_jsonl(paths.flows_log(), n)
             g = q.get("grep")
             return [f for f in reversed(flows) if not g or g in f.get("url", "")]
@@ -309,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise KeyError("flow")
             return json.loads(p.read_text())
         if path == "/api/events":
-            return list(reversed(tail_jsonl(paths.events_log(), int(q.get("n", 200)))))
+            return list(reversed(tail_jsonl(paths.events_log(), int(bounded(q.get("n"), 200, 1, 2000)))))
         if path == "/api/programs":
             return self._programs(b)
         if m := re.fullmatch(r"/api/board/([A-Za-z0-9_.-]+)", path):
@@ -388,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._start_run(body)
         if path == "/api/run/stop":
             pid = stack.pid_alive(ui_run_pidfile())
-            if not pid:
+            if not pid or not is_ui_run(pid):
                 return {"ok": False, "error": "no run started from the UI is alive"}
             os.killpg(os.getpgid(pid), signal.SIGINT)
             return {"ok": True, "stopped": pid}
@@ -435,15 +469,15 @@ class Handler(BaseHTTPRequestHandler):
         model = body.get("model") or DEFAULT_MODEL
         if not re.fullmatch(r"[a-z0-9.\[\]-]{2,40}", model):
             raise ValueError("bad model")
-        minutes = float(body.get("minutes") or 20)
-        turns = int(body.get("max_turns") or 40)
+        minutes = bounded(body.get("minutes"), 20, 1, 24 * 60)
+        turns = int(bounded(body.get("max_turns"), 40, 1, 1000))
         cmd = [sys.executable, "-m", "bh.cli"]
         if mode == "hunt":
-            cmd += ["hunt", str(full), "--hours", str(float(body.get("hours") or 4))]
+            cmd += ["hunt", str(full), "--hours", str(bounded(body.get("hours"), 4, 0.1, 72))]
         else:
             cmd += ["run", str(full)]
             if body.get("task"):
-                cmd += ["--task", str(body["task"])[:2000]]
+                cmd += [f"--task={str(body['task'])[:2000]}"]  # one argv item: a leading "-" stays text
             if body.get("resume"):
                 cmd += ["--resume"]
         cmd += ["--model", model, "--minutes", str(minutes), "--max-turns", str(turns)]
