@@ -23,3 +23,16 @@ addopts = "-q"
 
 [tool.uv.build-backend]
 module-name = "bh"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "BLE", "UP", "SIM", "RUF", "PL"]
+# complexity counters and magic numbers are judgment calls here; subprocess return codes are checked by hand
+ignore = ["PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", "PLW0603", "PLC0415", "PLW1510",
+          "PLR1714", "RUF001", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/bh/runner/prompt.py" = ["E501"]  # prompt text: one line per rule reads better than wrapped prose

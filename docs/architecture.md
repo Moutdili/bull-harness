@@ -65,18 +65,17 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 - **Calibrage sur Claude** : pas d'API key sur Pro → mesure différentielle via `claude -p --output-format json` (champ `usage`), avec et sans le symbole. ⚠ À valider : bruit dû au cache.
 - **Index** : la table `symbole → intention` est injectée une fois après le system prompt. L'expansion vit dans le wrapper.
 
-### 5. `plugins/` — arsenal modulaire
-Manifest YAML par outil ou builtin :
-```yaml
-name: subs
-alias: auto            # attribué par le compilateur
-kind: builtin          # tool | builtin
-run: "subfinder -d {domain} -silent | dnsx -silent | httpx -silent -json"
-args: {domain: {type: host, scope_check: true}}
-output: {format: jsonl, keep: [url, status_code, title, tech], top: 30}
-timeout: 600
-```
-Un builtin rend **un résumé de 30 lignes maximum + le chemin du brut**. Le scope est vérifié avant exécution.
+### 5. `agent/` — arsenal (builtins) et verrou d'outils
+Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/agent`). Un seul exécutable
+`bh-agent`, des liens `bh-recon`, `bh-crawl`, `bh-content`, `bh-scan`, `bh-params`, `bh-sqli`, `bh-xss`, `bh-note`.
+- Chaque builtin : passe par le gate au débit du programme, `--as <identité>`, brut dans `raw/`, résumé ≤ 25 lignes,
+  couverture enregistrée dans `coverage.json`, endpoints dans `endpoints.jsonl`.
+- `bh-crawl` = katana + extracteur maison des chemins cités dans le JS/HTML (avec le verbe HTTP quand il est visible).
+- **Verrou** (hook PreToolUse) : `curl`/`wget`/`python`… vers une origine sont refusés tant que crawl, content et scan
+  n'y ont pas tourné. Le message `[bh-lock]` donne les commandes exactes.
+- **File de surface** : le runner ajoute au board les endpoints trouvés et pas encore testés (testé = touché par un
+  `curl` autorisé ou un builtin de test).
+- Métrique par run : commandes arsenal / manuelles / verrouillées (`runs.arsenal_calls` …).
 
 ### 6. `runner/` — superviseur autonome
 - Une boucle : choisir un programme (priorité, temps déjà passé, dernier progrès) → lancer `claude -p` avec le contexte du board → suivre le flux `stream-json`.
@@ -101,7 +100,7 @@ Contexte neuf, il ne reçoit que la PoC. Il rejoue via le gate. Un finding non r
 Gmail API → Pub/Sub en **pull** (pas d'endpoint public), `watch` renouvelé tous les 6 jours. Un mail YWH/Intigriti de mise à jour de programme déclenche `bh scope sync <programme>`. Le diff est affiché dans l'UI et dans la todo.
 
 ### 10. `ui/`
-Vue en direct du flux de l'agent, board, findings + PoC (requêtes HAR rejouables en `curl`), todo humaine. Port vérifié libre (`ss -tlnp`) avant d'écouter, et écoute sur `127.0.0.1` seulement.
+Vue en direct du flux de l'agent, board, findings + PoC (requêtes HAR rejouables en `curl`), todo humaine. Écoute sur l'IP Tailscale (ou `127.0.0.1`), jamais `0.0.0.0` ; connexion par token (`secrets/ui.token`) puis cookie HttpOnly ; CSP stricte, rendu `textContent` uniquement.
 
 ### 11. `bh` — CLI orchestrateur
 `bh scope add|sync|diff|check <url>` · `bh run [--program X] [--once]` · `bh todo [done <id>]` · `bh finding ls|show|verify` · `bh target local <url>` (cible perso : scope généré, en-têtes vides, débit libre) · `bh alias mine|compile|stats` · `bh ui`.

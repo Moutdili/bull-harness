@@ -55,6 +55,7 @@ def test_scope_hot_reload(tmp_path):
     p = tmp_path / "active-scope.yaml"
     p.write_text("program: other\nplatform: local\nin_scope: [other.test]\n")
     import os
+
     os.utime(p, (time.time() + 5, time.time() + 5))
     assert not pol.classify("https://a.example.com/", "a.example.com").allowed
     assert pol.program == "other"
@@ -67,5 +68,6 @@ def test_token_bucket_rate():
         for _ in range(30):
             await b.take()
         return time.monotonic() - t0
+
     elapsed = asyncio.run(go())
     assert elapsed >= (30 - 20) / 20 * 0.9

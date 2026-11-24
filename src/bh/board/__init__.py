@@ -1,5 +1,5 @@
-"""Shared board: facts (title/summary/evidence), intents, findings, human todos, runs."""
+"""SQLite board: facts, intents, findings, human todos, runs."""
 
-from bh.board.db import Board, default_board_path
+from bh.board.db import Board
 
-__all__ = ["Board", "default_board_path"]
+__all__ = ["Board"]

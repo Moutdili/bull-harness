@@ -35,8 +35,9 @@ def _fmt(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
-def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, max_turns: int,
-         effort: str | None = None) -> None:
+def hunt(
+    scope_files: list[Path], *, hours: float, minutes: float, model: str, max_turns: int, effort: str | None = None
+) -> None:
     board = Board()
     progs = [ProgState(f, load_scope(f).program) for f in scope_files]
     deadline = time.time() + hours * 3600
@@ -46,15 +47,24 @@ def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, m
         ready = [p for p in progs if p.cooldown_until <= now]
         if not ready:
             wake = min(p.cooldown_until for p in progs)
+            if wake >= deadline:
+                print("every program is cooling down past the deadline: nothing left to do")
+                break
             print(f"all programs cooling down; sleeping until {_fmt(wake)}")
-            time.sleep(max(30, min(wake, deadline) - now))
+            time.sleep(max(30, wake - now))
             continue
         p = min(ready, key=lambda x: x.last_run)
         resume = p.resumes < MAX_RESUMES
-        extra = "" if resume else "Fresh session: read the HANDOFF facts on the board first."
         p.last_run = time.time()
-        res: SegmentResult = run_segment(p.file, model=model, max_turns=max_turns, minutes=minutes,
-                                         resume=resume, board=board, extra_task=extra, effort=effort)
+        res: SegmentResult = run_segment(
+            p.file,
+            model=model,
+            max_turns=max_turns,
+            minutes=minutes,
+            resume=resume,
+            board=board,
+            effort=effort,
+        )
         p.resumes = p.resumes + 1 if resume else 0
         if res.status == "quota":
             print(f"quota reached; sleeping {QUOTA_SLEEP_S // 60} min")
@@ -68,4 +78,5 @@ def hunt(scope_files: list[Path], *, hours: float, minutes: float, model: str, m
             p.cooldown_until = time.time() + COOLDOWN_S
             p.stagnant = 0
             print(f"{p.program}: cooldown until {_fmt(p.cooldown_until)} ({res.status})")
-    print("hunt: deadline reached")
+    else:
+        print("hunt: deadline reached")

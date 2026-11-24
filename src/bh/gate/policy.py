@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bh.agent.contract import PASSIVE_SUFFIXES
 from bh.scope import Decision, Scope, ScopeError, check, check_resolved, load_scope
 
 SYSTEM_HOSTS = (
@@ -28,13 +29,6 @@ SYSTEM_HOSTS = (
 # Regex for mitmproxy --ignore-hosts (TLS passthrough).
 SYSTEM_IGNORE_REGEX = "|".join(rf"^{re.escape(h)}:443$" for h in SYSTEM_HOSTS)
 
-PASSIVE_SUFFIXES = (
-    "web.archive.org", "archive.org", "index.commoncrawl.org", "otx.alienvault.com",
-    "urlscan.io", "crt.sh", "api.certspotter.com", "dns.bufferover.run", "api.hackertarget.com",
-    "rapiddns.io", "jldc.me", "api.subdomain.center", "sonar.omnisint.io",
-    "raw.githubusercontent.com", "api.github.com", "nvd.nist.gov", "osv.dev", "api.osv.dev",
-    "cve.mitre.org", "cveawg.mitre.org",
-)
 PASSIVE_RPS = 2.0
 
 

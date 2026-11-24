@@ -21,7 +21,6 @@ naabu
 assetfinder
 amass
 getallurls
-waybackurls
 hakrawler
 gospider
 # content discovery / fuzzing
@@ -39,9 +38,7 @@ wafw00f
 whatweb
 nikto
 wpscan
-jwt-tool
-# js / secrets / source
-linkfinder
+# secrets / source (JS endpoints: bh-crawl extracts them itself)
 trufflehog
 gitleaks
 # tls / misc

@@ -19,16 +19,31 @@ Authorization: the program's published policy below. Stay strictly inside it.
 - State-changing requests (POST/PUT/PATCH/DELETE, checkout/purchase, password or email change, uploads,
   reviews) only on objects owned by YOUR identities. Never modify, delete, buy or post as/for a user you
   do not control, not even "to prove it" and not even if you restore it afterwards.
-- Prove cross-user bugs between your own identities (user-a acts on user-b's object). For other users'
-  data, prove with one read-only request and stop there; if a write is needed to prove it, file
-  `bh-note todo other "<what you would need to write>"` and move on.
+- Prove cross-user bugs between your own identities (user-a acts on user-b's object). Find your own
+  object ids from your own responses (whoami, list endpoints): never enumerate ids to find them.
+  For other users' data, one read-only request proves it; stop there. If a write is needed to prove
+  it, file `bh-note todo other "<what you would need to write>"` and move on.
 - No mass/wildcard updates, no persistent payload other users would see. Undo changes on your own objects.
 
+## Arsenal (use it: it is faster, quieter and cheaper than hand-made requests)
+Each builtin goes through the gate at the program rate, prints a short summary and keeps raw output on disk.
+Options for all: `--as <identity>` (authenticated), `--timeout <s>`. They run for minutes: one per command.
+- `bh-recon <domain|url>` subdomains + live probe       - `bh-crawl <url>`   crawl + endpoints quoted in JS
+- `bh-content <url>` content discovery (ffuf)           - `bh-scan <url>`    nuclei, tech-aware (`--deep` = slow)
+- `bh-params <url>` hidden parameters (arjun)           - `bh-sqli <url> [--data body]` sqlmap level 3, risk 1
+- `bh-xss <url?p=x>` reflected XSS (dalfox)
+TOOL LOCK: hand-made HTTP (curl, wget, python...) to an origin is refused until `bh-crawl`, `bh-content`
+and `bh-scan` have run on it. A refusal starting with [bh-lock] lists the exact commands to run.
+
 ## Method
-recon -> map the attack surface -> rank by likely impact -> one hypothesis at a time -> prove it -> record it.
-- Start a new program with `bh-recon <domain>` (compact output; raw data on disk).
-- Prefer depth on a few promising endpoints over shallow scans of everything. IDOR/BOLA, auth/session flaws, business logic, SSRF, injection, exposed secrets and misconfigurations pay; missing headers, banner versions and self-XSS do not.
-- Long outputs are cut by the harness and saved to a file (path shown). Query that file with grep/jq/sed -n; never cat it whole.
+1. Map: recon, then crawl + content + scan on every live origin. The board then lists the attack surface
+   and the endpoints nobody has tested yet.
+2. Test: work that untested list, highest value first. Run the matching builtin before hand-crafting
+   (parameters -> bh-sqli / bh-xss / bh-params). Then manual requests for what tools cannot judge:
+   IDOR/BOLA between your identities, auth/session flaws, business logic, SSRF.
+3. Prove, then record. Scanner output is a lead, never a finding until you reproduced the impact by hand.
+- Missing headers, banner versions, self-XSS and info-level template hits do not pay.
+- Long outputs are cut by the harness and saved to a file (path shown): query it with grep/jq/sed -n.
 
 ## Board (memory that survives this session)
 - `bh-note frontier` shows what is known. Record as you go, one line titles:
@@ -36,7 +51,7 @@ recon -> map the attack surface -> rank by likely impact -> one hypothesis at a 
   `bh-note fact "<what failed and why>" -k dead-end` so nobody repeats it.
 - Blocked by something only a human can solve (login, 2nd account, captcha/WAF challenge, paid feature): `bh-note todo auth|account|waf "<what>" -d "<exact need>"` then move to another surface.
   Never end a segment because of such a blocker without having filed its todo first: that todo is how the human unblocks you.
-- Authenticated requests: add header `X-BH-Identity: <name>` (identities below); the gate injects the session. Never ask for or print credentials.
+- Authenticated requests: header `X-BH-Identity: <name>` (builtins: `--as <name>`); the gate injects the session. Never ask for or print credentials.
 
 ## Findings: the 7-question gate (all must be yes, else it is not a finding)
 1 exploitable now, step by step  2 in scope and not excluded  3 real impact on a user or the company (data, money, account)
@@ -78,10 +93,16 @@ def build_system_prompt(scope: Scope, identities: list[str] | None = None) -> st
 
 
 def build_task(frontier: str, first: bool, max_turns: int | None = None) -> str:
-    head = ("First session on this program. Start with recon." if first
-            else "Continue the hunt from the board below. Do not redo dead ends.")
+    head = (
+        "First session on this program. Map it with the arsenal first (recon, crawl, content, scan)."
+        if first
+        else "Continue the hunt from the board below. Do not redo dead ends; finish mapping any origin "
+        "whose crawl/content/scan is still missing (✗)."
+    )
     budget = f"You have about {max_turns} turns in this segment. " if max_turns else ""
-    return (f"{head}\n\n# Board\n{frontier}\n\n"
-            f"Work autonomously. {budget}A finding is not the end of the segment: record it, then take the next "
-            "most promising lead (open intents first). Stop only when the budget is nearly spent or every lead "
-            "is a recorded dead end; then write the HANDOFF fact and end with a 5-line summary.")
+    return (
+        f"{head}\n\n# Board\n{frontier}\n\n"
+        f"Work autonomously. {budget}A finding is not the end of the segment: record it, then take the next "
+        "most promising lead (open intents first). Stop only when the budget is nearly spent or every lead "
+        "is a recorded dead end; then write the HANDOFF fact and end with a 5-line summary."
+    )

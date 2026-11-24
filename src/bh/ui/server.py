@@ -19,33 +19,43 @@ import signal
 import subprocess
 import sys
 import time
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from bh import paths, stack
+from bh.agent.contract import tail_jsonl
 from bh.board import Board
+from bh.text import clip
 
 STATIC = Path(__file__).parent / "static"
 COOKIE = "bh_ui"
+COOKIE_ATTRS = "HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
 # No inline style/script: the CSP below forbids them. GET form -> existing /login?token= handler.
-LOGIN_PAGE = (b'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-              b'<title>bull-harness login</title><link rel="stylesheet" href="/static/app.css">'
-              b'<form action="/login" method="get"><p>bull-harness - paste secrets/ui.token</p>'
-              b'<input name="token" type="password" autocomplete="current-password" autofocus required> '
-              b'<button type="submit">login</button></form>')
-CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-       "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+LOGIN_PAGE = (
+    b'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+    b'<title>bull-harness login</title><link rel="stylesheet" href="/static/app.css">'
+    b'<form action="/login" method="get"><p>bull-harness - paste secrets/ui.token</p>'
+    b'<input name="token" type="password" autocomplete="current-password" autofocus required> '
+    b'<button type="submit">login</button></form>'
+)
+CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def ui_run_pidfile() -> Path:
+    return paths.var() / "ui-run.pid"
+
+
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 
 
-def home() -> Path:
-    return Path(os.environ.get("BH_HOME", Path.cwd()))
-
-
 def ui_token() -> str:
-    p = home() / "secrets" / "ui.token"
+    p = paths.secrets_dir() / "ui.token"
     if not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(secrets.token_urlsafe(24))
@@ -66,30 +76,8 @@ def default_host() -> str:
 
 
 # ------------------------------------------------------------------ data helpers
-def _tail_jsonl(path: Path, n: int) -> list[dict]:
-    if not path.exists():
-        return []
-    with open(path, "rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - 400_000))
-        lines = fh.read().splitlines()[-n:]
-    out = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            continue
-    return out
-
-
-def _clip(s, n=4000) -> str:
-    s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False)
-    return s if len(s) <= n else s[:n] + f"\n… [{len(s) - n} chars clipped]"
-
-
 def run_events(run_id: int, after: int = 0) -> dict:
-    files = sorted((home() / "var" / "runs").glob(f"{run_id:05d}-*.jsonl"))
+    files = sorted(paths.runs_dir().glob(f"{run_id:05d}-*.jsonl"))
     if not files:
         return {"events": [], "next": after}
     events = []
@@ -105,32 +93,42 @@ def run_events(run_id: int, after: int = 0) -> dict:
             if t == "assistant":
                 for c in ev.get("message", {}).get("content", []):
                     if c.get("type") == "text" and c.get("text", "").strip():
-                        events.append({"i": i, "kind": "text", "body": _clip(c["text"])})
+                        events.append({"i": i, "kind": "text", "body": clip(c["text"])})
                     elif c.get("type") == "tool_use":
                         inp = c.get("input", {})
-                        events.append({"i": i, "kind": "tool_use", "tool": c.get("name"),
-                                       "body": _clip(inp.get("command") or inp.get("description") or inp, 3000)})
+                        events.append(
+                            {
+                                "i": i,
+                                "kind": "tool_use",
+                                "tool": c.get("name"),
+                                "body": clip(inp.get("command") or inp.get("description") or inp, 3000),
+                            }
+                        )
             elif t == "user":
                 for c in ev.get("message", {}).get("content", []) or []:
                     if isinstance(c, dict) and c.get("type") == "tool_result":
                         content = c.get("content")
                         if isinstance(content, list):
                             content = "\n".join(x.get("text", "") for x in content if isinstance(x, dict))
-                        events.append({"i": i, "kind": "tool_result", "error": bool(c.get("is_error")),
-                                       "body": _clip(content or "", 4000)})
+                        events.append(
+                            {
+                                "i": i,
+                                "kind": "tool_result",
+                                "error": bool(c.get("is_error")),
+                                "body": clip(content or "", 4000),
+                            }
+                        )
             elif t == "result":
-                events.append({"i": i, "kind": "result", "body": _clip(ev.get("result") or ev.get("subtype", "")),
-                               "turns": ev.get("num_turns"), "cost": ev.get("total_cost_usd")})
+                events.append(
+                    {
+                        "i": i,
+                        "kind": "result",
+                        "body": clip(ev.get("result") or ev.get("subtype", "")),
+                        "turns": ev.get("num_turns"),
+                        "cost": ev.get("total_cost_usd"),
+                    }
+                )
     return {"events": events, "next": (events[-1]["i"] + 1) if events else after}
-
-
-def proc_alive(pidfile: Path) -> int | None:
-    try:
-        pid = int(pidfile.read_text())
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError):
-        return None
 
 
 # ------------------------------------------------------------------ handler
@@ -140,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # quiet, but keep errors (everything with BH_UI_DEBUG=1)
         if os.environ.get("BH_UI_DEBUG") or (len(args) > 1 and str(args[1]).startswith(("4", "5"))):
-            sys.stderr.write("ui %s - %s\n" % (self.address_string(), fmt % args))
+            sys.stderr.write(f"ui {self.address_string()} - {fmt % args}\n")
 
     # -- plumbing
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
@@ -175,9 +173,15 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[-1] for k, v in parse_qs(u.query).items()}
         if u.path == "/login":
             if hmac.compare_digest(q.get("token", ""), self.server.token):
-                return self._send(302, b"", "text/plain", {
-                    "Set-Cookie": f"{COOKIE}={self.server.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
-                    "Location": "/"})
+                return self._send(
+                    302,
+                    b"",
+                    "text/plain",
+                    {
+                        "Set-Cookie": f"{COOKIE}={self.server.token}; {COOKIE_ATTRS}",
+                        "Location": "/",
+                    },
+                )
             return self._send(403, b"bad token", "text/plain")
         if not self._authed():
             return self._send(401, LOGIN_PAGE, "text/html; charset=utf-8")
@@ -210,9 +214,9 @@ class Handler(BaseHTTPRequestHandler):
     def api_get(self, path: str, q: dict):
         b = Board()
         if path == "/api/status":
-            from bh.runner.run import AGENT, GATE, container_running
             from bh.scope import load_scope
-            active = home() / "var" / "state" / "active-scope.yaml"
+
+            active = paths.active_scope()
             act = None
             if active.exists():
                 try:
@@ -220,33 +224,48 @@ class Handler(BaseHTTPRequestHandler):
                     act = {"program": s.program, "platform": s.platform, "rps": s.max_rps}
                 except Exception:  # noqa: BLE001
                     act = {"program": "?", "error": "invalid"}
-            sev = {r["severity"] or "?": r["n"] for r in b.rows(
-                "SELECT severity, COUNT(*) n FROM findings WHERE status NOT IN ('rejected','duplicate') GROUP BY severity")}
-            running = b.rows("SELECT id, program, model, started FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1")
+            sev = {
+                r["severity"] or "?": r["n"]
+                for r in b.rows(
+                    "SELECT severity, COUNT(*) n FROM findings "
+                    "WHERE status NOT IN ('rejected','duplicate') GROUP BY severity"
+                )
+            }
+            running = b.rows(
+                "SELECT id, program, model, started FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1"
+            )
             return {
-                "containers": {c: container_running(c) for c in (GATE, AGENT)},
+                "containers": {c: stack.container_running(c) for c in (stack.GATE, stack.AGENT)},
                 "active_scope": act,
                 "severity": {s: sev.get(s, 0) for s in SEVERITIES},
-                "findings_to_review": b.rows("SELECT COUNT(*) n FROM findings WHERE status IN ('new','verified')")[0]["n"],
+                "findings_to_review": b.rows("SELECT COUNT(*) n FROM findings WHERE status IN ('new','verified')")[0][
+                    "n"
+                ],
                 "open_todos": b.rows("SELECT COUNT(*) n FROM todos WHERE status='open'")[0]["n"],
                 "facts": b.rows("SELECT COUNT(*) n FROM facts")[0]["n"],
                 "runs": b.rows("SELECT COUNT(*) n FROM runs")[0]["n"],
                 "running": dict(running[0]) if running else None,
-                "worker": {"run": proc_alive(home() / "var" / "ui-run.pid"), "log": "var/ui-run.log"},
+                "worker": {"run": stack.pid_alive(ui_run_pidfile()), "log": "var/ui-run.log"},
                 "now": time.time(),
             }
         if path == "/api/findings":
-            return [dict(r) for r in b.rows(
-                "SELECT id, program, title, severity, vuln_class, url, status, created FROM findings ORDER BY "
-                "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, id DESC")]
+            return [
+                dict(r)
+                for r in b.rows(
+                    "SELECT id, program, title, severity, vuln_class, url, status, created FROM findings ORDER BY "
+                    "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 "
+                    "WHEN 'low' THEN 3 ELSE 4 END, id DESC"
+                )
+            ]
         if m := re.fullmatch(r"/api/findings/(\d+)", path):
             rows = b.rows("SELECT * FROM findings WHERE id=?", int(m.group(1)))
             if not rows:
                 raise KeyError("finding")
             f = dict(rows[0])
             host = urlparse(f.get("url") or "").netloc
-            flows = [x for x in _tail_jsonl(home() / "var" / "state" / "flows.jsonl", 3000)
-                     if host and urlparse(x.get("url", "")).netloc == host][-40:]
+            flows = [
+                x for x in tail_jsonl(paths.flows_log(), 3000) if host and urlparse(x.get("url", "")).netloc == host
+            ][-40:]
             f["flows"] = flows
             return f
         if path == "/api/todos":
@@ -266,16 +285,16 @@ class Handler(BaseHTTPRequestHandler):
             return data
         if path == "/api/flows":
             n = min(int(q.get("n", 200)), 2000)
-            flows = _tail_jsonl(home() / "var" / "state" / "flows.jsonl", n)
+            flows = tail_jsonl(paths.flows_log(), n)
             g = q.get("grep")
             return [f for f in reversed(flows) if not g or g in f.get("url", "")]
         if m := re.fullmatch(r"/api/flows/([0-9A-Za-z-]+)", path):
-            p = home() / "var" / "state" / "flows" / f"{m.group(1)}.json"
+            p = paths.flow_file(m.group(1))
             if not p.exists():
                 raise KeyError("flow")
             return json.loads(p.read_text())
         if path == "/api/events":
-            return list(reversed(_tail_jsonl(home() / "var" / "state" / "events.jsonl", int(q.get("n", 200)))))
+            return list(reversed(tail_jsonl(paths.events_log(), int(q.get("n", 200)))))
         if path == "/api/programs":
             return self._programs(b)
         if m := re.fullmatch(r"/api/board/([A-Za-z0-9_.-]+)", path):
@@ -283,31 +302,39 @@ class Handler(BaseHTTPRequestHandler):
             return {
                 "facts": [dict(r) for r in b.rows("SELECT * FROM facts WHERE program=? ORDER BY id DESC", prog)],
                 "intents": [dict(r) for r in b.rows("SELECT * FROM intents WHERE program=? ORDER BY id DESC", prog)],
-                "identities": self._identities(prog),
+                "identities": paths.identities(prog),
             }
         raise KeyError(path)
 
     def _programs(self, b: Board) -> list[dict]:
         from bh.scope import ScopeError, load_scope
+
         out = []
-        for f in sorted((home() / "scopes").rglob("*.yaml")):
+        for f in sorted(paths.scopes_dir().rglob("*.yaml")):
             if "examples" in f.parts:
                 continue
             try:
                 s = load_scope(f)
             except ScopeError as exc:
-                out.append({"file": str(f.relative_to(home())), "error": str(exc)})
+                out.append({"file": str(f.relative_to(paths.home())), "error": str(exc)})
                 continue
             st = b.rows("SELECT COUNT(*) n, MAX(started) last FROM runs WHERE program=?", s.program)[0]
-            out.append({"file": str(f.relative_to(home())), "program": s.program, "platform": s.platform,
-                        "in_scope": [r.value for r in s.in_scope], "out_of_scope": [r.value for r in s.out_of_scope],
-                        "rps": s.max_rps, "automation": s.automation_allowed, "headers": s.required_headers,
-                        "runs": st["n"], "last_run": st["last"], "identities": self._identities(s.program)})
+            out.append(
+                {
+                    "file": str(f.relative_to(paths.home())),
+                    "program": s.program,
+                    "platform": s.platform,
+                    "in_scope": [r.value for r in s.in_scope],
+                    "out_of_scope": [r.value for r in s.out_of_scope],
+                    "rps": s.max_rps,
+                    "automation": s.automation_allowed,
+                    "headers": s.required_headers,
+                    "runs": st["n"],
+                    "last_run": st["last"],
+                    "identities": paths.identities(s.program),
+                }
+            )
         return out
-
-    def _identities(self, program: str) -> list[str]:
-        d = home() / "var" / "state" / "identities" / program
-        return sorted(p.stem for p in d.glob("*.json")) if d.is_dir() else []
 
     def api_post(self, path: str, body: dict):
         b = Board()
@@ -322,7 +349,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/run":
             return self._start_run(body)
         if path == "/api/run/stop":
-            pid = proc_alive(home() / "var" / "ui-run.pid")
+            pid = stack.pid_alive(ui_run_pidfile())
             if not pid:
                 return {"ok": False, "error": "no run started from the UI is alive"}
             os.killpg(os.getpgid(pid), signal.SIGINT)
@@ -342,22 +369,27 @@ class Handler(BaseHTTPRequestHandler):
                     headers[k] = v
         if not headers:
             raise ValueError("no valid 'Header: value' line")
-        d = home() / "var" / "state" / "identities" / prog
+        d = paths.identities_dir(prog)
         d.mkdir(parents=True, exist_ok=True)
         p = d / f"{name}.json"
-        p.write_text(json.dumps({"headers": headers, "updated": time.time()}))
+        if p.exists() and not body.get("overwrite"):
+            raise ValueError(f"identity '{name}' already exists for {prog}: tick 'replace' to overwrite it")
+        # created 0600 from the start: the session never sits world-readable on disk
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps({"headers": headers, "updated": time.time()}))
         p.chmod(0o600)
         if body.get("todo_id"):
             Board().close_todo(int(body["todo_id"]))
         return {"ok": True, "identity": name, "headers": sorted(headers)}
 
     def _start_run(self, body: dict) -> dict:
-        pidfile = home() / "var" / "ui-run.pid"
-        if proc_alive(pidfile):
+        pidfile = ui_run_pidfile()
+        if stack.pid_alive(pidfile):
             raise ValueError("a run started from the UI is already alive; stop it first")
         scope = Path(body["scope"])
-        full = (home() / scope).resolve()
-        if not str(full).startswith(str((home() / "scopes").resolve())) or not full.is_file():
+        full = (paths.home() / scope).resolve()
+        if not full.is_relative_to(paths.scopes_dir().resolve()) or not full.is_file():
             raise ValueError("scope must be a file under scopes/")
         mode = body.get("mode", "run")
         model = body.get("model") or "sonnet"
@@ -372,14 +404,22 @@ class Handler(BaseHTTPRequestHandler):
             cmd += ["run", str(full)]
             if body.get("task"):
                 cmd += ["--task", str(body["task"])[:2000]]
-            if body.get("fresh"):
-                cmd += ["--fresh"]
+            if body.get("resume"):
+                cmd += ["--resume"]
         cmd += ["--model", model, "--minutes", str(minutes), "--max-turns", str(turns)]
-        log = open(home() / "var" / "ui-run.log", "a")
-        log.write(f"\n=== {time.strftime('%F %T')} {' '.join(cmd[2:])}\n")
-        log.flush()
-        p = subprocess.Popen(cmd, cwd=home(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                             env={**os.environ, "BH_HOME": str(home()), "PYTHONUNBUFFERED": "1"})
+        if body.get("effort") in EFFORTS:
+            cmd += ["--effort", body["effort"]]
+        with open(paths.var() / "ui-run.log", "a") as log:  # the child keeps its own descriptor
+            log.write(f"\n=== {time.strftime('%F %T')} {' '.join(cmd[2:])}\n")
+            log.flush()
+            p = subprocess.Popen(
+                cmd,
+                cwd=paths.home(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env={**os.environ, "BH_HOME": str(paths.home()), "PYTHONUNBUFFERED": "1"},
+            )
         pidfile.write_text(str(p.pid))
         return {"ok": True, "pid": p.pid}
 
