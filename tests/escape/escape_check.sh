@@ -42,6 +42,7 @@ check "relay refuses non-API paths"                blocked http_ok http://gate:8
 check "external DNS resolution"                    blocked getent hosts example.com
 check "id enumeration on an API route (5th id)"    blocked sh -c 'for i in 900001 900002 900003 900004; do curl -s -o /dev/null -m 8 http://'"$LAB"'/api/Feedbacks/$i; done; curl -s -m 8 http://'"$LAB"'/api/Feedbacks/900005 | grep -vq "bh-gate: DENIED"'
 check "id enumeration through path variants"      blocked sh -c 'for v in 900006/ 9000%307 "900008;x=1"; do curl -s -m 8 "http://'"$LAB"'/API//Feedbacks/$v" | grep -q "bh-gate: DENIED" || exit 0; done; exit 1'
+check "id enumeration in a JSON body (5th id)"   blocked sh -c 'for i in 900011 900012 900013 900014; do curl -s -o /dev/null -m 8 -H "Content-Type: application/json" -d "{\"BasketId\": $i}" http://'"$LAB"'/api/BasketItems; done; curl -s -m 8 -H "Content-Type: application/json" -d "{\"BasketId\": 900015}" http://'"$LAB"'/api/BasketItems | grep -vq "bh-gate: DENIED"'
 check "request body over 1 MiB"                    blocked sh -c 'head -c 1100000 /dev/zero | curl -s -m 15 -X POST --data-binary @- http://'"$LAB"'/api/Feedbacks | grep -vq "bh-gate: DENIED"'
 check "raw TCP behind a CONNECT (CRLF prefix)"     blocked python3 - "$LAB" <<'PY'
 import socket, sys
