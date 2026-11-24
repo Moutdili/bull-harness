@@ -465,7 +465,9 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("findings", nargs="*", help="F12 F13 ... (default: every finding still 'new')")
     run_opts(v)
     v.add_argument("--limit", type=int, default=5)
-    v.set_defaults(func=cmd_verify)
+    from bh.verify import VERIFIER_MODEL
+
+    v.set_defaults(func=cmd_verify, model=VERIFIER_MODEL)  # the judge's model, not the hunter's
 
     h = sub.add_parser("hunt", help="autonomous supervisor rotating over programs")
     h.add_argument("scopes", nargs="+")

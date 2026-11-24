@@ -15,6 +15,7 @@ Decision table (deterministic, B can only lower a deterministic success, never i
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import time
 from pathlib import Path
@@ -28,6 +29,8 @@ from bh.scope import Scope
 from bh.text import one_line
 
 VERIFIER_TURNS, VERIFIER_MINUTES = 8, 5
+# the judge is not the hunter's model (correlated errors); BH_VERIFIER_MODEL overrides
+VERIFIER_MODEL = os.environ.get("BH_VERIFIER_MODEL", "opus")
 REPLAY_TIMEOUT_S = 420
 ACTIVE = ("new", "verifying", "verified", "inconclusive", "submitted")
 _PLACEHOLDERS = ",".join("?" * len(ACTIVE))
@@ -95,7 +98,7 @@ def stage_b(
         effort=effort,
         session=None,
         bh_dir=vdir,
-        extra_env={"BH_ROLE": "verifier"},
+        extra_env={"BH_ROLE": "verifier", "HOME": runner.sandbox_home(f"{run_id}-F{fid}")},
     )
     log_path = paths.runs_dir() / f"{run_id:05d}-{prog}-verify-F{fid}-{int(time.time())}.jsonl"
     res = runner.SegmentResult(program=prog, run_id=run_id)
@@ -121,7 +124,7 @@ def decide(replay: dict, verdict: str, reason: str) -> tuple[str, str]:
         return "rejected", "stage A: the control answered exactly like the attack, there is no differential"
     if verdict == "rejected":
         return "rejected", f"verifier: {reason}"
-    if replay.get("reproduced") and verdict == "confirmed":
+    if replay.get("reproduced") is True and verdict == "confirmed":
         return "verified", f"replayed twice with its control; verifier: {reason}"
     stage = "replayed" if replay.get("reproduced") else "NOT replayed (" + one_line(_misses(replay), 160) + ")"
     return "inconclusive", f"stage A {stage}; verifier {verdict}: {reason}"
@@ -178,6 +181,7 @@ def _identity_headers(program: str, name: str) -> list[str]:
 def verify_finding(
     board: Board, scope: Scope, fid: int, *, run_id: int, model: str, effort: str | None, say=print
 ) -> str:
+    """`model` is the verifier's (VERIFIER_MODEL by default in callers), not the hunter's."""
     rows = board.rows("SELECT * FROM findings WHERE id=? AND program=?", fid, scope.program)
     if not rows:
         raise SystemExit(f"F{fid} is not a finding of {scope.program}")
@@ -191,6 +195,8 @@ def verify_finding(
         return "duplicate"
     board.set_finding(fid, "verifying")
     proof = json.loads(finding["proof"])
+    # nothing of the hunter survives into the verification: its processes, HOME, user site, the old verdicts
+    runner.clean_sandbox(scope.program, runner.sandbox_home(f"{run_id}-F{fid}"))
     stack.agent_sh('rm -rf -- "$1"', verify_dir(scope.program, fid), user="root")
     replay = stage_a(scope.program, fid, proof)
     say(

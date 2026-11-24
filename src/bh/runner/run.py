@@ -145,21 +145,17 @@ def set_active_run(run_id: int | None, program: str = "") -> None:
         p.write_text(json.dumps({"run_id": run_id, "program": program}))
 
 
-def sandbox_home(run_id: int) -> str:
-    return f"/tmp/bh-home-{run_id}"
+def sandbox_home(session: int | str) -> str:
+    return f"/tmp/bh-home-{session}"
 
 
-def clean_sandbox(program: str, run_id: int) -> None:
-    """Nothing the agent wrote can configure the next session: fresh HOME (no ~/.claude settings or
-    memory), and no CLAUDE.md / .claude planted in the work tree."""
+def clean_sandbox(program: str, home: str) -> None:
+    """Nothing the agent wrote can configure the next session: no process of the previous one alive, fresh
+    HOME (no ~/.claude settings or memory), and no CLAUDE.md / .claude planted in the work tree."""
     root = c.WORK_ROOT
+    stack.reset_agent_user(home)
     stack.agent_sh(
-        'rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$2/CLAUDE.md" "$2/.claude" /tmp/bh-home-*; '
-        'mkdir -p "$3" && chown hunter:hunter "$3" && chmod 700 "$3"',
-        f"{root}/{program}",
-        root,
-        sandbox_home(run_id),
-        user="root",
+        'rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$2/CLAUDE.md" "$2/.claude"', f"{root}/{program}", root, user="root"
     )
 
 
@@ -549,7 +545,7 @@ def _run_locked(
     session = board.last_session(prog) if resume else None
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)
     run_id = board.run_start(prog, model)  # closes a run orphaned by a crash (we hold the lock)
-    clean_sandbox(prog, run_id)
+    clean_sandbox(prog, sandbox_home(run_id))
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
     prepare_workdir(board, scope, scope_file)
     before = coverage_counts(board, scope)
@@ -626,10 +622,10 @@ def _run_locked(
             res.status = "quota"
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
     if res.new_findings and res.status not in ("quota", "refusal"):
-        from bh.verify import verify_pending
+        from bh.verify import VERIFIER_MODEL, verify_pending
 
-        say(f"▶ verifying {res.new_findings} new finding(s)")
-        verify_pending(board, scope, run_id=run_id, model=model, effort=effort, say=say)
+        say(f"▶ verifying {res.new_findings} new finding(s) with {VERIFIER_MODEL}")
+        verify_pending(board, scope, run_id=run_id, model=VERIFIER_MODEL, effort=effort, say=say)
     say(
         f"■ run {run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · {res.tool_calls} tools "
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "
