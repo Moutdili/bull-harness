@@ -369,6 +369,21 @@ def cmd_prune(args) -> int:
     return 0
 
 
+def cmd_tokens(args) -> int:
+    """Token economy watch: calibrate the symbol pool, mine the agent's commands (aliases dropped, issue 017)."""
+    from bh.tokens import calibrate, miner
+
+    if args.tcmd == "calibrate":
+        t = calibrate.calibrate()
+        print(f"{t['candidates']} candidates, by cost {t['by_cost']}, one-token by block {t['one_token_by_block']}")
+        return 0
+    chosen, runs = miner.mine(turns=args.turns)
+    print(f"{runs} runs mined; {len(chosen)} prefixes worth an alias (net saving per {args.turns}-turn segment):")
+    for c in chosen:
+        print(f"  {c.net:8.0f} eq.  {c.uses:5.1f} uses/segment  {c.tokens:2d} tok  {c.prefix}")
+    return 0
+
+
 # ---------------------------------------------------------------- UI daemon
 def ui_pidfile() -> Path:
     return paths.var() / "ui.pid"
@@ -522,6 +537,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prune", help="delete gate flow files older than --days, rotate large gate logs")
     pr.add_argument("--days", type=float, default=None, help="default: BH_FLOW_DAYS or 14")
     pr.set_defaults(func=cmd_prune)
+
+    tk = sub.add_parser("tokens", help="token watch: symbol calibration, command miner")
+    tk.add_argument("tcmd", choices=("calibrate", "mine"))
+    tk.add_argument("--turns", type=int, default=50, help="segment length used to price an alias (default 50)")
+    tk.set_defaults(func=cmd_tokens)
     return p
 
 
