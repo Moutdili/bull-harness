@@ -72,9 +72,25 @@ class SegmentResult:
     locked_calls: int = 0  # commands refused by the tool lock
     text: str = ""
     usage: dict = field(default_factory=dict)
+    rate_limit: dict = field(default_factory=dict)  # last `rate_limit_info` of the stream: status, resetsAt, windows
     turn_log: list[dict] = field(default_factory=list)  # one per model message: tokens (observability)
     tool_log: list[dict] = field(default_factory=list)  # one per tool call: kind, duration, locked
     _pending: dict = field(default_factory=dict, repr=False)  # tool_use id -> index in tool_log
+
+
+def quota_line(info: dict) -> str:
+    """` · quota seven_day 5% (resets Mon 10:00)` from the stream's rate_limit_info, or ''."""
+    wins = info.get("unifiedWindows") or {}
+    parts = [
+        f"{name} {round(100 * w['utilization'])}%"
+        for name, w in wins.items()
+        if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float))
+    ]
+    if not parts:
+        return ""
+    reset = info.get("resetsAt")
+    when = f" (resets {time.strftime('%a %H:%M', time.localtime(reset))})" if isinstance(reset, (int, float)) else ""
+    return " · quota " + ", ".join(parts) + when
 
 
 # ------------------------------------------------------------------ guards
@@ -262,6 +278,7 @@ def agent_command(
         "BH_PROGRAM": prog,
         "BH_RPS": f"{scope.rate:g}",
         "BH_SCANNERS": "1" if scope.scanners_on else "0",
+        "BH_IDENTITIES": ",".join(sorted({i["name"] for i in scope.identities} | set(paths.identities(prog)))),
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
         **(extra_env or {}),
@@ -387,6 +404,8 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
                     if locked:
                         res.locked_calls += 1
                         say("  🔒 manual HTTP refused by the tool lock")
+            case "rate_limit_event":
+                res.rate_limit = ev.get("rate_limit_info") or {}
             case "result":
                 result = ev
     return result
@@ -645,7 +664,9 @@ def _run_locked(
         stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
         if timed_out:
             res.status = "timeout"
-        if res.status != "ok" and (QUOTA_RE.search(res.text) or QUOTA_RE.search(stderr)):
+        if res.rate_limit.get("status") == "rejected" or (
+            res.status != "ok" and (QUOTA_RE.search(res.text) or QUOTA_RE.search(stderr))
+        ):
             res.status = "quota"
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
     if res.new_findings and res.status not in ("quota", "refusal"):
@@ -662,6 +683,7 @@ def _run_locked(
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "
         f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_todos} todos (progress {res.progress})"
         + (f" · ${res.cost_usd:.2f} eq." if res.cost_usd else "")
+        + quota_line(res.rate_limit)
     )
     if res.status == "error" and stderr.strip():
         say("  stderr: " + one_line(stderr, 400))

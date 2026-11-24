@@ -1,7 +1,8 @@
 """Single entry point for the sandbox: dispatch on the program name.
 
 container/agent/bin/bh-agent is the only executable; bh-note, bh-crawl, ... are symlinks
-to it. `bh-agent hook-pre|hook-post` is what Claude Code's hooks call.
+to it (so are the short request helpers `q` and `qq`). `bh-agent hook-pre|hook-post` is what Claude Code's
+hooks call.
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ def main() -> None:
         from bh.agent import note
 
         note.main(args)
+    elif cmd in ("q", "qq"):
+        from bh.agent import q
+
+        q.main(cmd, args)
     elif cmd in TOOLS:
         from bh.agent import tools
 

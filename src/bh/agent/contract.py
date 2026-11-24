@@ -385,22 +385,31 @@ def runs_mapper(cmd: str) -> bool:
     return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl)\b", bare))
 
 
-_MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh)(?=\s|$)")
+_MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh|qq?)(?=\s|$)")
 _HTTP_CLIENT = re.compile(r"^(curl|wget)$")
+_Q_CLIENT = re.compile(r"^qq?$")  # bh.agent.q: `/path` arguments use the origin saved in BH_DIR/q-base
 _BARE_TARGET = re.compile(r"^([a-z0-9-]+(\.[a-z0-9-]+)+|\[[0-9a-f:]+\])(:\d+)?(/\S*)?$", re.I)
 
 
 def urls_in(cmd: str) -> list[str]:
-    """URLs a command talks to: literal http(s) URLs, plus scheme-less `host[:port]/path` arguments
-    of curl/wget (curl defaults them to http)."""
+    """URLs a command talks to: literal http(s) URLs, scheme-less `host[:port]/path` arguments of curl/wget
+    (curl defaults them to http), and `/path` arguments of q/qq on their saved origin."""
     urls = URL_RE.findall(cmd)
-    in_client = False
+    in_client = in_q = False
+    q_base = None
     for tok in re.findall(r"[;&|()\n]|[^\s;&|()]+", cmd):
         word = tok.strip("'\"")
         if tok in ";&|()\n":
-            in_client = False
+            in_client = in_q = False
         elif _HTTP_CLIENT.match(word):
             in_client = True
+        elif _Q_CLIENT.match(word):
+            in_q = True
+            q_base = q_base or _q_base()
+        elif in_q and "://" in word:
+            q_base = origin(word) or q_base
+        elif in_q and word.startswith("/") and q_base:
+            urls.append(q_base + word)
         elif (
             in_client
             and not word.startswith("-")
@@ -410,6 +419,13 @@ def urls_in(cmd: str) -> list[str]:
         ):
             urls.append("http://" + word)
     return urls
+
+
+def _q_base() -> str | None:
+    try:
+        return (bh_dir() / "q-base").read_text().strip() or None
+    except OSError:
+        return None
 
 
 def uses_arsenal(cmd: str) -> bool:

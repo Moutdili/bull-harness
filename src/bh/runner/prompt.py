@@ -35,6 +35,11 @@ Options for all: `--as <identity>` (authenticated), `--timeout <s>`. They run fo
 - `bh-content <url>` content discovery (ffuf)           - `bh-scan <url>`    nuclei, tech-aware (`--deep` = slow)
 - `bh-params <url>` hidden parameters (arjun)           - `bh-sqli <url> [--data body]` sqlmap level 3, risk 1
 - `bh-xss <url?p=x>` reflected XSS (dalfox)
+Hand-made requests: use `q` and `qq` rather than long curl lines (each line you write stays in your context).
+- `q [-a <identity>] [-X M] [-d body | -j json] [-H 'K: V'] [-n bytes] [-i] <url|/path>`: one request, prints
+  status, size, type and the first 400 bytes (full body saved, path shown). A `/path` reuses the last origin.
+- `qq <url|/path>`: the same GET as each of your identities and anonymous, one line each (status, size, hash,
+  `==` when two answers are identical). The first check for IDOR and broken access control.
 TOOL LOCK: hand-made HTTP (curl, wget, python...) to an origin is refused until `bh-crawl`, `bh-content`
 and `bh-scan` have run on it. A refusal starting with [bh-lock] lists the exact commands to run.
 
@@ -54,7 +59,7 @@ and `bh-scan` have run on it. A refusal starting with [bh-lock] lists the exact 
   `bh-note fact "<what failed and why>" -k dead-end` so nobody repeats it.
 - Blocked by something only a human can solve (login, 2nd account, captcha/WAF challenge, paid feature): `bh-note todo auth|account|waf "<what>" -d "<exact need>"` then move to another surface.
   Never end a segment because of such a blocker without having filed its todo first: that todo is how the human unblocks you.
-- Authenticated requests: header `X-BH-Identity: <name>` (builtins: `--as <name>`); the gate injects the session. Never ask for or print credentials.
+- Authenticated requests: `q -a <name>` (builtins: `--as <name>`, other tools: header `X-BH-Identity: <name>`); the gate injects the session. Never ask for or print credentials.
 
 ## Findings: the 7-question gate (all must be yes, else it is not a finding)
 1 exploitable now, step by step  2 in scope and not excluded  3 real impact on a user or the company (data, money, account)

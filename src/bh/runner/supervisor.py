@@ -15,7 +15,8 @@ from bh.scope import load_scope
 
 STAGNANT_LIMIT = 2  # segments without a new fact/finding before cooldown
 COOLDOWN_S = 2 * 3600
-QUOTA_SLEEP_S = 30 * 60
+QUOTA_SLEEP_S = 30 * 60  # when the stream gave no reset time
+QUOTA_MARGIN_S = 120
 # Resuming re-reads the whole session history every turn: lab runs 5-7 cost $0.13-0.20 for 3-10 turns,
 # fresh sessions from the board + HANDOFF $0.03-0.04 for similar output. Default: always fresh.
 MAX_RESUMES = int(os.environ.get("BH_MAX_RESUMES", "0"))
@@ -29,6 +30,15 @@ class ProgState:
     cooldown_until: float = 0.0
     last_run: float = 0.0
     resumes: int = 0
+
+
+def quota_wake(res: SegmentResult, now: float) -> float:
+    """When to try again after a quota stop: the reset time the API announced (`rate_limit_event.resetsAt`)
+    plus a margin, else QUOTA_SLEEP_S from now."""
+    reset = (res.rate_limit or {}).get("resetsAt")
+    if isinstance(reset, (int, float)) and now < reset < now + 8 * 86400:
+        return reset + QUOTA_MARGIN_S
+    return now + QUOTA_SLEEP_S
 
 
 def _fmt(ts: float) -> str:
@@ -67,8 +77,12 @@ def hunt(
         )
         p.resumes = p.resumes + 1 if resume else 0
         if res.status == "quota":
-            print(f"quota reached; sleeping {QUOTA_SLEEP_S // 60} min")
-            time.sleep(QUOTA_SLEEP_S)
+            wake = quota_wake(res, time.time())
+            if wake >= deadline:
+                print(f"quota reached; it resets at {_fmt(wake)}, after the deadline: stopping")
+                break
+            print(f"quota reached; sleeping until {_fmt(wake)}")
+            time.sleep(max(30, wake - time.time()))
             continue
         if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1
