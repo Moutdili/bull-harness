@@ -50,3 +50,30 @@ def test_skipped_entries_do_not_widen():
     assert check(s, "https://api.demo.test/").allowed
     for url in ("https://storage1.demo.test/", "https://app.demo.test/v1/x/admin", "https://demo.test/"):
         assert not check(s, url).allowed, url
+
+
+def _prog(*scopes):
+    return {"slug": "t", "scopes": [{"scope": v, "scope_type": t} for v, t in scopes], "rules": ""}
+
+
+def test_import_never_builds_a_rule_from_free_text_or_shared_platforms():
+    imp = convert(
+        _prog(
+            ("app.example.com", "web-application"),
+            ("a.com b.org", "web-application"),  # would glue into a.comb.org
+            ("Source Code", "web-application"),
+            ("KiteworksCore", "web-application"),  # single label: resolves through search domains
+            ("https://github.com/example/repo", "web-application"),
+            ("https://apps.apple.com/se/app/x/id1", "web-application"),
+            ("*.example.org", "other"),  # "other" is free text, translated by a human
+        ),
+        "mio",
+    )
+    applicable = [r["value"] for r in imp.doc["in_scope"] if r.get("type") != "other"]
+    assert applicable == ["app.example.com"]
+    assert len(imp.skipped) == 6
+
+
+def test_import_refuses_a_program_with_nothing_exact():
+    with pytest.raises(ScopeError):
+        convert(_prog(("Source Code", "other"), ("github.com/x/y", "web-application")), "mio")
