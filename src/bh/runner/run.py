@@ -12,9 +12,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from bh.runner.prompt import build_system_prompt, build_task
 from bh.scope import Scope, load_scope
 from bh.text import one_line
 
+DEFAULT_MODEL = "sonnet"  # alias resolved by Claude Code (claude-sonnet-5-5 on 2.1.330)
 QUOTA_RE = re.compile(r"(usage limit|limit reached|rate limit|resets? (at|in)|out of (extra )?usage)", re.I)
 # Builtins run for minutes (ffuf, nuclei, sqlmap): the Bash tool's 2-minute default would kill them.
 BASH_TIMEOUT_MS = {"BASH_DEFAULT_TIMEOUT_MS": "330000", "BASH_MAX_TIMEOUT_MS": "900000"}
@@ -53,6 +56,17 @@ class SegmentResult:
     usage: dict = field(default_factory=dict)
 
 
+@contextmanager
+def signals_ignored():
+    """Cleanup after Ctrl-C / SIGTERM must not be cut short by a second signal."""
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+
+
 def activate_scope(scope_file: Path) -> None:
     """Atomically make this scope the gate's active scope (the gate hot-reloads on mtime)."""
     dst = paths.active_scope()
@@ -62,9 +76,24 @@ def activate_scope(scope_file: Path) -> None:
     os.replace(tmp, dst)
 
 
+# User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
+MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
+
+
+def manually_tested(program: str) -> set[tuple[str, str]]:
+    """(origin, resource family) of every request the agent made by hand, as seen by the gate.
+    The gate sees the real URL, even when the command built it from shell variables."""
+    out = set()
+    for f in c.read_jsonl(paths.flows_log()):
+        manual = f.get("program") == program and MANUAL_UA.match(f.get("ua") or "")
+        if manual and (k := c.endpoint_key(f.get("url", ""), f.get("method", "GET"))):
+            out.add((k[0], c.family(k[1])))
+    return out
+
+
 def frontier(board: Board, program: str) -> str:
-    """Board view + attack surface found by the tools (read from the agent's work dir)."""
-    surface = c.surface(paths.work_bh(program))
+    """Board view + attack surface found by the tools, with what was tested by hand."""
+    surface = c.surface(paths.work_bh(program), also_tested=manually_tested(program))
     return board.frontier(program) + (f"\n{surface}" if surface else "")
 
 
@@ -73,8 +102,10 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
     stage = paths.stage(prog)
     stage.mkdir(parents=True, exist_ok=True)
     board.export_facts(prog, stage / c.FACTS)
-    cbh = f"/work/{prog}/.bh"
+    cbh = c.sandbox_dir(prog)
+    # bh-note frontier = this board view + the surface recomputed live in the sandbox
     stack.push_file(f"{cbh}/{c.FRONTIER}", board.frontier(prog))
+    stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(manually_tested(prog))))
     stack.push_file(f"{cbh}/{c.FACTS}", (stage / c.FACTS).read_text())
     stack.push_file(f"{cbh}/{c.SYSTEM}", build_system_prompt(scope, paths.identities(prog)))
     stack.push_file(f"{cbh}/{c.SCOPE}", Path(scope_file).read_text())
@@ -84,7 +115,7 @@ def agent_command(
     scope: Scope, task: str, *, model: str, max_turns: int, effort: str | None, session: str | None
 ) -> list[str]:
     prog = scope.program
-    bh = f"/work/{prog}/.bh"
+    bh = c.sandbox_dir(prog)
     env = {
         "BH_DIR": bh,
         "BH_PROGRAM": prog,
@@ -99,7 +130,7 @@ def agent_command(
         "--user",
         "hunter",
         "-w",
-        f"/work/{prog}",
+        f"{c.WORK_ROOT}/{prog}",
         *[x for k, v in env.items() for x in ("-e", f"{k}={v}")],
         # the wrapper records claude's pid so stack.kill_agent can stop it from the host
         stack.AGENT,
@@ -240,7 +271,7 @@ def finish(board: Board, res: SegmentResult, scope: Scope, model: str, effort: s
 def run_segment(
     scope_file: Path,
     *,
-    model: str = "sonnet",
+    model: str = DEFAULT_MODEL,
     max_turns: int = 60,
     minutes: float = 30,
     resume: bool = False,
@@ -295,14 +326,16 @@ def run_segment(
     try:
         result = consume_stream(proc, log_path, res, say)
     except BaseException:  # Ctrl-C / SIGTERM: kill the agent in the container, keep what it already wrote
-        timer.cancel()
-        stack.kill_agent(prog)
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
-        res.status = "stopped"
-        finish(board, res, scope, model, effort, "stopped by operator")
-        say(f"■ run {run_id} stopped by operator (agent killed in {stack.AGENT})")
+        with signals_ignored():
+            timer.cancel()
+            board.run_end(run_id, status="stopped", note="stopped by operator")
+            stack.kill_agent(prog)
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            res.status = "stopped"
+            finish(board, res, scope, model, effort, "stopped by operator")
+            say(f"■ run {run_id} stopped by operator (agent killed in {stack.AGENT})")
         raise
     finally:
         timer.cancel()

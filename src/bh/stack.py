@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from bh import paths
+from bh.agent import contract as c
 
 AGENT = "bh-agent"
 GATE = "bh-gate"
@@ -56,13 +57,13 @@ def push_file(container_path: str, text: str) -> None:
 
 
 def wipe_program(program: str) -> None:
-    agent_sh('rm -rf -- "/work/$1"', program)
+    agent_sh('rm -rf -- "$1"', f"{c.WORK_ROOT}/{program}")
 
 
 def kill_agent(program: str, grace: float = 8.0) -> None:
     """Stop the claude process of `program` (pid written by the launch wrapper). podman exec
     does not forward signals: killing the host-side process alone would leave an orphan."""
-    pidfile = f"/work/{program}/.bh/agent.pid"
+    pidfile = f"{c.sandbox_dir(program)}/{c.AGENT_PID}"
     script = (
         'p=$(cat "$1" 2>/dev/null) || exit 0; kill -0 "$p" 2>/dev/null || exit 0; kill -INT "$p"; i=0; '
         f'while kill -0 "$p" 2>/dev/null && [ $i -lt {int(grace * 2)} ]; do sleep 0.5; i=$((i+1)); done; '

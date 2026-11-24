@@ -15,12 +15,14 @@ Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie qu
 | 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope, H7 Gmail |
 | 4 Autonomie | 4.1 runner (stderr fichier, kill propre), 4.2 superviseur (progression réelle), 4.4 todos auth/waf/identity, **verrou d'outils + file de surface** | 4.2b rotation sur contexte, 4.3 vérificateur, 4.5 capture de session, 4.6 skills |
 | 5 CVE | — | tout |
-| 6 Runs réels | 6.0 lab Juice Shop (13 runs, 11 findings connus) | 6.1 app perso, 6.2 premier programme, 6.3 premier CVE |
+| 6 Runs réels | 6.0 lab Juice Shop (reset 2026-11-24 : 7 runs, 5 findings, cartographie 100 % arsenal) | 6.1 app perso, 6.2 premier programme, 6.3 premier CVE |
 
 Arsenal (`bh-recon/crawl/content/scan/params/sqli/xss`) : chaque builtin passe par le gate au débit du
 programme, garde le brut sur disque, rend ≤ 25 lignes et enregistre sa couverture. Mesures sur Juice Shop
 (20 req/s) : crawl 12 s / 91 endpoints (extracteur JS maison, katana seul n'en trouve aucun),
-content 4 min, sqli niveau 3 ≈ 3 min, scan borné par `--timeout` (nuclei lent, cause interne non résolue).
+content 4 min, sqli niveau 3 techniques BEU ≈ 15 s (le time-based figeait la cible), scan borné par
+`--timeout` (nuclei lent, cause interne non résolue). « Testé » = vu par le gate avec un User-Agent manuel
+(curl, scripts) ou touché par un builtin de test.
 
 ---
 

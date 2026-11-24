@@ -8,6 +8,7 @@ the container, var/work/<program>/.bh on the host):
   endpoints.jsonl  attack surface found by tools (crawl, content discovery)
   touched.jsonl    endpoints the agent actually tested (hook + test builtins)
   commands.jsonl   every Bash command + the hook decision (token / tool-usage metrics)
+  manual-tested.json  endpoints the gate saw requested by hand, pushed by the runner each segment
   raw/             full tool outputs; the model only sees summaries
   frontier.md, facts.json, system.md, scope.yaml   pushed by the runner each segment
 
@@ -54,6 +55,8 @@ PASSIVE_SUFFIXES = (
 
 IDENTITY_HEADER = "X-BH-Identity"
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
+SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
+WORK_ROOT = "/work"  # the agent's work volume (var/work on the host)
 
 NOTES, COVERAGE, ENDPOINTS, TOUCHED, COMMANDS = (
     "notes.jsonl",
@@ -62,13 +65,14 @@ NOTES, COVERAGE, ENDPOINTS, TOUCHED, COMMANDS = (
     "touched.jsonl",
     "commands.jsonl",
 )
-FRONTIER, FACTS, SYSTEM, SCOPE, AGENT_PID, RAW = (
+FRONTIER, FACTS, SYSTEM, SCOPE, AGENT_PID, RAW, MANUAL_TESTED = (
     "frontier.md",
     "facts.json",
     "system.md",
     "scope.yaml",
     "agent.pid",
     "raw",
+    "manual-tested.json",
 )
 
 STATIC_EXT = re.compile(r"\.(js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|otf|mp4|webm|mp3|pdf)$", re.I)
@@ -78,7 +82,12 @@ _ID_SEGMENT = re.compile(r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,}|[A-Za-
 
 # ------------------------------------------------------------------ locations
 def bh_dir() -> Path:
-    return Path(os.environ.get("BH_DIR", "/work/.bh"))
+    return Path(os.environ.get("BH_DIR", f"{WORK_ROOT}/.bh"))
+
+
+def sandbox_dir(program: str) -> str:
+    """BH_DIR of `program` as seen inside the agent container."""
+    return f"{WORK_ROOT}/{program}/.bh"
 
 
 def gate() -> str:
@@ -218,8 +227,11 @@ def record_touched(d: Path, urls: list[str], via: str, method: str = "GET") -> N
 
 
 # ------------------------------------------------------------------ surface (host + sandbox)
-def surface(d: Path, limit: int = 12) -> str:
-    """Frontier block: what the tools found and what nobody tested yet."""
+def surface(d: Path, limit: int = 12, also_tested: set[tuple[str, str]] | None = None) -> str:
+    """Frontier block: what the tools found and what nobody tested yet.
+
+    Tested = touched by a builtin or a literal URL in a command (touched.jsonl), or requested by
+    hand as seen by the gate (`also_tested`: (origin, family) pairs computed on the host)."""
     eps: dict[tuple[str, str], dict] = {}
     for e in read_jsonl(d / ENDPOINTS):
         k = (e.get("origin", ""), e.get("key", ""))
@@ -231,7 +243,7 @@ def surface(d: Path, limit: int = 12) -> str:
     cov = read_json(d / COVERAGE, {})
     if not eps and not cov:
         return ""
-    touched = {(t.get("origin"), family(t.get("key", ""))) for t in read_jsonl(d / TOUCHED)}
+    touched = {(t.get("origin"), family(t.get("key", ""))) for t in read_jsonl(d / TOUCHED)} | (also_tested or set())
     untested = [(k, v) for k, v in eps.items() if (k[0], family(k[1])) not in touched]
     untested.sort(
         key=lambda kv: (-len(kv[1]["params"]), not re.search(r"/(api|rest|graphql|v\d)/", kv[0][1]), kv[0][1])
@@ -247,7 +259,7 @@ def surface(d: Path, limit: int = 12) -> str:
         f"{len(untested)} untested. Next untested:"
     )
     for (o, key), v in untested[:limit]:
-        params = f" ?{','.join(sorted(v['params']))}" if v["params"] else ""
+        params = f" ?{','.join(sorted(v['params']))}  → bh-sqli / bh-xss" if v["params"] else ""
         out.append(f"  - {key}{params}  [{o}; {'+'.join(sorted(v['sources']))}]")
     return "\n".join(out)
 

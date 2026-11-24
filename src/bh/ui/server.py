@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from bh import paths, stack
-from bh.agent.contract import tail_jsonl
+from bh.agent.contract import SEVERITIES, tail_jsonl
 from bh.board import Board
 from bh.text import clip
 
@@ -43,7 +43,6 @@ CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 )
-SEVERITIES = ["critical", "high", "medium", "low", "info"]
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -392,7 +391,9 @@ class Handler(BaseHTTPRequestHandler):
         if not full.is_relative_to(paths.scopes_dir().resolve()) or not full.is_file():
             raise ValueError("scope must be a file under scopes/")
         mode = body.get("mode", "run")
-        model = body.get("model") or "sonnet"
+        from bh.runner.run import DEFAULT_MODEL
+
+        model = body.get("model") or DEFAULT_MODEL
         if not re.fullmatch(r"[a-z0-9.\[\]-]{2,40}", model):
             raise ValueError("bad model")
         minutes = float(body.get("minutes") or 20)

@@ -9,6 +9,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# File names inside the state dir, shared with the gate (which sees that dir as /state).
+ACTIVE_SCOPE, EVENTS, FLOWS, FLOWS_DIR, IDENTITIES = (
+    "active-scope.yaml",
+    "events.jsonl",
+    "flows.jsonl",
+    "flows",
+    "identities",
+)
+
 
 def home() -> Path:
     return Path(os.environ.get("BH_HOME", Path.cwd()))
@@ -24,23 +33,23 @@ def state() -> Path:
 
 
 def active_scope() -> Path:
-    return state() / "active-scope.yaml"
+    return state() / ACTIVE_SCOPE
 
 
 def events_log() -> Path:
-    return state() / "events.jsonl"
+    return state() / EVENTS
 
 
 def flows_log() -> Path:
-    return state() / "flows.jsonl"
+    return state() / FLOWS
 
 
 def flow_file(flow_id: str) -> Path:
-    return state() / "flows" / f"{flow_id}.json"
+    return state() / FLOWS_DIR / f"{flow_id}.json"
 
 
 def identities_dir(program: str) -> Path:
-    return state() / "identities" / program
+    return state() / IDENTITIES / program
 
 
 def identities(program: str) -> list[str]:
