@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from bh.agent.contract import PASSIVE_DENY_PATHS, is_passive, origin, path_key
+from bh.agent.contract import API_PATH, PASSIVE_DENY_PATHS, is_passive, origin, path_key
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
@@ -43,7 +43,6 @@ ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 4, 600, 5000
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
 # (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
 MISS_LIMIT, MISS_WINDOW_S = 25, 300
-_API_PATH = re.compile(r"/(api|rest|graphql|v\d+)(/|$)", re.I)
 
 
 def is_system(host: str) -> bool:
@@ -221,7 +220,7 @@ class Policy:
         the server's router sees it: case, //, a trailing slash, ;params and %xx do not make a new route."""
         path = _route_path(urlsplit(url).path)
         key = path_key(path)
-        if "{id}" not in key or not (authenticated or _API_PATH.search(path)):
+        if "{id}" not in key or not (authenticated or API_PATH.search(path)):
             return None
         ids = "/".join(seg for seg, k in zip(path.split("/"), key.split("/"), strict=False) if k == "{id}")
         route = f"{origin(url)} {key}"

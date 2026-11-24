@@ -17,11 +17,10 @@ from typing import Any
 
 import yaml
 
+from bh.agent.contract import DEFAULT_RPS  # one default rate for the scope, the gate and the sandbox
 from bh.scope.normalize import DEFAULT_PORTS, norm_host, norm_path, parse_ip
 
 SCHEMA_VERSION = 1
-# Rate used when a program publishes none: conservative, the gate and the builtins both apply it.
-DEFAULT_RPS = 2.0
 
 
 def canonical_vuln(name: str) -> str:

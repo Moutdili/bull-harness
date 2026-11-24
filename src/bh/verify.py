@@ -33,7 +33,8 @@ VERIFIER_TURNS, VERIFIER_MINUTES = 8, 5
 # the judge is not the hunter's model (correlated errors); BH_VERIFIER_MODEL overrides
 VERIFIER_MODEL = os.environ.get("BH_VERIFIER_MODEL", "opus")
 REPLAY_TIMEOUT_S = 420
-ACTIVE = ("new", "verifying", "verified", "inconclusive", "submitted")
+# a new finding is a duplicate of these (a rejected one too: re-proposing it would cost a verifier session each time)
+ACTIVE = ("new", "verifying", "verified", "inconclusive", "submitted", "rejected")
 _PLACEHOLDERS = ",".join("?" * len(ACTIVE))
 
 

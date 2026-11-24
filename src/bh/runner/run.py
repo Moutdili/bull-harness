@@ -80,7 +80,7 @@ class SegmentResult:
 @contextmanager
 def signals_ignored() -> Iterator[None]:
     """Cleanup after Ctrl-C / SIGTERM must not be cut short by a second signal."""
-    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         yield
     finally:
@@ -442,12 +442,15 @@ def merge_result(res: SegmentResult, result: dict | None) -> None:
         )
 
 
-def gate_counts(run_id: int) -> dict[str, int]:
-    """What the gate did for this run (flows and events are tagged with the run id)."""
+def gate_counts(board: Board, run_id: int) -> dict[str, int]:
+    """What the gate did for this run (flows and events are tagged with the run id); logs read from a cursor."""
     flows = [
-        f for f in c.read_jsonl(paths.flows_log()) if f.get("run") == run_id and f.get("class") in (None, "target")
+        f
+        for f in board.new_lines(paths.flows_log(), "gate-counts:flows")
+        if f.get("run") == run_id and f.get("class") in (None, "target")
     ]
-    denied = sum(1 for e in c.read_jsonl(paths.events_log()) if e.get("run") == run_id and e.get("kind") == "blocked")
+    events = board.new_lines(paths.events_log(), "gate-counts:events")
+    denied = sum(1 for e in events if e.get("run") == run_id and e.get("kind") == "blocked")
     return {
         "gate_requests": len(flows),
         "gate_denied": denied,
@@ -475,7 +478,7 @@ def finish(
             )
         )
     board.record_metrics(res.run_id, res.turn_log, res.tool_log)
-    board.run_set(res.run_id, **gate_counts(res.run_id))
+    board.run_set(res.run_id, **gate_counts(board, res.run_id))
     graph = Graph(board, scope)
     graph.sync(res.run_id)
     for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
@@ -634,7 +637,11 @@ def _run_locked(
         from bh.verify import VERIFIER_MODEL, verify_pending
 
         say(f"▶ verifying {res.new_findings} new finding(s) with {VERIFIER_MODEL}")
-        verify_pending(board, scope, run_id=run_id, model=VERIFIER_MODEL, effort=effort, say=say)
+        set_active_run(run_id, prog)  # the verifier's requests are this run's traffic too
+        try:
+            verify_pending(board, scope, run_id=run_id, model=VERIFIER_MODEL, effort=effort, say=say)
+        finally:
+            set_active_run(None)
     say(
         f"■ run {run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · {res.tool_calls} tools "
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "

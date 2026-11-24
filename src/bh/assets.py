@@ -209,9 +209,7 @@ class Graph:
             if "gate" in ev or (ev & _CLAIMS and "seen" in ev):
                 tested.add((origin_, key))
         untested = [(k, v) for k, v in eps.items() if k not in tested]
-        untested.sort(
-            key=lambda kv: (-len(kv[1]["params"]), not re.search(r"/(api|rest|graphql|v\d)/", kv[0][1]), kv[0][1])
-        )
+        untested.sort(key=c.frontier_order)
         cov: dict[str, dict] = {}
         for r in self.b.rows(
             "SELECT a.key, c.phase, c.status, c.ts FROM coverage c JOIN assets a ON a.id=c.asset_id WHERE a.program=?",
