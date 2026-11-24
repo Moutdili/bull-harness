@@ -136,7 +136,7 @@ function findingTable(f) {
 async function openFinding(id) {
   const f = await api(`/api/findings/${id}`);
   const body = el("div");
-  const tabs = { overview: "Vue d'ensemble", poc: "PoC", proof: "Non prouvé", traffic: `Trafic (${f.flows.length})`, triage: "Triage" };
+  const tabs = { overview: "Vue d'ensemble", verify: "Vérification", poc: "PoC", proof: "Non prouvé", traffic: `Trafic (${f.flows.length})`, triage: "Triage" };
   const pane = el("div");
   const sub = el("div", { class: "subtabs" }, ...Object.entries(tabs).map(([k, v]) => el("button", { "data-k": k, onclick: () => sel(k) }, v)));
   function sel(k) {
@@ -147,6 +147,20 @@ async function openFinding(id) {
       el("dt", {}, "URL"), el("dd", { class: "mono" }, f.url || "—"), el("dt", {}, "Créé"), el("dd", {}, time(f.created)),
       el("dt", {}, "Verdict"), el("dd", {}, f.verdict || "—"), el("dt", {}, "Preuve (fichier)"), el("dd", { class: "mono" }, f.evidence || "—")),
       el("h2", {}, "Impact / résumé"), el("pre", {}, f.summary || ""));
+    if (k === "verify") {
+      let replay = null; try { replay = f.replay ? JSON.parse(f.replay) : null; } catch (e) { replay = null; }
+      const steps = (replay?.rounds || []).flatMap((r, i) => r.map((s) => el("tr", {},
+        el("td", {}, i + 1), el("td", {}, s.role), el("td", {}, s.name), el("td", {}, s.status ?? "—"),
+        el("td", { class: s.ok ? "st-verified" : "st-rejected" }, s.ok ? "ok" : (s.misses || []).join("; ")))));
+      fill(pane, el("dl", {}, el("dt", {}, "Statut"), el("dd", { class: `st-${f.status}` }, f.status),
+          el("dt", {}, "Verdict"), el("dd", {}, f.verdict || "pas encore vérifié")),
+        el("h2", {}, "Rejeu déterministe (2 tours, via le gate)"),
+        steps.length ? el("table", {}, el("tr", {}, ...["tour", "rôle", "étape", "statut", "résultat"].map((h) => el("th", {}, h))), ...steps)
+          : el("div", { class: "empty" }, "Pas de rejeu."),
+        el("h2", {}, "PoC pour le triager (sessions à remplacer)"),
+        el("div", { class: "row" }, el("button", { class: "btn", onclick: () => { navigator.clipboard.writeText(f.poc_triager || "").then(() => toast("PoC copiée"), () => toast("copie refusée")); } }, "Copier")),
+        el("pre", { style: "max-height:50vh" }, f.poc_triager || "(générée après la vérification)"));
+    }
     if (k === "poc") fill(pane, el("div", { class: "row" }, el("button", { class: "btn", onclick: () => { navigator.clipboard.writeText(f.poc || ""); toast("PoC copiée"); } }, "Copier la PoC")),
       el("pre", { style: "max-height:70vh" }, f.poc || "(vide)"));
     if (k === "proof") fill(pane, el("p", { class: "muted small" }, "Ce que l'agent déclare NE PAS avoir prouvé. À lire avant toute soumission."), el("pre", {}, f.not_proven || "(rien déclaré)"));
@@ -156,7 +170,7 @@ async function openFinding(id) {
       const act = (s) => el("button", { class: `btn ${s === "verified" || s === "submitted" ? "primary" : ""}`, onclick: async () => {
         await api(`/api/findings/${f.id}/status`, { status: s, verdict: v.value }); toast(`F${f.id} → ${s}`); openFinding(f.id); refresh(); } }, s);
       fill(pane, el("p", { class: "muted small" }, "Relis la PoC, rejoue-la, puis classe le finding."),
-        el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "duplicate", "rejected", "new"].map(act)));
+        el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "duplicate", "rejected", "new"].map(act)));
     }
   }
   fill(body, el("div", { class: "row" }, sev(f.severity), el("h3", { style: "margin:0" }, `F${f.id} · ${f.title}`)), sub, pane);

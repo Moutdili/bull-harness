@@ -32,8 +32,14 @@ _SCANNER = re.compile(
 )
 
 
+_ANY_TOOL = re.compile(r"(^|[\s;&|(/])(bh-(recon|crawl)|katana|subfinder|httpx-toolkit)(?=\s|$)")
+
+
 def rules_decision(cmd: str) -> str | None:
-    """Program rules the harness enforces in the sandbox: no automated scanner when the program forbids them."""
+    """Program rules the harness enforces in the sandbox: no automated scanner when the program forbids them,
+    and the verifier re-tests by hand only (no scanners, no mapping tools)."""
+    if c.is_verifier() and (_SCANNER.search(cmd) or _ANY_TOOL.search(cmd)):
+        return f"{c.RULES_MARK} the verifier re-tests with single requests (curl / bh-agent replay), no tools."
     if not c.scanners_allowed() and _SCANNER.search(cmd):
         return (
             f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
@@ -67,7 +73,7 @@ def pre_tool_use(ev: dict) -> dict | None:
     cmd = (ev.get("tool_input") or {}).get("command") or ""
     if ev.get("tool_name") != "Bash" or not cmd:
         return None
-    denial = rules_decision(cmd) or lock_decision(cmd)
+    denial = rules_decision(cmd) or (None if c.is_verifier() else lock_decision(cmd))
     d = c.bh_dir()
     c.append_jsonl(
         d / c.COMMANDS,

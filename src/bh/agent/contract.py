@@ -94,6 +94,11 @@ def gate() -> str:
     return os.environ.get("BH_GATE", "http://gate:8080")
 
 
+def is_verifier() -> bool:
+    """The independent verifier runs with BH_ROLE=verifier (set for its claude process, not by the agent)."""
+    return os.environ.get("BH_ROLE") == "verifier"
+
+
 def scanners_allowed() -> bool:
     """From the environment claude was started with (the agent's own shell exports do not reach the hooks)."""
     return os.environ.get("BH_SCANNERS", "1") != "0"

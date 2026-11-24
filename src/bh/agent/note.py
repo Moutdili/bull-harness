@@ -3,8 +3,9 @@
   bh-note fact "title" [-s summary] [-e evidence_path] [-k fact|recon|handoff|dead-end]
   bh-note intent "what I will try next"
   bh-note done I12 "outcome"
-  bh-note finding "title" --severity high --class idor --url URL --poc-file poc.sh \\
-          --summary "..." --not-proven "..."
+  bh-note finding "title" --severity high --class idor --url URL --proof proof.json \\
+          --summary "..." --not-proven "..." [--poc-file poc.sh]
+  bh-note verdict F12 confirmed|rejected|inconclusive "reason"     # verifier only
   bh-note todo auth|waf|account|scope-question|refusal|other "title" [-d detail]
   bh-note show 42          # full summary/evidence of fact 42
   bh-note frontier         # current board view (+ attack surface)
@@ -19,6 +20,7 @@ import sys
 from pathlib import Path
 
 from bh.agent import contract as c
+from bh.agent import proof
 
 FACT_KINDS = ["fact", "recon", "handoff", "dead-end"]
 
@@ -45,9 +47,14 @@ def parser() -> argparse.ArgumentParser:
     fi.add_argument("--severity", required=True, choices=c.SEVERITIES)
     fi.add_argument("--class", dest="vuln_class", required=True)
     fi.add_argument("--url", required=True)
-    fi.add_argument("--poc-file", required=True, help="script/curl that reproduces the issue")
+    fi.add_argument("--proof", required=True, help="proof.json: attack + control steps (see the doctrine)")
+    fi.add_argument("--poc-file", help="optional script; the harness generates the triager PoC from the proof")
     fi.add_argument("--summary", required=True)
     fi.add_argument("--not-proven", default="")
+    v = sub.add_parser("verdict")
+    v.add_argument("finding_id")
+    v.add_argument("verdict", choices=["confirmed", "rejected", "inconclusive"])
+    v.add_argument("reason")
     t = sub.add_parser("todo")
     t.add_argument("kind")
     t.add_argument("title")
@@ -73,9 +80,19 @@ def main(argv: list[str] | None = None) -> None:
         manual = {tuple(x) for x in c.read_json(d / c.MANUAL_TESTED, [])}
         print(board + ("\n" + s if (s := c.surface(d, also_tested=manual)) else ""))
         return
+    if a.op == "verdict" and not c.is_verifier():
+        sys.exit("bh-note verdict is reserved to the independent verifier")
+    if a.op != "verdict" and c.is_verifier():
+        sys.exit("the verifier only records verdicts")
     if a.op == "finding":
-        poc = Path(a.poc_file)
-        if not poc.is_file():
+        try:
+            proof_doc = json.loads(Path(a.proof).read_text())
+        except (OSError, ValueError) as exc:
+            sys.exit(f"cannot read the proof: {exc}")
+        if errors := proof.validate(proof_doc):
+            sys.exit("proof refused:\n  - " + "\n  - ".join(errors))
+        poc = Path(a.poc_file) if a.poc_file else None
+        if poc is not None and not poc.is_file():
             sys.exit(f"poc file not found: {poc}")
         _emit(
             {
@@ -84,8 +101,9 @@ def main(argv: list[str] | None = None) -> None:
                 "severity": a.severity,
                 "vuln_class": a.vuln_class,
                 "url": a.url,
-                "poc": poc.read_text()[:20000],
-                "evidence": str(poc.resolve()),
+                "poc": poc.read_text()[:20000] if poc else "",
+                "evidence": str(Path(a.proof).resolve()),
+                "proof": proof_doc,
                 "summary": a.summary,
                 "not_proven": a.not_proven,
             }

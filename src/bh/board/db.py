@@ -55,12 +55,16 @@ MIGRATIONS = (
     ("runs", "locked_calls", "INTEGER"),
     ("runs", "cache_write", "INTEGER"),
     ("runs", "cards", "TEXT"),  # method cards loaded for the segment, comma-separated
+    ("findings", "proof", "TEXT"),  # proof.json written by the agent (steps: setup / attack / control)
+    ("findings", "replay", "TEXT"),  # verifier stage A: deterministic replay result (JSON)
+    ("findings", "poc_triager", "TEXT"),  # PoC generated from the replayed proof, sessions as placeholders
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
 
-TODO_KINDS = {"auth", "waf", "account", "scope-question", "refusal", "submit", "quota", "other"}
-FINDING_STATUS = {"new", "verifying", "verified", "rejected", "submitted", "duplicate"}
+TODO_KINDS = {"auth", "waf", "account", "scope-question", "refusal", "submit", "verify", "quota", "other"}
+FINDING_STATUS = {"new", "verifying", "verified", "inconclusive", "rejected", "submitted", "duplicate"}
+FINDING_FIELDS = ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven", "proof")
 
 
 class Board:
@@ -161,8 +165,11 @@ class Board:
 
     # ---- findings
     def add_finding(self, program: str, title: str, run_id: int | None = None, **kw: Any) -> int:
-        allowed = {"severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven"}
-        data = {k: (str(v) if v is not None else None) for k, v in kw.items() if k in allowed}
+        data = {
+            k: (json.dumps(v) if isinstance(v, (dict, list)) else str(v) if v is not None else None)
+            for k, v in kw.items()
+            if k in FINDING_FIELDS
+        }
         cols = ["program", "run_id", "title", "created", *data]
         cur = self.db.execute(
             f"INSERT INTO findings({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -170,6 +177,12 @@ class Board:
         )
         self.db.commit()
         return int(cur.lastrowid)
+
+    def finding_set(self, fid: int, **fields: Any) -> None:
+        """Verifier outputs (replay, poc_triager). Status changes go through set_finding."""
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE findings SET {cols}, updated=? WHERE id=?", (*fields.values(), time.time(), fid))
+        self.db.commit()
 
     def set_finding(self, fid: int, status: str, verdict: str | None = None) -> None:
         if status not in FINDING_STATUS:

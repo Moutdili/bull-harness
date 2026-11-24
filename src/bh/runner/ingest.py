@@ -13,6 +13,8 @@ from pathlib import Path
 from bh import paths
 from bh.agent import contract as c
 from bh.board import Board
+from bh.board.db import FINDING_FIELDS
+from bh.classes import canonical
 from bh.scope import Scope
 
 AUTH_TODO_THRESHOLD = 3
@@ -75,10 +77,8 @@ def notes(
                     program,
                     n.get("title", ""),
                     run_id=run_id,
-                    **{
-                        k: n.get(k)
-                        for k in ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven")
-                    },
+                    **{k: n.get(k) for k in FINDING_FIELDS if k != "vuln_class"},
+                    vuln_class=canonical(n.get("vuln_class") or "unknown"),
                 )
                 if scope is not None and (excluded := scope.excludes(n.get("vuln_class"))):
                     # the program does not pay for this class: rejected by the harness, not by the model's judgment
