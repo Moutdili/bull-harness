@@ -15,6 +15,9 @@ check() {  # check "<name>" <expected: blocked|allowed> <command...>
 # 0/1 helpers: succeed only when the target really answered (not the gate)
 http_ok()   { local code; code=$(curl -s -o /tmp/esc.body -w '%{http_code}' -m 10 "$@"); [ "$code" != 000 ] && ! grep -q 'bh-gate: DENIED' /tmp/esc.body; }
 reaches()   { curl -s -o /dev/null -m 8 "$@"; }
+# succeeds unless the gate refused for exactly this reason: a refusal for another reason (e.g. an HTTPS
+# request judged on the pinned IP, "not in scope") must not count as the expected block
+not_refused_for() { local why=$1; shift; curl -s -o /tmp/esc.body -m 10 "$@"; ! grep -qF "$why" /tmp/esc.body; }
 
 check "direct egress without the proxy"            blocked reaches --noproxy '*' https://1.1.1.1
 check "out-of-scope host via the gate"             blocked reaches https://example.com/
@@ -23,8 +26,10 @@ check "Host header: passive dest, target Host"     blocked http_ok -H "Host: $LA
 check "Host header: target dest, passive Host"     blocked http_ok -H "Host: web.archive.org" "http://$LAB/"
 check "exotic method PURGE"                        blocked http_ok -X PURGE "http://$LAB/"
 check "DELETE without identity"                    blocked http_ok -X DELETE "http://$LAB/api/Feedbacks/999999"
-check "passive POST"                               blocked http_ok -X POST -d x https://web.archive.org/cdx
-check "passive server-side fetch /save"            blocked http_ok https://web.archive.org/save/https://example.com
+check "HTTPS by hostname (passive GET)"            allowed http_ok "https://web.archive.org/cdx/search/cdx?url=example.com&limit=1"
+check "passive POST (refused as a POST)"           blocked not_refused_for "POST not allowed" -X POST -d x https://web.archive.org/cdx
+check "passive /save (refused as a path)"          blocked not_refused_for "path not allowed" https://web.archive.org/save/https://example.com
+check "HTTPS tunnel with a foreign Host header"    blocked not_refused_for "different Host header" -H "Host: example.com" https://web.archive.org/
 check "removed passive host (raw.githubusercontent)" blocked http_ok https://raw.githubusercontent.com/
 check "Claude API direct (bypassing the relay)"    blocked reaches https://api.anthropic.com/v1/models
 check "Claude API on a non-443 port"               blocked reaches -p https://api.anthropic.com:22/

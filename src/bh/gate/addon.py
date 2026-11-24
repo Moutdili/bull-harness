@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from mitmproxy import ctx, http, tcp, udp
-from mitmproxy.net.http.url import parse_authority
+from mitmproxy.net.http.url import parse_authority, unparse
 from mitmproxy.proxy import mode_specs, server_hooks
 
 from bh import paths
@@ -162,7 +162,7 @@ class Gate:
             {
                 "kind": "blocked",
                 "where": where,
-                "url": flow.request.url,
+                "url": self._named(flow)[0],
                 "method": flow.request.method,
                 "reason": v.reason,
                 "rule": v.rule,
@@ -182,6 +182,22 @@ class Gate:
         if not server.address:
             return None, None
         return self._dest.get(server.id, server.address[0]), server.address[1]
+
+    def _named(self, flow: http.HTTPFlow) -> tuple[str, str]:
+        """(url, host) of a request under the hostname the client asked for. Inside a CONNECT tunnel
+        mitmproxy takes the request host from the server address, which server_connect pinned to the
+        vetted IP: map that IP back to the name it was vetted for. Every decision and log line uses this."""
+        if dest := flow.metadata.get("bh_dest"):
+            return dest
+        req, srv = flow.request, flow.server_conn
+        if req.method == "CONNECT":
+            return req.url, req.host
+        host = req.host
+        if srv is not None and srv.address and (req.host, req.port) == tuple(srv.address):
+            host = self._dest.get(srv.id, req.host)
+        dest = (unparse(req.scheme, host, req.port, req.path), host)
+        flow.metadata["bh_dest"] = dest
+        return dest
 
     @fail_closed
     def tcp_start(self, flow: tcp.TCPFlow) -> None:
@@ -262,9 +278,10 @@ class Gate:
         identity = req.headers.pop(IDENTITY_HEADER, None)
         flow.metadata["bh_identity"] = identity
         host_header = parse_authority(req.host_header, check=False)[0] if req.host_header else None
+        url, host = self._named(flow)
         v = self.policy.classify_request(
-            req.url,
-            req.host,
+            url,
+            host,
             req.method,
             host_header=host_header,
             identity=identity,
@@ -298,7 +315,7 @@ class Gate:
         try:
             ident = json.loads(path.read_text())
         except (OSError, ValueError):
-            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": flow.request.url})
+            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": self._named(flow)[0]})
             return
         injected = ident.get("headers") or {}
         for k, val in injected.items():
@@ -314,7 +331,8 @@ class Gate:
         fid = self._record(flow, flow.response.status_code)
         if flow.metadata.get("bh_class") != "target":
             return
-        req, resp = flow.request, flow.response
+        resp = flow.response
+        url, host = self._named(flow)
         body = resp.raw_content or b""
         server = resp.headers.get("server", "").lower()
         waf = resp.status_code in (403, *PUSHBACK_STATUS) and bool(
@@ -329,8 +347,8 @@ class Gate:
                 paths.EVENTS,
                 {
                     "kind": "waf",
-                    "host": req.host,
-                    "url": req.url,
+                    "host": host,
+                    "url": url,
                     "status": resp.status_code,
                     "server": server,
                     "flow": fid,
@@ -341,8 +359,8 @@ class Gate:
                 paths.EVENTS,
                 {
                     "kind": "auth",
-                    "host": req.host,
-                    "url": req.url,
+                    "host": host,
+                    "url": url,
                     "flow": fid,
                     "identity": flow.metadata.get("bh_identity"),
                 },
@@ -357,13 +375,14 @@ class Gate:
     def _record(self, flow: http.HTTPFlow, status, error: str | None = None) -> str:
         """One line in flows.jsonl (+ the full exchange for targets, identity values redacted)."""
         req, resp = flow.request, flow.response
+        url, host = self._named(flow)
         fid = f"{int(time.time())}-{secrets.token_hex(3)}-{next(self.seq)}"
         body = (resp.raw_content or b"") if resp is not None else b""
         rec = {
             "id": fid,
             "class": flow.metadata.get("bh_class"),
             "method": req.method,
-            "url": req.url,
+            "url": url,
             "status": status,
             "len": len(body),
             "ctype": resp.headers.get("content-type", "") if resp else "",
@@ -371,7 +390,7 @@ class Gate:
             "ua": flow.metadata.get("bh_ua", "")[:120],
             "identity": flow.metadata.get("bh_identity"),
         }
-        if req.host_header and parse_authority(req.host_header, check=False)[0] != req.host:
+        if req.host_header and parse_authority(req.host_header, check=False)[0] != host:
             rec["host_header"] = req.host_header
         if error:
             rec["error"] = error
