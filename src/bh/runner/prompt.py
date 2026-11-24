@@ -102,7 +102,7 @@ def build_system_prompt(scope: Scope, identities: list[str] | None = None) -> st
     return DOCTRINE + "\n" + scope_block(scope, identities) + "\n"
 
 
-def build_task(frontier: str, first: bool, max_turns: int | None = None) -> str:
+def build_task(frontier: str, first: bool, max_turns: int | None = None, cards: str = "") -> str:
     head = (
         "First session on this program. Map it with the arsenal first (recon, crawl, content, scan)."
         if first
@@ -115,4 +115,5 @@ def build_task(frontier: str, first: bool, max_turns: int | None = None) -> str:
         f"Work autonomously. {budget}A finding is not the end of the segment: record it, then take the next "
         "most promising lead (open intents first). Stop only when the budget is nearly spent or every lead "
         "is a recorded dead end; then write the HANDOFF fact and end with a 5-line summary."
+        + (f"\n\n{cards}" if cards else "")
     )

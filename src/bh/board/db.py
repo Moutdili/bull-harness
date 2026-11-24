@@ -54,6 +54,7 @@ MIGRATIONS = (
     ("runs", "manual_calls", "INTEGER"),
     ("runs", "locked_calls", "INTEGER"),
     ("runs", "cache_write", "INTEGER"),
+    ("runs", "cards", "TEXT"),  # method cards loaded for the segment, comma-separated
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
@@ -108,11 +109,13 @@ class Board:
         self.db.commit()
         return int(cur.lastrowid)
 
-    def run_end(self, run_id: int, **fields: Any) -> None:
-        fields.setdefault("ended", time.time())
+    def run_set(self, run_id: int, **fields: Any) -> None:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(f"UPDATE runs SET {cols} WHERE id=?", (*fields.values(), run_id))
         self.db.commit()
+
+    def run_end(self, run_id: int, **fields: Any) -> None:
+        self.run_set(run_id, ended=time.time(), **fields)
 
     def run_ids(self, program: str) -> set[int]:
         return {r["id"] for r in self.db.execute("SELECT id FROM runs WHERE program=?", (program,))}

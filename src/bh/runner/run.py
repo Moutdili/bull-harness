@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
 
-from bh import paths, stack
+from bh import classes, paths, stack
 from bh.agent import contract as c
 from bh.board import Board
 from bh.runner import ingest
@@ -185,6 +185,22 @@ def coverage_counts(board: Board, scope: Scope) -> tuple[int, int]:
     return c.surface_counts(
         paths.work_bh(scope.program), also_tested=manually_tested(board, scope.program), phases=phases_for(scope)
     )
+
+
+def pick_cards(board: Board, scope: Scope) -> list[str]:
+    """Method cards for this segment, from the attack surface the tools found (none before mapping)."""
+    endpoints = [
+        (e.get("key", ""), e.get("params") or []) for e in c.read_jsonl(paths.work_bh(scope.program) / c.ENDPOINTS)
+    ]
+    recent = [
+        cid
+        for r in board.rows(
+            "SELECT cards FROM runs WHERE program=? AND cards IS NOT NULL ORDER BY id DESC LIMIT 2", scope.program
+        )
+        for cid in (r["cards"] or "").split(",")
+        if cid
+    ]
+    return classes.select_cards(endpoints, exclude=scope.forbidden_vulns, recently_used=recent)
 
 
 def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
@@ -451,16 +467,20 @@ def _run_locked(
     clean_sandbox(prog, run_id)
     prepare_workdir(board, scope, scope_file)
     before = coverage_counts(board, scope)
-    task = build_task(frontier(board, prog, scope), first=first, max_turns=max_turns)
+    cards = pick_cards(board, scope)
+    task = build_task(frontier(board, prog, scope), first=first, max_turns=max_turns, cards=classes.cards_block(cards))
     if extra_task:
         task += "\n\nOperator instruction for this segment: " + extra_task
     log_path = paths.run_log(run_id, prog)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     res = SegmentResult(program=prog, run_id=run_id, session_id=session)
+    board.run_set(run_id, cards=",".join(cards) or None)
     say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     say(
         f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · "
-        f"max {max_turns} turns / {minutes:g} min" + (f" · resume {session[:8]}" if session else "")
+        f"max {max_turns} turns / {minutes:g} min"
+        + (f" · resume {session[:8]}" if session else "")
+        + (f" · cards {', '.join(cards)}" if cards else "")
     )
 
     deadline = time.monotonic() + minutes * 60

@@ -22,27 +22,13 @@ from bh.scope.normalize import DEFAULT_PORTS, norm_host, norm_path, parse_ip
 SCHEMA_VERSION = 1
 # Rate used when a program publishes none: conservative, the gate and the builtins both apply it.
 DEFAULT_RPS = 2.0
-# Vulnerability classes as programs name them in their exclusion lists -> one canonical name.
-VULN_ALIASES = {
-    "dos": ("denial-of-service", "ddos", "resource-exhaustion", "dos"),
-    "brute-force": ("bruteforce", "credential-stuffing", "password-spraying", "brute-force"),
-    "self-xss": ("self-xss",),
-    "clickjacking": ("ui-redressing", "clickjacking"),
-    "csrf-logout": ("logout-csrf", "csrf-logout"),
-    "missing-headers": ("missing-security-headers", "security-headers", "missing-headers"),
-    "rate-limiting": ("rate-limit", "missing-rate-limit", "no-rate-limit", "rate-limiting"),
-    "version-disclosure": ("banner-disclosure", "banner", "version-disclosure"),
-    "social-engineering": ("phishing", "social-engineering"),
-    "spam": ("spam", "email-flooding"),
-    "physical": ("physical",),
-}
-_ALIAS = {alias: canon for canon, aliases in VULN_ALIASES.items() for alias in aliases}
 
 
 def canonical_vuln(name: str) -> str:
-    """'Denial of Service' -> 'dos', 'Missing_Security headers' -> 'missing-headers'."""
-    key = "-".join(str(name).lower().replace("_", " ").replace("/", " ").split())
-    return _ALIAS.get(key, key)
+    """Canonical vulnerability class name (single definition in bh.classes)."""
+    from bh.classes import canonical
+
+    return canonical(name)
 
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
