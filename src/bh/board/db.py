@@ -219,8 +219,15 @@ class Board:
 
     def frontier(self, program: str, max_facts: int = 25) -> str:
         """Compact context for the agent: titles only, newest first. Target <= ~40 lines."""
+        # Bookkeeping facts repeat every segment (one HANDOFF, one "gate denied" per run): only the latest
+        # of each kind is worth resending; every other fact stays, newest first.
         facts = self.rows(
-            "SELECT id, kind, title FROM facts WHERE program=? ORDER BY id DESC LIMIT ?", program, max_facts
+            "SELECT id, kind, title FROM facts WHERE program=? AND (kind NOT IN ('handoff', 'blocked') OR id IN "
+            "(SELECT MAX(id) FROM facts WHERE program=? AND kind IN ('handoff', 'blocked') GROUP BY kind)) "
+            "ORDER BY id DESC LIMIT ?",
+            program,
+            program,
+            max_facts,
         )
         intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)

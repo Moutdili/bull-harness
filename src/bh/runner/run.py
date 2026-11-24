@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import IO
 
 from bh import classes, paths, stack
+from bh.assets import Graph
 from bh.agent import contract as c
 from bh.board import Board
 from bh.runner import ingest
@@ -43,13 +44,12 @@ AGENT_TOOLS = os.environ.get("BH_TOOLS", "Bash,Read")
 # (cheap: the context is still small), at most MAX_LEGS times, while less than EARLY_STOP of the
 # turn budget is used.
 MAX_LEGS, EARLY_STOP, MIN_LEFT_TURNS, MIN_LEFT_S = 3, 0.5, 5, 180
+MIN_LEG_TOOL_CALLS = 2  # a leg that barely used tools has run out of leads: nudging it again only costs tokens
 CONTINUE_PROMPT = (
     "Continue in this session: about {turns} turns and {minutes} minutes remain. Run `bh-note frontier`, "
     "take the next untested endpoint or open intent, test it, record the outcome, and keep going. "
     "Stop only when every lead on the board is a recorded dead end; then write the HANDOFF fact."
 )
-# User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
-MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
 
 
 @dataclass
@@ -158,33 +158,21 @@ def rotate_notes(program: str, run_id: int) -> Path:
     return paths.work_bh(program) / name
 
 
-def manually_tested(board: Board, program: str) -> set[tuple[str, str]]:
-    """(origin, family) of every request the agent made by hand during this program's runs, as seen
-    by the gate (the real URL, even when the command built it from shell variables)."""
-    runs = board.run_ids(program)
-    out = set()
-    for f in c.read_jsonl(paths.flows_log()):
-        by_hand = f.get("run") in runs and MANUAL_UA.match(f.get("ua") or "")
-        if by_hand and (k := c.endpoint_key(f.get("url", ""), f.get("method", "GET"))):
-            out.add((k[0], c.family(k[1])))
-    return out
-
-
 def phases_for(scope: Scope | None) -> tuple[str, ...]:
     """Tool-lock phases for this program: the light ones only when it forbids automated scanners."""
     return c.required_phases(scope is None or scope.scanners_allowed is not False)
 
 
 def frontier(board: Board, program: str, scope: Scope | None = None) -> str:
-    """Board view + attack surface found by the tools, with what was tested by hand."""
-    surface = c.surface(paths.work_bh(program), also_tested=manually_tested(board, program), phases=phases_for(scope))
+    """Board view + the attack surface from the asset graph (needs the scope: every host is checked)."""
+    if scope is None:
+        return board.frontier(program)
+    surface = Graph(board, scope).render(phases_for(scope))
     return board.frontier(program) + (f"\n{surface}" if surface else "")
 
 
 def coverage_counts(board: Board, scope: Scope) -> tuple[int, int]:
-    return c.surface_counts(
-        paths.work_bh(scope.program), also_tested=manually_tested(board, scope.program), phases=phases_for(scope)
-    )
+    return Graph(board, scope).counts(phases_for(scope))
 
 
 def pick_cards(board: Board, scope: Scope) -> list[str]:
@@ -211,7 +199,12 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
     cbh = c.sandbox_dir(prog)
     # bh-note frontier = this board view + the surface recomputed live in the sandbox
     stack.push_file(f"{cbh}/{c.FRONTIER}", board.frontier(prog))
-    stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(manually_tested(board, prog))))
+    tested = board.rows(
+        "SELECT a.key FROM assets a WHERE a.program=? AND a.kind='endpoint' "
+        "AND EXISTS (SELECT 1 FROM tests t WHERE t.asset_id=a.id)",
+        prog,
+    )
+    stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(r["key"].split(" ", 1) for r in tested)))
     stack.push_file(f"{cbh}/{c.FACTS}", (stage / c.FACTS).read_text())
     stack.push_file(f"{cbh}/{c.SYSTEM}", build_system_prompt(scope, paths.identities(prog)))
     stack.push_file(f"{cbh}/{c.SCOPE}", Path(scope_file).read_text())
@@ -410,6 +403,11 @@ def finish(
                 dedup=f"{prog}:refusal:{res.run_id}",
             )
         )
+    graph = Graph(board, scope)
+    graph.sync(res.run_id)
+    for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
+        graph.link(r["url"], "finding", r["id"])
+    board.db.commit()
     after = coverage_counts(board, scope)
     res.progress = res.new_findings + max(0, after[0] - before[0]) + max(0, after[1] - before[1])
     u = res.usage
@@ -484,6 +482,7 @@ def _run_locked(
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)
     run_id = board.run_start(prog, model)  # closes a run orphaned by a crash (we hold the lock)
     clean_sandbox(prog, run_id)
+    Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
     prepare_workdir(board, scope, scope_file)
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
@@ -509,6 +508,7 @@ def _run_locked(
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             while res.legs < MAX_LEGS:
                 res.legs += 1
+                calls_before = res.tool_calls
                 cmd = agent_command(
                     scope,
                     prompt,
@@ -529,6 +529,7 @@ def _run_locked(
                     or res.turns >= max_turns * EARLY_STOP
                     or left_turns < MIN_LEFT_TURNS
                     or left_s < MIN_LEFT_S
+                    or res.tool_calls - calls_before < MIN_LEG_TOOL_CALLS  # it says there is nothing left to do
                 ):
                     break
                 say(f"  ↻ stopped early ({res.turns}/{max_turns} turns): nudging the same session to continue")

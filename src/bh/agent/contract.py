@@ -288,16 +288,14 @@ def surface_counts(
     return len(eps) - len(untested), phases_done
 
 
-def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases: tuple[str, ...] | None = None) -> str:
-    """Frontier block: what the tools found and what nobody tested yet."""
-    eps, untested, cov = _surface_data(d, also_tested)
-    req = phases or required_phases()
+def format_surface(eps: dict, untested: list, cov: dict, phases: tuple[str, ...], limit: int = 12) -> str:
+    """The frontier block, shared by the live sandbox view and the host's asset graph (bh.assets)."""
     if not eps and not cov:
         return ""
     out = ["## attack surface (from your tools)"]
     for o, done in cov.items():
-        state = " ".join(f"{p}{_phase_mark(done.get(p))}" for p in req)
-        extra = " ".join(p for p in done if p not in req)
+        state = " ".join(f"{p}{_phase_mark(done.get(p))}" for p in phases)
+        extra = " ".join(p for p in done if p not in phases)
         out.append(f"- {o}: {state}" + (f" · also {extra}" if extra else ""))
     with_params = sum(1 for v in eps.values() if v["params"])
     out.append(
@@ -305,10 +303,16 @@ def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases:
         f"{len(untested)} untested. Next untested:"
     )
     for (o, key), v in untested[:limit]:
-        hint = "  → bh-sqli / bh-xss" if req == REQUIRED_PHASES else "  → test by hand, low rate"
+        hint = "  → bh-sqli / bh-xss" if phases == REQUIRED_PHASES else "  → test by hand, low rate"
         params = f" ?{','.join(sorted(v['params']))}{hint}" if v["params"] else ""
         out.append(f"  - {key}{params}  [{o}; {'+'.join(sorted(v['sources']))}]")
     return "\n".join(out)
+
+
+def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases: tuple[str, ...] | None = None) -> str:
+    """Live view from the sandbox files (bh-note frontier); the host renders the same block from its asset graph."""
+    eps, untested, cov = _surface_data(d, also_tested)
+    return format_surface(eps, untested, cov, phases or required_phases(), limit)
 
 
 # ------------------------------------------------------------------ command classification (metrics)

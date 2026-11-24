@@ -226,7 +226,9 @@ def verify_pending(
     """Verify the newest unverified findings of the program (bounded: each one costs a claude session)."""
     out: dict[str, int] = {}
     for r in board.rows(
-        "SELECT id FROM findings WHERE program=? AND status='new' AND proof IS NOT NULL ORDER BY id DESC LIMIT ?", scope.program, limit
+        "SELECT id FROM findings WHERE program=? AND status='new' AND proof IS NOT NULL ORDER BY id DESC LIMIT ?",
+        scope.program,
+        limit,
     ):
         status = verify_finding(board, scope, int(r["id"]), run_id=run_id, model=model, effort=effort, say=say)
         out[status] = out.get(status, 0) + 1

@@ -89,6 +89,20 @@ def cmd_scope_import(args) -> int:
     return 0
 
 
+def _scope_for(program: str):
+    """The scope file whose `program` is `program` (None if there is none)."""
+    from bh.scope import ScopeError, load_scope
+
+    for f in sorted(paths.scopes_dir().rglob("*.yaml")):
+        try:
+            s = load_scope(f)
+        except ScopeError:
+            continue
+        if s.program == program:
+            return s
+    return None
+
+
 def _researcher() -> dict[str, str]:
     """secrets/researcher.env: KEY=value lines (YWH alias e-mail, username). Never sent anywhere."""
     p = paths.secrets_dir() / "researcher.env"
@@ -287,7 +301,12 @@ def cmd_board(args) -> int:
     if args.what == "frontier":
         from bh.runner.run import frontier
 
-        print(frontier(b, args.program))
+        scope = _scope_for(args.program)
+        if scope is not None:
+            from bh.assets import Graph
+
+            Graph(b, scope).sync(None)
+        print(frontier(b, args.program, scope))
     elif args.what == "reset":
         return board_reset(b, args.program, args.yes)
     else:

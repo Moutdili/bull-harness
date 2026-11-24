@@ -49,46 +49,6 @@ def test_reset_program(tmp_path):
     assert b.meta_get("notes:p") == "" and len(b.rows("SELECT * FROM facts")) == 1
 
 
-def test_manual_requests_seen_by_the_gate_count_as_tested(tmp_path, monkeypatch):
-    from bh.agent import contract as c
-    from bh.runner.run import manually_tested
-
-    monkeypatch.setenv("BH_HOME", str(tmp_path))
-    b = Board(tmp_path / "b.sqlite")
-    rid = b.run_start("p", "m")
-    other = b.run_start("q", "m")
-    _write(
-        tmp_path / "var" / "state" / "flows.jsonl",
-        [
-            {"run": rid, "method": "GET", "url": "http://h/api/Users/12", "ua": "curl/8.10.1"},
-            {"run": rid, "method": "GET", "url": "http://h/api/Cards", "ua": "Fuzz Faster U Fool v2.3.0"},
-            {"run": other, "method": "GET", "url": "http://h/api/Feedbacks", "ua": "curl/8.10.1"},
-            {
-                "run": None,
-                "method": "GET",
-                "url": "http://h/api/Quantitys",
-                "ua": "curl/8.10.1",
-            },  # operator, between runs
-        ],
-    )
-    tested = manually_tested(b, "p")
-    assert tested == {("http://h:80", "GET /api/Users/{id}")}
-    d = tmp_path / "bh"
-    c.append_jsonl(
-        d / c.ENDPOINTS,
-        *[
-            {"origin": "http://h:80", "key": k, "params": p, "source": "js"}
-            for k, p in (("GET /api/Users/", []), ("GET /api/Cards", []), ("GET /s", ["q"]))
-        ],
-    )
-    s = c.surface(d, also_tested=tested)
-    assert "1 tested, 2 untested" in s and "GET /s ?q  → bh-sqli / bh-xss" in s
-    assert c.surface_counts(d, also_tested=tested) == (1, 0)
-    for phase in c.REQUIRED_PHASES:
-        c.record_phase(d, "http://h:80", phase, status="error rc=1" if phase == "scan" else "ok", count=0, raw="")
-    assert c.surface_counts(d, also_tested=tested) == (1, 2)  # a tool error is not coverage
-
-
 def test_legacy_cursor_is_honoured_once(tmp_path):
     b = Board(tmp_path / "b.sqlite")
     f = tmp_path / "notes-9.jsonl"
