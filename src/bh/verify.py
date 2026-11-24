@@ -117,13 +117,22 @@ def stage_b(
         bh_dir=vdir,
         extra_env={"BH_ROLE": "verifier", "HOME": runner.sandbox_home(f"{run_id}-F{fid}"), "BH_VERDICT_NONCE": nonce},
         user=stack.JUDGE,
+        # live sessions only: a stale one answers 401 and would read as "not reproduced"
+        identities=runner.live_identities(board, prog, also=[i["name"] for i in scope.identities]),
     )
     log_path = paths.runs_dir() / f"{run_id:05d}-{prog}-verify-F{fid}-{int(time.time())}.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     res = runner.SegmentResult(program=prog, run_id=run_id)
     with open(log_path, "x", buffering=1) as log:
         result, timed_out = runner.run_leg(
-            cmd, log, log_path.with_suffix(".stderr"), res, say, prog, VERIFIER_MINUTES * 60, bh_dir=vdir
+            cmd,
+            log,
+            log_path.with_suffix(".stderr"),
+            res,
+            say,
+            program=prog,
+            timeout_s=VERIFIER_MINUTES * 60,
+            bh_dir=vdir,
         )
     runner.merge_result(res, result)
     board.db.execute("UPDATE runs SET verify_cost=COALESCE(verify_cost, 0) + ? WHERE id=?", (res.cost_usd, run_id))

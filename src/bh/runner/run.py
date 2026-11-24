@@ -483,6 +483,7 @@ def run_leg(
     err_path: Path,
     res: SegmentResult,
     say,
+    *,
     program: str,
     timeout_s: float,
     bh_dir: str | None = None,
@@ -727,7 +728,13 @@ def _run_locked(
                     identities=identities,
                 )
                 result, timed_out = run_leg(
-                    cmd, log, log_path.with_suffix(".stderr"), res, say, prog, deadline - time.monotonic()
+                    cmd,
+                    log,
+                    log_path.with_suffix(".stderr"),
+                    res,
+                    say,
+                    program=prog,
+                    timeout_s=deadline - time.monotonic(),
                 )
                 merge_result(res, result)
                 left_turns, left_s = max_turns - res.turns, deadline - time.monotonic()
