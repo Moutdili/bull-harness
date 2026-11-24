@@ -5,8 +5,9 @@ Conversion never widens the program's scope:
 - domains, URLs, `*.wildcards` and IPs/CIDRs map 1:1; `(a|b)` alternations expand to exact rules;
 - a trailing `/*` becomes a URL path prefix;
 - anything that cannot be expressed exactly (a `*` inside a path or a label, boolean expressions,
-  free text, mobile apps) is NOT turned into a wider rule: it is kept as an informational `other`
-  rule and listed for the human;
+  free text, a name without a dot, mobile apps, `other` assets, paths on shared platforms such as
+  github.com or apps.apple.com) is NOT turned into a wider rule: it is kept as an informational
+  `other` rule and listed for the human;
 - hosts and URLs quoted in the free-text out-of-scope list become out-of-scope rules (excluding
   more is the safe direction);
 - non-qualifying vulnerabilities become `forbidden_vulns` (findings of those classes are rejected);
@@ -26,7 +27,24 @@ from typing import Any
 from bh.scope.model import ScopeError, parse_rule
 
 API = "https://api.yeswehack.com/programs/{slug}"
-WEB_TYPES = {"web-application", "api", "ip-address", "wildcard", "other"}
+WEB_TYPES = {"web-application", "api", "ip-address", "wildcard"}  # "other" is free text: the human translates it
+# hosts shared by everyone: a program's path on them (its repo, its app page) is not the program's server
+SHARED_PLATFORMS = (
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "githubusercontent.com",
+    "apps.apple.com",
+    "itunes.apple.com",
+    "play.google.com",
+    "chrome.google.com",
+    "chromewebstore.google.com",
+    "addons.mozilla.org",
+    "npmjs.com",
+    "pypi.org",
+    "hub.docker.com",
+    "marketplace.visualstudio.com",
+)
 _ALTERNATION = re.compile(r"\(([^()]+\|[^()]+)\)")
 _URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>),]+", re.I)
 _HOST_IN_TEXT = re.compile(r"(?<![\w@/.-])((?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})(?![\w-])", re.I)
@@ -67,8 +85,8 @@ def _expand(value: str) -> list[str]:
 
 def _web_rule(value: str) -> str | None:
     """Exact rule text for one in-scope value, or None if it cannot be expressed without widening."""
-    v = re.sub(r"\s+", "", value)
-    if not v:
+    v = re.sub(r"^\*\.\s+", "*.", value.strip())  # "*. vfsevisa.id": a typo, not free text
+    if not v or re.search(r"\s", v):  # free text ("a.com b.org" would glue into a.comb.org)
         return None
     if "://" not in v and "/" in v:  # host/path without scheme
         v = "https://" + v
@@ -78,12 +96,21 @@ def _web_rule(value: str) -> str | None:
         path = "/" + path
         if path.endswith("/*"):
             path = path[:-1]
-        if "*" in path or "*" in host.lstrip("*."):
+        if "*" in path or "*" in host.lstrip("*.") or not _own_host(host):
             return None
         return f"{scheme}://{host}{path}"
     if "*" in v and not (v.startswith("*.") and "*" not in v[2:]):
         return None
-    return v
+    return v if _own_host(v) else None
+
+
+def _own_host(host: str) -> bool:
+    """A name the program can own: dotted (a single label resolves through the gate's search domains),
+    not a shared platform. IPs and CIDRs pass."""
+    name = host.lower().lstrip("*.").split(":")[0].strip("[]").rstrip(".")
+    if re.fullmatch(r"[\d.]+(/\d+)?|[0-9a-f:]+(/\d+)?", name):
+        return True
+    return "." in name and not any(name == p or name.endswith("." + p) for p in SHARED_PLATFORMS)
 
 
 def _check(rule: str) -> bool:
@@ -129,6 +156,8 @@ def convert(program: dict, username: str | None) -> Imported:
             if rules and all(_web_rule(v) for v in _expand(value)):
                 in_scope += [{"value": r, "note": note} for r in rules]
                 continue
+            imp.skipped.append(value)
+        elif stype == "other":  # free text: often a web asset, shown to the human, never enforced
             imp.skipped.append(value)
         in_scope.append({"type": "other", "value": value, "note": note + " (not enforceable as written)"})
     if not any(isinstance(r, dict) and r.get("type") != "other" for r in in_scope):
