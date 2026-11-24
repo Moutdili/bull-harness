@@ -14,6 +14,7 @@ resolves to them (DNS rebinding / internal pivot protection).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from bh.scope.model import Rule, RuleType, Scope
@@ -33,6 +34,11 @@ class Decision:
 def _host_matches(pattern: str, host: str) -> bool:
     if pattern.startswith("*."):
         return host.endswith("." + pattern[2:])
+    if "*" in pattern:  # `api-*.example.com`: one label, same parent, '*' = one or more label characters
+        label, _, rest = pattern.partition(".")
+        h_label, _, h_rest = host.partition(".")
+        head, _, tail = label.partition("*")
+        return h_rest == rest and re.fullmatch(re.escape(head) + "[a-z0-9-]+" + re.escape(tail), h_label) is not None
     return host == pattern
 
 
@@ -53,7 +59,7 @@ def _match(rule: Rule, t: Target, *, out: bool) -> bool:
         case RuleType.DOMAIN | RuleType.WILDCARD:
             if t.host is None:
                 return False
-            pattern = rule.host if rule.type is RuleType.DOMAIN else "*." + rule.host
+            pattern = rule.host if rule.type is RuleType.DOMAIN or "*" in rule.host else "*." + rule.host
             return _host_matches(pattern, t.host)
         case RuleType.CIDR:
             return t.ip is not None and t.ip in rule.network

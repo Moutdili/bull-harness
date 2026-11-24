@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -19,6 +20,7 @@ import yaml
 
 from bh.agent.contract import DEFAULT_RPS  # one default rate for the scope, the gate and the sandbox
 from bh.scope.normalize import DEFAULT_PORTS, norm_host, norm_path, parse_ip
+from bh.scope.psl import is_public_suffix
 
 SCHEMA_VERSION = 1
 
@@ -51,7 +53,7 @@ class Rule:
     type: RuleType
     value: str
     note: str = ""
-    host: str | None = None  # DOMAIN host, WILDCARD base, URL host (may start with "*.")
+    host: str | None = None  # DOMAIN host, WILDCARD base (or `api-*.base` pattern), URL host (may hold a '*')
     network: Network | None = None
     scheme: str | None = None
     port: int | None = None
@@ -123,16 +125,37 @@ _RULE_KEYS = {"type", "value", "note"}
 def _infer_type(value: str) -> RuleType:
     if "://" in value:
         return RuleType.URL
-    if value.startswith("*."):
+    if value.startswith("*.") or ("*" in value and "/" not in value):
         return RuleType.WILDCARD
     if "/" in value or parse_ip(value) is not None:
         return RuleType.CIDR
     return RuleType.DOMAIN
 
 
+_MID_LABEL = re.compile(r"[a-z0-9-]*\*[a-z0-9-]*")
+
+
 def _check_wildcard_shape(value: str, ctx: str) -> None:
-    if "*" in value and not (value.startswith("*.") and "*" not in value[2:]):
-        raise ScopeError(f"{ctx}: unsupported wildcard {value!r} (only leading '*.' is allowed)")
+    """Two shapes: a leading `*.` (`*.example.com`), or one `*` inside the first label (`api-*.example.com`)."""
+    if "*" not in value or (value.startswith("*.") and "*" not in value[2:]):
+        return
+    label, _, rest = value.partition(".")
+    if value.count("*") == 1 and rest and label != "*" and _MID_LABEL.fullmatch(label.lower()):
+        return
+    raise ScopeError(
+        f"{ctx}: unsupported wildcard {value!r} (a leading '*.' or one '*' inside the first label, as in 'api-*.x.com')"
+    )
+
+
+def _wild_host(value: str, ctx: str) -> str:
+    """Normalized host of a wildcard: the base for `*.base`, the whole pattern for `api-*.base`.
+    The base must be a name someone owns, never a public suffix (`*.co.uk`, `*.github.io`, `api-*.co.uk`)."""
+    _check_wildcard_shape(value, ctx)
+    label, _, rest = value.partition(".")
+    base = norm_host(rest)
+    if is_public_suffix(base):
+        raise ScopeError(f"{ctx}: wildcard {value!r} would cover the public suffix {base!r}")
+    return base if label == "*" else f"{label.lower()}.{base}"
 
 
 def parse_rule(entry: Any, ctx: str) -> Rule:
@@ -163,10 +186,9 @@ def parse_rule(entry: Any, ctx: str) -> Rule:
                     raise ScopeError(f"{ctx}: {value!r} is a wildcard, use type 'wildcard'")
                 return Rule(rtype, value, note, host=norm_host(value))
             case RuleType.WILDCARD:
-                _check_wildcard_shape(value, ctx)
-                if not value.startswith("*."):
-                    raise ScopeError(f"{ctx}: wildcard must start with '*.'")
-                return Rule(rtype, value, note, host=norm_host(value[2:]))
+                if "*" not in value:
+                    raise ScopeError(f"{ctx}: wildcard {value!r} has no '*'")
+                return Rule(rtype, value, note, host=_wild_host(value, ctx))
             case RuleType.CIDR:
                 try:
                     net = ipaddress.ip_network(value, strict=False)
@@ -214,7 +236,11 @@ def _parse_url_rule(value: str, note: str, ctx: str) -> Rule:
     ip = parse_ip(host_s)
     if ip is not None:
         raise ScopeError(f"{ctx}: URL rules need a hostname; use a 'cidr' rule for {host_s}")
-    host = "*." + norm_host(host_s[2:]) if host_s.startswith("*.") else norm_host(host_s)
+    if "*" in host_s:
+        wild = _wild_host(host_s, ctx)
+        host = "*." + wild if host_s.startswith("*.") else wild
+    else:
+        host = norm_host(host_s)
     normalized, _ = norm_path(path)
     return Rule(
         RuleType.URL, value, note, host=host, scheme=scheme, port=port or DEFAULT_PORTS[scheme], path=normalized

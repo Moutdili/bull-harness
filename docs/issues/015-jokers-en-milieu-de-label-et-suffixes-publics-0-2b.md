@@ -2,7 +2,7 @@
 id: 15
 title: "Jokers en milieu de label et suffixes publics (0.2b)"
 labels: [P1, area:scope, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Jokers en milieu de label et suffixes publics (0.2b)
