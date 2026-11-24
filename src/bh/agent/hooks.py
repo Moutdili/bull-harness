@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -25,6 +26,22 @@ HEAD, TAIL = 30, 12
 
 
 # ------------------------------------------------------------------ PreToolUse
+_SCANNER = re.compile(
+    r"(^|[\s;&|(/])(bh-(content|scan|params|sqli|xss)|nuclei|sqlmap|ffuf|feroxbuster|gobuster|dirsearch|nikto|"
+    r"wpscan|dalfox|arjun|commix|wfuzz|katana -d [4-9])(?=\s|$)"
+)
+
+
+def rules_decision(cmd: str) -> str | None:
+    """Program rules the harness enforces in the sandbox: no automated scanner when the program forbids them."""
+    if not c.scanners_allowed() and _SCANNER.search(cmd):
+        return (
+            f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
+            "hand-made requests at a low rate; do not try another scanner."
+        )
+    return None
+
+
 def lock_decision(cmd: str) -> str | None:
     """Denial message if `cmd` hand-crafts HTTP to an origin the tools have not covered yet."""
     if not c.uses_manual_http(cmd):
@@ -50,7 +67,7 @@ def pre_tool_use(ev: dict) -> dict | None:
     cmd = (ev.get("tool_input") or {}).get("command") or ""
     if ev.get("tool_name") != "Bash" or not cmd:
         return None
-    denial = lock_decision(cmd)
+    denial = rules_decision(cmd) or lock_decision(cmd)
     d = c.bh_dir()
     c.append_jsonl(
         d / c.COMMANDS,

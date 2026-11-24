@@ -86,6 +86,7 @@ class Scope:
     required_headers: dict[str, str] = field(default_factory=dict)
     user_agent: str | None = None
     automation_allowed: bool | None = None  # None = unknown -> todo humaine
+    scanners_allowed: bool | None = None  # False = program forbids automated scanners (ffuf, nuclei, sqlmap...)
     forbidden_vulns: tuple[str, ...] = ()
     identities: tuple[dict[str, str], ...] = ()  # {name, secret_ref}; never the secret
     source: str | None = None
@@ -108,6 +109,7 @@ class Scope:
 
 _TOP_KEYS = {
     "schema",
+    "scanners_allowed",
     "program",
     "platform",
     "in_scope",
@@ -260,6 +262,9 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     auto = doc.get("automation_allowed")
     if auto is not None and not isinstance(auto, bool):
         raise ScopeError(f"{origin}: 'automation_allowed' must be true, false or null")
+    scanners = doc.get("scanners_allowed")
+    if scanners is not None and not isinstance(scanners, bool):
+        raise ScopeError(f"{origin}: 'scanners_allowed' must be true, false or null")
     identities = doc.get("identities") or []
     for i, ident in enumerate(identities):
         if not isinstance(ident, dict) or set(ident) - {"name", "secret_ref"} or "name" not in ident:
@@ -274,6 +279,7 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         required_headers={str(k): v for k, v in headers.items()},
         user_agent=doc.get("user_agent"),
         automation_allowed=auto,
+        scanners_allowed=scanners,
         forbidden_vulns=tuple(doc.get("forbidden_vulns") or ()),
         identities=tuple(identities),
         source=doc.get("source"),
