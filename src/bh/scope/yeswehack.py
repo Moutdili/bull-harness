@@ -1,0 +1,226 @@
+"""Import a public YesWeHack program into a scope file (TODO H5, public programs only).
+
+Source: the public program API (`GET https://api.yeswehack.com/programs/<slug>`, no authentication).
+Conversion never widens the program's scope:
+- domains, URLs, `*.wildcards` and IPs/CIDRs map 1:1; `(a|b)` alternations expand to exact rules;
+- a trailing `/*` becomes a URL path prefix;
+- anything that cannot be expressed exactly (a `*` inside a path or a label, boolean expressions,
+  free text, a name without a dot, mobile apps, `other` assets, paths on shared platforms such as
+  github.com or apps.apple.com) is NOT turned into a wider rule: it is kept as an informational
+  `other` rule and listed for the human;
+- hosts and URLs quoted in the free-text out-of-scope list become out-of-scope rules (excluding
+  more is the safe direction);
+- non-qualifying vulnerabilities become `forbidden_vulns` (findings of those classes are rejected);
+- `automation_allowed` stays null: a human reads the rules and decides (the runner refuses until then).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import urllib.request
+from dataclasses import dataclass, field
+from itertools import product
+from typing import Any
+
+from bh.scope.model import ScopeError, parse_rule
+
+API = "https://api.yeswehack.com/programs/{slug}"
+WEB_TYPES = {"web-application", "api", "ip-address", "wildcard"}  # "other" is free text: the human translates it
+# hosts shared by everyone: a program's path on them (its repo, its app page) is not the program's server
+SHARED_PLATFORMS = (
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "githubusercontent.com",
+    "apps.apple.com",
+    "itunes.apple.com",
+    "play.google.com",
+    "chrome.google.com",
+    "chromewebstore.google.com",
+    "addons.mozilla.org",
+    "npmjs.com",
+    "pypi.org",
+    "hub.docker.com",
+    "marketplace.visualstudio.com",
+)
+_ALTERNATION = re.compile(r"\(([^()]+\|[^()]+)\)")
+_URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>),]+", re.I)
+_HOST_IN_TEXT = re.compile(r"(?<![\w@/.-])((?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})(?![\w-])", re.I)
+_PLACEHOLDER = re.compile(r"(:[a-z_]+:?|\{[^}]*\}|<[^>]*>|\bXX\b|\*)", re.I)
+_RATE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:requests?|reqs?|queries)\s*(?:/|per)\s*(second|sec|s|minute|min)\b", re.I)
+_NO_SCANNERS = re.compile(
+    r"(do not|don't|never|no|not (?:be )?allowed|prohibited|forbidden)[^.\n]{0,60}"
+    r"(automated|automatic|automation)\s+(scanner|scanning|scan|tool)",
+    re.I,
+)
+_RULE_HINTS = re.compile(r"(automat|scanner|scanning|\btool|rate|requests? per|header|user[- ]agent|vpn|brute)", re.I)
+
+
+@dataclass
+class Imported:
+    doc: dict[str, Any]
+    skipped: list[str] = field(default_factory=list)  # in-scope entries the human must translate by hand
+    excluded_from_text: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)  # text exclusions that would remove a listed asset
+    rule_excerpts: list[str] = field(default_factory=list)
+
+
+def fetch(slug: str) -> dict:
+    if not re.fullmatch(r"[a-z0-9-]{3,120}", slug):
+        raise ScopeError(f"bad program slug {slug!r}")
+    req = urllib.request.Request(
+        API.format(slug=slug), headers={"User-Agent": "bull-harness", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def _expand(value: str) -> list[str]:
+    """`*.doctolib.(fr|de)` -> [`*.doctolib.fr`, `*.doctolib.de`]."""
+    parts = _ALTERNATION.split(value)
+    choices = [p.split("|") if i % 2 else [p] for i, p in enumerate(parts)]
+    return ["".join(c).strip() for c in product(*choices)]
+
+
+def _web_rule(value: str) -> str | None:
+    """Exact rule text for one in-scope value, or None if it cannot be expressed without widening."""
+    v = re.sub(r"^\*\.\s+", "*.", value.strip())  # "*. vfsevisa.id": a typo, not free text
+    if not v or re.search(r"\s", v):  # free text ("a.com b.org" would glue into a.comb.org)
+        return None
+    if "://" not in v and "/" in v:  # host/path without scheme
+        v = "https://" + v
+    if "://" in v:
+        scheme, rest = v.split("://", 1)
+        host, _, path = rest.partition("/")
+        path = "/" + path
+        if path.endswith("/*"):
+            path = path[:-1]
+        if "*" in path or "*" in host.lstrip("*.") or not _own_host(host):
+            return None
+        return f"{scheme}://{host}{path}"
+    if "*" in v and not (v.startswith("*.") and "*" not in v[2:]):
+        return None
+    return v if _own_host(v) else None
+
+
+def _own_host(host: str) -> bool:
+    """A name the program can own: dotted (a single label resolves through the gate's search domains),
+    not a shared platform. IPs and CIDRs pass."""
+    name = host.lower().lstrip("*.").split(":")[0].strip("[]").rstrip(".")
+    if re.fullmatch(r"[\d.]+(/\d+)?|[0-9a-f:]+(/\d+)?", name):
+        return True
+    if not re.fullmatch(r"[a-z0-9.-]+", name):  # "edge.blablacar.fr)" from a broken alternation
+        return False
+    return "." in name and not any(name == p or name.endswith("." + p) for p in SHARED_PLATFORMS)
+
+
+def _check(rule: str) -> bool:
+    try:
+        parse_rule(rule, "ywh")
+    except ScopeError:
+        return False
+    return True
+
+
+def _exclusions(texts: list[str]) -> list[str]:
+    out: list[str] = []
+    for text in texts:
+        for url in _URL_IN_TEXT.findall(text):
+            cut = _PLACEHOLDER.split(url, maxsplit=1)[0]  # stop at :folder:, {id}, XX, *
+            if cut.count("/") >= 3 and _check(cut):
+                out.append(cut)
+        for host in _HOST_IN_TEXT.findall(_URL_IN_TEXT.sub(" ", text)):
+            templated = re.search(r"(^|[.-])x{2,}([.-]|$)", host, re.I)  # ov-XX.example.ch: not a real host
+            file_like = re.search(r"\.(png|jpe?g|pdf|html?|php|js|pub|txt|zip)$", host, re.I)
+            if not templated and not file_like and _check(host):
+                out.append(host.lower())
+    return sorted(set(out))
+
+
+def _without_listed_assets(exclusions: list[str], in_scope: list) -> tuple[list[str], list[str]]:
+    """Exclusions picked from free text that would remove an asset the program LISTS in scope ("www.otto.de" cited in
+    a sentence about one of its paths, "*.dana.id" over a listed "m.dana.id") are not applied: they go to the human.
+    Excluding more stays the safe direction for everything else."""
+    from bh.scope import check, scope_from_dict
+
+    listed = []
+    for r in in_scope:
+        if isinstance(r, dict) and r.get("type") != "other":
+            v = r["value"]
+            listed.append(v if "://" in v else ("https://" + v.removeprefix("*.")))
+    keep, conflicts = [], []
+    for ex in exclusions:
+        probe = scope_from_dict({"schema": 1, "program": "probe", "platform": "local", "in_scope": [ex]}, origin="ywh")
+        hits = [v for v in listed if check(probe, v).allowed]
+        (conflicts if hits else keep).append(f"{ex} (covers {', '.join(hits[:3])})" if hits else ex)
+    return keep, conflicts
+
+
+def _max_rps(rules: str) -> float | None:
+    rates = []
+    for num, unit in _RATE.findall(rules or ""):
+        n = float(num.replace(",", "."))
+        rates.append(n / 60 if unit.lower().startswith("min") else n)
+    return min(rates) if rates else None
+
+
+def convert(program: dict, username: str | None) -> Imported:
+    slug = program.get("slug") or program.get("pid") or "program"
+    imp = Imported(doc={})
+    in_scope: list[Any] = []
+    for sc in program.get("scopes") or []:
+        value, stype = str(sc.get("scope", "")), sc.get("scope_type", "")
+        note = f"{sc.get('scope_type_name') or stype}, asset value {sc.get('asset_value') or '?'}"
+        if stype in WEB_TYPES:
+            rules = [r for v in _expand(value) if (r := _web_rule(v)) and _check(r)]
+            if rules and all(_web_rule(v) for v in _expand(value)):
+                in_scope += [{"value": r, "note": note} for r in rules]
+                continue
+            imp.skipped.append(value)
+        elif stype == "other":  # free text: often a web asset, shown to the human, never enforced
+            imp.skipped.append(value)
+        in_scope.append({"type": "other", "value": value, "note": note + " (not enforceable as written)"})
+    if not any(isinstance(r, dict) and r.get("type") != "other" for r in in_scope):
+        raise ScopeError(f"{slug}: no in-scope web asset can be expressed exactly; write the scope by hand")
+
+    oos_text = [str(x) for x in program.get("out_of_scope") or []]
+    imp.excluded_from_text, imp.conflicts = _without_listed_assets(_exclusions(oos_text), in_scope)
+    ua = program.get("user_agent") or None
+    if ua and "<" in ua:
+        if not username:
+            raise ScopeError(f"{slug}: the program requires User-Agent {ua!r}; pass --username <your YWH username>")
+        ua = re.sub(r"<[^>]*>", username, ua)
+    rules_md = program.get("rules") or ""
+    imp.rule_excerpts = [ln.strip() for ln in rules_md.splitlines() if _RULE_HINTS.search(ln)][:25]
+    notes = [
+        f"https://yeswehack.com/programs/{slug}",
+        f"VPN required: {bool(program.get('vpn_active'))}",
+        "Accounts: " + re.sub(r"\s+", " ", program.get("account_access") or "not specified")[:400],
+        "Out of scope (program text): " + " | ".join(oos_text)[:1500],
+    ]
+    if imp.conflicts:
+        notes.append(
+            "Out-of-scope text names LISTED in-scope assets, NOT applied (read it): " + " | ".join(imp.conflicts)
+        )
+    if imp.skipped:
+        notes.append("In-scope entries NOT enforced (translate by hand if needed): " + " | ".join(imp.skipped))
+    imp.doc = {
+        "schema": 1,
+        "program": f"ywh-{slug}"[:80],
+        "platform": "yeswehack",
+        "source": API.format(slug=slug),
+        "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "automation_allowed": None,
+        "scanners_allowed": False if _NO_SCANNERS.search(rules_md) else None,
+        "max_rps": _max_rps(rules_md),
+        "user_agent": ua,
+        "required_headers": {},
+        "in_scope": in_scope,
+        "out_of_scope": imp.excluded_from_text,
+        "forbidden_vulns": [str(v) for v in program.get("non_qualifying_vulnerability") or []],
+        "identities": [],
+        "notes": "\n".join(notes),
+    }
+    return imp

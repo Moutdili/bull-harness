@@ -1,0 +1,38 @@
+# bull-harness agent sandbox — Kali rolling + headless metapackage + web bug bounty arsenal.
+# Network at RUNTIME is confined by the gate (sandbox network is internal); the build itself has normal network.
+FROM docker.io/kalilinux/kali-rolling:latest
+
+ARG CLAUDE_CODE_VERSION=2.1.330
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+
+# 1. Kali headless metapackage (the "default" CLI toolset).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends kali-linux-headless \
+ && rm -rf /var/lib/apt/lists/*
+
+# 2. Web bug bounty arsenal. Packages missing from the Kali repo are logged, not fatal:
+#    /opt/bh/missing-packages.txt is checked by check.sh.
+COPY packages.txt /opt/bh/packages.txt
+RUN mkdir -p /opt/bh && apt-get update \
+ && avail="" && for p in $(grep -vE '^\s*(#|$)' /opt/bh/packages.txt); do \
+      if apt-cache show "$p" >/dev/null 2>&1; then avail="$avail $p"; else echo "$p" >> /opt/bh/missing-packages.txt; fi; \
+    done \
+ && apt-get install -y --no-install-recommends $avail \
+ && rm -rf /var/lib/apt/lists/* \
+ && touch /opt/bh/missing-packages.txt
+
+# 3. Claude Code CLI (pinned to the host version).
+RUN npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
+
+# 4. Python tools not packaged by Kali.
+RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install semgrep
+
+# 5. Unprivileged hunter user (claude refuses bypassPermissions as root).
+RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work
+COPY entrypoint.sh check.sh /opt/bh/
+RUN chmod 755 /opt/bh/entrypoint.sh /opt/bh/check.sh
+ENV PATH="/opt/bh/bin:${PATH}"
+
+WORKDIR /work
+ENTRYPOINT ["/opt/bh/entrypoint.sh"]
+CMD ["sleep", "infinity"]
