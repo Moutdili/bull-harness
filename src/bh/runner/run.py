@@ -251,9 +251,10 @@ def agent_command(
     session: str | None,
     bh_dir: str | None = None,
     extra_env: dict[str, str] | None = None,
+    user: str = "hunter",
 ) -> list[str]:
-    """claude -p inside the agent for this program. `bh_dir`/`extra_env` let the verifier reuse it with its own
-    work dir and role."""
+    """claude -p inside the agent for this program. `bh_dir`/`extra_env`/`user` let the verifier reuse it with
+    its own work dir, role and Unix user."""
     prog = scope.program
     bh = bh_dir or c.sandbox_dir(prog)
     env = {
@@ -270,7 +271,7 @@ def agent_command(
         "exec",
         "-i",
         "--user",
-        "hunter",
+        user,
         "-w",
         f"{c.WORK_ROOT}/{prog}",
         *[x for k, v in env.items() for x in ("-e", f"{k}={v}")],

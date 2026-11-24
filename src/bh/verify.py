@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import time
@@ -69,9 +70,9 @@ def duplicate_of(board: Board, finding: dict) -> int | None:
 def stage_a(program: str, fid: int, proof: dict) -> dict:
     """Deterministic replay inside the agent container (so it goes through the gate like the hunter did)."""
     path = f"{verify_dir(program, fid)}/proof.json"
-    stack.push_file(path, json.dumps(proof))
+    stack.push_file(path, json.dumps(proof), user=stack.JUDGE)
     try:
-        r = stack.agent_sh('/opt/bh/bin/bh-agent replay "$1"', path, timeout=REPLAY_TIMEOUT_S)
+        r = stack.agent_sh('/opt/bh/bin/bh-agent replay "$1"', path, user=stack.JUDGE, timeout=REPLAY_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return {"reproduced": False, "control_disproves": False, "error": f"replay over {REPLAY_TIMEOUT_S}s"}
     try:
@@ -89,7 +90,9 @@ def stage_b(
     stack.push_file(
         f"{vdir}/{c.SYSTEM}",
         prompts.build_verifier_prompt(scope, finding, replay, classes.evidence(finding["vuln_class"])),
+        user=stack.JUDGE,
     )
+    nonce = secrets.token_hex(16)  # only this claude process gets it: a verdict without it was not written by it
     task = (
         f"Verify finding F{fid}. The proof is at {vdir}/proof.json. Re-test it, then record exactly one "
         f"`bh-note verdict F{fid} ...`."
@@ -103,9 +106,11 @@ def stage_b(
         effort=effort,
         session=None,
         bh_dir=vdir,
-        extra_env={"BH_ROLE": "verifier", "HOME": runner.sandbox_home(f"{run_id}-F{fid}")},
+        extra_env={"BH_ROLE": "verifier", "HOME": runner.sandbox_home(f"{run_id}-F{fid}"), "BH_VERDICT_NONCE": nonce},
+        user=stack.JUDGE,
     )
     log_path = paths.runs_dir() / f"{run_id:05d}-{prog}-verify-F{fid}-{int(time.time())}.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     res = runner.SegmentResult(program=prog, run_id=run_id)
     with open(log_path, "x", buffering=1) as log:
         result, timed_out = runner.run_leg(
@@ -117,7 +122,9 @@ def stage_b(
     verdicts = [
         n
         for n in c.read_jsonl(host_verify_dir(prog, fid) / c.NOTES)
-        if n.get("op") == "verdict" and str(n.get("finding_id", "")).lstrip("F") == str(fid)
+        if n.get("op") == "verdict"
+        and str(n.get("finding_id", "")).lstrip("F") == str(fid)
+        and secrets.compare_digest(str(n.get("nonce", "")), nonce)
     ]
     if not verdicts:
         return "inconclusive", "the verifier recorded no verdict" + (" (timeout)" if timed_out else "")
@@ -224,9 +231,11 @@ def verify_finding(
 def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: str, effort: str | None, say) -> str:
     fid = finding["id"]
     proof = json.loads(finding["proof"])
-    # nothing of the hunter survives into the verification: its processes, HOME, user site, the old verdicts
-    runner.clean_sandbox(scope.program, runner.sandbox_home(f"{run_id}-F{fid}"))
-    stack.agent_sh('rm -rf -- "$1"', verify_dir(scope.program, fid), user="root")
+    # nothing of the hunter survives into the verification: its processes, HOME, user site, the old verdicts.
+    # The verification runs as its own Unix user, in a work dir and HOME the hunter cannot write.
+    home = runner.sandbox_home(f"{run_id}-F{fid}")
+    runner.clean_sandbox(scope.program, home)
+    stack.prepare_judge(home, verify_dir(scope.program, fid))
     replay = stage_a(scope.program, fid, proof)
     say(
         f"  ↳ F{fid} stage A: reproduced={replay.get('reproduced')} control_disproves={replay.get('control_disproves')}"
