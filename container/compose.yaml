@@ -95,7 +95,8 @@ services:
 
   # Local practice target: `podman-compose -f container/compose.yaml --profile lab up -d juiceshop`
   juiceshop:
-    image: docker.io/bkimminich/juice-shop:latest
+    # pinned: the lab is a regression bench, its vulnerabilities must not change between versions
+    image: docker.io/bkimminich/juice-shop@sha256:69e0504ca940fe19dc6b0405d5536c9475014cc28719e795602d95e83b8d2207
     container_name: bh-lab-juiceshop
     profiles: [lab]
     networks:
