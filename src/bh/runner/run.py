@@ -280,9 +280,13 @@ def agent_command(
     return cmd
 
 
+_QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+
+
 def command_kind(cmd: str) -> str:
-    """arsenal | manual | note | other: how a Bash command is counted in the metrics."""
-    if c.uses_arsenal(cmd):
+    """arsenal | manual | note | other: how a Bash command is counted in the metrics. Quoted text is ignored for
+    the arsenal test: a note that mentions sqlmap is not a sqlmap run."""
+    if c.uses_arsenal(_QUOTED.sub("''", cmd)):
         return "arsenal"
     if c.uses_manual_http(cmd):
         return "manual"
@@ -587,6 +591,10 @@ def _run_locked(
                     break
                 say(f"  ↻ stopped early ({res.turns}/{max_turns} turns): nudging the same session to continue")
                 prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
+                if not cards and (cards := pick_cards(board, scope)):  # the surface exists once mapping is done
+                    board.run_set(run_id, cards=",".join(cards))
+                    prompt += "\n\n" + classes.cards_block(cards)
+                    say(f"  ↻ cards {', '.join(cards)}")
     except BaseException as exc:  # Ctrl-C / SIGTERM, or a harness error: record what the agent already wrote
         with signals_ignored():
             stopped = isinstance(exc, KeyboardInterrupt)

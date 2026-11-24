@@ -39,8 +39,11 @@ def test_frontier_keeps_only_the_latest_bookkeeping_fact(tmp_path):
 def test_metrics_are_recorded_per_run(tmp_path):
     b = Board(tmp_path / "b.sqlite")
     rid = b.run_start("p", "m")
-    b.record_metrics(rid, [{"ts": 1, "input": 2, "cache_read": 7000, "cache_write": 900, "output": 40}],
-                     [{"ts": 1, "tool": "Bash", "kind": "arsenal", "cmd": "bh-crawl http://h", "ms": 12000, "locked": False}])
+    b.record_metrics(
+        rid,
+        [{"ts": 1, "input": 2, "cache_read": 7000, "cache_write": 900, "output": 40}],
+        [{"ts": 1, "tool": "Bash", "kind": "arsenal", "cmd": "bh-crawl http://h", "ms": 12000, "locked": False}],
+    )
     b.record_metrics(rid, [{"ts": 2, "output": 5}], [])  # a second leg appends
     assert b.rows("SELECT COUNT(*) n FROM turns WHERE run_id=?", rid)[0]["n"] == 2
     assert b.rows("SELECT kind, ms FROM tool_calls WHERE run_id=?", rid)[0]["ms"] == 12000
