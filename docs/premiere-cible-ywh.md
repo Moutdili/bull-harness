@@ -10,7 +10,7 @@ Chaque ligne est vérifiable. On ne lance `bh run` qu'une fois tout coché.
 
 ## 2. Régler le YAML (c'est toi qui décides, pas l'importeur)
 - [ ] `automation_allowed: true|false` selon les règles. `null` bloque le runner.
-- [ ] `scanners_allowed: false` si les règles interdisent les scanners automatiques (l'import le met déjà quand il le détecte).
+- [ ] `scanners_allowed: true|false` selon les règles. `null` bloque le runner (l'import met déjà `false` quand il détecte une interdiction, mais il en rate : relire les règles).
       Effet : bh-content, bh-scan, bh-params, bh-sqli, bh-xss et nuclei/sqlmap/ffuf directs sont refusés ; seuls bh-recon, bh-crawl et le manuel restent.
 - [ ] `user_agent` : comparer la valeur de l'API et celle du texte des règles ; garder celle que les règles exigent.
 - [ ] `required_headers` : ajouter tout en-tête d'identification exigé.
