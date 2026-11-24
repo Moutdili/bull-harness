@@ -26,7 +26,7 @@ from mitmproxy import ctx, http, tcp, udp
 from mitmproxy.net.http.url import parse_authority, unparse
 from mitmproxy.proxy import mode_specs, server_hooks
 
-from bh import paths
+from bh import paths, redact
 from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER
 from bh.gate.policy import SYSTEM_HOSTS, Policy, Verdict, deny
 
@@ -409,7 +409,7 @@ class Gate:
             "id": fid,
             "class": flow.metadata.get("bh_class"),
             "method": req.method,
-            "url": url,
+            "url": redact.url(url),  # tokens in query strings stay out of the log
             "status": status,
             "len": len(body),
             "ctype": resp.headers.get("content-type", "") if resp else "",
@@ -423,15 +423,17 @@ class Gate:
             rec["error"] = error
         self._log(paths.FLOWS, rec)
         if rec["class"] == "target":
-            redact = flow.metadata.get("bh_redact") or {}
+            injected = flow.metadata.get("bh_redact") or {}
             full = {
                 **rec,
                 "request": {
-                    "headers": [(k, redact.get(k.lower(), v)) for k, v in req.headers.items(multi=True)],
+                    "headers": [
+                        (k, injected.get(k.lower()) or redact.header(k, v)) for k, v in req.headers.items(multi=True)
+                    ],
                     "body": (req.raw_content or b"")[:MAX_BODY].decode("utf-8", "replace"),
                 },
                 "response": {
-                    "headers": list(resp.headers.items(multi=True)) if resp else [],
+                    "headers": [(k, redact.header(k, v)) for k, v in resp.headers.items(multi=True)] if resp else [],
                     "body": body[:MAX_BODY].decode("utf-8", "replace"),
                 },
             }

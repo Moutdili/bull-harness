@@ -37,7 +37,8 @@ from bh.agent import contract as c
 ROLES = ("setup", "attack", "control")
 METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 EXPECT_KEYS = ("status", "contains", "absent", "regex")
-MAX_STEPS, TIMEOUT_S, ROUNDS, SNIPPET = 8, 20, 2, 300
+MAX_STEPS, TIMEOUT_S, ROUNDS, SNIPPET, MAX_REGEX = 8, 20, 2, 300, 200
+_NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*}][^)]*\)\s*[+*{]")  # (a+)+ (x*)* (a{2,})+ : catastrophic backtracking
 
 
 def validate(proof: object) -> list[str]:
@@ -70,10 +71,13 @@ def validate(proof: object) -> list[str]:
             if st.get("role") == "attack" and not (exp.get("contains") or exp.get("absent") or exp.get("regex")):
                 errors.append(f"{where}: an attack must name a body marker (contains, absent or regex), not a status")
             if "regex" in exp:
+                rx = str(exp["regex"])
                 try:
-                    re.compile(str(exp["regex"]))
+                    re.compile(rx)
                 except re.error as exc:
                     errors.append(f"{where}: bad regex: {exc}")
+                if len(rx) > MAX_REGEX or _NESTED_QUANTIFIER.search(rx):  # replay has no regex timeout
+                    errors.append(f"{where}: regex too long or with nested quantifiers; use contains instead")
     roles = [st.get("role") for st in steps if isinstance(st, dict)]
     if "attack" not in roles:
         errors.append("at least one step must have role 'attack' (the request that proves the impact)")
