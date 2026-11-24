@@ -191,6 +191,31 @@ def cmd_run(args) -> int:
     return 0 if res.status in ("ok", "max_turns", "timeout") else 1
 
 
+def cmd_verify(args) -> int:
+    """Re-verify findings of a program (default: every finding still 'new')."""
+    from bh.board import Board
+    from bh.runner.run import run_lock
+    from bh.verify import verify_finding, verify_pending
+
+    scope = _load_scope_or_exit(args.scope)
+    board = Board()
+    with run_lock():
+        run_id = board.run_start(scope.program, args.model)
+        try:
+            if args.findings:
+                for f in args.findings:
+                    verify_finding(
+                        board, scope, int(str(f).lstrip("F")), run_id=run_id, model=args.model, effort=args.effort
+                    )
+            else:
+                print(
+                    verify_pending(board, scope, run_id=run_id, model=args.model, effort=args.effort, limit=args.limit)
+                )
+        finally:
+            board.run_end(run_id, status="ok", note="verification")
+    return 0
+
+
 def cmd_hunt(args) -> int:
     from bh.runner.supervisor import hunt
 
@@ -415,6 +440,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--task", help="extra operator instruction for this segment")
     r.set_defaults(func=cmd_run)
 
+    v = sub.add_parser("verify", help="independent verification of findings (replay + verifier session)")
+    v.add_argument("scope")
+    v.add_argument("findings", nargs="*", help="F12 F13 ... (default: every finding still 'new')")
+    run_opts(v)
+    v.add_argument("--limit", type=int, default=5)
+    v.set_defaults(func=cmd_verify)
+
     h = sub.add_parser("hunt", help="autonomous supervisor rotating over programs")
     h.add_argument("scopes", nargs="+")
     run_opts(h)
@@ -429,7 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = sub.add_parser("finding", help="list / show / triage findings")
     f.add_argument("id", nargs="?")
-    f.add_argument("--set", choices=sorted(["new", "verifying", "verified", "rejected", "submitted", "duplicate"]))
+    from bh.board.db import FINDING_STATUS
+
+    f.add_argument("--set", choices=sorted(FINDING_STATUS))
     f.add_argument("--verdict")
     f.set_defaults(func=cmd_finding)
 

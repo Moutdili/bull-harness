@@ -24,6 +24,10 @@ def main() -> None:
         from bh.agent import hooks
 
         hooks.run(hooks.pre_tool_use if cmd == "hook-pre" else hooks.post_tool_use)
+    elif cmd == "replay":
+        from bh.agent import proof
+
+        proof.main(args)
     elif cmd == "note":
         from bh.agent import note
 

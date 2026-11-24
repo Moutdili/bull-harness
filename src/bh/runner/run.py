@@ -219,10 +219,21 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
 
 # ------------------------------------------------------------------ one claude process
 def agent_command(
-    scope: Scope, task: str, *, run_id: int, model: str, max_turns: int, effort: str | None, session: str | None
+    scope: Scope,
+    task: str,
+    *,
+    run_id: int,
+    model: str,
+    max_turns: int,
+    effort: str | None,
+    session: str | None,
+    bh_dir: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> list[str]:
+    """claude -p inside the agent for this program. `bh_dir`/`extra_env` let the verifier reuse it with its own
+    work dir and role."""
     prog = scope.program
-    bh = c.sandbox_dir(prog)
+    bh = bh_dir or c.sandbox_dir(prog)
     env = {
         "BH_DIR": bh,
         "BH_PROGRAM": prog,
@@ -230,6 +241,7 @@ def agent_command(
         "BH_SCANNERS": "0" if scope.scanners_allowed is False else "1",
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
+        **(extra_env or {}),
     }
     cmd = [
         "podman",
@@ -320,7 +332,14 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
 
 
 def run_leg(
-    cmd: list[str], log: IO[str], err_path: Path, res: SegmentResult, say, program: str, timeout_s: float
+    cmd: list[str],
+    log: IO[str],
+    err_path: Path,
+    res: SegmentResult,
+    say,
+    program: str,
+    timeout_s: float,
+    bh_dir: str | None = None,
 ) -> tuple[dict | None, bool]:
     """One claude process. Returns (result event, timed out)."""
     with open(err_path, "a") as err_fh:  # a pipe read only at the end can fill up and block claude
@@ -329,7 +348,7 @@ def run_leg(
 
     def on_timeout() -> None:
         timed_out.set()
-        stack.kill_agent(program)
+        stack.kill_agent(program, bh_dir=bh_dir)
         time.sleep(5)
         if proc.poll() is None:
             proc.kill()
@@ -341,7 +360,7 @@ def run_leg(
     except BaseException:
         with signals_ignored():
             timer.cancel()
-            stack.kill_agent(program)
+            stack.kill_agent(program, bh_dir=bh_dir)
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
@@ -533,6 +552,11 @@ def _run_locked(
         if res.status != "ok" and (QUOTA_RE.search(res.text) or QUOTA_RE.search(stderr)):
             res.status = "quota"
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
+    if res.new_findings and res.status not in ("quota", "refusal"):
+        from bh.verify import verify_pending
+
+        say(f"▶ verifying {res.new_findings} new finding(s)")
+        verify_pending(board, scope, run_id=run_id, model=model, effort=effort, say=say)
     say(
         f"■ run {run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · {res.tool_calls} tools "
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "

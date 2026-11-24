@@ -81,8 +81,8 @@ kill -KILL $all 2>/dev/null; rm -f "$1"; true
 """
 
 
-def kill_agent(program: str, grace: float = 8.0) -> None:
-    """Stop the claude process of `program` and everything it started. podman exec does not
-    forward signals: killing the host-side process alone would leave an orphan."""
-    pidfile = f"{c.sandbox_dir(program)}/{c.AGENT_PID}"
+def kill_agent(program: str, grace: float = 8.0, bh_dir: str | None = None) -> None:
+    """Stop the claude process of `program` (or of the work dir `bh_dir`, e.g. a verifier's) and everything
+    it started. podman exec does not forward signals: killing the host-side process alone would leave an orphan."""
+    pidfile = f"{bh_dir or c.sandbox_dir(program)}/{c.AGENT_PID}"
     agent_sh(_KILL_SCRIPT, pidfile, str(int(grace * 2)), user="root", timeout=grace + 20)
