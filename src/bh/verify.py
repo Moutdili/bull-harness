@@ -100,9 +100,12 @@ def stage_b(
     log_path = paths.runs_dir() / f"{run_id:05d}-{prog}-verify-F{fid}-{int(time.time())}.jsonl"
     res = runner.SegmentResult(program=prog, run_id=run_id)
     with open(log_path, "x", buffering=1) as log:
-        _, timed_out = runner.run_leg(
+        result, timed_out = runner.run_leg(
             cmd, log, log_path.with_suffix(".stderr"), res, say, prog, VERIFIER_MINUTES * 60, bh_dir=vdir
         )
+    runner.merge_result(res, result)
+    board.db.execute("UPDATE runs SET verify_cost=COALESCE(verify_cost, 0) + ? WHERE id=?", (res.cost_usd, run_id))
+    board.db.commit()
     verdicts = [
         n
         for n in c.read_jsonl(host_verify_dir(prog, fid) / c.NOTES)
