@@ -90,7 +90,8 @@ def cmd_scope_import(args) -> int:
     print(
         "next: set automation_allowed and scanners_allowed (true/false) after reading the rules (the runner "
         "refuses while either is null); create test accounts with your "
-        "@yeswehack.ninja alias and store them as identities (UI > Todo or var/state/identities)."
+        "@yeswehack.ninja alias and store them as identities before the hunt, never during a run "
+        "(UI > Identités or var/state/identities)."
     )
     return 0
 
@@ -187,9 +188,10 @@ def cmd_status(args) -> int:
             f"  arsenal/manual/locked {r['arsenal_calls'] or 0}/{r['manual_calls'] or 0}/{r['locked_calls'] or 0}"
             + (f"  ${r['cost_usd']:.2f} eq." if r["cost_usd"] else "")
         )
-    n_todo = b.rows("SELECT COUNT(*) AS n FROM todos WHERE status='open'")[0]["n"]
-    n_find = b.rows("SELECT COUNT(*) AS n FROM findings WHERE status IN ('new','verified')")[0]["n"]
-    print(f"open todos: {n_todo} · findings to review: {n_find}")
+    n_submit = b.rows("SELECT COUNT(*) AS n FROM todos WHERE status='open' AND kind='submit'")[0]["n"]
+    n_inc = b.rows("SELECT COUNT(*) AS n FROM findings WHERE status='inconclusive'")[0]["n"]
+    n_block = b.rows("SELECT COUNT(*) AS n FROM facts WHERE kind='blocker' AND created>=?", time.time() - 86400)[0]["n"]
+    print(f"to submit: {n_submit} · inconclusive: {n_inc} (findings) · blockers (24 h): {n_block}")
     return 0
 
 
@@ -261,13 +263,33 @@ def cmd_todo(args) -> int:
             b.close_todo(int(str(t).lstrip("T")))
         print(f"closed {len(args.done)}")
         return 0
-    rows = b.rows("SELECT * FROM todos WHERE status=? ORDER BY id", "done" if args.all else "open")
+    # Only submissions: todos of the retired kinds stay in the table as history, never as work.
+    rows = b.rows("SELECT * FROM todos WHERE kind='submit' AND status=? ORDER BY id", "done" if args.all else "open")
     for r in rows:
         print(f"T{r['id']:<4} [{r['kind']:14}] {r['program'] or '-':16} {r['title']}")
         if args.verbose and r["detail"]:
             print(f"      {r['detail']}")
     if not rows:
-        print("no open todo")
+        print("nothing to submit")
+    return 0
+
+
+def cmd_blockers(args) -> int:
+    """Read-only: leads the agent recorded as blocked and moved past (blocker facts)."""
+    sql = "SELECT id, program, title, summary, evidence, created FROM facts WHERE kind='blocker' AND created>=?"
+    params: list = [time.time() - args.since * 3600]
+    if args.program:
+        sql += " AND program=?"
+        params.append(args.program)
+    rows = _board().rows(sql + " ORDER BY id", *params)
+    for r in rows:
+        t = time.strftime("%m-%d %H:%M", time.localtime(r["created"]))
+        host = f"  ({r['evidence']})" if r["evidence"] else ""
+        print(f"{r['id']:>5} {t} {r['program']:16} {r['title']}{host}")
+        if args.verbose and r["summary"]:
+            print(f"      {r['summary']}")
+    if not rows:
+        print(f"no blocker in the last {args.since:g} h")
     return 0
 
 
@@ -469,7 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--foreground", action="store_true")
     ui.add_argument("--stop", action="store_true")
     ui.set_defaults(func=cmd_ui)
-    sub.add_parser("status", help="stack, last runs, todo count").set_defaults(func=cmd_status)
+    sub.add_parser("status", help="stack, last runs, submissions and blockers").set_defaults(func=cmd_status)
 
     def run_opts(sp):
         from bh.runner.run import DEFAULT_MODEL
@@ -508,11 +530,17 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--hours", type=float, default=8)
     h.set_defaults(func=cmd_hunt)
 
-    t = sub.add_parser("todo", help="human todo")
+    t = sub.add_parser("todo", help="post-triage todo: verified findings to submit")
     t.add_argument("--done", nargs="+", metavar="ID")
     t.add_argument("--all", action="store_true")
     t.add_argument("-v", "--verbose", action="store_true")
     t.set_defaults(func=cmd_todo)
+
+    bl = sub.add_parser("blockers", help="leads the agent recorded as blocked (read-only)")
+    bl.add_argument("program", nargs="?")
+    bl.add_argument("--since", type=float, default=24, metavar="HOURS", help="look back HOURS (default 24)")
+    bl.add_argument("-v", "--verbose", action="store_true")
+    bl.set_defaults(func=cmd_blockers)
 
     f = sub.add_parser("finding", help="list / show / triage findings")
     f.add_argument("id", nargs="?")

@@ -29,3 +29,46 @@ def test_scope_check_exit_codes(capsys):
 def test_board_reset_needs_confirmation(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     assert main(["board", "reset", "demo"]) == 2
+
+
+def test_blockers_command_is_in_help(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "blockers" in out and "post-triage todo: verified findings to submit" in out
+
+
+def test_todo_lists_submissions_only(tmp_path, monkeypatch, capsys):
+    import time
+
+    from bh.board import Board
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    b = Board()
+    b.add_todo("submit", "F7 verified XSS", program="lab")
+    b.db.execute(
+        "INSERT INTO todos(program, kind, title, status, created) VALUES ('lab','waf','old waf todo','obsolete',?)",
+        (time.time(),),
+    )
+    b.db.execute(
+        "INSERT INTO todos(program, kind, title, status, created) VALUES ('lab','auth','old auth todo','open',?)",
+        (time.time(),),
+    )
+    b.db.commit()
+    assert main(["todo"]) == 0
+    out = capsys.readouterr().out
+    assert "F7 verified XSS" in out and "old waf todo" not in out and "old auth todo" not in out
+
+
+def test_blockers_command_lists_blocker_facts(tmp_path, monkeypatch, capsys):
+    from bh.board import Board
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    b = Board()
+    b.add_blocker("lab", "auth", "session expired", host="a.example.com")
+    b.add_blocker("other", "waf", "captcha")
+    b.add_fact("lab", "not a blocker")
+    assert main(["blockers", "lab"]) == 0
+    out = capsys.readouterr().out
+    assert "[auth] session expired" in out and "host:a.example.com" in out
+    assert "captcha" not in out and "not a blocker" not in out

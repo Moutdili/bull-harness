@@ -286,7 +286,11 @@ class Handler(BaseHTTPRequestHandler):
                 "findings_to_review": b.rows("SELECT COUNT(*) n FROM findings WHERE status IN ('new','verified')")[0][
                     "n"
                 ],
-                "open_todos": b.rows("SELECT COUNT(*) n FROM todos WHERE status='open'")[0]["n"],
+                "to_submit": b.rows("SELECT COUNT(*) n FROM todos WHERE status='open' AND kind='submit'")[0]["n"],
+                "inconclusive": b.rows("SELECT COUNT(*) n FROM findings WHERE status='inconclusive'")[0]["n"],
+                "blockers_24h": b.rows(
+                    "SELECT COUNT(*) n FROM facts WHERE kind='blocker' AND created>=?", time.time() - 86400
+                )[0]["n"],
                 "facts": b.rows("SELECT COUNT(*) n FROM facts")[0]["n"],
                 "runs": b.rows("SELECT COUNT(*) n FROM runs")[0]["n"],
                 "running": dict(running[0]) if running else None,
@@ -314,8 +318,19 @@ class Handler(BaseHTTPRequestHandler):
             f["flows"] = flows
             return f
         if path == "/api/todos":
+            # Submissions only: todos of the retired kinds are history (status obsolete), not work.
             st = q.get("status", "open")
-            return [dict(r) for r in b.rows("SELECT * FROM todos WHERE status=? ORDER BY id DESC", st)]
+            return [
+                dict(r) for r in b.rows("SELECT * FROM todos WHERE kind='submit' AND status=? ORDER BY id DESC", st)
+            ]
+        if path == "/api/blockers":
+            return [
+                dict(r)
+                for r in b.rows(
+                    "SELECT id, program, run_id, title, summary, evidence, created FROM facts "
+                    "WHERE kind='blocker' ORDER BY id DESC LIMIT 100"
+                )
+            ]
         if path == "/api/runs":
             return [dict(r) for r in b.rows("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
         if path == "/api/metrics":
@@ -414,7 +429,11 @@ class Handler(BaseHTTPRequestHandler):
             b.set_finding(int(m.group(1)), body["status"], body.get("verdict") or None)
             return {"ok": True}
         if m := re.fullmatch(r"/api/todos/(\d+)/done", path):
-            b.close_todo(int(m.group(1)))
+            tid = int(m.group(1))
+            # Mio ticks a submission done; an obsolete todo of a retired kind stays as it was.
+            if not b.rows("SELECT 1 FROM todos WHERE id=? AND kind='submit' AND status='open'", tid):
+                raise KeyError(f"open submit todo T{tid}")
+            b.close_todo(tid)
             return {"ok": True}
         if path == "/api/identities":
             return self._save_identity(body)
@@ -451,8 +470,6 @@ class Handler(BaseHTTPRequestHandler):
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps({"headers": headers, "updated": time.time()}))
         p.chmod(0o600)
-        if body.get("todo_id"):
-            Board().close_todo(int(body["todo_id"]))
         return {"ok": True, "identity": name, "headers": sorted(headers)}
 
     def _start_run(self, body: dict) -> dict:
