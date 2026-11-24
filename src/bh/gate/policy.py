@@ -20,7 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from bh.agent.contract import PASSIVE_DENY_PATHS, is_passive, origin, path_key
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
@@ -39,7 +39,7 @@ BACKOFF_FACTOR, BACKOFF_SECONDS, MIN_RPS = 0.5, 300.0, 0.2
 MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a proof
 # Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
 # authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S.
-ID_LIMIT, ID_WINDOW_S = 4, 600
+ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 4, 600, 5000
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
 # (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
 MISS_LIMIT, MISS_WINDOW_S = 25, 300
@@ -148,9 +148,7 @@ class Policy:
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         v = self._target(authority)
         if v is not None:
-            if v.allowed and not (v.rule or "").startswith("cidr:") and port not in WEB_PORTS:
-                return deny(f"port {port} is not a web port for a domain rule", v.rule)
-            return v
+            return _web_port(v, port) or v
         if is_passive(host):
             return Verdict(port == 443, "passive" if port == 443 else "deny", f"passive source {host}")
         return deny(self.scope_error or "not in scope")
@@ -172,6 +170,8 @@ class Policy:
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         v = self._target(url)
         if v is not None and v.allowed:
+            if bad_port := _web_port(v, _port(url)):
+                return bad_port
             if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
                 alt = self._target(url.replace(f"//{host}", f"//{host_header}", 1))
                 if alt is None or not alt.allowed:
@@ -217,8 +217,9 @@ class Policy:
         return None
 
     def _enumeration(self, url: str, authenticated: bool) -> Verdict | None:
-        """Deny the (ID_LIMIT+1)-th distinct object id on one route within the window."""
-        path = urlsplit(url).path
+        """Deny the (ID_LIMIT+1)-th distinct object id on one route within the window. The route is the path as
+        the server's router sees it: case, //, a trailing slash, ;params and %xx do not make a new route."""
+        path = _route_path(urlsplit(url).path)
         key = path_key(path)
         if "{id}" not in key or not (authenticated or _API_PATH.search(path)):
             return None
@@ -235,6 +236,9 @@ class Policy:
                 "(prove access control with your own identities' objects)"
             )
         seen_q.append((now, ids))
+        if len(self.ids_seen) > ROUTES_MAX:  # bounded memory: forget routes idle for a whole window
+            for r in [r for r, q in self.ids_seen.items() if not q or q[-1][0] < now - ID_WINDOW_S]:
+                del self.ids_seen[r]
         return None
 
     def check_ip(self, host: str, ip: str) -> Verdict:
@@ -270,3 +274,23 @@ class Policy:
         if b is None or b.rps != rps:
             b = self.buckets[klass] = TokenBucket(rps)
         return b
+
+
+def _web_port(v: Verdict, port: int) -> Verdict | None:
+    """Domain rules cover web ports only (a CIDR rule is an explicit grant of the address, all ports)."""
+    if v.allowed and not (v.rule or "").startswith("cidr:") and port not in WEB_PORTS:
+        return deny(f"port {port} is not a web port for a domain rule", v.rule)
+    return None
+
+
+def _port(url: str) -> int:
+    u = urlsplit(url)
+    try:
+        return u.port or (443 if u.scheme == "https" else 80)
+    except ValueError:
+        return -1
+
+
+def _route_path(path: str) -> str:
+    path = re.sub(r";[^/]*", "", unquote(path)).lower()
+    return re.sub(r"/{2,}", "/", path).rstrip("/") or "/"

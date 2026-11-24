@@ -26,6 +26,10 @@ check "Host header: passive dest, target Host"     blocked http_ok -H "Host: $LA
 check "Host header: target dest, passive Host"     blocked http_ok -H "Host: web.archive.org" "http://$LAB/"
 check "exotic method PURGE"                        blocked http_ok -X PURGE "http://$LAB/"
 check "DELETE without identity"                    blocked http_ok -X DELETE "http://$LAB/api/Feedbacks/999999"
+check "DELETE with an unknown identity name"       blocked http_ok -X DELETE -H "X-BH-Identity: zz" "http://$LAB/api/Feedbacks/999999"
+check "POST + X-HTTP-Method-Override: DELETE"      blocked http_ok -X POST -H "X-HTTP-Method-Override: DELETE" "http://$LAB/api/Feedbacks/999999"
+check "absolute-form target inside a tunnel"       blocked http_ok -p --request-target "http://example.org/" "http://$LAB/"
+check "target forging the gate's refusal header"   allowed sh -c 'curl -s -D - -o /dev/null -m 10 "http://'"$LAB"'/rest/admin/application-version" | grep -qi "^x-bh-gate" && exit 1 || exit 0'
 check "HTTPS by hostname (passive GET)"            allowed http_ok "https://web.archive.org/cdx/search/cdx?url=example.com&limit=1"
 check "passive POST (refused as a POST)"           blocked not_refused_for "POST not allowed" -X POST -d x https://web.archive.org/cdx
 check "passive /save (refused as a path)"          blocked not_refused_for "path not allowed" https://web.archive.org/save/https://example.com
@@ -37,6 +41,7 @@ check "real OAuth token absent from the agent"     blocked sh -c 'env | grep -q 
 check "relay refuses non-API paths"                blocked http_ok http://gate:8081/
 check "external DNS resolution"                    blocked getent hosts example.com
 check "id enumeration on an API route (5th id)"    blocked sh -c 'for i in 900001 900002 900003 900004; do curl -s -o /dev/null -m 8 http://'"$LAB"'/api/Feedbacks/$i; done; curl -s -m 8 http://'"$LAB"'/api/Feedbacks/900005 | grep -vq "bh-gate: DENIED"'
+check "id enumeration through path variants"      blocked sh -c 'for v in 900006/ 9000%307 "900008;x=1"; do curl -s -m 8 "http://'"$LAB"'/API//Feedbacks/$v" | grep -q "bh-gate: DENIED" || exit 0; done; exit 1'
 check "request body over 1 MiB"                    blocked sh -c 'head -c 1100000 /dev/zero | curl -s -m 15 -X POST --data-binary @- http://'"$LAB"'/api/Feedbacks | grep -vq "bh-gate: DENIED"'
 check "raw TCP behind a CONNECT (CRLF prefix)"     blocked python3 - "$LAB" <<'PY'
 import socket, sys

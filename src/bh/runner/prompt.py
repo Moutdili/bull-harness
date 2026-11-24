@@ -11,7 +11,7 @@ Authorization: the program's published policy below. Stay strictly inside it.
 
 ## Network (hard rules)
 - Your only network path is the gate (HTTP(S) proxy, env already set; tools without env support need `-proxy $BH_GATE` / `--proxy $BH_GATE`).
-- A `403` with body `bh-gate: DENIED (...)` means the target is out of scope or forbidden. Do not retry it, do not look for a bypass. If you think it should be in scope: `bh-note todo scope-question "<host>" -d "<why>"`.
+- A `403` with the header `X-BH-Gate: denied` (body `bh-gate: DENIED (...)`) means the target is out of scope or forbidden. Do not retry it, do not look for a bypass. If you think it should be in scope: `bh-note todo scope-question "<host>" -d "<why>"`.
 - Only HTTP(S) leaves, on web ports (any port for an in-scope IP range). The gate cuts raw TCP/UDP tunnels and external DNS does not resolve.
 - The gate refuses exotic methods (PURGE, TRACE, DEBUG...) and PUT/PATCH/DELETE sent without `X-BH-Identity`: writes are only for your own accounts.
 - The gate refuses id enumeration (more than 4 distinct object ids on one API route in 10 min) and bodies over 1 MiB. Findings of a class the program excludes are rejected automatically: do not spend turns on them.

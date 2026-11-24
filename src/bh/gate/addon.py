@@ -27,7 +27,7 @@ from mitmproxy.net.http.url import parse_authority, unparse
 from mitmproxy.proxy import mode_specs, server_hooks
 
 from bh import paths
-from bh.agent.contract import IDENTITY_HEADER
+from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER
 from bh.gate.policy import SYSTEM_HOSTS, Policy, Verdict, deny
 
 MAX_BODY = 16_384
@@ -45,9 +45,15 @@ def _now() -> float:
     return round(time.time(), 3)
 
 
-def _deny_response(v: Verdict) -> http.Response:
+# headers that make a framework run another method than the request line's (POST + override = DELETE)
+METHOD_OVERRIDES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
+
+
+def refuse(flow: http.HTTPFlow, v: Verdict) -> None:
+    """The gate's refusal: a 403 marked X-BH-Gate, and a metadata flag a target response cannot fake."""
     body = f"bh-gate: DENIED ({v.reason}{' / ' + v.rule if v.rule else ''})\n".encode()
-    return http.Response.make(403, body, {"Content-Type": "text/plain", "X-BH-Gate": "denied"})
+    flow.response = http.Response.make(403, body, {"Content-Type": "text/plain", GATE_HEADER: "denied"})
+    flow.metadata["bh_denied"] = True
 
 
 def fail_closed(hook):
@@ -56,7 +62,7 @@ def fail_closed(hook):
     def on_error(hook_name: str, arg, exc: Exception) -> None:
         ctx.log.error(f"bh-gate: {hook_name} failed, denying: {exc!r}")
         if isinstance(arg, http.HTTPFlow):
-            arg.response = _deny_response(deny(f"gate error in {hook_name}"))
+            refuse(arg, deny(f"gate error in {hook_name}"))
         elif isinstance(arg, (tcp.TCPFlow, udp.UDPFlow)):
             arg.kill()
         elif isinstance(arg, server_hooks.ServerConnectionHookData):
@@ -156,7 +162,7 @@ class Gate:
             ctx.log.error(f"bh-gate: cannot write {name}: {exc}")
 
     def _deny(self, flow: http.HTTPFlow, v: Verdict, where: str) -> None:
-        flow.response = _deny_response(v)  # first: a failing log write must not let the request through
+        refuse(flow, v)  # first: a failing log write must not let the request through
         self._log(
             paths.EVENTS,
             {
@@ -276,13 +282,25 @@ class Gate:
             return
         req = flow.request
         identity = req.headers.pop(IDENTITY_HEADER, None)
+        if identity is not None and self._identity_file(identity) is None:
+            self._log(
+                paths.EVENTS, {"kind": "identity-missing", "identity": identity[:60], "url": self._named(flow)[0]}
+            )
+            identity = None  # an unknown name is no identity: it must not unlock writes
         flow.metadata["bh_identity"] = identity
+        if not req.path.startswith("/"):  # "@other.host/x" would re-parse as another destination
+            self._deny(flow, deny("the request target must start with /"), "request")
+            return
+        if req.authority and not (req.is_http2 or req.is_http3):  # absolute form inside a tunnel: sent unjudged
+            self._deny(flow, deny("absolute-form request target inside a tunnel"), "request")
+            return
         host_header = parse_authority(req.host_header, check=False)[0] if req.host_header else None
         url, host = self._named(flow)
+        override = next((req.headers[h] for h in METHOD_OVERRIDES if h in req.headers), None)
         v = self.policy.classify_request(
             url,
             host,
-            req.method,
+            override.strip().upper() if override else req.method,
             host_header=host_header,
             identity=identity,
             body_len=len(req.raw_content or b""),
@@ -308,13 +326,20 @@ class Gate:
             for k in ("Cookie", "Authorization"):
                 req.headers.pop(k, None)
 
-    def _apply_identity(self, flow: http.HTTPFlow, name: str) -> None:
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", name):
-            return
+    def _identity_file(self, name: str) -> Path | None:
+        """The identity's file for the active program, None for an unknown or malformed name."""
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,39}", name):
+            return None
         path = self.state / paths.IDENTITIES / self.policy.program / f"{name}.json"
+        return path if path.is_file() else None
+
+    def _apply_identity(self, flow: http.HTTPFlow, name: str) -> None:
+        path = self._identity_file(name)
         try:
-            ident = json.loads(path.read_text())
+            ident = json.loads(path.read_text()) if path else None
         except (OSError, ValueError):
+            ident = None
+        if not isinstance(ident, dict):
             self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": self._named(flow)[0]})
             return
         injected = ident.get("headers") or {}
@@ -324,8 +349,9 @@ class Gate:
 
     @fail_closed
     def response(self, flow: http.HTTPFlow) -> None:
-        if flow.response is None or flow.response.headers.get("X-BH-Gate") == "denied":
+        if flow.response is None or flow.metadata.get("bh_denied"):
             return
+        flow.response.headers.pop(GATE_HEADER, None)  # only the gate's own refusals carry it
         if flow.metadata.get("bh_class") not in ("target", "passive"):
             return
         fid = self._record(flow, flow.response.status_code)

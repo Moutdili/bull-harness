@@ -53,6 +53,7 @@ PASSIVE_HOSTS = (
 PASSIVE_DENY_PATHS = {"web.archive.org": ("/save",)}
 
 IDENTITY_HEADER = "X-BH-Identity"
+GATE_HEADER = "X-BH-Gate"  # set by the gate on its own refusals only (it strips it from target answers)
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
 RULES_MARK = "[bh-rules]"  # prefix of a denial imposed by the program's rules
 SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
