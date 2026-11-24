@@ -79,6 +79,11 @@ def cmd_scope_import(args) -> int:
         print("the rules forbid automated scanners: scanners_allowed=false (only bh-recon, bh-crawl and manual tests)")
     if imp.skipped:
         print("NOT enforced, translate by hand if you want them:\n  " + "\n  ".join(imp.skipped))
+    if imp.conflicts:
+        print(
+            "out-of-scope text names LISTED assets, NOT applied (read the program text):\n  "
+            + "\n  ".join(imp.conflicts)
+        )
     if imp.rule_excerpts:
         print("rules lines about automation / rate / headers (read the full rules too):")
         print("  " + "\n  ".join(line[:200] for line in imp.rule_excerpts))
