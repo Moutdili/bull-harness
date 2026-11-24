@@ -12,9 +12,12 @@ A proof is JSON the hunting agent writes next to a finding:
   ]}
 
 Rules: at least one `attack` step and one `control` step; every step states what must be observed
-(`status`, `contains`, `absent`, `regex`); a control is the refused or benign twin of the attack and
-must expect something different. Replay sends every step through the gate (same scope, identities
-injected by the gate), twice, and reports which expectations held. No LLM involved.
+(`status`, `contains`, `absent`, `regex`); an attack names a marker in the body (`contains`, `absent` or
+`regex`), status alone proves nothing; a control is the TWIN of an attack (same method, origin and path:
+only the identity, the query or the body differ) and must expect something different. Replay sends every
+step through the gate (same scope, identities injected by the gate), twice, and reports which
+expectations held. The proof is disproved when a control's answer satisfies its attack's expectation
+(no differential). No LLM involved.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from urllib.parse import urlsplit
 
 from bh.agent import contract as c
 
@@ -59,20 +64,43 @@ def validate(proof: object) -> list[str]:
         exp = st.get("expect")
         if not isinstance(exp, dict) or not set(exp) & set(EXPECT_KEYS) or set(exp) - set(EXPECT_KEYS):
             errors.append(f"{where}: expect needs at least one of {', '.join(EXPECT_KEYS)} and nothing else")
-        elif "regex" in exp:
-            try:
-                re.compile(str(exp["regex"]))
-            except re.error as exc:
-                errors.append(f"{where}: bad regex: {exc}")
+        else:
+            if any(not str(n) for k in ("contains", "absent") for n in (exp.get(k) or [])) or exp.get("regex") == "":
+                errors.append(f"{where}: empty marker (an empty string matches every answer)")
+            if st.get("role") == "attack" and not (exp.get("contains") or exp.get("absent") or exp.get("regex")):
+                errors.append(f"{where}: an attack must name a body marker (contains, absent or regex), not a status")
+            if "regex" in exp:
+                try:
+                    re.compile(str(exp["regex"]))
+                except re.error as exc:
+                    errors.append(f"{where}: bad regex: {exc}")
     roles = [st.get("role") for st in steps if isinstance(st, dict)]
     if "attack" not in roles:
         errors.append("at least one step must have role 'attack' (the request that proves the impact)")
     if "control" not in roles:
         errors.append("at least one step must have role 'control' (the refused or benign twin of the attack)")
-    attacks = [st.get("expect") for st in steps if isinstance(st, dict) and st.get("role") == "attack"]
-    if any(st.get("expect") in attacks for st in steps if isinstance(st, dict) and st.get("role") == "control"):
-        errors.append("a control must expect something different from the attack")
+    attacks = [st for st in steps if isinstance(st, dict) and st.get("role") == "attack"]
+    for i, st in enumerate(steps):
+        if not isinstance(st, dict) or st.get("role") != "control":
+            continue
+        if any(st.get("expect") == a.get("expect") for a in attacks):
+            errors.append("a control must expect something different from the attack")
+        if not any(_twins(a, st) for a in attacks):
+            errors.append(
+                f"step {i + 1}: a control is the twin of an attack (same method, origin and path; only the "
+                "identity, query or body change)"
+            )
     return errors
+
+
+def _twins(attack: dict, control: dict) -> bool:
+    """Same method and same origin + path: the control asks the same thing, refused or benign."""
+
+    def where(st: dict) -> tuple[str, str | None, str]:
+        url = str(st.get("url", ""))
+        return str(st.get("method", "GET")).upper(), c.origin(url), urlsplit(url).path.rstrip("/") or "/"
+
+    return where(attack) == where(control)
 
 
 def _expect_holds(exp: dict, status: int, body: str) -> tuple[bool, list[str]]:
@@ -120,11 +148,13 @@ def _send(step: dict) -> tuple[int, str]:
 def replay(proof: dict, rounds: int = ROUNDS) -> dict:
     """{"reproduced": bool, "control_disproves": bool, "rounds": [[step results]]}."""
     results = []
+    control_disproves = False
     for _ in range(rounds):
-        round_ = []
+        round_, answers = [], []
         for st in proof["steps"]:
             try:
                 status, body = _send(st)
+                answers.append((st, status, body))
                 ok, misses = _expect_holds(st["expect"], status, body)
                 denied = "bh-gate: DENIED" in body
                 round_.append(
@@ -150,13 +180,13 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
                     }
                 )
         results.append(round_)
+        # no differential: a control's answer already satisfies what its attack claims to prove
+        for a in (st for st in proof["steps"] if st["role"] == "attack"):
+            for k, status, body in answers:
+                if k["role"] == "control" and _twins(a, k) and _expect_holds(a["expect"], status, body)[0]:
+                    control_disproves = True
     every = [s for r in results for s in r]
     reproduced = all(s["ok"] for s in every)
-    # the control answered like the attack (same status and same body): there is no differential to prove
-    pairs = [(a, k) for r in results for a in r if a["role"] == "attack" for k in r if k["role"] == "control"]
-    control_disproves = any(
-        a.get("sha1") and a.get("sha1") == k.get("sha1") and a["status"] == k["status"] for a, k in pairs
-    )
     return {
         "reproduced": reproduced and not control_disproves,
         "control_disproves": control_disproves,

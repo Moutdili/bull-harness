@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-"""Sandbox entry point. bh-note, bh-crawl, ... are symlinks to this file (see bh.agent.main)."""
+#!/usr/bin/python3 -I
+"""Sandbox entry point. bh-note, bh-crawl, ... are symlinks to this file (see bh.agent.main).
+Isolated mode (-I): no user site-packages, PYTHONPATH or current dir, so nothing the agent drops in its
+HOME (usercustomize.py, a fake module) runs inside the hooks or the verifier's replay."""
 import sys
 
 sys.path.insert(0, "/opt/bh/lib")

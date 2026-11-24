@@ -81,6 +81,24 @@ kill -KILL $all 2>/dev/null; rm -f "$1"; true
 """
 
 
+# Every process of the agent user dies (except the container's keep-alive, a child of root's runuser),
+# every session HOME and the user site-packages go, then one fresh HOME is created. Nothing the hunter
+# started or planted (background job, usercustomize.py, ~/.claude) survives into the next session.
+_RESET_SCRIPT = r"""
+keep=" $(for r in $(pgrep -u root -x runuser); do pgrep -P "$r"; done | tr '\n' ' ') "
+for p in $(pgrep -u hunter); do case "$keep" in *" $p "*) ;; *) kill -KILL "$p" 2>/dev/null ;; esac; done
+rm -rf /tmp/bh-home-* /home/hunter/.local /home/hunter/.claude /home/hunter/.config/claude
+mkdir -p "$1" && chown hunter:hunter "$1" && chmod 700 "$1"
+"""
+
+
+def reset_agent_user(home: str) -> None:
+    """Start a session from nothing the previous one left behind; `home` is the new session's HOME."""
+    r = agent_sh(_RESET_SCRIPT, home, user="root", timeout=30)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot reset the agent user in {AGENT}: {r.stderr.strip()}")
+
+
 def kill_agent(program: str, grace: float = 8.0, bh_dir: str | None = None) -> None:
     """Stop the claude process of `program` (or of the work dir `bh_dir`, e.g. a verifier's) and everything
     it started. podman exec does not forward signals: killing the host-side process alone would leave an orphan."""

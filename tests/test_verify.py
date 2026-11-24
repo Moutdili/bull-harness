@@ -138,3 +138,31 @@ def test_duplicates(tmp_path):
     row = lambda fid: dict(b.rows("SELECT * FROM findings WHERE id=?", fid)[0])  # noqa: E731
     assert duplicate_of(b, row(f2)) == f1
     assert duplicate_of(b, row(f3)) is None
+
+
+def test_validation_refuses_empty_proofs():
+    base = "http://t"
+    empty = {
+        "steps": [
+            {"role": "attack", "method": "GET", "url": f"{base}/", "expect": {"status": [200]}},
+            {"role": "control", "method": "GET", "url": f"{base}/api/nope", "expect": {"status": [404, 500]}},
+        ]
+    }
+    errors = proof.validate(empty)
+    assert any("body marker" in e for e in errors) and any("twin" in e for e in errors)
+    blank = idor_proof(base, control_expect={"status": [401], "regex": ""})
+    assert any("empty marker" in e for e in proof.validate(blank))
+
+
+def test_replay_is_disproved_when_the_control_satisfies_the_attack(target):
+    """A control that 'expects' 403 but gets the same data as the attack: no differential, whatever its sha1."""
+    Target.vulnerable = True
+    p = idor_proof(target)
+    p["steps"][2] |= {"as": "user-c", "expect": {"status": [403]}}  # another session: the server answers 200
+    r = proof.replay(p)
+    assert r["control_disproves"] and not r["reproduced"]
+    assert decide(r, "confirmed", "x")[0] == "rejected"
+
+
+def test_decision_needs_a_real_boolean():
+    assert decide({"reproduced": "yes"}, "confirmed", "x")[0] == "inconclusive"
