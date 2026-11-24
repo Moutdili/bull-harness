@@ -84,8 +84,10 @@ class Scope:
         """The program exclusion matching `vuln_class`, if any."""
         if not vuln_class:
             return None
+        from bh.classes import exclusion
+
         canon = canonical_vuln(vuln_class)
-        return next((f for f in self.forbidden_vulns if canonical_vuln(f) == canon), None)
+        return next((f for f in self.forbidden_vulns if exclusion(f) == canon), None)
 
     @property
     def scanners_on(self) -> bool:

@@ -143,7 +143,7 @@ CLASSES: tuple[VulnClass, ...] = (
     ),
     VulnClass(
         "business-logic",
-        ("business-logic", "logic-flaw", "race-condition", "price-manipulation"),
+        ("business-logic", "logic-flaw", "price-manipulation"),
         (
             r"/(basket|cart|checkout|order|payment|pay|coupon|voucher|wallet|transfer|price|discount|subscription|refund)",
         ),
@@ -182,6 +182,7 @@ CLASSES: tuple[VulnClass, ...] = (
     ),
     # exclusion-only classes (no card): names programs use in their non-qualifying lists
     VulnClass("dos", ("denial-of-service", "ddos", "resource-exhaustion", "dos")),
+    VulnClass("race-condition", ("race-condition", "race-conditions")),  # excluding it must not drop business-logic
     VulnClass("brute-force", ("bruteforce", "credential-stuffing", "password-spraying", "brute-force")),
     VulnClass("self-xss", ("self-xss",)),
     VulnClass("clickjacking", ("ui-redressing", "clickjacking")),
@@ -195,12 +196,66 @@ CLASSES: tuple[VulnClass, ...] = (
 )
 BY_ID = {c.id: c for c in CLASSES}
 _ALIAS = {alias: c.id for c in CLASSES for alias in (*c.aliases, c.id)}
+# names distinctive enough to be found inside a longer phrase ("XSS (stored)", "Denial of Service (DoS) attacks");
+# single words like "session" or "auth" are not ("Missing session timeout" is not every auth bug)
+_DISTINCT = {
+    "xss",
+    "sqli",
+    "ssrf",
+    "idor",
+    "bola",
+    "lfi",
+    "dos",
+    "ddos",
+    "clickjacking",
+    "cors",
+    "spam",
+    "phishing",
+    "bruteforce",
+    "nosqli",
+    "graphql",
+}
+_IN_PHRASE = sorted(((a, cid) for a, cid in _ALIAS.items() if "-" in a or a in _DISTINCT), key=lambda ac: -len(ac[0]))
+_FILLER = {"attack", "attacks", "vulnerability", "vulnerabilities", "issue", "issues", "bug", "bugs", "flaw", "flaws"}
+# an exclusion with a condition ("without demonstrated impact", "unless chained") is the human's call
+_QUALIFIED = re.compile(
+    r"\b(without|unless|except|only|if|when|requires?|limited|low[- ]impact|no (real|proven))\b", re.I
+)
+
+
+def _slug(name: str) -> str:
+    return "-".join(re.sub(r"[^a-z0-9]+", " ", str(name).lower()).split())
 
 
 def canonical(name: str) -> str:
-    """'Denial of Service' -> 'dos', 'Missing_Security headers' -> 'missing-headers'. Unknown names are slugged."""
-    key = "-".join(str(name).lower().replace("_", " ").replace("/", " ").split())
-    return _ALIAS.get(key, key)
+    """'Denial of Service (DoS) attacks' -> 'dos', 'XSS (stored)' -> 'xss', 'Missing_Security headers' ->
+    'missing-headers'. Exact alias first, then the longest distinctive alias inside the phrase; else the slug."""
+    key = _slug(name)
+    if key in _ALIAS:
+        return _ALIAS[key]
+    padded = f"-{key}-"
+    return next((cid for alias, cid in _IN_PHRASE if f"-{alias}-" in padded), key)
+
+
+def exclusion(text: str) -> str | None:
+    """The class a program's non-qualifying entry removes ENTIRELY, or None (a human reads it). Only an entry that is
+    the class's name, give or take filler words, removes a class: "Denial of Service (DoS) attacks" -> dos, but
+    "Pre-account takeover via OAuth" or "Open redirect without impact" remove nothing automatically."""
+    if _QUALIFIED.search(str(text)):
+        return None
+    words = _slug(re.sub(r"\([^)]*\)", " ", str(text))).split("-")
+    for lead in (("lack", "of"), ("absence", "of"), ("missing",), ("no",), ("any",), ("all",)):
+        if tuple(words[: len(lead)]) == lead and len(words) > len(lead):
+            stripped = words[len(lead) :]
+            break
+    else:
+        stripped = words
+    while stripped and stripped[-1] in _FILLER:
+        stripped = stripped[:-1]
+    for candidate in ("-".join(words), "-".join(stripped)):
+        if candidate in _ALIAS:
+            return _ALIAS[candidate]
+    return None
 
 
 def evidence(name: str) -> str:
@@ -223,7 +278,7 @@ def select_cards(
 ) -> list[str]:
     """Classes whose card fits this surface best. `endpoints`: (key, params) pairs; `exclude`: classes the
     program does not pay for; `recently_used`: cards of the last segments, ranked lower so methods rotate."""
-    excluded = {canonical(x) for x in exclude}
+    excluded = {e for x in exclude if (e := exclusion(x))}
     recent = list(recently_used)
     scores: dict[str, float] = {}
     for raw_key, raw_params in endpoints:
