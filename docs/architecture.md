@@ -116,12 +116,15 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 4. Gate HTTP seulement contournable par un outil qui ignore le proxy. Mitigation : l'agent n'a **aucune route** hors du réseau `sandbox`. Le gate est le seul chemin, pas une convention.
 
 ## Limites connues (revue hostile du 2026-11-24, non fermées)
-- **Jeton OAuth Pro lisible par l'agent** : `claude` et l'outil Bash tournent sous le même uid ; le jeton est dans
-  l'environnement de `claude` (`/proc/<pid>/environ`). Seul `api.anthropic.com:443` est joignable avec ; un `claude -p`
-  imbriqué reste possible et invisible (passthrough TLS). Risque accepté tant que l'agent est un seul process.
+- ~~Jeton OAuth lisible par l'agent~~ **fermé** : l'agent n'a qu'un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081` ;
+  le gate (reverse proxy) injecte le vrai jeton, qui n'existe que dans son conteneur. Accès direct à l'API refusé.
+  Reste : l'agent peut lancer un `claude -p` imbriqué via le relais (consomme le quota, mais sans jeton à exfiltrer).
 - **Le verrou d'outils et la surface sont des aides, pas des frontières** : `coverage.json`, `touched.jsonl`,
   `commands.jsonl` sont écrits dans le sandbox et modifiables par l'agent. Les garanties dures sont dans le gate.
-- **Exclusions de vulnérabilités (`forbidden_vulns`) et énumération d'ids** : doctrine seulement, non appliquées par le gate.
+- **Exclusions** appliquées par le harnais : findings d'une classe exclue rejetés à l'ingestion (alias normalisés),
+  énumération d'ids refusée par le gate (> 4 ids distincts par route d'API ou requête authentifiée en 10 min),
+  corps > 1 Mio refusés. Non couvert : exclusions sans signature réseau (social engineering, physique : pas d'outil
+  pour), et le brute force reste interdit par doctrine (sqlmap sur un login lui ressemble trop pour un filtre au gate).
 - **Vérificateur indépendant (4.3) absent** : tout finding reste `new` jusqu'à la relecture humaine.
 - **Coût du verrou sur une vraie cible** : crawl + content + scan par origine (~10 min chacun à 2 req/s).
 - **nuclei** : ~1,5 req/s via le gate, cause interne non trouvée ; borné par `--timeout`.

@@ -26,8 +26,13 @@ check "DELETE without identity"                    blocked http_ok -X DELETE "ht
 check "passive POST"                               blocked http_ok -X POST -d x https://web.archive.org/cdx
 check "passive server-side fetch /save"            blocked http_ok https://web.archive.org/save/https://example.com
 check "removed passive host (raw.githubusercontent)" blocked http_ok https://raw.githubusercontent.com/
+check "Claude API direct (bypassing the relay)"    blocked reaches https://api.anthropic.com/v1/models
 check "Claude API on a non-443 port"               blocked reaches -p https://api.anthropic.com:22/
+check "real OAuth token absent from the agent"     blocked sh -c 'env | grep -q "^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-[A-Za-z0-9_-]\{80,\}$" || grep -rqs "sk-ant-oat01-[A-Za-z0-9_-]\{80,\}" /proc/[0-9]*/environ /work /home /tmp 2>/dev/null'
+check "relay refuses non-API paths"                blocked http_ok http://gate:8081/
 check "external DNS resolution"                    blocked getent hosts example.com
+check "id enumeration on an API route (5th id)"    blocked sh -c 'for i in 900001 900002 900003 900004; do curl -s -o /dev/null -m 8 http://'"$LAB"'/api/Feedbacks/$i; done; curl -s -m 8 http://'"$LAB"'/api/Feedbacks/900005 | grep -vq "bh-gate: DENIED"'
+check "request body over 1 MiB"                    blocked sh -c 'head -c 1100000 /dev/zero | curl -s -m 15 -X POST --data-binary @- http://'"$LAB"'/api/Feedbacks | grep -vq "bh-gate: DENIED"'
 check "raw TCP behind a CONNECT (CRLF prefix)"     blocked python3 - "$LAB" <<'PY'
 import socket, sys
 host, port = sys.argv[1].split(":")
@@ -42,6 +47,5 @@ except OSError:
     data = b""
 sys.exit(0 if data.startswith(b"HTTP/") else 1)
 PY
-check "Claude API TLS passthrough (real cert)"     allowed sh -c "echo | openssl s_client -proxy gate:8080 -connect api.anthropic.com:443 -servername api.anthropic.com 2>/dev/null | grep -q 'Google Trust Services'"
 echo "failures: $fails"
 exit $fails
