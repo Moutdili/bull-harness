@@ -10,6 +10,7 @@ from bh.accounts.enroll import browser_jar, identity
 from bh.gate import policy as pol
 from bh.gate.policy import Policy, WsGuard, WsLimits, ws_message_record
 from bh.scope import load_scope
+from bh.scope.enforce import check
 
 COPILOT = Path(__file__).resolve().parents[1] / "scopes" / "msrc" / "copilot.yaml"
 
@@ -174,9 +175,15 @@ def test_copilot_scope_targets_and_support():
     assert {r.value for r in s.in_scope} == {
         "copilot.microsoft.com",
         "copilot.com",
-        "substrate.office.com",
-        "substrate.svc.cloud.microsoft",
+        "https://substrate.office.com/m365Copilot/",
+        "https://substrate.office.com/search/api/v1/userconfig",
+        "https://substrate.office.com/search/api/v1/prompts",
+        "https://substrate.office.com/search/api/v1/suggestions",
+        "https://substrate.svc.cloud.microsoft/m365Copilot/",
     }
+    # substrate is the whole M365 back end: only the Copilot paths (audit B5)
+    assert not check(s, "https://substrate.office.com/api/v2.0/me/messages").allowed
+    assert check(s, "https://substrate.office.com/m365Copilot/Chathub/x").allowed
     assert s.websockets_on
     assert set(s.support_hosts("sso")) == {"login.live.com", "login.microsoftonline.com"}
     assert s.support_hosts("passthrough") == ("challenges.cloudflare.com", "brunhild.challenges.cloudflare.com")
