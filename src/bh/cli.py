@@ -514,6 +514,47 @@ def cmd_accounts(args) -> int:
     return rc
 
 
+def cmd_accounts_set(args) -> int:
+    """Store a test account's credential typed by Mio (hidden input), for accounts that cannot sign up on their own
+    (Microsoft, programs with KYC). Values never reach the screen, the shell history or the arguments."""
+    import base64
+    import getpass
+    import re as _re
+
+    from bh.accounts import secrets as sec
+
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", args.program) or not _re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", args.name
+    ):
+        raise SystemExit("ERR program and identity names: letters, digits, - _ (program may hold dots)")
+    cred = sec.load_raw(args.program, args.name) or {}
+    email = args.email or input(
+        f"email of {args.name} (empty: keep {'the stored one' if cred.get('email') else 'none'}): "
+    )
+    if email:
+        cred["email"] = email.strip()
+    pw = getpass.getpass("password (hidden, empty: keep): ")
+    if pw:
+        if getpass.getpass("password again: ") != pw:
+            raise SystemExit("ERR passwords differ: nothing written")
+        cred["password"] = pw
+    totp = getpass.getpass("TOTP secret, base32 or otpauth:// URI (hidden, empty: none / keep): ").strip()
+    if totp:
+        if not totp.startswith("otpauth://"):
+            totp = totp.replace(" ", "").upper()
+            try:
+                base64.b32decode(totp + "=" * (-len(totp) % 8))
+            except ValueError:
+                raise SystemExit("ERR the TOTP secret is not base32: nothing written") from None
+        cred["totp"] = totp
+    if not cred.get("email") or not cred.get("password"):
+        raise SystemExit("ERR an email and a password are needed: nothing written")
+    cred.setdefault("created", time.time())
+    path = sec.save(args.program, args.name, cred)
+    print(f"saved {path} (0600): {', '.join(sorted(k for k in cred if k != 'created'))} — no value shown")
+    return 0
+
+
 def cmd_accounts_mail_check(args) -> int:
     """Refresh the Gmail token and count the last 24 h of mail to the researcher alias. Prints a count only:
     never a subject, a sender, a body or a token."""
@@ -652,6 +693,11 @@ def build_parser() -> argparse.ArgumentParser:
         if name != "ls":
             a.add_argument("--force", action="store_true", help="lift the one-login-per-hour limit")
         a.set_defaults(func=cmd_accounts, force=False)
+    st = acs.add_parser("set", help="store a test account's credential typed by hand (hidden input, 0600)")
+    st.add_argument("program", help="program name, as in the scope file (e.g. msrc-copilot)")
+    st.add_argument("name", help="identity name (e.g. user-a)")
+    st.add_argument("--email", help="the account's email (asked if omitted; it is not a secret)")
+    st.set_defaults(func=cmd_accounts_set)
     acs.add_parser(
         "mail-check", help="Gmail (read-only): refresh the token, count 24 h of mail to the researcher alias"
     ).set_defaults(func=cmd_accounts_mail_check)

@@ -72,3 +72,22 @@ def test_blockers_command_lists_blocker_facts(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "[auth] session expired" in out and "host:a.example.com" in out
     assert "captcha" not in out and "not a blocker" not in out
+
+
+def test_accounts_set_stores_hidden_values(tmp_path, monkeypatch, capsys):
+    import getpass
+    import json
+    import os
+
+    from bh import cli
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    answers = iter(["s3cret-Pw", "s3cret-Pw", "JBSWY3DPEHPK3PXP"])
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(answers))
+    assert cli.main(["accounts", "set", "msrc-copilot", "user-a", "--email", "msobb-a@outlook.test"]) == 0
+    out = capsys.readouterr().out
+    assert "s3cret" not in out and "JBSWY3DP" not in out
+    f = tmp_path / "secrets" / "identities" / "msrc-copilot" / "user-a.json"
+    assert oct(os.stat(f).st_mode & 0o777) == "0o600"
+    d = json.loads(f.read_text())
+    assert d["email"] == "msobb-a@outlook.test" and d["password"] == "s3cret-Pw" and d["totp"] == "JBSWY3DPEHPK3PXP"
