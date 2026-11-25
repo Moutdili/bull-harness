@@ -126,6 +126,12 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 4. Gate HTTP seulement contournable par un outil qui ignore le proxy. Mitigation : l'agent n'a **aucune route** hors du réseau `sandbox`. Le gate est le seul chemin, pas une convention.
 
 ## Limites connues (après les deux revues hostiles du 2026-11-24)
+- **Proxy du gate ouvert à ses réseaux** : `regular@8080` accepte tout client des réseaux du gate, donc aussi Juice
+  Shop sur le réseau `lab`. Sans effet sur une cible réelle, qui n'est jamais sur nos réseaux ; le relais Anthropic, lui,
+  n'accepte que l'agent. L'enrôlement des comptes passe volontairement par ce proxy depuis le gate (`127.0.0.1:8080`)
+  pour subir la même politique que l'agent.
+- **Session morte** : un 401 sous identité peut être un refus d'accès légitime (objet d'un autre). La marque « périmée »
+  qu'il pose est levée au segment suivant si la sonde de l'identité (`probe`, avec contenu attendu) répond bien.
 - **MCP** : la session de l'agent et celle du juge ne chargent aucun serveur MCP (`--strict-mcp-config` sans
   `--mcp-config`), et un `.mcp.json` laissé dans le dossier de travail est effacé entre deux segments. Raison : les hooks
   ne voient que `Bash`. Les outils tiers entrent comme builtins `bh-*` (`research/08-mcp-arsenal.md`).
