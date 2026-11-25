@@ -2,7 +2,7 @@
 id: 4
 title: "Lab d'injection de prompt contre le chasseur et le juge"
 labels: [P0, area:gate, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Lab d'injection de prompt contre le chasseur et le juge
