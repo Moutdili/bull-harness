@@ -178,7 +178,9 @@ LOGIN_RETRY_S = 3600  # one login attempt per identity and hour, whatever its ou
 def refresh_identities(board: Board, scope: Scope, run_id: int, say=None) -> set[str]:
     """Before a segment: every identity with an `enroll` recipe whose session is missing or stale (the gate saw it
     die in an earlier segment: GateOutcome.stale left the `identity-stale` mark) is refreshed through the gate
-    (bh.accounts.enroll.refresh), at most once per hour. A failure is a `login-failed` blocker, never a todo.
+    (bh.accounts.enroll.refresh). The probe runs every segment: it is one request, and it lifts a false stale mark
+    (a 401 that was an authorization refusal, not a dead session). Logins are rate-limited inside refresh; after a
+    failure the identity is retried after LOGIN_RETRY_S. A failure is a `login-failed` blocker, never a todo.
     Returns the recipe identities still without a live session: they stay out of the prompt."""
     from bh.accounts import enroll as en
 
@@ -193,14 +195,14 @@ def refresh_identities(board: Board, scope: Scope, run_id: int, say=None) -> set
             last = float(board.meta_get(key, "0") or 0)
         except ValueError:
             last = 0.0
-        if time.time() - last < LOGIN_RETRY_S:
+        if time.time() - last < LOGIN_RETRY_S:  # failed recently: do not hammer the login
             continue
-        board.meta_set(key, str(time.time()))
         try:
             outcome = en.refresh(scope, name, board=board)
             if say:
                 say(f"  identity {name}: {outcome}")
         except en.AccountError as exc:
+            board.meta_set(key, str(time.time()))
             board.add_blocker(prog, "login-failed", f"identity {name}", one_line(str(exc), 300), run_id=run_id)
             if say:
                 say(f"  identity {name}: login failed ({one_line(str(exc), 200)})")

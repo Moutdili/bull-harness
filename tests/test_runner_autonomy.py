@@ -131,3 +131,42 @@ def test_identity_without_session_is_refreshed_once_an_hour(tmp_path, monkeypatc
     calls.clear()
     assert run.refresh_identities(b, scope, 4) == {"alice"}  # `ok` rewrote the file before the mark: still stale
     assert calls == ["alice"]
+
+
+def test_a_false_stale_mark_is_lifted_at_the_next_segment(tmp_path, monkeypatch):
+    """A 401 that was an authorization refusal marks the identity stale; the next segment probes it again at once
+    (no hourly wait after a success), and a good probe rewrites the session file, which lifts the mark."""
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    from bh.accounts import enroll as en
+
+    b = Board(tmp_path / "board.sqlite")
+    recipe = {
+        "login": {"method": "POST", "url": "http://a.test/login", "json": {"email": "{email}"}},
+        "token": "t",
+        "headers": {"Authorization": "Bearer {token}"},
+    }
+    scope = scope_from_dict(
+        {
+            "program": "p",
+            "platform": "local",
+            "in_scope": ["a.test"],
+            "identities": [{"name": "alice", "enroll": recipe}],
+        }
+    )
+    calls = []
+
+    def probe_ok(scope, name, board):
+        calls.append(name)
+        d = paths.identities_dir("p")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.json").write_text('{"headers": {}}')
+        return "session ok"
+
+    monkeypatch.setattr(en, "refresh", probe_ok)
+    assert run.refresh_identities(b, scope, 1) == set()
+    f = paths.identities_dir("p") / "alice.json"
+    os.utime(f, (time.time() - 100, time.time() - 100))
+    b.meta_set("identity-stale:alice:p", str(time.time() - 50))  # false session-dead during segment 1
+    assert run.live_identities(b, "p") == []
+    assert run.refresh_identities(b, scope, 2) == set()  # probed again right away, mark lifted
+    assert calls == ["alice", "alice"]
