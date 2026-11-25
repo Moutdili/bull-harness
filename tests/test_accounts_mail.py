@@ -233,3 +233,33 @@ def test_mail_check_prints_a_count_only(tmp_path, monkeypatch, capsys, caplog):
     for leak in (SUBJECT, BODY_MARK, ALIAS, DOMAIN, "ACCESS-1", "R-TOKEN", "csec"):
         assert leak not in out.out + out.err + caplog.text
     assert not any("/messages/" in c[1] for c in http.calls)  # counting never opens a message
+
+
+def test_consent_link_and_code_exchange(tmp_path, monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    from bh.accounts import mail
+
+    url = mail.consent_url("cid.apps.googleusercontent.com", "http://127.0.0.1:5555/", "chal", "st8")
+    q = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
+    assert q["scope"] == mail.GMAIL_SCOPE and q["access_type"] == "offline" and q["code_challenge_method"] == "S256"
+    seen = {}
+
+    def post(uri, form):
+        seen.update(form)
+        return {"refresh_token": "rt", "access_token": "at", "scope": mail.GMAIL_SCOPE}
+
+    tok = mail.exchange_code(
+        "c0de",
+        client=("cid", "csec", "https://oauth2.googleapis.com/token"),
+        redirect_uri="http://127.0.0.1:5555/",
+        verifier="v",
+        post=post,
+    )
+    assert tok["refresh_token"] == "rt" and "access_token" not in tok and seen["code_verifier"] == "v"
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    monkeypatch.delenv("BH_GMAIL_TOKEN", raising=False)
+    own = mail.own_token_path()
+    own.parent.mkdir(parents=True, exist_ok=True)
+    own.write_text('{"refresh_token": "x"}')
+    assert mail.token_path() == own  # the harness's own token wins over Hermes's

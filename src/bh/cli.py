@@ -565,6 +565,62 @@ def cmd_accounts_set(args) -> int:
     return 0
 
 
+def cmd_accounts_gmail_login(args) -> int:
+    """Give the harness its own read-only Gmail token: print Google's consent link, take the answer (local
+    redirect, or the final address pasted by Mio), keep the refresh token in secrets/gmail_token.json (0600)."""
+    import base64
+    import hashlib
+    import http.server
+    import json
+    import secrets as _rand
+    import threading
+    from urllib.parse import parse_qs, urlsplit
+
+    from bh.accounts import mail
+    from bh.accounts import secrets as sec
+
+    client = mail.oauth_client(args.client)
+    verifier = _rand.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = _rand.token_urlsafe(16)
+    got: dict = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            got.update({k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()})
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"bull-harness: you can close this tab and go back to the terminal.")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    redirect = f"http://127.0.0.1:{srv.server_address[1]}/"
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    print("1. Open this link in a browser logged in to the Gmail account that receives the codes:\n")
+    print(mail.consent_url(client[0], redirect, challenge, state) + "\n")
+    print("2. Accept (read-only Gmail). If the browser is on this machine, it comes back here by itself.")
+    print("   Otherwise the last page shows an error: copy that page's full address and paste it below.\n")
+    if not got:
+        pasted = input("final address (or Enter if this machine's browser was used): ").strip()
+        if pasted:
+            got.update({k: v[0] for k, v in parse_qs(urlsplit(pasted).query).items()})
+    srv.server_close()
+    if got.get("state") != state or not got.get("code"):
+        raise SystemExit(f"ERR no valid answer from Google ({got.get('error') or 'missing code or state'})")
+    tok = mail.exchange_code(got["code"], client=client, redirect_uri=redirect, verifier=verifier)
+    dest = mail.own_token_path()
+    sec._private_dir(dest.parent)
+    tmp = dest.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(tok, fh)
+    os.replace(tmp, dest)
+    print(f"saved {dest} (0600, read-only Gmail) — now: uv run bh accounts mail-check")
+    return 0
+
+
 def cmd_accounts_mail_check(args) -> int:
     """Refresh the Gmail token and count the last 24 h of mail to the researcher alias. Prints a count only:
     never a subject, a sender, a body or a token."""
@@ -709,6 +765,9 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--email", help="the account's email (asked if omitted; it is not a secret)")
     st.add_argument("--code-to", help="inbox that receives the site's login codes, when it is not --email")
     st.set_defaults(func=cmd_accounts_set)
+    gl = acs.add_parser("gmail-login", help="give the harness its own read-only Gmail token (consent link)")
+    gl.add_argument("--client", default="~/.hermes/google_client_secret.json", help="Google OAuth client JSON")
+    gl.set_defaults(func=cmd_accounts_gmail_login)
     acs.add_parser(
         "mail-check", help="Gmail (read-only): refresh the token, count 24 h of mail to the researcher alias"
     ).set_defaults(func=cmd_accounts_mail_check)

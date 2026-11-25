@@ -347,8 +347,18 @@ class GmailMailbox:
 
 
 # ---------------------------------------------------------------- selection
+def own_token_path() -> Path:
+    """The harness's own Gmail token (`bh accounts gmail-login`), in secrets/: preferred over Hermes's."""
+    from bh import paths
+
+    return paths.secrets_dir() / "gmail_token.json"
+
+
 def token_path() -> Path:
-    return Path(os.path.expanduser(os.environ.get("BH_GMAIL_TOKEN") or DEFAULT_TOKEN))
+    if env := os.environ.get("BH_GMAIL_TOKEN"):
+        return Path(os.path.expanduser(env))
+    own = own_token_path()
+    return own if own.is_file() else Path(os.path.expanduser(DEFAULT_TOKEN))
 
 
 def mailbox() -> Mailbox:
@@ -365,3 +375,70 @@ def mailbox() -> Mailbox:
 
 
 default = mailbox
+
+
+# ---------------------------------------------------------------- consent (bh accounts gmail-login)
+GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+
+
+def oauth_client(path: str = "~/.hermes/" + CLIENT_SECRET_NAME) -> tuple[str, str | None, str]:
+    """(client_id, client_secret, token_uri) of an installed-app OAuth client (Google's client_secret JSON)."""
+    doc = json.loads(Path(os.path.expanduser(path)).read_text(encoding="utf-8"))
+    inner = doc.get("installed") or doc.get("web") or doc
+    return (
+        inner["client_id"],
+        inner.get("client_secret"),
+        inner.get("token_uri") or "https://oauth2.googleapis.com/token",
+    )
+
+
+def consent_url(client_id: str, redirect_uri: str, challenge: str, state: str) -> str:
+    """Google's consent page: read-only Gmail, a refresh token (offline + consent), PKCE S256."""
+    from urllib.parse import urlencode
+
+    q = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": GMAIL_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    return AUTH_URI + "?" + urlencode(q)
+
+
+def exchange_code(
+    code: str, *, client: tuple[str, str | None, str], redirect_uri: str, verifier: str, post=None
+) -> dict:
+    """The authorization code for tokens. Returns what the token file keeps (never printed)."""
+    cid, csec, uri = client
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": cid,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }
+    if csec:
+        form["client_secret"] = csec
+    if post is None:
+        import urllib.parse
+        import urllib.request
+
+        req = urllib.request.Request(uri, data=urllib.parse.urlencode(form).encode(), method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            doc = json.loads(r.read())
+    else:
+        doc = post(uri, form)
+    if not doc.get("refresh_token"):
+        raise MailError("Google returned no refresh token (consent not complete?)")
+    if GMAIL_SCOPE not in str(doc.get("scope", "")).split():
+        raise MailError("the consent did not grant read-only Gmail")
+    out = {"refresh_token": doc["refresh_token"], "client_id": cid, "token_uri": uri, "scopes": [GMAIL_SCOPE]}
+    if csec:
+        out["client_secret"] = csec
+    return out
