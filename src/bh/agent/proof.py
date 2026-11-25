@@ -15,9 +15,9 @@ Rules: at least one `attack` step and one `control` step; every step states what
 (`status`, `contains`, `absent`, `regex`); an attack names a marker in the body (`contains`, `absent` or
 `regex`), status alone proves nothing; a control is the TWIN of an attack (same method, origin and path:
 only the identity, the query or the body differ) and must expect something different. Replay sends every
-step through the gate (same scope, identities injected by the gate), twice, and reports which
-expectations held. The proof is disproved when a control's answer satisfies its attack's expectation
-(no differential). No LLM involved.
+step through the gate (same scope, identities injected by the gate) and reports which expectations held: reads
+twice, writes and setup steps once (they create state: a second booking of the same slot answers 409). The proof
+is disproved when a control's answer satisfies its attack's expectation (no differential). No LLM involved.
 
 A step that only a rendered page proves (DOM XSS, a client-side route) adds `"browse": {"xss": "<marker>"}`
 (GET only): replay runs `bh-browse <url> --xss <marker>` and its text summary is the step's body, so the attack
@@ -45,6 +45,7 @@ from bh.agent import contract as c
 
 ROLES = ("setup", "attack", "control")
 METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 EXPECT_KEYS = ("status", "contains", "absent", "regex")
 MAX_STEPS, TIMEOUT_S, ROUNDS, SNIPPET, MAX_REGEX = 8, 20, 2, 300, 200
 BROWSE_TIMEOUT_S = 90  # one rendered page through the gate (17-40 s measured on the lab)
@@ -203,9 +204,11 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
     """{"reproduced": bool, "control_disproves": bool, "rounds": [[step results]]}."""
     results = []
     control_disproves = False
-    for _ in range(rounds):
+    for n in range(rounds):
         round_, answers = [], []
         for st in proof["steps"]:
+            if n and (st["role"] == "setup" or str(st.get("method", "GET")).upper() not in SAFE_METHODS):
+                continue  # a write creates state (a booking, an object): replaying it would collide (409), not prove
             try:
                 status, body, denied = _browse(st) if "browse" in st else _send(st)
                 answers.append((st, status, body))
