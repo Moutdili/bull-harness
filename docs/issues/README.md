@@ -12,17 +12,17 @@ nature `measure` (mesurer avant de décider), `build`, `research-check` (doctrin
 |---|---|---|---|
 | 1 | [Mesurer un segment long sur le lab (100 tours)](001-mesurer-un-segment-long-sur-le-lab-100-tours.md) | `area:tokens` `owner:claude` `measure` | open |
 | 2 | [Vérifier le TTL du cache de prompt en OAuth (5 min ou 1 h)](002-verifier-le-ttl-du-cache-de-prompt-en-oauth-5-min.md) | `area:tokens` `owner:claude` `measure` | open |
-| 3 | [Isoler le juge dans son propre conteneur](003-isoler-le-juge-dans-son-propre-conteneur.md) | `area:verify` `owner:claude` `build` | open |
+| 3 | [Isoler le juge dans son propre conteneur](003-isoler-le-juge-dans-son-propre-conteneur.md) | `area:verify` `owner:claude` `build` | closed |
 | 4 | [Lab d'injection de prompt contre le chasseur et le juge](004-lab-d-injection-de-prompt-contre-le-chasseur-et-le.md) | `area:gate` `owner:claude` `build` | open |
 | 5 | [Reconstruire l'image agent depuis la base épinglée](005-reconstruire-l-image-agent-depuis-la-base-epinglee.md) | `area:ops` `owner:hermes` `build` | open |
 | 6 | [Lire les règles hunter YWH sur l'automatisation et l'IA](006-lire-les-regles-hunter-ywh-sur-l-automatisation-et.md) | `area:scope` `owner:mio` `research-check` | open |
 | 7 | [Run sur l'app perso de Mio (6.1)](007-run-sur-l-app-perso-de-mio-6-1.md) | `area:ops` `owner:claude` `owner:mio` `build` | open |
 | 8 | [Audit Mythos du plan, de la doctrine et du code](008-audit-mythos-du-plan-de-la-doctrine-et-du-code.md) | `area:verify` `owner:claude` `owner:mio` `audit` | open |
 | 9 | [Choisir le premier programme YWH](009-choisir-le-premier-programme-ywh.md) | `area:scope` `owner:mio` | open |
-| 24 | [Outil bh-browse : navigateur headless dans l'agent](024-outil-bh-browse-navigateur-headless-dans-l-agent.md) | `area:autonomy` `owner:claude` `build` | open |
-| 25 | [Comptes de test autonomes (bh accounts)](025-comptes-de-test-autonomes-bh-accounts.md) | `area:autonomy` `owner:claude` `build` | open |
-| 26 | [Jarre de cookies et session morte dans le gate](026-jarre-de-cookies-et-session-morte-dans-le-gate.md) | `area:gate` `owner:claude` `build` | open |
-| 27 | [Validation live du swarm autonomie](027-validation-live-du-swarm-autonomie.md) | `area:ops` `owner:claude` `owner:mio` `measure` | open |
+| 24 | [Outil bh-browse : navigateur headless dans l'agent](024-outil-bh-browse-navigateur-headless-dans-l-agent.md) | `area:autonomy` `owner:claude` `build` | closed |
+| 25 | [Comptes de test autonomes (bh accounts)](025-comptes-de-test-autonomes-bh-accounts.md) | `area:autonomy` `owner:claude` `build` | closed |
+| 26 | [Jarre de cookies et session morte dans le gate](026-jarre-de-cookies-et-session-morte-dans-le-gate.md) | `area:gate` `owner:claude` `build` | closed |
+| 27 | [Validation live du swarm autonomie](027-validation-live-du-swarm-autonomie.md) | `area:ops` `owner:claude` `owner:mio` `measure` | closed |
 
 ## P1
 
@@ -39,8 +39,8 @@ nature `measure` (mesurer avant de décider), `build`, `research-check` (doctrin
 | 28 | [Mesures anti-bot sur le lab](028-mesures-anti-bot-sur-le-lab.md) | `area:gate` `owner:claude` `measure` | open |
 | 29 | [Outil bh-js : bundles JS et source maps (REA en CLI)](029-outil-bh-js-bundles-js-et-source-maps-rea-en-cli.md) | `area:autonomy` `owner:claude` `build` | open |
 | 32 | [Historique d'URL passif (gau / waymore) dans bh-recon](032-historique-d-url-passif-gau-waymore-dans-bh-recon.md) | `area:autonomy` `owner:hermes` `build` | open |
-| 33 | [Proxy-scanner headless : ZAP daemon (Burp Pro en option)](033-proxy-scanner-headless-zap-daemon-burp-pro-en-option.md) | `area:autonomy` `owner:claude` `build` | open |
-| 34 | [Rejet sur contrôle mal construit : rendre la main au chasseur](034-rejet-sur-controle-mal-construit-rendre-la-main-au-chasseur.md) | `area:verify` `owner:claude` `build` | open |
+| 33 | [Proxy-scanner headless : ZAP daemon (Burp Pro en option)](033-proxy-scanner-headless-zap-daemon-burp-pro-en-option.md) | `area:autonomy` `owner:claude` `build` | closed |
+| 34 | [Rejet sur contrôle mal construit : rendre la main au chasseur](034-rejet-sur-controle-mal-construit-rendre-la-main-au-chasseur.md) | `area:verify` `owner:claude` `build` | closed |
 | 35 | [Preuves avec écriture : valeurs fraîches au rejeu](035-preuves-avec-ecriture-valeurs-fraiches-au-rejeu.md) | `area:verify` `owner:claude` `build` | open |
 
 ## P2

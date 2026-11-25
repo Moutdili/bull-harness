@@ -2,7 +2,7 @@
 id: 3
 title: "Isoler le juge dans son propre conteneur"
 labels: [P0, area:verify, owner:claude, build]
-status: doing
+status: closed
 ---
 
 # Isoler le juge dans son propre conteneur

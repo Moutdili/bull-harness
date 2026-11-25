@@ -2,7 +2,7 @@
 id: 27
 title: "Validation live du swarm autonomie"
 labels: [P0, area:ops, owner:claude, owner:mio, measure]
-status: open
+status: closed
 ---
 
 # Validation live du swarm autonomie

@@ -2,7 +2,7 @@
 id: 34
 title: "Rejet sur contrôle mal construit : rendre la main au chasseur"
 labels: [P1, area:verify, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Rejet sur contrôle mal construit : rendre la main au chasseur

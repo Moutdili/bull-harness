@@ -2,7 +2,7 @@
 id: 26
 title: "Jarre de cookies et session morte dans le gate"
 labels: [P0, area:gate, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Jarre de cookies et session morte dans le gate

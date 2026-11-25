@@ -2,7 +2,7 @@
 id: 25
 title: "Comptes de test autonomes (bh accounts)"
 labels: [P0, area:autonomy, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Comptes de test autonomes (bh accounts)
@@ -20,3 +20,5 @@ Conteneur `browser` piloté par l'hôte (jamais par l'agent), recette d'inscript
 - Reste : `enroll.py` n'appelle pas encore la boîte (pas d'étape `confirm` dans la recette). Le lien rendu devra être suivi via le gate.
 
 Plan : [docs/plan-v3.md](../plan-v3.md)
+
+Fermée le 2026-11-25 : inscription et reconnexion par recette, validées sur Juice Shop et Larkspur. Reste hors issue : lecture Gmail (code prêt, jeton Hermes `invalid_grant`, app OAuth à passer en production).

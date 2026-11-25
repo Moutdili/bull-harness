@@ -2,7 +2,7 @@
 id: 24
 title: "Outil bh-browse : navigateur headless dans l'agent"
 labels: [P0, area:autonomy, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Outil bh-browse : navigateur headless dans l'agent

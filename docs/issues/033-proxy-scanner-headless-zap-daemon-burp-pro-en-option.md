@@ -2,7 +2,7 @@
 id: 33
 title: "Proxy-scanner headless : ZAP daemon (Burp Pro en option)"
 labels: [P1, area:autonomy, owner:claude, build]
-status: open
+status: closed
 ---
 
 # Proxy-scanner headless : ZAP daemon (Burp Pro en option)
