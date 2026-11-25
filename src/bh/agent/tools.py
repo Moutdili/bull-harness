@@ -4,6 +4,7 @@ Every builtin goes through the gate at the program rate limit, keeps the full to
 output under raw/, prints at most ~30 lines, and records what it covered:
 
   bh-recon   <domain|url>   subdomains (domains only) + live HTTP probe        httpx, subfinder
+                            + archived URLs of the in-scope hosts, gf classes   gau + gf patterns
   bh-crawl   <url>          crawl + JS endpoint extraction + forms             katana
   bh-content <url>          content discovery, auto-calibrated                 ffuf + seclists
   bh-scan    <url>          template scan, tech-aware, no intrusive templates   nuclei
@@ -22,7 +23,9 @@ import math
 import re
 import shlex
 import subprocess
+import shutil
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -36,6 +39,19 @@ WORDLISTS = Path("/usr/share/seclists/Discovery/Web-Content")
 # Never run: noisy, destructive or brute-force templates, and OOB templates (no interactsh through the gate).
 NUCLEI_EXCLUDE_TAGS = "dos,fuzz,intrusive,bruteforce,brute-force,default-login,osint,oast,headless"
 SUMMARY_LINES = 25
+# Archive step of bh-recon (gau 2.2.4). Only the providers the gate lets through as passive sources (contract
+# PASSIVE_HOSTS): wayback = web.archive.org/cdx, otx = otx.alienvault.com, urlscan = urlscan.io/api/v1/search.
+# commoncrawl is left out: gau 2.2.4 reads its index list from http://index.commoncrawl.org/collinfo.json
+# (pkg/providers/commoncrawl/commoncrawl.go), a CONNECT to port 80 the gate refuses (passive is 443 only).
+# gau only queries these indexes; nothing here ever fetches an archived page.
+ARCHIVE_PROVIDERS = ("wayback", "otx", "urlscan")
+ARCHIVE_MAX_URLS = 10_000
+ARCHIVE_TIMEOUT = 120
+ARCHIVE_BLACKLIST = "png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,css,mp4,webm,mp3,pdf"
+# gf patterns (tomnomnom/gf examples + 1ndianl33t/Gf-Patterns, pinned in the Containerfile): JSON files with
+# grep flags and regexes. Applied here the way `gf <name>` does: (p1|p2|...), case-insensitive with -i.
+GF_DIR = Path("/opt/bh/gf")
+GF_CLASSES = ("sqli", "xss", "ssrf", "redirect", "idor", "lfi", "rce", "ssti")
 # Quoted absolute paths in JS/HTML, with the HTTP verb when the call site shows it
 # (`http.put(base + "/rest/x")`, `axios.post("/api/y")`, `fetch("/z")`).
 _JS_PATH = re.compile(
@@ -146,8 +162,288 @@ def _add_endpoints(job: Job, items: list[tuple[str, str, list[str], int | None]]
     return len(recs)
 
 
+# ------------------------------------------------------------------ archive (bh-recon)
+# A scope rule as the sandbox sees it: (kind, host pattern, scheme, port, path prefix). The gate decides with
+# bh.scope; this local copy only keeps what gets recorded in scope (out of scope always wins, CIDR/repo ignored).
+ScopeRule = tuple[str, str, str | None, int | None, str | None]
+
+
+def _rule(entry: object) -> ScopeRule | None:
+    if isinstance(entry, dict):
+        value, kind = str(entry.get("value", "")).strip(), entry.get("type")
+    else:
+        value, kind = str(entry).strip(), None
+    if not value:
+        return None
+    if kind is None:
+        kind = (
+            "url"
+            if "://" in value
+            else "wildcard"
+            if "*" in value and "/" not in value
+            else "cidr"
+            if "/" in value or re.fullmatch(r"[0-9.]+|[0-9a-fA-F:]*:[0-9a-fA-F:.]*", value)
+            else "domain"
+        )
+    if kind in ("domain", "wildcard"):
+        return kind, value.lower().rstrip("."), None, None, None
+    if kind == "url":
+        try:
+            p = urlsplit(value)
+            port = p.port
+        except ValueError:
+            return None
+        if not p.hostname:
+            return None
+        port = port or (443 if p.scheme == "https" else 80)
+        return "url", p.hostname.lower(), p.scheme.lower(), port, p.path or "/"
+    return None
+
+
+def scope_rules(path: Path) -> tuple[list[ScopeRule], list[ScopeRule]] | None:
+    """(in, out) web rules of the scope.yaml the runner pushes to BH_DIR; None if absent or unreadable."""
+    import yaml  # python3-yaml in the image
+
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("in_scope"), list):
+        return None
+
+    def rules(key: str) -> list[ScopeRule]:
+        return [r for e in doc.get(key) or [] if (r := _rule(e))]
+
+    return rules("in_scope"), rules("out_of_scope")
+
+
+def _host_matches(pattern: str, host: str) -> bool:
+    """Same reading as bh.scope.enforce: `*.x` = subdomains of x (not x), `api-*.x` = one label, else exact."""
+    if pattern.startswith("*."):
+        return host.endswith("." + pattern[2:])
+    if "*" in pattern:
+        label, _, rest = pattern.partition(".")
+        h_label, _, h_rest = host.partition(".")
+        head, _, tail = label.partition("*")
+        return h_rest == rest and re.fullmatch(re.escape(head) + "[a-z0-9-]+" + re.escape(tail), h_label) is not None
+    return host == pattern
+
+
+def _rule_hits(rule: ScopeRule, url: str, *, out: bool) -> bool:
+    kind, pattern, scheme, port, prefix = rule
+    try:
+        p = urlsplit(url)
+        host, u_port = (p.hostname or "").lower(), p.port or (443 if p.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if not host or not _host_matches(pattern, host):
+        return False
+    if kind != "url":
+        return True
+    path, base = p.path or "/", (prefix or "/").rstrip("/")
+    if out:  # wide on purpose, like enforce._path_hits_exclusion: any scheme/port, /x also bans /x.json, /x;y
+        pl, bl = path.lower(), base.lower()
+        return bl == "" or pl == bl or (pl.startswith(bl) and pl[len(bl)] in "/;.%")
+    return p.scheme == scheme and u_port == port and (base == "" or path == base or path.startswith(base + "/"))
+
+
+def in_scope(url: str, rules: tuple[list[ScopeRule], list[ScopeRule]] | None, domain: str) -> bool:
+    """An archived URL is kept when the scope covers it (out of scope wins). Without a scope file, only the
+    queried domain and its subdomains are kept."""
+    if c.origin(url) is None:
+        return False
+    if rules is None:
+        host = c.host_of(url)
+        return host == domain or host.endswith("." + domain)
+    ins, outs = rules
+    return not any(_rule_hits(r, url, out=True) for r in outs) and any(_rule_hits(r, url, out=False) for r in ins)
+
+
+def archive_query(target: str, rules: tuple[list[ScopeRule], list[ScopeRule]] | None) -> tuple[str, bool] | None:
+    """(domain to ask the archives for, include subdomains), None when the scope covers nothing under it.
+    A URL target asks for its host only; a bare domain also for its subdomains when a wildcard reaches them."""
+    host = c.host_of(target) if "://" in target else target.lower().strip().rstrip(".")
+    if not host or c.is_passive(host):
+        return None
+    if "://" in target:
+        return (host, False) if rules is None or any(_host_matches(r[1], host) for r in rules[0]) else None
+    if rules is None:
+        return host, True
+    patterns = [r[1] for r in rules[0]]
+
+    def base(p: str) -> str:  # *.x.com -> x.com, api-*.x.com -> x.com, a.x.com -> a.x.com
+        return p[2:] if p.startswith("*.") else p.partition(".")[2] if "*" in p else p
+
+    covered = any(_host_matches(p, host) for p in patterns)
+    # subdomains are worth asking for when a rule names something under the domain (*.x, api-*.x, a.x,
+    # https://a.x/) or a wildcard above it covers its subdomains too
+    subs = any(
+        (base(p) == host and p != host)
+        or base(p).endswith("." + host)
+        or (p.startswith("*.") and host.endswith("." + base(p)))
+        for p in patterns
+    )
+    if not (covered or subs):
+        return None
+    return host, subs
+
+
+def gf_patterns(names: tuple[str, ...] = GF_CLASSES, directory: Path | None = None) -> dict[str, re.Pattern]:
+    """name -> compiled gf pattern; a missing or malformed file is skipped (gf prints and skips it too)."""
+    out = {}
+    for name in names:
+        doc = c.read_json((directory or GF_DIR) / f"{name}.json", None)
+        if not isinstance(doc, dict):
+            continue
+        pattern = doc.get("pattern") or (
+            "(" + "|".join(doc["patterns"]) + ")" if isinstance(doc.get("patterns"), list) and doc["patterns"] else ""
+        )
+        if not pattern:
+            continue
+        try:
+            out[name] = re.compile(pattern, re.I if "i" in str(doc.get("flags", "")) else 0)
+        except re.error:
+            continue
+    return out
+
+
+def gf_classify(urls: list[str], patterns: dict[str, re.Pattern]) -> dict[str, list[str]]:
+    """URLs with a query string matched by each gf pattern (one URL may land in several classes)."""
+    with_params = [u for u in urls if c.query_params(u)]
+    return {name: [u for u in with_params if rx.search(u)] for name, rx in patterns.items()}
+
+
+def _stream(job: Job, cmd: list[str], stdout: str, max_lines: int, timeout: int) -> tuple[list[str], int, bool, bool]:
+    """Run a tool and read its stdout line by line into raw/<stdout>, killing it after `max_lines` lines or
+    `timeout` seconds. Returns (lines, rc, timed_out, capped)."""
+    name = Path(cmd[0]).name
+    with open(job.raw / "cmd.txt", "a") as fh:
+        fh.write(shlex.join(cmd) + "\n")
+    lines: list[str] = []
+    fired: list[bool] = []
+
+    def expire(proc: subprocess.Popen) -> None:
+        fired.append(True)
+        proc.kill()
+
+    with open(job.raw / stdout, "w") as out, open(job.raw / f"{name}.err", "w") as err:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL, text=True, errors="replace"
+            )
+        except FileNotFoundError:
+            return [], 127, False, False
+        timer = threading.Timer(timeout, expire, (proc,))
+        timer.start()
+        capped = False
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if not (line := line.strip()):
+                    continue
+                out.write(line + "\n")
+                lines.append(line)
+                if len(lines) >= max_lines:
+                    capped = True
+                    proc.kill()
+                    break
+        finally:
+            timer.cancel()
+            if proc.stdout:
+                proc.stdout.close()
+            rc = proc.wait()
+    return lines, (0 if capped else rc), bool(fired) and not capped, capped
+
+
+def _add_archive_endpoints(urls: list[str]) -> tuple[int, int, dict[str, int]]:
+    """Archived URLs -> endpoints.jsonl (source `archive`), one per route family and origin, parameters merged
+    over all the URLs of the family. Returns (families, new endpoints, new endpoints per origin)."""
+    d = c.bh_dir()
+    known = {(e.get("origin"), c.family(e.get("key", ""))) for e in c.read_jsonl(d / c.ENDPOINTS)}
+    fams: dict[tuple[str, str], dict] = {}
+    for url in urls:
+        k = c.endpoint_key(url)
+        if not k or c.STATIC_EXT.search(k[1].split(" ", 1)[-1]):
+            continue
+        rec = fams.setdefault((k[0], c.family(k[1])), {"origin": k[0], "key": k[1], "url": url, "params": set()})
+        rec["params"].update(c.query_params(url))
+    recs, per_origin = [], {}
+    for fk, rec in fams.items():
+        if fk in known:
+            continue
+        recs.append({**rec, "params": sorted(rec["params"]), "status": None, "source": "archive"})
+        per_origin[rec["origin"]] = per_origin.get(rec["origin"], 0) + 1
+    if recs:
+        c.append_jsonl(d / c.ENDPOINTS, *recs)
+    return len(fams), len(recs), per_origin
+
+
+def archive(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, timeout: int = ARCHIVE_TIMEOUT) -> list[str]:
+    """Historical URLs of the target from passive archives (gau), kept when in scope, recorded per route family,
+    classed by gf. Returns the summary lines (put first in the bh-recon summary)."""
+    gau = shutil.which("gau")
+    if not gau:
+        return ["archive: skipped, gau is not installed in this sandbox (image built before issue 32?)"]
+    rules = scope_rules(c.bh_dir() / c.SCOPE)
+    query = archive_query(target, rules)
+    if query is None:
+        return [f"archive: skipped, {target} is not covered by the scope (or is a passive source)"]
+    domain, subs = query
+    conf = job.raw / "gau.toml"
+    # Own config file: ~/.gau.toml (which could point urlscan/otx at another host) is never read.
+    conf.write_text(
+        'threads = 1\nretries = 2\nsubdomains = {}\nproviders = [{}]\n[urlscan]\n  apikey = ""\n'.format(
+            str(subs).lower(), ", ".join(f'"{p}"' for p in ARCHIVE_PROVIDERS)
+        )
+    )
+    # gau's HTTP client (fasthttp) ignores HTTP(S)_PROXY: the gate is given explicitly (CONNECT, port 443).
+    cmd = [
+        gau,
+        "--config",
+        str(conf),
+        "--providers",
+        ",".join(ARCHIVE_PROVIDERS),
+        "--proxy",
+        c.gate(),
+        "--threads",
+        "1",
+        "--retries",
+        "2",
+        "--timeout",
+        "30",
+        "--blacklist",
+        ARCHIVE_BLACKLIST,
+        *(["--subs"] if subs else []),
+        domain,
+    ]
+    urls, rc, timed_out, capped = _stream(job, cmd, "gau.txt", max_urls, min(timeout, job.timeout))
+    kept = sorted({u for u in urls if in_scope(u, rules, domain)})
+    (job.raw / "archive-inscope.txt").write_text("".join(u + "\n" for u in kept))
+    fams, new, per_origin = _add_archive_endpoints(kept)
+    for o, n in per_origin.items():
+        c.record_phase(c.bh_dir(), o, "archive", status="ok", count=n, raw=str(job.raw))
+    state = " (cut at --max-urls)" if capped else " (timeout, partial)" if timed_out else f" (rc={rc})" if rc else ""
+    lines = [
+        f"archive: {len(urls)} URLs from {'+'.join(ARCHIVE_PROVIDERS)} for {'*.' if subs else ''}{domain}{state}, "
+        f"{len(kept)} in scope, {fams} route families, {new} new endpoints (source archive)"
+    ]
+    err = [x for x in (job.raw / "gau.err").read_text(errors="replace").splitlines() if x.strip()]
+    if not urls and err:
+        lines.append(f"archive: gau stderr: {err[-1][:200]}")
+    patterns = gf_patterns()
+    if not patterns:
+        lines.append(f"archive: gf patterns missing at {GF_DIR}, no classification")
+        return lines
+    classes = gf_classify(kept, patterns)
+    for name, hits in classes.items():
+        (job.raw / f"gf-{name}.txt").write_text("".join(u + "\n" for u in hits))
+    n_params = sum(1 for u in kept if c.query_params(u))
+    lines.append(f"gf ({n_params} URLs with params): " + " ".join(f"{n}={len(h)}" for n, h in classes.items()))
+    return lines
+
+
 # ------------------------------------------------------------------ builtins
-def recon(job: Job, target: str) -> None:
+def recon(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, use_archive: bool = True) -> None:
     hosts = job.raw / "hosts.txt"
     if "://" in target:
         hosts.write_text(target + "\n")
@@ -185,6 +481,8 @@ def recon(job: Job, target: str) -> None:
         stdout="httpx.jsonl",
     )
     live = c.read_jsonl(job.raw / "httpx.jsonl")
+    if use_archive:
+        job.lines += archive(job, target, max_urls)
     for h in sorted(live, key=lambda x: (x.get("status_code", 0), x.get("url", ""))):
         tech = ",".join(h.get("tech") or [])[:60]
         job.lines.append(f"{h.get('status_code')} {h.get('url')}  {(h.get('title') or '')[:50]}  {tech}")
@@ -499,6 +797,11 @@ def main(phase: str, argv: list[str] | None = None) -> None:
     p.add_argument("target", help="URL (or a bare domain for bh-recon)")
     p.add_argument("--as", dest="identity", help="identity name, sent as X-BH-Identity")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT[phase], help="seconds")
+    if phase == "recon":
+        p.add_argument(
+            "--max-urls", type=int, default=ARCHIVE_MAX_URLS, help="archived URLs read at most (gau is stopped there)"
+        )
+        p.add_argument("--no-archive", action="store_true", help="skip the archived URLs step (gau + gf)")
     if phase == "content":
         p.add_argument("--wordlist")
     if phase == "scan":
@@ -520,7 +823,7 @@ def main(phase: str, argv: list[str] | None = None) -> None:
     job = Job(phase, url, a.identity, a.timeout)
     match phase:
         case "recon":
-            recon(job, a.target)
+            recon(job, a.target, max(1, a.max_urls), not a.no_archive)
         case "crawl":
             crawl(job)
         case "content":

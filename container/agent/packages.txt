@@ -22,7 +22,7 @@ nuclei
 naabu
 assetfinder
 amass
-getallurls
+# gau: not the Kali `getallurls` (gau 1.0.7), the pinned 2.2.4 release (Containerfile step 4b)
 hakrawler
 gospider
 # content discovery / fuzzing
