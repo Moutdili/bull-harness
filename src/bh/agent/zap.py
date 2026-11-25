@@ -432,7 +432,10 @@ def _configure(api: Api, a: argparse.Namespace, origin_: str) -> str:
     if a.active:
         api.json("ascan/action/setOptionThreadPerHost", Integer=ASCAN_THREADS_PER_HOST)
         api.json("ascan/action/setOptionHostPerScan", Integer=1)
-        api.json("ascan/action/disableScanners", ids=",".join(DISABLED_RULES))
+        # only the rules this ZAP has: one unknown id makes disableScanners refuse the whole list
+        installed = {str(r.get("id")) for r in api.json("ascan/view/scanners").get("scanners", [])}
+        if off := sorted(set(map(str, DISABLED_RULES)) & installed):
+            api.json("ascan/action/disableScanners", ids=",".join(off))
     return str(ctx)
 
 
