@@ -87,11 +87,11 @@ def test_anthropic_beta_outside_the_list_is_refused():
 
 def test_model_bound_to_the_client():
     models = pol.relay_models()
-    assert models["agent"] == {"claude-sonnet-5-5", "claude-opus-5-5"}
-    assert models["judge"] == {"claude-opus-5-5", "claude-mythos-5-2"}
+    assert models["agent"] == {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"}
+    assert models["judge"] == {"claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"}
     assert check(body(model="claude-mythos-5-2"))[0].startswith("model 'claude-mythos-5-2' is not allowed")
     assert check(body(model="claude-mythos-5-2"), models=models["judge"])[0] is None
-    assert check(body(model="claude-haiku-5-5"))[0].startswith("model 'claude-haiku-5-5'")
+    assert check(body(model="claude-mythos-5-2"))[0].startswith("model 'claude-mythos-5-2'")  # judge only
     assert check(body(model=None))[0].startswith("model None")
     env = {"BH_RELAY_MODELS_AGENT": "claude-haiku-5-5"}
     assert pol.relay_models(env)["agent"] == {"claude-haiku-5-5"}
@@ -215,7 +215,7 @@ def test_count_tokens_accepts_any_relay_model_but_the_same_body_rules(addon, tmp
     f = _flow("10.89.0.6", body(model="claude-opus-5-5", tools=[tool]), path="/v1/messages/count_tokens")
     g._relay(f)
     assert f.metadata.get("bh_denied")
-    f = _flow("10.89.0.6", body(model="claude-haiku-5-5"), path="/v1/messages/count_tokens")
+    f = _flow("10.89.0.6", body(model="claude-3-unknown"), path="/v1/messages/count_tokens")
     g._relay(f)
     assert f.metadata.get("bh_denied")
 
@@ -226,7 +226,10 @@ def test_relay_roles_follow_the_compose_service(addon):
     assert addon.relay_roles("10.89.0.6", table) == {"judge"}
     assert addon.relay_roles("10.231.0.10", table) == frozenset()
     assert addon.relay_models_for(frozenset(), "/v1/messages") == frozenset()
-    assert addon.relay_models_for(frozenset({"agent", "judge"}), "/v1/messages") == {"claude-opus-5-5"}
+    assert addon.relay_models_for(frozenset({"agent", "judge"}), "/v1/messages") == {
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
+    }
 
 
 # ------------------------------------------------------------------ the target hooks touched by the same review

@@ -488,9 +488,11 @@ RELAY_EGRESS_FIELDS = ("mcp_servers", "container")
 # BH_RELAY_MODELS_JUDGE (comma-separated ids). Exact API ids: Claude Code resolves its aliases before sending.
 # hunter: `sonnet` (DEFAULT_MODEL) or `opus`, as Claude Code 2.1.330 resolves them; judge: `opus`
 # (BH_VERIFIER_MODEL) and the escalation model (BH_ESCALATION_MODEL).
+# claude-haiku-5-5: Claude Code's own small model for background calls (seen 4 times in the relay log); a model
+# gives no network access, refusing it would only break Claude Code in ways the run does not show
 RELAY_MODELS_DEFAULT = {
-    "agent": ("claude-sonnet-5-5", "claude-opus-5-5"),
-    "judge": ("claude-opus-5-5", "claude-mythos-5-2"),
+    "agent": ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"),
+    "judge": ("claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"),
 }
 # anthropic-beta values the relay lets through (BH_RELAY_BETAS replaces the list). Taken from the beta table of
 # Claude Code 2.1.330 (strings of the binary), keeping only those that change how a request is answered (auth,
