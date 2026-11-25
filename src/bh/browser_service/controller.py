@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import re
+from urllib.parse import urlsplit
 import shutil
 import signal
 import socket
@@ -101,10 +102,18 @@ def _str(v: Any, field: str, lo: int, hi: int) -> str:
     return v
 
 
+_LOCAL_HOST = re.compile(
+    r"^(localhost|.*\.localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1?\]?|\[?::ffff:.*|browser)$", re.I
+)
+
+
 def _url(v: Any) -> str:
     u = _str(v, "url", 8, URL_MAX)
     if not re.match(r"https?://[^/\s]", u, re.I) or any(c.isspace() for c in u):
         raise Refused("url: http(s) only (no file:, chrome:, data:, javascript:, view-source:)")
+    host = urlsplit(u).hostname or ""
+    if _LOCAL_HOST.match(host.rstrip(".")):
+        raise Refused("url: the browser's own container is not a target")
     return u
 
 
@@ -366,6 +375,7 @@ def chromium_argv(profile: str, binary: str = CHROMIUM, proxy: str = GATE_PROXY)
         f"--user-data-dir={profile}",
         f"--remote-debugging-port={CDP_PORT}",  # headful Chromium binds it to 127.0.0.1
         f"--proxy-server={proxy}",
+        "--proxy-bypass-list=<-loopback>",  # loopback via the gate too (refused): CDP, VNC, API unreachable
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-dev-shm-usage",

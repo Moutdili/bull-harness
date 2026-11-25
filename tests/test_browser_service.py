@@ -390,3 +390,22 @@ def test_token_file_is_private(tmp_path, monkeypatch):
     ensure_token()  # never rotated by a second `bh up`
     assert token_file().read_text() == first and first.startswith("BH_BROWSER_TOKEN=") and len(first) > 40
     assert token_file().stat().st_mode & 0o777 == 0o600
+
+
+def test_goto_refuses_the_browsers_own_container_and_forces_loopback_through_the_gate():
+    import pytest
+
+    from bh.browser_service import controller as c
+
+    for u in (
+        "http://127.0.0.1:9222/json",
+        "http://localhost:8790/op",
+        "http://[::1]:5900/",
+        "http://browser:8790/",
+        "http://a.localhost/",
+        "http://0.0.0.0:9222/",
+    ):
+        with pytest.raises(c.Refused):
+            c._url(u)
+    assert c._url("https://copilot.com/chat") == "https://copilot.com/chat"
+    assert "--proxy-bypass-list=<-loopback>" in c.chromium_argv("/p")
