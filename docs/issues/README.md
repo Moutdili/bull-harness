@@ -41,6 +41,7 @@ nature `measure` (mesurer avant de décider), `build`, `research-check` (doctrin
 | 32 | [Historique d'URL passif (gau / waymore) dans bh-recon](032-historique-d-url-passif-gau-waymore-dans-bh-recon.md) | `area:autonomy` `owner:hermes` `build` | open |
 | 33 | [Proxy-scanner headless : ZAP daemon (Burp Pro en option)](033-proxy-scanner-headless-zap-daemon-burp-pro-en-option.md) | `area:autonomy` `owner:claude` `build` | open |
 | 34 | [Rejet sur contrôle mal construit : rendre la main au chasseur](034-rejet-sur-controle-mal-construit-rendre-la-main-au-chasseur.md) | `area:verify` `owner:claude` `build` | open |
+| 35 | [Preuves avec écriture : valeurs fraîches au rejeu](035-preuves-avec-ecriture-valeurs-fraiches-au-rejeu.md) | `area:verify` `owner:claude` `build` | open |
 
 ## P2
 
