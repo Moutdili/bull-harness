@@ -6,6 +6,15 @@ from bh.agent.contract import BLOCKER_TTL_S
 from bh.board import Board
 
 
+def test_needs_proof_is_a_finding_status_shown_to_the_hunter(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    fid = b.add_finding("demo", "IDOR basket", severity="high")
+    b.set_finding(fid, "needs-proof", "no differential")
+    assert f"F{fid} [needs-proof/high] IDOR basket" in b.frontier("demo")
+    with pytest.raises(ValueError):
+        b.set_finding(fid, "needs-love")
+
+
 def test_board_crud(tmp_path):
     b = Board(tmp_path / "b.sqlite")
     rid = b.run_start("demo", "sonnet")

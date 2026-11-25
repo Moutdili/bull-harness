@@ -120,3 +120,47 @@ def test_program_reset_forgets_the_asset_graph(tmp_path, monkeypatch):
     assert not b.rows("SELECT 1 FROM assets WHERE program='p'")
     assert b.rows("SELECT 1 FROM assets WHERE program='q'")  # other programs keep theirs
     assert b.rows("SELECT COUNT(*) n FROM tests")[0]["n"] == 1
+
+
+def test_malformed_sandbox_values_are_skipped_never_fatal(tmp_path, monkeypatch):
+    """M4: a dict or a list where a string is expected drops that entry; sync never raises."""
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["*.t.test"]})
+    b = Board(tmp_path / "var" / "board.sqlite")
+    o = "https://a.t.test:443"
+    d = tmp_path / "var" / "work" / "p" / ".bh"
+    _write(
+        d / c.ENDPOINTS,
+        [
+            [1],
+            "text",
+            {"origin": o, "key": {"a": 1}},
+            {"origin": o, "key": "GET /x", "source": {"a": 1}},
+            {"origin": o, "key": "GET /y", "status": [200]},
+            {"origin": o, "key": "GET /z", "params": {"q": 1}},
+            {"origin": [o], "key": "GET /w"},
+            {"origin": o, "key": "GET /ok", "params": ["q", {"x": 1}], "status": 200},
+        ],
+    )
+    c.write_json(
+        d / c.COVERAGE,
+        {
+            o: {
+                "crawl": {"status": {"a": 1}},
+                "content": {"status": "ok", "ts": [1]},
+                "scan": {"status": "ok", "raw": ["x"]},
+                "recon": {"status": "ok", "ts": 10**400},
+                "params": {"status": "ok", "ts": 1.5, "raw": "/work/x"},
+            },
+            "https://b.t.test:443": [1],
+        },
+    )
+    _write(d / c.TOUCHED, [[1], {"origin": o, "key": "GET /t", "via": {"a": 1}}, {"origin": o, "key": ["x"]}])
+    _write(tmp_path / "var" / "state" / "flows.jsonl", [])
+    n = Graph(b, scope).sync(None)
+    assert n["endpoints"] == 1 and n["coverage"] == 1 and n["tests"] == 0
+    keys = {r["key"] for r in b.rows("SELECT key FROM assets WHERE kind='endpoint'")}
+    assert keys == {f"{o} GET /ok"}
+    assert [tuple(r) for r in b.rows("SELECT phase, status, ts, raw FROM coverage")] == [
+        ("params", "ok", 1.5, "/work/x")
+    ]

@@ -6,6 +6,7 @@ replay or hide its own notes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
@@ -23,6 +24,13 @@ from bh.scope import Scope
 from bh.text import one_line
 
 AUTH_THRESHOLD = 3  # 401 answers on one host (and identity) before it counts as a wall, not a probe
+# session-dead events with reason 401, on distinct routes of one identity, before it is marked stale (H4): a single
+# 401 is often an access refusal (the control of a test), not a dead session. The gate applies a threshold too.
+DEAD_401_ROUTES = 3
+# Fact kinds and blocker reasons only the host writes: a note asking for them is downgraded (B6)
+HOST_FACT_KINDS = frozenset({"blocker", "harness"})
+HOST_BLOCKER_REASONS = frozenset({"refusal"})
+_BRACKET_TITLE = re.compile(r"^\s*\[([^\]]*)\]")
 INTENT_ID = re.compile(r"I?(\d{1,12})")
 
 
@@ -69,16 +77,47 @@ def _s(value, n: int = 2000) -> str:
     return "" if value is None else (value if isinstance(value, str) else json.dumps(value))[:n]
 
 
+def _hunter_title(title: str) -> str:
+    """A note's title never starts like a host-written one ("[refusal] ...", "[waf] ..."): brackets become parens."""
+    return _BRACKET_TITLE.sub(r"(\1)", title, count=1)
+
+
+def _hunter_reason(reason: str) -> str:
+    """A blocker reason the hunter may give (the host alone records model refusals)."""
+    return "other" if reason in HOST_BLOCKER_REASONS else reason
+
+
+def _revive(board: Board, program: str, title: str, fields: dict, doc) -> int | None:
+    """A new, valid proof under the title of a needs-proof finding (issue 34): that finding takes the proof and goes
+    back to 'new' for one more verification (bh.verify rejects it if this proof has no differential either)."""
+    if doc is None or not title:
+        return None
+    rows = board.rows(
+        "SELECT id FROM findings WHERE program=? AND title=? AND status='needs-proof' ORDER BY id DESC LIMIT 1",
+        program,
+        title,
+    )
+    if not rows:
+        return None
+    fid = int(rows[0]["id"])
+    keep = {k: v for k, v in fields.items() if k in ("severity", "summary", "poc", "evidence", "not_proven")}
+    board.finding_set(fid, proof=json.dumps(doc), replay=None, **keep)
+    board.set_finding(fid, "new", "new proof received from the hunter: verified once more")
+    return fid
+
+
 def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None) -> tuple[int, int, int]:
     """One note -> (facts, findings, blockers) added."""
     match n.get("op"):
         case "fact":
+            kind = _s(n.get("kind") or "fact", 40)
             board.add_fact(
                 program,
-                _s(n.get("title"), 300),
+                _hunter_title(_s(n.get("title"), 300)),
                 _s(n.get("summary")),
                 _s(n.get("evidence")),
-                kind=_s(n.get("kind") or "fact", 40),
+                # blocker and harness facts are the host's (add_blocker, ingestion): a note cannot forge them
+                kind=kind if kind in c.FACT_KINDS else "fact",
                 run_id=run_id,
             )
             return 1, 0, 0
@@ -95,9 +134,12 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
             if doc is not None and proof.validate(doc):  # re-checked on the host: the sandbox check is advisory
                 fields["not_proven"] = (fields.get("not_proven", "") + " [proof refused by the host]").strip()
                 doc = None
+            title = _s(n.get("title"), 300)
+            if _revive(board, program, title, fields, doc) is not None:
+                return 0, 1, 0
             fid = board.add_finding(
                 program,
-                _s(n.get("title"), 300) or "(untitled)",
+                title or "(untitled)",
                 run_id=run_id,
                 proof=doc,
                 **fields,
@@ -109,7 +151,7 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
                 return 0, 0, 0
             return 0, 1, 0
         case "blocked":
-            reason = _s(n.get("reason"), 40)
+            reason = _hunter_reason(_s(n.get("reason"), 40))
             board.add_blocker(
                 program,
                 reason,
@@ -126,17 +168,35 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
             if kind == "scope-question":  # a scope is never widened from the hunt: kept as a fact
                 board.add_fact(program, title, _s(n.get("detail")), kind="out-of-scope", run_id=run_id)
                 return 1, 0, 0
-            board.add_blocker(program, kind, title, _s(n.get("detail")), run_id=run_id)  # unknown kind -> other
+            board.add_blocker(program, _hunter_reason(kind), title, _s(n.get("detail")), run_id=run_id)
             return 0, 0, 1
     return 0, 0, 0
 
 
+def _ts(e: dict, default: float) -> float:
+    """The event's own time (the gate stamps every event), `default` when it has none."""
+    v = e.get("ts")
+    return float(v) if isinstance(v, int | float) and not isinstance(v, bool) and v > 0 else default
+
+
+def _route(e: dict, host: str) -> str:
+    """The route a gate event is about (origin + method + path family), for counting distinct ones."""
+    url = e.get("url") if isinstance(e.get("url"), str) else ""
+    k = c.endpoint_key(url, _s(e.get("method") or "GET", 10))
+    return f"{k[0]} {c.family(k[1])}" if k else f"{host} ?"
+
+
 def _identity_dead(
-    board: Board, program: str, run_id: int, out: GateOutcome, *, ident: str, host: str, title: str
+    board: Board, program: str, run_id: int, out: GateOutcome, *, ident: str, host: str, title: str, ts: float
 ) -> None:
     """Mark an identity stale (meta `identity-stale:<ident>:<program>`: the runner leaves it out of the prompt
-    and the judge until its session file is rewritten) and record one `auth` blocker per identity and run."""
-    board.meta_set(f"identity-stale:{ident}:{program}", str(time.time()))
+    and the judge until its session file is rewritten) and record one `auth` blocker per identity and run.
+    The mark carries the time of the EVENT, not of the ingestion: a probe that failed before a login must not
+    mark stale the session that login wrote afterwards (H4 b). The latest mark wins."""
+    key = f"identity-stale:{ident}:{program}"
+    with contextlib.suppress(ValueError):
+        ts = max(ts, float(board.meta_get(key, "0") or 0))
+    board.meta_set(key, str(ts))
     out.stale.add(ident)
     key = f"auth-blocker:{ident}:{program}"
     if board.meta_get(key) == str(run_id):
@@ -156,15 +216,16 @@ def _identity_dead(
 def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> GateOutcome:
     """One summary fact for denials, blocker facts for walls (WAF, 401) and missing identities.
 
-    `session-dead` (the gate saw a 401, a redirect to the login page or a failed probe under an identity) ->
-    that identity is stale at once (_identity_dead). `GateOutcome.stale` lists the dead identities: the entry
-    point for logging in again (issue 25).
-    401 sent WITH an identity, AUTH_THRESHOLD times -> same (gates older than session-dead only sent `auth`).
+    `session-dead` with a redirect to the login page or a failed probe -> that identity is stale at once
+    (_identity_dead); with a 401 -> only once DEAD_401_ROUTES distinct routes answered it. `GateOutcome.stale`
+    lists the dead identities: the entry point for logging in again (issue 25).
+    401 sent WITH an identity (`auth` event) -> counted with the 401 session-dead ones, per distinct route.
     401 sent WITHOUT one -> blocker only if the program has no identity at all: an agent probing
     unauthenticated access control on purpose has hit no wall."""
     out = GateOutcome()
     blocked: dict[str, int] = {}
-    auth: dict[tuple[str, str], int] = {}
+    auth: dict[str, int] = {}  # host -> 401 answers sent without an identity
+    dead401: dict[str, dict[str, tuple[str, float]]] = {}  # identity -> route -> (host, ts)
     missing: set[str] = set()
     now = time.time()
     for e in board.new_lines(paths.events_log(), "gate-events"):
@@ -188,12 +249,19 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                     )
                     out.blockers += 1
             case "auth":
-                key = (_s(e.get("host") or "?", 255), _s(e.get("identity"), 80))
-                auth[key] = auth.get(key, 0) + 1
+                host, ident = _s(e.get("host") or "?", 255), _s(e.get("identity"), 80)
+                if ident:  # the same 401 as a session-dead one: counted per distinct route, never per answer
+                    dead401.setdefault(ident, {})[_route(e, host)] = (host, _ts(e, now))
+                else:
+                    auth[host] = auth.get(host, 0) + 1
             case "session-dead":
                 if ident := _s(e.get("identity"), 80):
                     host = _s(e.get("host") or "?", 255)
-                    why = {"401": "401", "login-redirect": "a redirect to its login page", "probe": "a failed probe"}
+                    reason = _s(e.get("reason"), 20)
+                    if reason == "401" or (not reason and e.get("status") == 401):
+                        dead401.setdefault(ident, {})[_route(e, host)] = (host, _ts(e, now))
+                        continue
+                    why = {"login-redirect": "a redirect to its login page", "probe": "a failed probe"}
                     _identity_dead(
                         board,
                         program,
@@ -202,7 +270,8 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                         ident=ident,
                         host=host,
                         title=f"identity '{ident}': session dead on {host} "
-                        f"({why.get(_s(e.get('reason'), 20), 'status ' + _s(e.get('status'), 5))})",
+                        f"({why.get(reason, 'status ' + _s(e.get('status'), 5))})",
+                        ts=_ts(e, now),
                     )
             case "identity-missing":
                 ident = _s(e.get("identity"), 80)
@@ -215,20 +284,24 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                         kind="harness",
                         run_id=run_id,
                     )
-    for (host, ident), n in auth.items():
+    for ident, routes in dead401.items():
+        if len(routes) < DEAD_401_ROUTES:
+            continue  # an access refusal on one or two objects is the finding's control, not a dead session
+        host, ts = max(routes.values(), key=lambda v: v[1])
+        _identity_dead(
+            board,
+            program,
+            run_id,
+            out,
+            ident=ident,
+            host=host,
+            title=f"identity '{ident}': session dead on {host} (401 on {len(routes)} routes)",
+            ts=ts,
+        )
+    for host, n in auth.items():
         if n < AUTH_THRESHOLD:
             continue
-        if ident:
-            _identity_dead(
-                board,
-                program,
-                run_id,
-                out,
-                ident=ident,
-                host=host,
-                title=f"identity '{ident}' gets 401 on {host} ({n}x): session expired",
-            )
-        elif not identities:
+        if not identities:
             # once per host while the blocker is visible; past its TTL the wall is reported again if still there
             key = f"auth-wall:{host}:{program}"
             if now - float(board.meta_get(key, "0") or 0) < c.BLOCKER_TTL_S:

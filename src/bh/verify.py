@@ -2,13 +2,18 @@
 
   new finding ──► dedup ──► stage A: deterministic replay of proof.json (2 rounds, through the gate)
                          ──► stage B: fresh claude session, verifier role, single requests, bounded
-                         ──► decision ──► verified (+ todo submit) | rejected | inconclusive
+                         ──► decision ──► verified (+ todo submit) | rejected | inconclusive | needs-proof
                                       └─► inconclusive, never escalated: stage B once more with a second judge
                                           (ESCALATION_MODEL, fresh context, new nonce), same stage A, same decision
                          └─► triager PoC generated from the proof (sessions as placeholders)
 
+Before any judging, the gate (M1): the finding's host in a WAF pause -> back to 'new', nothing replayed; a replay step
+refused by the gate -> back to 'new', no stage B, no escalation. Neither is a doubt about the finding: it waits for a
+later pass. A refused replay is counted; past MAX_GATE_DEFERRALS it is left inconclusive.
+
 Decision table (deterministic, B can only lower a deterministic success, never invent one):
-  control answered exactly like the attack          -> rejected (no differential)
+  control answered exactly like the attack          -> needs-proof the first time (a fact tells the hunter to send a
+                                                       better proof under the same title), rejected the second time
   B rejected                                         -> rejected
   A reproduced and B confirmed                       -> verified
   anything else                                      -> inconclusive
@@ -29,6 +34,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from bh import classes, paths, redact, stack
 from bh.agent import contract as c
@@ -46,8 +52,11 @@ ESCALATION_MODEL = os.environ.get("BH_ESCALATION_MODEL", "claude-mythos-5-2")
 ESCALATION_EFFORT = "high"
 MAX_VERIFY_ERRORS = 2  # an error is a breakdown, not a doubt: retried on a later pass, never escalated
 REPLAY_TIMEOUT_S = 420
-# a new finding is a duplicate of these (a rejected one too: re-proposing it would cost a verifier session each time)
-ACTIVE = ("new", "verifying", "verified", "inconclusive", "submitted", "rejected")
+# A new finding is a duplicate of these. Not of a rejected or needs-proof one (B12): the earlier proof was refused,
+# a later finding on the same resource may carry the proof it lacked.
+ACTIVE = ("new", "verifying", "verified", "inconclusive", "submitted")
+MAX_GATE_DEFERRALS = 3  # replays refused by the gate before the finding is left inconclusive
+GATE_REFUSED = "refused by the gate"  # bh.agent.proof.replay marks a step the gate refused with this miss
 _PLACEHOLDERS = ",".join("?" * len(ACTIVE))
 
 
@@ -164,6 +173,8 @@ def stage_b(
 
 
 def decide(replay: dict, verdict: str, reason: str) -> tuple[str, str]:
+    """Stage A + stage B -> (status, why). A control that answers like the attack is a rejection of the proof;
+    _verify turns the first one into needs-proof (issue 34)."""
     if replay.get("control_disproves"):
         return "rejected", "stage A: the control answered exactly like the attack, there is no differential"
     if verdict == "rejected":
@@ -172,6 +183,67 @@ def decide(replay: dict, verdict: str, reason: str) -> tuple[str, str]:
         return "verified", f"replayed twice with its control; verifier: {reason}"
     stage = "replayed" if replay.get("reproduced") else "NOT replayed (" + one_line(_misses(replay), 160) + ")"
     return "inconclusive", f"stage A {stage}; verifier {verdict}: {reason}"
+
+
+def gate_refused(replay: dict) -> bool:
+    """A step of the replay was refused by the gate (scope, cooldown, method rule): the replay proves nothing."""
+    return any(
+        isinstance(s, dict) and GATE_REFUSED in (s.get("misses") or [])
+        for r in (replay.get("rounds") or [])
+        if isinstance(r, list)
+        for s in r
+    )
+
+
+def paused_hosts(board: Board, scope: Scope, finding: dict, proof: dict | None) -> list[str]:
+    """Hosts of the finding (its url and its proof's steps) that the gate has set aside right now (WAF pause)."""
+    from bh.assets import Graph
+
+    blocked = Graph(board, scope).blocked()
+    if not blocked:
+        return []
+    urls = [finding.get("url") or ""]
+    urls += [s.get("url") for s in ((proof or {}).get("steps") or []) if isinstance(s, dict)]
+    hosts = {(urlsplit(u).hostname or "") for u in urls if isinstance(u, str)}
+    return sorted(h for h in hosts if h in blocked)
+
+
+def _defer(board: Board, scope: Scope, fid: int, why: str, *, count: bool, say) -> str:
+    """The gate kept the replay from proving anything: back to 'new' (no stage B, no escalation). Only a refused
+    replay counts (it cost requests); a pause ends by itself and costs nothing."""
+    key = f"gate-deferred:F{fid}:{scope.program}"
+    n = int(board.meta_get(key, "0") or 0) + int(count)
+    if count:
+        board.meta_set(key, str(n))
+    if n > MAX_GATE_DEFERRALS:
+        status, why = "inconclusive", f"{why}; refused by the gate {n} times, left inconclusive"
+    else:
+        status, why = "new", f"{why}; back in the queue ({n}/{MAX_GATE_DEFERRALS} refused replays)"
+    board.set_finding(fid, status, why[:500])
+    say(f"  ↳ F{fid} {status}: {one_line(why, 200)}")
+    return status
+
+
+def _needs_proof(board: Board, scope: Scope, finding: dict) -> tuple[str, str]:
+    """No differential in stage A (issue 34). First time: needs-proof, and a fact tells the hunter how to send a
+    better proof (bh.runner.ingest revives the finding when it arrives under the same title). Second time:
+    rejected."""
+    fid = finding["id"]
+    key = f"proof-retry:F{fid}:{scope.program}"
+    if board.meta_get(key):
+        return "rejected", "stage A: the control answered exactly like the attack again, with the second proof"
+    board.meta_set(key, str(time.time()))
+    title = one_line(finding.get("title") or "", 120)
+    board.add_fact(
+        scope.program,
+        f"F{fid} needs a new proof: its control answers like the attack",
+        f"F{fid} ({title}): your control answers like the attack. Choose a marker only the attacker gets, then "
+        'rewrite the proof and record it again with `bh-note finding "<same title>" ... --proof proof.json`, '
+        "exactly the same title. That new proof is verified once; a second proof without a differential is "
+        "rejected.",
+        kind="harness",
+    )
+    return "needs-proof", "stage A: the control answered exactly like the attack (no differential); new proof asked"
 
 
 def _misses(replay: dict) -> str:
@@ -246,6 +318,13 @@ def verify_finding(
         board.set_finding(fid, "duplicate", f"same class and resource as F{dup}")
         say(f"  ↳ F{fid} duplicate of F{dup}")
         return "duplicate"
+    try:
+        proof_doc = json.loads(finding["proof"])
+    except ValueError:
+        proof_doc = None
+    if paused := paused_hosts(board, scope, finding, proof_doc if isinstance(proof_doc, dict) else None):
+        # replaying now would hit the gate's cooldown: nothing is spent, the pause ends by itself
+        return _defer(board, scope, fid, "not replayed: WAF pause on " + ", ".join(paused), count=False, say=say)
     board.set_finding(fid, "verifying")
     try:
         return _verify(board, scope, finding, run_id=run_id, model=model, effort=effort, say=say)
@@ -275,8 +354,10 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
         f"  ↳ F{fid} stage A: reproduced={replay.get('reproduced')} control_disproves={replay.get('control_disproves')}"
     )
     board.finding_set(fid, replay=json.dumps(replay)[:200_000], poc_triager=triager_poc(scope, proof))
+    if gate_refused(replay):  # the gate's word, not a doubt about the finding: no judge, no escalation
+        return _defer(board, scope, fid, "stage A: a replay step was refused by the gate", count=True, say=say)
     if replay.get("control_disproves"):
-        status, why = decide(replay, "rejected", "control answered like the attack")
+        status, why = _needs_proof(board, scope, finding)
     else:
         verdict, reason = stage_b(board, scope, finding, replay, run_id=run_id, model=model, effort=effort, say=say)
         status, why = decide(replay, verdict, reason)

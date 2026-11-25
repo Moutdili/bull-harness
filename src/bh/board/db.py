@@ -81,7 +81,19 @@ PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
 
 # The only human step left: submitting a verified finding. Anything that blocks the hunt is a blocker fact.
 TODO_KINDS = {"submit"}
-FINDING_STATUS = {"new", "verifying", "verified", "inconclusive", "rejected", "submitted", "duplicate"}
+# needs-proof: stage A found no differential (the control answered like the attack). The proof is at fault, not
+# necessarily the finding: the hunter gets one chance to send a better one (issue 34). The column has no CHECK
+# constraint, so a new status needs no schema migration.
+FINDING_STATUS = {
+    "new",
+    "verifying",
+    "verified",
+    "inconclusive",
+    "needs-proof",
+    "rejected",
+    "submitted",
+    "duplicate",
+}
 FINDING_FIELDS = ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven", "proof")
 
 

@@ -341,3 +341,81 @@ def test_two_errors_end_inconclusive_without_escalation(judged):
     status, verdict, todos = state()
     assert status == "inconclusive" and "verification error 2/2" in verdict and todos == []
     assert [m for m, _ in calls] == ["opus", "opus"]
+
+
+# ------------------------------------------------------------------ the gate in the way (M1)
+def _refused_replay():
+    step = {"name": "attack", "role": "attack", "status": 403, "ok": False, "misses": ["refused by the gate"]}
+    return {"reproduced": False, "control_disproves": False, "rounds": [[step]]}
+
+
+def test_a_replay_refused_by_the_gate_goes_back_to_new_without_any_judge(judged, monkeypatch):
+    from bh import verify as v
+
+    verify, state, calls, _answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: _refused_replay())
+    for i in range(1, v.MAX_GATE_DEFERRALS + 1):
+        assert verify() == "new"
+        assert f"({i}/{v.MAX_GATE_DEFERRALS} refused replays)" in state()[1]
+    assert verify() == "inconclusive"  # past the bound: no endless loop
+    assert calls == [] and not board.meta_get(f"escalated:F{fid}:p") and state()[2] == []
+
+
+def test_a_waf_pause_on_the_finding_host_defers_without_replay(judged, monkeypatch):
+    import time
+
+    from bh import verify as v
+    from bh.assets import Graph
+    from bh.scope import scope_from_dict
+
+    verify, state, calls, _answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: pytest.fail("replayed during a WAF pause"))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    Graph(board, scope).mark_blocked("t.test", "waf", time.time() + 3600)
+    for _ in range(v.MAX_GATE_DEFERRALS + 2):  # a pause ends by itself: it is never counted
+        assert verify() == "new"
+    assert "WAF pause on t.test" in state()[1] and calls == []
+    assert not board.meta_get(f"gate-deferred:F{fid}:p")
+
+
+# ------------------------------------------------------------------ a control that answers like the attack (issue 34)
+def test_no_differential_asks_the_hunter_for_a_new_proof_once(judged, monkeypatch):
+    from bh import verify as v
+
+    verify, state, calls, _answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": False, "control_disproves": True})
+    assert verify() == "needs-proof"
+    assert state()[0] == "needs-proof" and state()[2] == [] and calls == []
+    facts = board.rows("SELECT kind, title, summary FROM facts")
+    assert len(facts) == 1 and facts[0]["kind"] == "harness" and facts[0]["title"].startswith(f"F{fid} ")
+    assert "marker only the attacker gets" in facts[0]["summary"] and "bh-note finding" in facts[0]["summary"]
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    pending = v.verify_pending(board, scope, run_id=1, model="m", effort=None, say=lambda *a: None)
+    assert pending == {}  # needs-proof waits for the hunter
+    board.set_finding(fid, "new")  # what ingest does when the new proof arrives under the same title
+    assert verify() == "rejected"  # the second proof has no differential either
+    assert "again" in state()[1] and len(board.rows("SELECT 1 FROM facts")) == 1
+
+
+def test_a_better_proof_after_needs_proof_is_verified(judged, monkeypatch):
+    from bh import verify as v
+
+    verify, state, _calls, answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": False, "control_disproves": True})
+    assert verify() == "needs-proof"
+    board.set_finding(fid, "new")
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": True, "control_disproves": False})
+    answers += [("confirmed", "reads another user's basket")]
+    assert verify() == "verified" and state()[2] == ["submit"]
+
+
+def test_rejected_and_needs_proof_findings_are_not_duplicates_targets(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    f1 = b.add_finding("p", "IDOR basket", vuln_class="idor", url="https://t.test/basket/7")
+    f2 = b.add_finding("p", "IDOR basket v2", vuln_class="idor", url="https://t.test/basket/9")
+    row = lambda fid: dict(b.rows("SELECT * FROM findings WHERE id=?", fid)[0])  # noqa: E731
+    for status in ("rejected", "needs-proof"):
+        b.set_finding(f1, status)
+        assert duplicate_of(b, row(f2)) is None
+    b.set_finding(f1, "inconclusive")
+    assert duplicate_of(b, row(f2)) == f1

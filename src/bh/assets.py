@@ -62,6 +62,37 @@ def _origin(e) -> str | None:
     return c.origin(e["origin"]) if isinstance(e, dict) and isinstance(e.get("origin"), str) else None
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _typed_endpoint(e: dict) -> bool:
+    """Every field of an endpoints.jsonl entry has the type SQL and the graph expect (M4): a dict or a list where a
+    string is expected drops the entry, it never raises."""
+    return (
+        isinstance(e.get("source"), str | None)
+        and (e.get("params") is None or isinstance(e.get("params"), list))
+        and (e.get("status") is None or _is_int(e.get("status")))
+    )
+
+
+def _coverage_row(phase, entry) -> tuple[str, str | None, float | None, str | None] | None:
+    """(phase, status, ts, raw) of a coverage.json entry, typed for SQL; None when a value has the wrong type."""
+    if not isinstance(phase, str) or not phase or len(phase) > 40 or not isinstance(entry, dict):
+        return None
+    status, ts, raw = entry.get("status"), entry.get("ts"), entry.get("raw")
+    if not isinstance(status, str | None) or not isinstance(raw, str | None):
+        return None
+    if ts is not None:
+        if isinstance(ts, bool) or not isinstance(ts, int | float):
+            return None
+        try:
+            ts = float(ts)  # an integer too large for SQLite would raise at bind time
+        except OverflowError:
+            return None
+    return phase, status[:200] if status else status, ts, raw[:2000] if raw else raw
+
+
 def ensure(board: Board) -> None:
     board.db.executescript(SCHEMA)
 
@@ -160,13 +191,11 @@ class Graph:
         n = {"endpoints": 0, "coverage": 0, "tests": 0, "skipped": 0}
         for e in c.read_jsonl(d / c.ENDPOINTS):
             o, key = _origin(e), _text(e, "key") if isinstance(e, dict) else None
-            if not o or not key or c.STATIC_EXT.search(key):
+            if not o or not key or c.STATIC_EXT.search(key) or not _typed_endpoint(e):
                 n["skipped"] += isinstance(e, dict) and not c.STATIC_EXT.search(key or "")
                 continue
-            params = (
-                [p for p in e.get("params") or [] if isinstance(p, str)] if isinstance(e.get("params"), list) else []
-            )
-            status = e.get("status") if isinstance(e.get("status"), int) else None
+            params = [p[:200] for p in e.get("params") or [] if isinstance(p, str)][:200]
+            status = e.get("status") if _is_int(e.get("status")) else None
             self.endpoint(o, c.family(key), _text(e, "source") or "tool", params, status)
             n["endpoints"] += 1
         coverage = c.read_json(d / c.COVERAGE, {})
@@ -176,17 +205,20 @@ class Graph:
                 continue
             oid = self.origin(o, "tool")
             for phase, entry in phases.items():
-                if not isinstance(entry, dict):
+                row = _coverage_row(phase, entry)
+                if row is None:
                     n["skipped"] += 1
                     continue
                 self.b.db.execute(
                     "INSERT INTO coverage(asset_id, phase, status, ts, raw) VALUES (?,?,?,?,?) "
                     "ON CONFLICT(asset_id, phase) DO UPDATE SET "
                     "status=excluded.status, ts=excluded.ts, raw=excluded.raw",
-                    (oid, phase, entry.get("status"), entry.get("ts"), entry.get("raw")),
+                    (oid, *row),
                 )
                 n["coverage"] += 1
         for t in c.read_jsonl(d / c.TOUCHED):
+            if not isinstance(t, dict) or not isinstance(t.get("via"), str | None):
+                continue
             if (o := _origin(t)) and (key := _text(t, "key")):
                 self.tested(o, key, "tool" if t.get("via") != "manual" else "literal", run_id)
                 n["tests"] += 1
