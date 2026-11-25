@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -151,7 +152,12 @@ def _browse(step: dict) -> tuple[int, str, bool]:
         cmd += ["--as", str(step["as"])]
     if marker := (step.get("browse") or {}).get("xss"):
         cmd += ["--xss", str(marker)]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=BROWSE_TIMEOUT_S, env=os.environ.copy())
+    # the replay runs as the judge, whose HOME and default work dir may not exist or be writable: bh-browse
+    # gets a throwaway work dir (raw files) and HOME (Chromium profile, gate CA) of its own
+    with tempfile.TemporaryDirectory(prefix="bh-replay-") as tmp:
+        env = {**os.environ, "BH_DIR": f"{tmp}/bh", "HOME": f"{tmp}/home"}
+        Path(env["HOME"]).mkdir()
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=BROWSE_TIMEOUT_S, env=env, cwd=tmp)
     out = p.stdout + p.stderr
     m = _BROWSE_STATUS.search(out.split("\n", 1)[0])
     # a page the gate refused has no 2xx status line: the expectation on the summary fails on its own
