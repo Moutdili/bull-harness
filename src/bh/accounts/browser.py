@@ -77,6 +77,28 @@ def trust(home, ca):
                        check=True, capture_output=True)
 
 
+# Where a failed login stopped, to fix the recipe: URL, title, visible fields (type/name/id) and button labels.
+# Never a field's value: the page holds the password that was typed.
+WHERE_JS = (
+    '() => { const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);'
+    " const f = Array.from(document.querySelectorAll('input,textarea,select')).filter(vis).slic"
+    "e(0, 8).map(e => e.tagName.toLowerCase() + '[type=' + (e.type || '') + (e.name ? ',name=' "
+    "+ e.name : '') + (e.id ? ',id=' + e.id : '') + ']'); const b = Array.from(document.querySe"
+    "lectorAll('button,[role=button],input[type=submit],a')).filter(vis).slice(0, 12).map(e => "
+    "(e.innerText || e.value || e.id || '').trim().split(String.fromCharCode(10)).join(' ').sli"
+    'ce(0, 30)).filter(x => x); return {fields: f, buttons: b}; }'
+)
+
+
+def where(page):
+    try:
+        d = page.evaluate(WHERE_JS)
+        return ('at ' + page.url[:120] + ' title ' + repr(page.title()[:60]) + ' fields '
+                + repr(d.get('fields')) + ' buttons ' + repr(d.get('buttons')))[:900]
+    except Exception:
+        return 'at (page unavailable)'
+
+
 def run(p, home):
     from playwright.sync_api import Error as PwError
     from playwright.sync_api import TimeoutError as PwTimeout
@@ -141,10 +163,10 @@ def run(p, home):
                 except PwTimeout:
                     if s.get("optional"):
                         continue
-                    raise Fail(f"step {i} ({a}): timeout") from None
+                    raise Fail(f"step {i} ({a}): timeout | {where(page)}") from None
                 except PwError as e:
                     first = (str(e).strip().splitlines() or ["error"])[0][:160]
-                    raise Fail(f"step {i} ({a}): {first}") from None
+                    raise Fail(f"step {i} ({a}): {first} | {where(page)}") from None
             cap = p["capture"]
             if cap["authorization"]:
                 end = time.monotonic() + max(0.0, min(p["auth_wait"], deadline - time.monotonic()))
