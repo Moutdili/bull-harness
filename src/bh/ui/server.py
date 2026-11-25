@@ -288,6 +288,7 @@ class Handler(BaseHTTPRequestHandler):
                 ],
                 "to_submit": b.rows("SELECT COUNT(*) n FROM todos WHERE status='open' AND kind='submit'")[0]["n"],
                 "inconclusive": b.rows("SELECT COUNT(*) n FROM findings WHERE status='inconclusive'")[0]["n"],
+                "needs_proof": b.rows("SELECT COUNT(*) n FROM findings WHERE status='needs-proof'")[0]["n"],
                 "blockers_24h": b.rows(
                     "SELECT COUNT(*) n FROM facts WHERE kind='blocker' AND created>=?", time.time() - 86400
                 )[0]["n"],

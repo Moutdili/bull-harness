@@ -72,7 +72,7 @@ views.dash = async () => {
     el("div", { class: "grid" }, ...Object.keys(s).map((k) =>
       el("div", { class: `card kpi ${k === "critical" ? "crit" : k}` }, el("div", { class: "v" }, s[k]), el("div", { class: "k" }, k)))),
     el("div", { class: "grid", style: "margin-top:12px" },
-      kpi("À soumettre", status.to_submit), kpi("Inconclusive", status.inconclusive),
+      kpi("À soumettre", status.to_submit), kpi("Inconclusive", status.inconclusive), kpi("Preuve à refaire", status.needs_proof),
       kpi("Pistes bloquées (24 h)", status.blockers_24h), kpi("Faits sur le board", status.facts), kpi("Runs", status.runs)),
     el("div", { class: "two" },
       el("div", {}, el("h2", {}, "Pistes bloquées récentes"),
@@ -171,7 +171,7 @@ async function openFinding(id) {
       const act = (s) => el("button", { class: `btn ${s === "verified" || s === "submitted" ? "primary" : ""}`, onclick: async () => {
         await api(`/api/findings/${f.id}/status`, { status: s, verdict: v.value }); toast(`F${f.id} → ${s}`); openFinding(f.id); refresh(); } }, s);
       fill(pane, el("p", { class: "muted small" }, "Relis la PoC, rejoue-la, puis classe le finding."),
-        el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "duplicate", "rejected", "new"].map(act)));
+        el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "needs-proof", "duplicate", "rejected", "new"].map(act)));
     }
   }
   fill(body, el("div", { class: "row" }, sev(f.severity), el("h3", { style: "margin:0" }, `F${f.id} · ${f.title}`)), sub, pane);

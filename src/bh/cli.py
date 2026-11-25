@@ -191,8 +191,12 @@ def cmd_status(args) -> int:
         )
     n_submit = b.rows("SELECT COUNT(*) AS n FROM todos WHERE status='open' AND kind='submit'")[0]["n"]
     n_inc = b.rows("SELECT COUNT(*) AS n FROM findings WHERE status='inconclusive'")[0]["n"]
+    n_proof = b.rows("SELECT COUNT(*) AS n FROM findings WHERE status='needs-proof'")[0]["n"]
     n_block = b.rows("SELECT COUNT(*) AS n FROM facts WHERE kind='blocker' AND created>=?", time.time() - 86400)[0]["n"]
-    print(f"to submit: {n_submit} · inconclusive: {n_inc} (findings) · blockers (24 h): {n_block}")
+    print(
+        f"to submit: {n_submit} · inconclusive: {n_inc} · needs proof (hunter): {n_proof} (findings)"
+        f" · blockers (24 h): {n_block}"
+    )
     return 0
 
 
