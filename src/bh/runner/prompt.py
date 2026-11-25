@@ -35,6 +35,7 @@ Options for all: `--as <identity>` (authenticated), `--timeout <s>`. They run fo
 - `bh-content <url>` content discovery (ffuf)           - `bh-scan <url>`    nuclei, tech-aware (`--deep` = slow)
 - `bh-params <url>` hidden parameters (arjun)           - `bh-sqli <url> [--data body]` sqlmap level 3, risk 1
 - `bh-xss <url?p=x>` reflected XSS (dalfox)
+- `bh-browse <url> [--fill CSS=V]... [--click CSS] [--routes] [--xss M]` headless Chromium, text summary first; `--shot` only for a layout or a proof; `Read` an image only to decide
 Hand-made requests: use `q` and `qq` rather than long curl lines (each line you write stays in your context).
 - `q [-a <identity>] [-X M] [-d body | -j json] [-H 'K: V'] [-n bytes] [-i] <url|/path>`: one request, prints
   status, size, type and the first 400 bytes (full body saved, path shown). A `/path` reuses the last origin.

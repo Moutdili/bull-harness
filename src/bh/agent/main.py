@@ -18,7 +18,8 @@ def main() -> None:
     args = sys.argv[1:]
     if name == "bh-agent":
         if not args:
-            sys.exit("usage: bh-agent hook-pre|hook-post|note|<tool> ...  (tools: " + ", ".join(TOOLS) + ")")
+            tools = ", ".join((*TOOLS, "browse"))
+            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
     if cmd in ("hook-pre", "hook-post"):
@@ -37,6 +38,10 @@ def main() -> None:
         from bh.agent import q
 
         q.main(cmd, args)
+    elif cmd == "browse":  # the only module that imports playwright, lazily: bh-agent starts without it
+        from bh.agent import browse
+
+        browse.main(args)
     elif cmd in TOOLS:
         from bh.agent import tools
 

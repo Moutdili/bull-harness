@@ -11,6 +11,8 @@ ca-certificates
 proxychains4
 dnsutils
 util-linux
+# certutil: the gate CA in the NSS DB Chromium reads (bh-browse)
+libnss3-tools
 # recon (ProjectDiscovery and friends)
 subfinder
 httpx-toolkit

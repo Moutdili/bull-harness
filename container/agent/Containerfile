@@ -29,7 +29,20 @@ RUN npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/clau
 # 4. Python tools not packaged by Kali.
 RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install semgrep==1.186.0
 
-# 5. Unprivileged hunter user (claude refuses bypassPermissions as root).
+# 5. Headless browser for bh-browse: Playwright Python for the system python3 (bh-agent runs `python3 -I`, which
+#    keeps the system site-packages) + chrome-headless-shell, all fetched at build time, none at runtime.
+#    1.65.2: latest on PyPI per docs/research/09-vision-headless.md §2 (2026-11-14). The API used by browse.py was
+#    checked against the 1.62.0 wheel (route_web_socket, aria_snapshot, service_workers, record_har_path).
+ARG PLAYWRIGHT_VERSION=1.65.2
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN python3 -m pip install --no-cache-dir --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
+ && python3 -m playwright install --with-deps --only-shell chromium \
+ && rm -rf /var/lib/apt/lists/* \
+ && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH" \
+ && python3 -I -c "import playwright.sync_api" \
+ && ls "$PLAYWRIGHT_BROWSERS_PATH"/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell
+
+# 6. Unprivileged hunter user (claude refuses bypassPermissions as root).
 RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work
 COPY entrypoint.sh check.sh /opt/bh/
 RUN chmod 755 /opt/bh/entrypoint.sh /opt/bh/check.sh
