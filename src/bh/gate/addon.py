@@ -78,6 +78,11 @@ def _agent_ips() -> frozenset[str]:
     return _AGENT_IPS[1]
 
 
+def _from_gate(flow: http.HTTPFlow) -> bool:
+    """The request comes from inside the gate container (account enrollment), not from the agent."""
+    return (flow.client_conn.peername or ("?",))[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
 def _model(req: http.Request) -> str | None:
     """The `model` a Claude API request asks for (JSON body), None when there is none."""
     if req.method != "POST" or not req.raw_content or len(req.raw_content) > 32 << 20:
@@ -528,9 +533,14 @@ class Gate:
         url, host = self._named(flow)
         fid = f"{int(time.time())}-{secrets.token_hex(3)}-{next(self.seq)}"
         body = (resp.raw_content or b"") if resp is not None else b""
+        klass = flow.metadata.get("bh_class")
+        if klass == "target" and _from_gate(flow):
+            # account enrollment (bh.accounts runs in the gate through this proxy): its bodies carry passwords and
+            # session tokens, so the exchange is not kept, and it is not the agent's testing (assets, counts)
+            klass = "enroll"
         rec = {
             "id": fid,
-            "class": flow.metadata.get("bh_class"),
+            "class": klass,
             "method": req.method,
             "url": redact.url(url),  # tokens in query strings stay out of the log
             "status": status,
