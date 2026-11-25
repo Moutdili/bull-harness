@@ -24,6 +24,9 @@ support:
   - {value: "fpt.live.com", kind: auth, note: "login anti-fraud fingerprint"}
   - {value: "account.live.com", kind: auth, note: "Microsoft account pages of the login"}
   - {value: "login.microsoftonline.com", kind: auth, note: "Entra ID login (redirects of the sign-in)"}
+  - {value: "ms-sso.copilot.microsoft.com", kind: auth, note: "Copilot single sign-on bridge"}
+  - {value: "ms-sso.copilot.com", kind: auth, note: "Copilot single sign-on bridge"}
+  - {value: "df.cfp.microsoft.com", kind: auth, note: "login anti-fraud"}
   - {value: "*.msftauth.net", kind: assets, note: "login page assets"}
   - {value: "*.msauth.net", kind: assets, note: "login page assets"}
   - {value: "res.cdn.office.net", kind: assets, note: "Copilot app assets (JS)"}
