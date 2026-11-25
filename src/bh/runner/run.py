@@ -51,6 +51,13 @@ CONTINUE_PROMPT = (
     "take the next untested endpoint or open intent, test it, record the outcome, and keep going. "
     "Stop only when every lead on the board is a recorded dead end; then write the HANDOFF fact."
 )
+# Context rotation (issue 10, TODO 4.2b). A turn's context = input + cache read + cache write tokens. Measured
+# (plan v3 §1): 8.4-10.3k at the base of a session, a 19.4k peak over 22 turns (run 12). 30k is 3x the base and
+# 1.5x the highest peak measured: a healthy segment never rotates, one whose observations pile up does. Above it,
+# the next leg is a fresh session from the board instead of `--resume` (which re-reads the whole history every
+# turn). At CONTEXT_HARD_FACTOR x the threshold the leg is stopped after the turn in progress, then rotated.
+CONTEXT_ROTATE_TOKENS = int(os.environ.get("BH_CONTEXT_ROTATE_TOKENS", "30000"))
+CONTEXT_HARD_FACTOR = 2
 
 
 @dataclass
@@ -74,6 +81,9 @@ class SegmentResult:
     usage: dict = field(default_factory=dict)
     rate_limit: dict = field(default_factory=dict)  # last `rate_limit_info` of the stream: status, resetsAt, windows
     turn_log: list[dict] = field(default_factory=list)  # one per model message: tokens (observability)
+    rotations: int = 0  # legs started as a fresh session because the previous one crossed the context threshold
+    leg_context: list[int] = field(default_factory=list)  # max context (tokens) of each leg
+    overflow: bool = False  # the last leg was stopped by the runner past CONTEXT_HARD_FACTOR x the threshold
     tool_log: list[dict] = field(default_factory=list)  # one per tool call: kind, duration, locked
     _pending: dict = field(default_factory=dict, repr=False)  # tool_use id -> index in tool_log
 
@@ -91,6 +101,17 @@ def quota_line(info: dict) -> str:
     reset = info.get("resetsAt")
     when = f" (resets {time.strftime('%a %H:%M', time.localtime(reset))})" if isinstance(reset, (int, float)) else ""
     return " · quota " + ", ".join(parts) + when
+
+
+def turn_context(turn: dict) -> int:
+    """Tokens of context one model turn was sent: input + cache read + cache write (missing = 0)."""
+    return sum(v for k in ("input", "cache_read", "cache_write") if isinstance(v := turn.get(k), int))
+
+
+def leg_context(turns: list[dict]) -> tuple[int, int]:
+    """(context of the last turn, max context) over the turns of one leg; (0, 0) for none."""
+    ctx = [turn_context(t) for t in turns]
+    return (ctx[-1], max(ctx)) if ctx else (0, 0)
 
 
 # ------------------------------------------------------------------ guards
@@ -294,9 +315,10 @@ mkdir -p "$1" && chown hunter:hunter "$1" && chmod 755 "$1"  # 755: the host rea
 """
 
 
-def rotate_notes(program: str, run_id: int) -> Path:
-    """Freeze this segment's notes under a per-run name; returns the host path to ingest."""
-    name = f"notes-{run_id}.jsonl"
+def rotate_notes(program: str, run_id: int, leg: int | None = None) -> Path:
+    """Freeze this segment's notes under a per-run name (per leg for a mid-segment context rotation, so the
+    end-of-segment rotation never re-reads a file already ingested); returns the host path to ingest."""
+    name = f"notes-{run_id}.jsonl" if leg is None else f"notes-{run_id}-leg{leg}.jsonl"
     stack.agent_sh(
         'cd "$1" 2>/dev/null && [ -f notes.jsonl ] && mv notes.jsonl "$2"; true', c.sandbox_dir(program), name
     )
@@ -448,9 +470,14 @@ def _tool_result_text(block: dict) -> str:
     return content if isinstance(content, str) else ""
 
 
-def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say) -> dict | None:
-    """Mirror the stream to the run log (the UI tails it), update `res`, return the result event."""
+def consume_stream(
+    proc: subprocess.Popen, log: IO[str], res: SegmentResult, say, *, limit: int | None = None, stop=None
+) -> dict | None:
+    """Mirror the stream to the run log (the UI tails it), update `res`, return the result event.
+    `limit`: once a turn's context exceeds it, `stop()` is called when that turn's tool results are back
+    (the turn in progress ends, the next one is cut) and `res.overflow` is set."""
     result = None
+    over = False
     for line in proc.stdout:
         log.write(line)
         try:
@@ -476,6 +503,9 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
                             "output": u.get("output_tokens"),
                         }
                     )
+                    if limit and not over and (ctx := turn_context(res.turn_log[-1])) > limit:
+                        over = True
+                        say(f"  ⚠ context {ctx} tokens > {limit}: the leg stops after this turn")
                 for block in msg.get("content", []):
                     if block.get("type") == "text" and block.get("text", "").strip():
                         say(f"  💬 {one_line(block['text'], 220)}")
@@ -508,6 +538,9 @@ def consume_stream(proc: subprocess.Popen, log: IO[str], res: SegmentResult, say
                     if locked:
                         res.locked_calls += 1
                         say("  🔒 manual HTTP refused by the tool lock")
+                    if over and not res.overflow and stop is not None:  # the turn's tool results are back
+                        res.overflow = True
+                        stop()
             case "rate_limit_event":
                 res.rate_limit = ev.get("rate_limit_info") or {}
             case "result":
@@ -525,23 +558,32 @@ def run_leg(
     program: str,
     timeout_s: float,
     bh_dir: str | None = None,
+    context_limit: int | None = None,
 ) -> tuple[dict | None, bool]:
-    """One claude process. Returns (result event, timed out)."""
+    """One claude process. Returns (result event, timed out). Past `context_limit` the process is stopped after
+    the turn in progress, the same way as on timeout; `res.overflow` tells the two apart."""
+    res.overflow = False
     with open(err_path, "a") as err_fh:  # a pipe read only at the end can fill up and block claude
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_fh, text=True, bufsize=1)
     timed_out = threading.Event()
 
-    def on_timeout() -> None:
-        timed_out.set()
+    def kill() -> None:
         stack.kill_agent(program, bh_dir=bh_dir)
         time.sleep(5)
         if proc.poll() is None:
             proc.kill()
 
+    def on_timeout() -> None:
+        timed_out.set()
+        kill()
+
+    def on_overflow() -> None:  # off the reading thread: the stream keeps draining until claude exits
+        threading.Thread(target=kill, daemon=True).start()
+
     timer = threading.Timer(max(1.0, timeout_s), on_timeout)
     timer.start()
     try:
-        result = consume_stream(proc, log, res, say)
+        result = consume_stream(proc, log, res, say, limit=context_limit, stop=on_overflow)
     except BaseException:
         with signals_ignored():
             timer.cancel()
@@ -600,9 +642,11 @@ def finish(
     """Ingest what the segment left and act on its walls without anyone: a refusal closes its lead, WAF hosts are
     set aside, new out-of-scope hosts are recorded once."""
     prog = scope.program
-    res.new_facts, res.new_findings, res.new_blockers = ingest.notes(
-        board, prog, res.run_id, rotate_notes(prog, res.run_id), scope
-    )
+    facts, findings, blockers = ingest.notes(board, prog, res.run_id, rotate_notes(prog, res.run_id), scope)
+    # added to what a mid-segment context rotation already ingested
+    res.new_facts += facts
+    res.new_findings += findings
+    res.new_blockers += blockers
     outcome = ingest.gate_events(board, prog, res.run_id, live_identities(board, prog))
     res.new_blockers += outcome.blockers
     if res.status == "refusal":
@@ -619,6 +663,7 @@ def finish(
         record_refusal(board, prog)
     board.record_metrics(res.run_id, res.turn_log, res.tool_log)
     board.run_set(res.run_id, blockers=res.new_blockers, **gate_counts(board, res.run_id))
+    run_set_known(board, res.run_id, rotations=res.rotations, max_context=max(res.leg_context, default=None))
     graph = Graph(board, scope)
     graph.sync(res.run_id)
     for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
@@ -654,6 +699,69 @@ def finish(
         locked_calls=res.locked_calls,
         note=one_line(note, 500),
     )
+
+
+def run_set_known(board: Board, run_id: int, **fields) -> None:
+    """Set only the `runs` columns the board has: rotations / max_context wait for their db.py migration."""
+    cols = {r["name"] for r in board.rows("PRAGMA table_info(runs)")}
+    if known := {k: v for k, v in fields.items() if k in cols}:
+        board.run_set(run_id, **known)
+
+
+def last_fact_id(board: Board) -> int:
+    return board.rows("SELECT COALESCE(MAX(id), 0) AS n FROM facts")[0]["n"]
+
+
+def auto_handoff(
+    board: Board, program: str, run_id: int, *, since: int, context: int, last_cmd: str
+) -> tuple[str, str]:
+    """(title, summary) of the HANDOFF the runner writes when a session rotates without one. Built from the board
+    (the agent's own notes, each title cut to one bounded line) and the last command, never from target output."""
+    intents = board.rows(
+        "SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id DESC LIMIT 5", program
+    )
+    facts = board.rows(
+        "SELECT kind, title FROM facts WHERE program=? AND run_id=? AND id>? AND kind IN ('fact', 'recon', 'dead-end') "
+        "ORDER BY id DESC LIMIT 6",
+        program,
+        run_id,
+        since,
+    )
+    findings = board.rows("SELECT id, title FROM findings WHERE program=? AND run_id=? ORDER BY id", program, run_id)
+    lines = [f"Written by the runner: the session reached {context} tokens of context and rotated before its HANDOFF."]
+    if findings:
+        lines.append("Findings this run: " + "; ".join(f"F{r['id']} {one_line(r['title'], 80)}" for r in findings))
+    if intents:
+        lines.append("Open intents: " + "; ".join(f"I{r['id']} {one_line(r['title'], 80)}" for r in intents))
+    if dead := [r for r in facts if r["kind"] == "dead-end"]:
+        lines.append("Dead ends (do not redo): " + "; ".join(one_line(r["title"], 80) for r in dead))
+    if done := [r for r in facts if r["kind"] != "dead-end"]:
+        lines.append("Recorded: " + "; ".join(one_line(r["title"], 80) for r in done))
+    if last_cmd:
+        lines.append("Last command: " + one_line(last_cmd, 150))
+    return f"HANDOFF (runner): context rotation at {context} tokens", "\n".join(lines)
+
+
+def prepare_rotation(
+    board: Board, scope: Scope, scope_file: Path, res: SegmentResult, *, since: int, context: int
+) -> bool:
+    """Before a fresh session takes over mid-segment: ingest the notes so far, write the HANDOFF if none was
+    ingested since fact id `since`, push the updated frontier to the sandbox. True when the runner wrote it."""
+    prog = scope.program
+    facts, findings, blockers = ingest.notes(board, prog, res.run_id, rotate_notes(prog, res.run_id, res.legs), scope)
+    res.new_facts += facts
+    res.new_findings += findings
+    res.new_blockers += blockers
+    wrote = not board.rows(
+        "SELECT 1 FROM facts WHERE program=? AND run_id=? AND kind='handoff' AND id>? LIMIT 1", prog, res.run_id, since
+    )
+    if wrote:
+        last = next((t["cmd"] for t in reversed(res.tool_log) if t.get("cmd")), "")
+        title, summary = auto_handoff(board, prog, res.run_id, since=since, context=context, last_cmd=last)
+        board.add_fact(prog, title, summary, kind="handoff", run_id=res.run_id)
+    Graph(board, scope).sync(res.run_id)
+    prepare_workdir(board, scope, scope_file)
+    return wrote
 
 
 def pending_findings(board: Board, program: str) -> int:
@@ -727,15 +835,18 @@ def _run_locked(
     prepare_workdir(board, scope, scope_file)
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
-    task = build_task(
-        frontier(board, prog, scope),
-        first=first,
-        max_turns=max_turns,
-        cards=classes.cards_block(cards),
-        refused=last_refusal(board, prog, run_id),
+    refused = last_refusal(board, prog, run_id)
+    operator = f"\n\nOperator instruction for this segment: {extra_task}" if extra_task else ""
+    task = (
+        build_task(
+            frontier(board, prog, scope),
+            first=first,
+            max_turns=max_turns,
+            cards=classes.cards_block(cards),
+            refused=refused,
+        )
+        + operator
     )
-    if extra_task:
-        task += "\n\nOperator instruction for this segment: " + extra_task
     log_path = paths.run_log(run_id, prog)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     res = SegmentResult(program=prog, run_id=run_id, session_id=session)
@@ -749,7 +860,8 @@ def _run_locked(
     )
 
     deadline = time.monotonic() + minutes * 60
-    prompt, timed_out = task, False
+    prompt, timed_out, next_session = task, False, session
+    limit = CONTEXT_ROTATE_TOKENS
     identities = [
         n for n in live_identities(board, prog, also=[i["name"] for i in scope.identities]) if n not in no_session
     ]
@@ -758,7 +870,7 @@ def _run_locked(
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             while res.legs < MAX_LEGS:
                 res.legs += 1
-                calls_before = res.tool_calls
+                calls_before, turns_before, facts_before = res.tool_calls, len(res.turn_log), last_fact_id(board)
                 cmd = agent_command(
                     scope,
                     prompt,
@@ -766,7 +878,7 @@ def _run_locked(
                     model=model,
                     max_turns=max_turns - res.turns,
                     effort=effort,
-                    session=res.session_id if res.legs > 1 else session,
+                    session=next_session,
                     identities=identities,
                 )
                 result, timed_out = run_leg(
@@ -777,24 +889,78 @@ def _run_locked(
                     say,
                     program=prog,
                     timeout_s=deadline - time.monotonic(),
+                    context_limit=CONTEXT_HARD_FACTOR * limit,
                 )
                 merge_result(res, result)
+                leg_turns = res.turn_log[turns_before:]
+                if res.overflow and result is None:  # stopped by the runner: no result event to count from
+                    res.turns += len(leg_turns)
+                    if res.status != "refusal":
+                        res.status = "ok"
+                last_ctx, max_ctx = leg_context(leg_turns)
+                res.leg_context.append(max_ctx)
+                rotate = res.overflow or last_ctx > limit
+                log.write(
+                    json.dumps(
+                        {
+                            "type": "bh_leg",
+                            "leg": res.legs,
+                            "turns": len(leg_turns),
+                            "context_last": last_ctx,
+                            "context_max": max_ctx,
+                            "threshold": limit,
+                            "overflow": res.overflow,
+                            "rotate": rotate,
+                        }
+                    )
+                    + "\n"
+                )
+                say(f"  ◆ leg {res.legs}: {len(leg_turns)} turns, context max {max_ctx} / last {last_ctx} tokens")
                 left_turns, left_s = max_turns - res.turns, deadline - time.monotonic()
                 if (
                     timed_out
                     or res.status != "ok"
-                    or res.turns >= max_turns * EARLY_STOP
+                    or res.legs >= MAX_LEGS
                     or left_turns < MIN_LEFT_TURNS
                     or left_s < MIN_LEFT_S
-                    or res.tool_calls - calls_before < MIN_LEG_TOOL_CALLS  # it says there is nothing left to do
+                    # the agent ended the leg itself (not cut by the runner) after most of the budget, or
+                    # with almost no tool use: it says there is nothing left to do
+                    or (
+                        not res.overflow
+                        and (res.turns >= max_turns * EARLY_STOP or res.tool_calls - calls_before < MIN_LEG_TOOL_CALLS)
+                    )
                 ):
                     break
-                say(f"  ↻ stopped early ({res.turns}/{max_turns} turns): nudging the same session to continue")
-                prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
                 if not cards and (cards := pick_cards(board, scope)):  # the surface exists once mapping is done
                     board.run_set(run_id, cards=",".join(cards))
-                    prompt += "\n\n" + classes.cards_block(cards)
                     say(f"  ↻ cards {', '.join(cards)}")
+                    new_cards = classes.cards_block(cards)
+                else:
+                    new_cards = ""
+                if rotate:
+                    res.rotations += 1
+                    wrote = prepare_rotation(board, scope, scope_file, res, since=facts_before, context=last_ctx)
+                    say(
+                        f"  ⟳ context {last_ctx} tokens > {limit}: fresh session from the board"
+                        + (" (HANDOFF written by the runner)" if wrote else "")
+                    )
+                    prompt = (
+                        build_task(
+                            frontier(board, prog, scope),
+                            first=False,
+                            max_turns=left_turns,
+                            cards=classes.cards_block(cards),
+                            refused=refused,
+                            rotated=True,
+                        )
+                        + operator
+                    )
+                    next_session = None
+                else:
+                    say(f"  ↻ stopped early ({res.turns}/{max_turns} turns): nudging the same session to continue")
+                    prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
+                    prompt += f"\n\n{new_cards}" if new_cards else ""
+                    next_session = res.session_id
     except BaseException as exc:  # Ctrl-C / SIGTERM, or a harness error: record what the agent already wrote
         with signals_ignored():
             stopped = isinstance(exc, KeyboardInterrupt)
@@ -828,7 +994,9 @@ def _run_locked(
         finally:
             set_active_run(None)
     say(
-        f"■ run {run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · {res.tool_calls} tools "
+        f"■ run {run_id} {res.status} · {res.legs} leg(s)"
+        + (f" ({res.rotations} context rotation(s))" if res.rotations else "")
+        + f" · {res.turns} turns · {res.tool_calls} tools "
         f"(arsenal {res.arsenal_calls}, manual {res.manual_calls}, locked {res.locked_calls}) · "
         f"+{res.new_facts} facts +{res.new_findings} findings +{res.new_blockers} blockers (progress {res.progress})"
         + (f" · ${res.cost_usd:.2f} eq." if res.cost_usd else "")

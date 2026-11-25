@@ -119,13 +119,26 @@ def build_system_prompt(scope: Scope, identities: list[str] | None = None) -> st
     return DOCTRINE + "\n" + scope_block(scope, identities) + "\n"
 
 
-def build_task(frontier: str, first: bool, max_turns: int | None = None, cards: str = "", refused: str = "") -> str:
+def build_task(
+    frontier: str,
+    first: bool,
+    *,
+    max_turns: int | None = None,
+    cards: str = "",
+    refused: str = "",
+    rotated: bool = False,
+) -> str:
     head = (
         "First session on this program. Map it with the arsenal first (recon, crawl, content, scan)."
         if first
         else "Continue the hunt from the board below. Do not redo dead ends; finish mapping any origin "
         "whose crawl/content/scan is still missing (✗)."
     )
+    if rotated:  # the session before this one, same segment, was closed on its context size
+        head = (
+            "The previous session of this segment was rotated on a context threshold. Read the latest HANDOFF "
+            "and the facts first (`bh-note frontier`), then go on from there: do not redo what they record.\n" + head
+        )
     budget = f"You have about {max_turns} turns in this segment. " if max_turns else ""
     # A refusal is never rephrased: retrying it reads as evasion and the harness does not know what was refused.
     closed = (
