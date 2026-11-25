@@ -210,8 +210,9 @@ def _check_step(step: Any, ctx: str) -> dict[str, Any]:
     elif "from" in step:
         raise RecipeError(f"{ctx}: 'from' only goes with email_code")
     if "optional" in step:
-        if not isinstance(step["optional"], bool) or action not in ("click", "wait_for"):
-            raise RecipeError(f"{ctx}.optional: true or false, on click or wait_for only")
+        # an MFA prompt is conditional (a site asks for a code only sometimes): its field may be optional too
+        if not isinstance(step["optional"], bool) or action not in ("click", "wait_for", "totp", "email_code"):
+            raise RecipeError(f"{ctx}.optional: true or false, on click, wait_for, totp or email_code only")
         out["optional"] = step["optional"]
     if "timeout" in step:
         t = step["timeout"]
