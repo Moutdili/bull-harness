@@ -131,11 +131,35 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
     return 0, 0, 0
 
 
+def _identity_dead(
+    board: Board, program: str, run_id: int, out: GateOutcome, *, ident: str, host: str, title: str
+) -> None:
+    """Mark an identity stale (meta `identity-stale:<ident>:<program>`: the runner leaves it out of the prompt
+    and the judge until its session file is rewritten) and record one `auth` blocker per identity and run."""
+    board.meta_set(f"identity-stale:{ident}:{program}", str(time.time()))
+    out.stale.add(ident)
+    key = f"auth-blocker:{ident}:{program}"
+    if board.meta_get(key) == str(run_id):
+        return
+    board.meta_set(key, str(run_id))
+    board.add_blocker(
+        program,
+        "auth",
+        title,
+        f"left out until var/state/identities/{program}/{ident}.json is refreshed",
+        run_id=run_id,
+        host=host,
+    )
+    out.blockers += 1
+
+
 def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> GateOutcome:
     """One summary fact for denials, blocker facts for walls (WAF, 401) and missing identities.
 
-    401 sent WITH an identity -> that session probably expired: meta `identity-stale:<ident>:<program>`
-    is set (the runner drops the identity until its file is refreshed) and a blocker is recorded.
+    `session-dead` (the gate saw a 401, a redirect to the login page or a failed probe under an identity) ->
+    that identity is stale at once (_identity_dead). `GateOutcome.stale` lists the dead identities: the entry
+    point for logging in again (issue 25).
+    401 sent WITH an identity, AUTH_THRESHOLD times -> same (gates older than session-dead only sent `auth`).
     401 sent WITHOUT one -> blocker only if the program has no identity at all: an agent probing
     unauthenticated access control on purpose has hit no wall."""
     out = GateOutcome()
@@ -166,6 +190,20 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
             case "auth":
                 key = (_s(e.get("host") or "?", 255), _s(e.get("identity"), 80))
                 auth[key] = auth.get(key, 0) + 1
+            case "session-dead":
+                if ident := _s(e.get("identity"), 80):
+                    host = _s(e.get("host") or "?", 255)
+                    why = {"401": "401", "login-redirect": "a redirect to its login page", "probe": "a failed probe"}
+                    _identity_dead(
+                        board,
+                        program,
+                        run_id,
+                        out,
+                        ident=ident,
+                        host=host,
+                        title=f"identity '{ident}': session dead on {host} "
+                        f"({why.get(_s(e.get('reason'), 20), 'status ' + _s(e.get('status'), 5))})",
+                    )
             case "identity-missing":
                 ident = _s(e.get("identity"), 80)
                 if ident not in missing:
@@ -181,18 +219,15 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
         if n < AUTH_THRESHOLD:
             continue
         if ident:
-            board.meta_set(f"identity-stale:{ident}:{program}", str(now))
-            if ident not in out.stale:
-                out.stale.add(ident)
-                board.add_blocker(
-                    program,
-                    "auth",
-                    f"identity '{ident}' gets 401 on {host} ({n}x): session expired",
-                    f"left out until var/state/identities/{program}/{ident}.json is refreshed",
-                    run_id=run_id,
-                    host=host,
-                )
-                out.blockers += 1
+            _identity_dead(
+                board,
+                program,
+                run_id,
+                out,
+                ident=ident,
+                host=host,
+                title=f"identity '{ident}' gets 401 on {host} ({n}x): session expired",
+            )
         elif not identities:
             # once per host while the blocker is visible; past its TTL the wall is reported again if still there
             key = f"auth-wall:{host}:{program}"

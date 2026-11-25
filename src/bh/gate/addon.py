@@ -4,8 +4,16 @@ Enforces bh.gate.policy on every CONNECT, TLS handshake, request and upstream co
 rate-limits (with backoff when the target pushes back), injects program headers and identities,
 and writes compact JSONL logs that the runner turns into board facts.
 
+Identities (bh.gate.session): a request with X-BH-Identity to an in-scope target gets the identity's headers
+and the cookies of its jar. The Set-Cookie of the answer go into the jar (file rewritten atomically) and reach
+the agent with their value masked. A 401, a redirect to the identity's `login_url` or a failed probe writes one
+`session-dead` event per identity and minute; the runner marks the identity stale and the host logs in again.
+
 Fail closed: mitmproxy only logs exceptions raised by addons and lets the flow continue, so every
 hook here catches its own errors and denies.
+
+mitmdump reloads this file on change, not the modules it imports (policy, session): after changing those,
+restart the gate.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from mitmproxy.proxy import mode_specs, server_hooks
 
 from bh import paths, redact
 from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER
+from bh.gate import session
 from bh.gate.policy import SYSTEM_HOSTS, Policy, Verdict, deny
 
 MAX_BODY = 16_384
@@ -133,6 +142,7 @@ class Gate:
         # server connection id -> hostname asked for. server_connect pins the address to a vetted IP,
         # and with the eager connection strategy that happens before the TLS / TCP hooks run.
         self._dest: dict[str, str] = {}
+        self._dead = session.DeadLimiter()  # one session-dead event per identity per minute
 
     def load(self, loader) -> None:
         loader.add_option("bh_state", str, "/state", "bull-harness state dir")
@@ -392,18 +402,72 @@ class Gate:
         return path if path.is_file() else None
 
     def _apply_identity(self, flow: http.HTTPFlow, name: str) -> None:
+        """Inject the identity's headers and the cookies its jar holds for this URL (bh.gate.session).
+        Cookies: the jar (fresh, rotated by Set-Cookie) beats a static `Cookie` of `headers`; both beat an agent
+        cookie of the same name (session.combine), whose name is then recorded in the flow."""
         path = self._identity_file(name)
-        try:
-            ident = json.loads(path.read_text()) if path else None
-        except (OSError, ValueError):
-            ident = None
-        if not isinstance(ident, dict):
-            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": self._named(flow)[0]})
+        url = self._named(flow)[0]
+        sess = session.load(path) if path else None
+        if sess is None:
+            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": url})
             return
-        injected = ident.get("headers") or {}
+        req, mark = flow.request, f"<identity:{name}>"
+        injected = {k: v for k, v in sess["headers"].items() if k.lower() != "cookie"}
         for k, val in injected.items():
-            flow.request.headers[k] = val
-        flow.metadata["bh_redact"] = {k.lower(): f"<identity:{name}>" for k in injected}
+            req.headers[k] = val
+        jar = session.cookies_for(sess, url)
+        static = session.parse_cookie_header(next((v for k, v in sess["headers"].items() if k.lower() == "cookie"), ""))
+        ident_cookies = jar + [(n, v) for n, v in static if n not in {j for j, _ in jar}]
+        redacted = {k.lower(): mark for k in injected}
+        if ident_cookies:
+            cookie, replaced = session.combine("; ".join(req.headers.get_all("cookie")) or None, ident_cookies)
+            req.headers["Cookie"] = cookie
+            redacted["cookie"] = mark
+            if replaced:
+                flow.metadata["bh_cookie_replaced"] = replaced
+        flow.metadata["bh_redact"] = redacted
+        decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
+        flow.metadata["bh_session"] = {
+            "file": str(path),
+            "login_url": decl.get("login_url"),
+            "probe": decl.get("probe") or sess.get("probe"),
+        }
+
+    def _identity_response(self, flow: http.HTTPFlow) -> None:
+        """Under an identity, on an in-scope target: fold Set-Cookie into the jar (the agent gets them with the
+        value masked) and report a dead session. Runs before the flow is recorded."""
+        ident, info = flow.metadata.get("bh_identity"), flow.metadata.get("bh_session")
+        if not ident or not info:
+            return  # no identity applied (none asked, unknown name, or not a target): nothing to keep
+        resp, (url, host) = flow.response, self._named(flow)
+        set_cookies = resp.headers.get_all("set-cookie")
+        if set_cookies:
+            # mask first: whatever happens to the jar, the agent never receives an identity's cookie value
+            resp.headers.set_all("set-cookie", [session.mask_set_cookie(v, f"<identity:{ident}>") for v in set_cookies])
+            try:
+                session.absorb(Path(info["file"]), url, set_cookies, in_scope=flow.metadata.get("bh_class") == "target")
+            except OSError as exc:  # a jar that cannot be written costs a stale session, not the answer
+                ctx.log.error(f"bh-gate: cannot update the session of {ident}: {exc}")
+        reason = session.dead_reason(
+            flow.request.method,
+            url,
+            resp.status_code,
+            resp.headers.get("location"),
+            login_url=info["login_url"],
+            probe=info["probe"],
+        )
+        if reason and self._dead.allow(ident):
+            self._log(
+                paths.EVENTS,
+                {
+                    "kind": "session-dead",
+                    "identity": ident,
+                    "host": host,
+                    "status": resp.status_code,
+                    "reason": reason,
+                    "url": redact.url(url),
+                },
+            )
 
     @fail_closed
     def response(self, flow: http.HTTPFlow) -> None:
@@ -412,6 +476,7 @@ class Gate:
         flow.response.headers.pop(GATE_HEADER, None)  # only the gate's own refusals carry it
         if flow.metadata.get("bh_class") not in ("target", "passive"):
             return
+        self._identity_response(flow)
         fid = self._record(flow, flow.response.status_code)
         if flow.metadata.get("bh_class") != "target":
             return
@@ -475,6 +540,8 @@ class Gate:
             "ua": flow.metadata.get("bh_ua", "")[:120],
             "identity": flow.metadata.get("bh_identity"),
         }
+        if replaced := flow.metadata.get("bh_cookie_replaced"):
+            rec["cookie_replaced"] = replaced  # agent cookies the identity's jar overrode (names only)
         if req.host_header and parse_authority(req.host_header, check=False)[0] != host:
             rec["host_header"] = req.host_header
         if error:

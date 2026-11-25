@@ -75,7 +75,8 @@ class Scope:
     automation_allowed: bool | None = None  # None = unknown -> todo humaine
     scanners_allowed: bool | None = None  # None = unknown -> todo humaine; read it through scanners_on
     forbidden_vulns: tuple[str, ...] = ()
-    identities: tuple[dict[str, str], ...] = ()  # {name, secret_ref}; never the secret
+    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status}}; never a secret (see _identity)
+    identities: tuple[dict[str, Any], ...] = ()
     source: str | None = None
     synced_at: str | None = None
     notes: str = ""
@@ -285,11 +286,13 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     if scanners is not None and not isinstance(scanners, bool):
         raise ScopeError(f"{origin}: 'scanners_allowed' must be true, false or null")
     identities = doc.get("identities") or []
-    for i, ident in enumerate(identities):
-        if not isinstance(ident, dict) or set(ident) - {"name", "secret_ref"} or "name" not in ident:
-            raise ScopeError(f"{origin}: identities[{i}] must be {{name, secret_ref}}")
+    if not isinstance(identities, list):
+        raise ScopeError(f"{origin}: 'identities' must be a list")
+    identities = [_identity(ident, f"{origin}: identities[{i}]") for i, ident in enumerate(identities)]
+    if len({i["name"] for i in identities}) != len(identities):
+        raise ScopeError(f"{origin}: two identities share a name")
 
-    return Scope(
+    scope = Scope(
         program=doc["program"].strip(),
         platform=doc["platform"].strip(),
         in_scope=in_rules,
@@ -306,6 +309,63 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         notes=str(doc.get("notes") or ""),
         digest=_canonical_digest(doc),
     )
+    _identity_urls_in_scope(scope, origin)
+    return scope
+
+
+_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe"}
+# a credential written into the scope file would reach the gate and the agent's prompt: refused by name
+_SECRET_KEY = re.compile(r"passw|pwd|secret|totp|otp|token|cookie|api[_-]?key|credential|session", re.I)
+_IDENTITY_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,39}")  # the shape the gate accepts in X-BH-Identity
+_HTTP_URL = re.compile(r"https?://", re.I)
+
+
+def _identity(ident: Any, ctx: str) -> dict[str, Any]:
+    """One declared identity. The YAML says how to log in and how to check the session, never with what:
+    passwords, TOTP seeds and tokens live behind `secret_ref` (host side), so a key that names one is an error."""
+    if not isinstance(ident, dict) or "name" not in ident:
+        raise ScopeError(f"{ctx}: an identity is a mapping with at least 'name'")
+    secret = sorted(str(k) for k in ident if str(k) != "secret_ref" and _SECRET_KEY.search(str(k)))
+    if secret:
+        raise ScopeError(f"{ctx}: {secret} look like secrets; keep them behind 'secret_ref', never in the scope file")
+    unknown = set(ident) - _IDENTITY_KEYS
+    if unknown:
+        raise ScopeError(f"{ctx}: unknown identity keys {sorted(unknown)} (allowed: {sorted(_IDENTITY_KEYS)})")
+    if not isinstance(ident["name"], str) or not _IDENTITY_NAME.fullmatch(ident["name"]):
+        raise ScopeError(f"{ctx}: identity name must match {_IDENTITY_NAME.pattern}")
+    for key in ("secret_ref", "login_url", "signup_url"):
+        if key in ident and (not isinstance(ident[key], str) or not ident[key].strip()):
+            raise ScopeError(f"{ctx}: '{key}' must be a non-empty string")
+    for key in ("login_url", "signup_url"):
+        if key in ident and not _HTTP_URL.match(ident[key]):
+            raise ScopeError(f"{ctx}: '{key}' must be an http(s) URL")
+    if "probe" in ident:
+        probe = ident["probe"]
+        if (
+            not isinstance(probe, dict)
+            or set(probe) != {"url", "status"}
+            or not isinstance(probe["url"], str)
+            or not _HTTP_URL.match(probe["url"])
+            or isinstance(probe["status"], bool)
+            or not isinstance(probe["status"], int)
+            or not 100 <= probe["status"] <= 599
+        ):
+            raise ScopeError(f"{ctx}: 'probe' must be {{url: http(s) URL, status: HTTP status code}}")
+    return dict(ident)
+
+
+def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
+    """Login, signup and probe URLs are visited through the gate: a scope that names one outside itself is broken."""
+    from bh.scope.enforce import check  # enforce imports this module
+
+    for i, ident in enumerate(scope.identities):
+        for key, u in (
+            ("login_url", ident.get("login_url")),
+            ("signup_url", ident.get("signup_url")),
+            ("probe.url", (ident.get("probe") or {}).get("url")),
+        ):
+            if u is not None and not (d := check(scope, u)):
+                raise ScopeError(f"{origin}: identities[{i}].{key} {u!r} is not in scope ({d.reason})")
 
 
 def load_scope(path: str | Path) -> Scope:

@@ -160,3 +160,24 @@ def test_malformed_notes_never_stop_the_host(tmp_path):
     pocs = [r["poc"] for r in b.rows("SELECT poc FROM findings")]
     assert all("s3cr3t" not in (p or "") for p in pocs)
     assert all(r["proof"] is None for r in b.rows("SELECT proof FROM findings"))  # a list is no proof
+
+
+def test_session_dead_marks_the_identity_stale_at_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    b = Board(tmp_path / "b.sqlite")
+    ev = tmp_path / "var" / "state" / "events.jsonl"
+    dead = {"kind": "session-dead", "identity": "user-a", "host": "t", "status": 302, "program": "p", "run": 7}
+    recs = [{**dead, "reason": "login-redirect"}, {**dead, "status": 401, "reason": "401"}]
+    recs += [{"kind": "auth", "host": "t", "program": "p", "identity": "user-a"}] * 3  # same identity: no 2nd blocker
+    recs += [{**dead, "identity": "user-b", "program": "other"}, {**dead, "identity": ""}]
+    _write(ev, recs)
+    out = ingest.gate_events(b, "p", 7, identities=["user-a", "user-b"])
+    assert out.stale == {"user-a"} and out.blockers == 1
+    assert float(b.meta_get("identity-stale:user-a:p")) > 0 and not b.meta_get("identity-stale:user-b:p")
+    assert _blockers(b) == ["[auth] identity 'user-a': session dead on t (a redirect to its login page)"]
+    _write(ev, [*recs, dead])  # a later segment of the same run: stale again, no second blocker
+    out = ingest.gate_events(b, "p", 7, identities=["user-a"])
+    assert out.stale == {"user-a"} and out.blockers == 0
+    _write(ev, [*recs, dead, dead])  # next run: one blocker again
+    assert ingest.gate_events(b, "p", 8, identities=["user-a"]).blockers == 1
+    assert b.rows("SELECT COUNT(*) n FROM todos")[0]["n"] == 0
