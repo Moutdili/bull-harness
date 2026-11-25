@@ -121,17 +121,64 @@ kill -KILL $all 2>/dev/null; rm -f "$1"; true
 """
 
 
-# Every process of the agent user dies (except the container's keep-alive, a child of root's runuser),
-# every session HOME and the user site-packages go, then one fresh HOME is created. Nothing the hunter
-# started or planted (background job, usercustomize.py, ~/.claude) survives into the next session.
-_RESET_SCRIPT = r"""
+# Kill every process of `$users` (but the container's keep-alive, a child of root's runuser) until none is left:
+# a process that respawns or forks during the sweep is caught by the next round. Zombies are skipped (they hold
+# nothing; init reaps them). Past the limit the script fails: a session never starts next to a survivor.
+_KILL_USERS = r"""
 keep=" $(for r in $(pgrep -u root -x runuser); do pgrep -P "$r"; done | tr '\n' ' ') "
-for p in $(pgrep -u hunter; pgrep -u judge 2>/dev/null); do
-  case "$keep" in *" $p "*) ;; *) kill -KILL "$p" 2>/dev/null ;; esac
+i=0
+while :; do
+  left=""
+  for u in $users; do
+    id "$u" >/dev/null 2>&1 || continue
+    for p in $(pgrep -u "$u"); do
+      case "$keep" in *" $p "*) continue ;; esac
+      case "$(ps -o stat= -p "$p" 2>/dev/null)" in Z*|'') continue ;; esac
+      left="$left $p"
+    done
+  done
+  [ -z "$left" ] && break
+  [ $i -ge 50 ] && { echo "processes of $users survive the kill:$left" >&2; exit 1; }
+  kill -KILL $left 2>/dev/null; sleep 0.1; i=$((i+1))
 done
-rm -rf /tmp/bh-home-* /home/hunter/.local /home/hunter/.claude /home/hunter/.config/claude
-mkdir -p "$1" && chown hunter:hunter "$1" && chmod 700 "$1"
 """
+
+# Every process of the agent user dies, every session HOME, the user site-packages and every file the hunter left
+# in the temporary dirs go, then one fresh HOME is created (never through a link the hunter could have planted).
+# Nothing the hunter started or planted (background job, usercustomize.py, ~/.claude) survives into the next session.
+_RESET_SCRIPT = (
+    'users="hunter judge"\n'
+    + _KILL_USERS
+    + r"""
+rm -rf /tmp/bh-home-* /home/hunter/.local /home/hunter/.claude /home/hunter/.claude.json /home/hunter/.config/claude
+find /tmp /var/tmp /dev/shm -mindepth 1 -user hunter -exec rm -rf -- {} + 2>/dev/null
+rm -rf -- "$1" && mkdir -m 700 -- "$1" && chown -h hunter:hunter -- "$1"
+"""
+)
+
+# Between two legs of one segment: the same kill, and the session HOME keeps only what `--resume` needs (the
+# transcripts under .claude/projects), without auto memory or any CLAUDE.md. Settings, memory, MCP or plugin files
+# the hunter wrote there are gone before the next leg loads them. A HOME that is not a plain directory of the
+# hunter's is recreated empty (the resume then fails: a leg error, never a planted configuration).
+_SCRUB_SCRIPT = (
+    'users="hunter judge"\n'
+    + _KILL_USERS
+    + r"""
+rm -rf /home/hunter/.local /home/hunter/.claude /home/hunter/.claude.json /home/hunter/.config/claude
+h="$1"
+if [ -L "$h" ] || [ ! -d "$h" ] || [ "$(stat -c %U -- "$h")" != hunter ]; then
+  rm -rf -- "$h" && mkdir -m 700 -- "$h" && chown -h hunter:hunter -- "$h" || exit 1
+  exit 0
+fi
+find "$h" -mindepth 1 -maxdepth 1 ! -name .claude -exec rm -rf -- {} +
+if [ -L "$h/.claude" ] || [ ! -d "$h/.claude" ]; then rm -rf -- "$h/.claude"; exit 0; fi
+find "$h/.claude" -mindepth 1 -maxdepth 1 ! -name projects -exec rm -rf -- {} +
+if [ -L "$h/.claude/projects" ] || [ ! -d "$h/.claude/projects" ]; then rm -rf -- "$h/.claude/projects"; exit 0; fi
+find "$h/.claude/projects" -mindepth 1 \( -name memory -o -name 'CLAUDE*.md' -o -name .claude -o -type l \) \
+  -prune -exec rm -rf -- {} +
+true
+"""
+)
 
 
 # The verifier's own Unix user, in its own container (created on first use: the image needs no rebuild). The
@@ -139,14 +186,16 @@ mkdir -p "$1" && chown hunter:hunter "$1" && chmod 700 "$1"
 # Between two verifications every judge process dies, every HOME and every file the judge left in the
 # temporary dirs go, and the work dir is recreated empty.
 JUDGE = "judge"
-_JUDGE_SCRIPT = r"""
-id judge >/dev/null 2>&1 || useradd --no-create-home --home-dir /nonexistent --shell /bin/sh judge || exit 1
-pkill -KILL -u judge 2>/dev/null
-i=0; while pgrep -u judge >/dev/null && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+_JUDGE_SCRIPT = (
+    "id judge >/dev/null 2>&1 || useradd --no-create-home --home-dir /nonexistent --shell /bin/sh judge || exit 1\n"
+    'users="judge"\n'
+    + _KILL_USERS
+    + r"""
 rm -rf -- /tmp/bh-home-* "$1" "$2"
 find /tmp /var/tmp /dev/shm -mindepth 1 -user judge -exec rm -rf -- {} + 2>/dev/null
-mkdir -p "$1" "$2" && chown judge:judge "$1" "$2" && chmod 700 "$1" && chmod 755 "$2"
+mkdir -p -- "$1" "$2" && chown -h judge:judge -- "$1" "$2" && chmod 700 "$1" && chmod 755 "$2"
 """
+)
 
 
 def prepare_judge(home: str, work_dir: str) -> None:
@@ -159,9 +208,17 @@ def prepare_judge(home: str, work_dir: str) -> None:
 
 def reset_agent_user(home: str) -> None:
     """Start a session from nothing the previous one left behind; `home` is the new session's HOME."""
-    r = agent_sh(_RESET_SCRIPT, home, user="root", timeout=30)
+    r = agent_sh(_RESET_SCRIPT, home, user="root", timeout=60)
     if r.returncode != 0:
         raise SystemExit(f"cannot reset the agent user in {AGENT}: {r.stderr.strip()}")
+
+
+def scrub_agent_user(home: str) -> None:
+    """Between two legs of a segment: no process of the previous leg alive, nothing in `home` but the session
+    transcripts `--resume` reads. Runs before the next leg starts, so it never touches that leg's process."""
+    r = agent_sh(_SCRUB_SCRIPT, home, user="root", timeout=60)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot scrub the agent user in {AGENT}: {r.stderr.strip()}")
 
 
 def kill_agent(program: str, grace: float = 8.0, bh_dir: str | None = None) -> None:

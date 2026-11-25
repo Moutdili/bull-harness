@@ -52,7 +52,14 @@ def test_quota_wake_uses_the_announced_reset():
         program="p", run_id=1, status="quota", rate_limit={"status": "rejected", "resetsAt": now + 3600}
     )
     assert supervisor.quota_wake(res, now) == now + 3600 + supervisor.QUOTA_MARGIN_S
-    for bad in ({}, {"resetsAt": now - 10}, {"resetsAt": now + 30 * 86400}, {"resetsAt": "soon"}):
+    for bad in (
+        {},
+        {"resetsAt": now - 10},
+        {"resetsAt": now + 30 * 86400},
+        {"resetsAt": now + 8 * 86400 + 1},
+        {"resetsAt": "soon"},
+        {"resetsAt": True},
+    ):
         res.rate_limit = bad
         assert supervisor.quota_wake(res, now) == now + supervisor.QUOTA_SLEEP_S
 
@@ -139,6 +146,48 @@ def test_program_not_ready_mid_hunt_is_parked(tmp_path, monkeypatch):
     supervisor.hunt([_scope(tmp_path, n) for n in "abc"], hours=2, minutes=10, model="m", max_turns=5)
     assert calls.count("c") == 1
     assert calls.count("a") > 2 and calls.count("b") > 2
+
+
+def test_a_segment_that_crashes_parks_its_program_only(tmp_path, monkeypatch, capsys):
+    """M4: a sandbox file that breaks ingestion (an Exception, not a SystemExit) parks that program; the others go
+    on. It would fail again at once: its files stay."""
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    clock = _clocked(monkeypatch)
+    calls: list[str] = []
+
+    def fake_run(scope_file, **kw):
+        name = scope_file.stem
+        calls.append(name)
+        clock["t"] += 600
+        if name == "b":
+            raise AttributeError("'list' object has no attribute 'get'")
+        return SegmentResult(program=name, run_id=len(calls), status="ok", progress=1)
+
+    monkeypatch.setattr(supervisor, "run_segment", fake_run)
+    supervisor.hunt([_scope(tmp_path, n) for n in "abc"], hours=2, minutes=10, model="m", max_turns=5)
+    assert calls.count("b") == 1
+    assert calls.count("a") > 2 and calls.count("c") > 2
+    assert "b: parked until the end of the hunt (segment failed: AttributeError(" in capsys.readouterr().out
+
+
+def test_a_refusal_on_a_cause_already_refused_does_not_climb_the_ladder(tmp_path, monkeypatch):
+    """M8: the same page refused again costs a cooldown, not the program's place in the hunt."""
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    clock = _clocked(monkeypatch)
+    calls: list[str] = []
+
+    def fake_run(scope_file, **kw):
+        name = scope_file.stem
+        calls.append(name)
+        clock["t"] += 600
+        if name == "b":
+            first = calls.count("b") == 1
+            return SegmentResult(program=name, run_id=len(calls), status="refusal", refusal_repeat=not first)
+        return SegmentResult(program=name, run_id=len(calls), status="ok", progress=1)
+
+    monkeypatch.setattr(supervisor, "run_segment", fake_run)
+    supervisor.hunt([_scope(tmp_path, n) for n in "ab"], hours=24, minutes=10, model="m", max_turns=5)
+    assert calls.count("b") > 2  # never parked: every later refusal was on the page already refused
 
 
 def test_other_system_exit_stops_the_hunt(tmp_path, monkeypatch):

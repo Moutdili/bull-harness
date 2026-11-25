@@ -83,6 +83,14 @@ def seg(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "CONTEXT_ROTATE_TOKENS", LIMIT)
     for name in ("activate_scope", "clean_sandbox", "prepare_workdir", "set_active_run"):
         monkeypatch.setattr(run, name, lambda *a, **k: None)
+    state = {"legs": [], "cmds": [], "limits": [], "cleaned": []}
+    monkeypatch.setattr(run, "clean_leg", lambda prog, home: state["cleaned"].append((len(state["cmds"]), home)))
+
+    def no_podman(*a, **k):
+        raise AssertionError("a test reached podman")
+
+    monkeypatch.setattr(run.stack, "agent_sh", no_podman)
+    monkeypatch.setattr(run.stack.subprocess, "run", no_podman)
     monkeypatch.setattr(run.retention, "prune", lambda: None)
     monkeypatch.setattr(run.stack, "kill_agent", lambda *a, **k: None)
     monkeypatch.setattr(run, "refresh_identities", lambda *a, **k: set())
@@ -99,7 +107,6 @@ def seg(tmp_path, monkeypatch):
         return dst
 
     monkeypatch.setattr(run, "rotate_notes", rotate)
-    state = {"legs": [], "cmds": [], "limits": []}
 
     def fake_leg(cmd, log, err_path, res, say, *, program, timeout_s, bh_dir=None, context_limit=None):
         err_path.touch()
@@ -153,6 +160,8 @@ def test_no_rotation_under_the_threshold(seg):
     assert res.rotations == 0
     assert res.leg_context == [900, 950]
     assert st["limits"] == [2 * LIMIT, 2 * LIMIT]
+    # M5: the sandbox is scrubbed before the 2nd leg (after the 1st exited), in the segment's HOME
+    assert st["cleaned"] == [(1, run.sandbox_home(res.run_id))]
     assert not board.rows("SELECT 1 FROM facts WHERE kind='handoff'")
 
 

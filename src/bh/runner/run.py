@@ -3,8 +3,12 @@
 Host side only:
   lock (one agent at a time) -> activate the scope for the gate -> tag gate flows with the run
   -> clean the sandbox (fresh HOME, no planted CLAUDE.md / .claude) -> push frontier / doctrine
-  -> podman exec claude -p (stream-json), nudged to continue in the same session when it stops early
+  -> podman exec claude -p (stream-json), nudged to continue in the same session when it stops early (the sandbox
+     is scrubbed again before every leg)
   -> rotate + ingest notes, gate events -> measured progress.
+
+The stream is written by a process the hunter shares a uid with: what it claims about refusals and quota is
+believed only where another source agrees (see `refusal_confirmed`, `quota_confirmed`).
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
+from urllib.parse import urlsplit
 
 from bh import classes, paths, retention, stack
 from bh.assets import Graph
@@ -35,8 +40,14 @@ from bh.scope import Scope, load_scope
 from bh.text import one_line
 
 DEFAULT_MODEL = "sonnet"  # alias resolved by Claude Code (claude-sonnet-5-5 on 2.1.330)
-# Claude usage-limit wording only: "rate limit" is everyday bug bounty vocabulary (false positives).
+# Claude usage-limit wording only: "rate limit" is everyday bug bounty vocabulary (false positives). Matched on
+# claude's stderr only, never on the model's text (a target page quoted by the model says "limit reached" too).
 QUOTA_RE = re.compile(r"(usage limit|limit reached|resets? at \d|out of (extra )?usage)", re.I)
+RESET_HORIZON_S = 8 * 86400  # a resetsAt further away than this is ignored (no quota window is that long)
+# The hunter's system prompt: a file root pushes (0444) in a directory of root's (755), outside the work tree. The
+# hunter reads it, never rewrites it between two legs.
+SYSTEM_DIR = "/var/lib/bh-run"
+SYSTEM_FILE = f"{SYSTEM_DIR}/{c.SYSTEM}"
 # Builtins run for minutes (ffuf, nuclei, sqlmap): the Bash tool's 2-minute default would kill them.
 BASH_TIMEOUT_MS = {"BASH_DEFAULT_TIMEOUT_MS": "330000", "BASH_MAX_TIMEOUT_MS": "900000"}
 # Token economy: every turn resends tool schemas + command listings; keep only what the hunt uses.
@@ -85,7 +96,12 @@ class SegmentResult:
     leg_context: list[int] = field(default_factory=list)  # max context (tokens) of each leg
     overflow: bool = False  # the last leg was stopped by the runner past CONTEXT_HARD_FACTOR x the threshold
     tool_log: list[dict] = field(default_factory=list)  # one per tool call: kind, duration, locked
+    refusal_id: str | None = None  # id of the message the stream says was refused
+    refusal_cause: dict = field(default_factory=dict)  # cmd, url, host, key: what the refusal most likely followed
+    refusal_repeat: bool = False  # a refusal on a cause already refused within 7 days: not escalated again
+    quota_claimed: bool = False  # the stream said `rejected`, confirmed or not: no verification after it
     _pending: dict = field(default_factory=dict, repr=False)  # tool_use id -> index in tool_log
+    _last_urls: list[str] = field(default_factory=list, repr=False)  # URLs of the last tool result
 
 
 def quota_line(info: dict) -> str:
@@ -178,17 +194,44 @@ REFUSAL_WINDOW_S = 7 * 86400
 WAF_PAUSE_S = 3600  # same length as the gate's waf-cooldown
 
 
-def live_identities(board: Board, program: str, also: list[str] | tuple[str, ...] = ()) -> list[str]:
+# A stale mark the runner can neither check nor lift (identity without `enroll` recipe nor `probe`, e.g. one made
+# in the UI) stops counting after this long: the gate marks it again if the session is really dead.
+UNVERIFIABLE_STALE_S = 6 * 3600
+
+
+def stale_mark(board: Board, program: str, name: str) -> float:
+    """When the gate last saw this identity's session die (meta `identity-stale`), 0 when never or when the identity
+    file was written after it (rewriting the file lifts the mark)."""
+    try:
+        mark = float(board.meta_get(f"identity-stale:{name}:{program}", "0") or 0)
+    except ValueError:
+        return 0.0
+    f = paths.identities_dir(program) / f"{name}.json"
+    return mark if mark > (f.stat().st_mtime if f.exists() else 0.0) else 0.0
+
+
+def verifiable(scope: Scope | None, name: str) -> bool:
+    """The runner can check this identity's session before a segment: it has a login recipe or a probe."""
+    decl = next((i for i in (scope.identities if scope else ()) if i["name"] == name), None)
+    return bool(decl and (decl.get("enroll") or decl.get("probe")))
+
+
+def live_identities(
+    board: Board,
+    program: str,
+    also: list[str] | tuple[str, ...] = (),
+    scope: Scope | None = None,
+    now: float | None = None,
+) -> list[str]:
     """Identity names (files, plus `also`) minus those the gate saw expire: an `identity-stale` mark newer than
-    the identity file. Rewriting the file lifts the mark."""
+    the identity file. Rewriting the file lifts the mark; so does a good probe (refresh_identities). The mark of an
+    identity the runner cannot verify (see `verifiable`, needs `scope`; any identity when `scope` is None) is never
+    final: it lapses after UNVERIFIABLE_STALE_S."""
+    now = time.time() if now is None else now
     out = []
     for name in sorted(set(paths.identities(program)) | set(also)):
-        f = paths.identities_dir(program) / f"{name}.json"
-        try:
-            stale = float(board.meta_get(f"identity-stale:{name}:{program}", "0") or 0)
-        except ValueError:
-            stale = 0.0
-        if stale <= (f.stat().st_mtime if f.exists() else 0.0):
+        mark = stale_mark(board, program, name)
+        if not mark or (not verifiable(scope, name) and now - mark > UNVERIFIABLE_STALE_S):
             out.append(name)
     return out
 
@@ -196,20 +239,42 @@ def live_identities(board: Board, program: str, also: list[str] | tuple[str, ...
 LOGIN_RETRY_S = 3600  # one login attempt per identity and hour, whatever its outcome
 
 
+def _probe_only(board: Board, scope: Scope, name: str, run_id: int, say) -> None:
+    """An identity with a probe and no recipe, marked stale: one request through the gate. A good probe lifts the
+    mark (the 401 was an access refusal, not a dead session); a bad or impossible one leaves it."""
+    from bh.accounts import enroll as en
+
+    try:
+        ok, detail = en.probe(en.identity(scope, name))
+    except en.AccountError as exc:
+        ok, detail = None, one_line(str(exc), 200)
+    if ok:
+        board.meta_set(f"identity-stale:{name}:{scope.program}", "0")
+    if say:
+        say(f"  identity {name}: probe {'ok, stale mark lifted' if ok else f'not ok ({detail})'}")
+
+
 def refresh_identities(board: Board, scope: Scope, run_id: int, say=None) -> set[str]:
-    """Before a segment: every identity with an `enroll` recipe whose session is missing or stale (the gate saw it
-    die in an earlier segment: GateOutcome.stale left the `identity-stale` mark) is refreshed through the gate
-    (bh.accounts.enroll.refresh). The probe runs every segment: it is one request, and it lifts a false stale mark
-    (a 401 that was an authorization refusal, not a dead session). Logins are rate-limited inside refresh; after a
-    failure the identity is retried after LOGIN_RETRY_S. A failure is a `login-failed` blocker, never a todo.
-    Returns the recipe identities still without a live session: they stay out of the prompt."""
+    """Before a segment (and before the verification): every identity with an `enroll` recipe whose session is
+    missing or stale (the gate saw it die in an earlier segment: GateOutcome.stale left the `identity-stale` mark) is
+    refreshed through the gate (bh.accounts.enroll.refresh), which probes first: a good probe lifts a false stale
+    mark (a 401 that was an authorization refusal, not a dead session). An identity with a probe but no recipe is
+    probed when marked. Logins are rate-limited inside refresh; after a failure the identity is retried after
+    LOGIN_RETRY_S. A failure is a `login-failed` blocker, never a todo.
+    Returns the verifiable identities still without a live session: they stay out of the prompt."""
     from bh.accounts import enroll as en
 
     prog = scope.program
-    live = set(live_identities(board, prog))
+    files = set(paths.identities(prog))
     for ident in scope.identities:
         name = ident["name"]
-        if not ident.get("enroll") or name in live:
+        if not (ident.get("enroll") or ident.get("probe")):
+            continue
+        if not ident.get("enroll"):
+            if stale_mark(board, prog, name) and name in files:
+                _probe_only(board, scope, name, run_id, say)
+            continue
+        if name in files and not stale_mark(board, prog, name):
             continue
         key = f"accounts-attempt:{name}:{prog}"
         try:
@@ -227,28 +292,76 @@ def refresh_identities(board: Board, scope: Scope, run_id: int, say=None) -> set
             board.add_blocker(prog, "login-failed", f"identity {name}", one_line(str(exc), 300), run_id=run_id)
             if say:
                 say(f"  identity {name}: login failed ({one_line(str(exc), 200)})")
-    live = set(live_identities(board, prog))
-    return {i["name"] for i in scope.identities if i.get("enroll") and i["name"] not in live}
+    files = set(paths.identities(prog))
+    return {
+        i["name"]
+        for i in scope.identities
+        if (i.get("enroll") and i["name"] not in files)
+        or (verifiable(scope, i["name"]) and stale_mark(board, prog, i["name"]))
+    }
+
+
+def _refusal_log(board: Board, program: str, now: float) -> list[tuple[float, str]]:
+    """(timestamp, cause) of this program's model refusals within the last 7 days (meta `refusals:<program>`). An
+    entry of the old format (a bare timestamp) is its own cause."""
+    try:
+        entries = json.loads(board.meta_get(f"refusals:{program}", "[]") or "[]")
+    except ValueError:
+        return []
+    if not isinstance(entries, list):
+        return []
+    out = []
+    for e in entries:
+        ts, cause = (e.get("ts"), e.get("cause")) if isinstance(e, dict) else (e, None)
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and now - REFUSAL_WINDOW_S < ts <= now:
+            out.append((float(ts), cause if isinstance(cause, str) and cause else f"@{ts}"))
+    return out
 
 
 def recent_refusals(board: Board, program: str, now: float | None = None) -> list[float]:
-    """Timestamps of this program's model refusals within the last 7 days (meta `refusals:<program>`)."""
+    """One timestamp per distinct cause (its first refusal) within the last 7 days: what the escalation counts.
+    Three refusals on the same page are one."""
     now = time.time() if now is None else now
-    try:
-        stamps = json.loads(board.meta_get(f"refusals:{program}", "[]") or "[]")
-    except ValueError:
-        stamps = []
-    if not isinstance(stamps, list):
-        return []
-    return [float(t) for t in stamps if isinstance(t, (int, float)) and now - REFUSAL_WINDOW_S < t <= now]
+    first: dict[str, float] = {}
+    for ts, cause in _refusal_log(board, program, now):
+        first.setdefault(cause, ts)
+    return sorted(first.values())
 
 
-def record_refusal(board: Board, program: str, now: float | None = None) -> int:
-    """Add a refusal to the sliding window; returns how many it now holds."""
+def record_refusal(board: Board, program: str, now: float | None = None, cause: str = "") -> int:
+    """Add a refusal to the sliding window; returns how many distinct causes it now holds."""
     now = time.time() if now is None else now
-    stamps = [*recent_refusals(board, program, now), now]
-    board.meta_set(f"refusals:{program}", json.dumps(stamps))
-    return len(stamps)
+    entries = [{"ts": ts, "cause": k} for ts, k in _refusal_log(board, program, now)]
+    entries.append({"ts": now, "cause": cause or f"@{now}"})
+    board.meta_set(f"refusals:{program}", json.dumps(entries))
+    return len(recent_refusals(board, program, now))
+
+
+def refused_before(board: Board, program: str, cause: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return bool(cause) and any(k == cause for _, k in _refusal_log(board, program, now))
+
+
+_URL = re.compile(r"https?://[^\s'\"<>`|;)\]}]+", re.I)
+
+
+def refusal_cause(cmd: str, result_urls: list[str]) -> dict:
+    """What a refusal most likely followed: the last command, and the URL it aimed at (else the first URL of the
+    last tool result: the page the tool reports on comes before the links of its body). `key` is what the
+    escalation compares: host + path of that URL (same page = same cause, whatever its query), else the command."""
+    urls = _URL.findall(cmd or "")
+    url = urls[-1] if urls else (result_urls[0] if result_urls else "")
+    host, key = "", ""
+    if url:
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+            key = f"{host}{parts.path.rstrip('/') or '/'}" if host else ""
+        except ValueError:
+            host = ""
+    if not key:
+        key = "cmd:" + re.sub(r"\s+", " ", cmd or "").strip()[:200] if cmd else ""
+    return {"cmd": cmd or "", "url": url[:300], "host": host, "key": key}
 
 
 def last_refusal(board: Board, program: str, run_id: int) -> str:
@@ -297,22 +410,54 @@ def sandbox_home(session: int | str) -> str:
 
 def clean_sandbox(program: str, home: str) -> None:
     """Nothing the agent wrote can configure the next session: no process of the previous one alive, fresh
-    HOME (no ~/.claude settings or memory), no CLAUDE.md / .claude / .mcp.json planted in the work tree (claude -p
-    would load a project .mcp.json, whose tools the Bash-only hooks never see). And the agent
-    reaches only this program's work dir: /work is root's, every other program's dir is closed (root, 700),
+    HOME (no ~/.claude settings or memory), no CLAUDE.md / CLAUDE.local.md / .claude / .mcp.json anywhere in the
+    program's work tree (claude -p would load a project .mcp.json, whose tools the Bash-only hooks never see). And the
+    agent reaches only this program's work dir: /work is root's, every other program's dir is closed (root, 700),
     so notes, endpoints or coverage of program B cannot be written from a segment on program A."""
     stack.reset_agent_user(home)
-    stack.agent_sh(_WORK_SCRIPT, f"{c.WORK_ROOT}/{program}", c.WORK_ROOT, user="root")
+    _clean_work(program)
 
 
-_WORK_SCRIPT = r"""
-rm -rf -- "$1/CLAUDE.md" "$1/.claude" "$1/.mcp.json" "$2/CLAUDE.md" "$2/.claude" "$2/.mcp.json"
+def clean_leg(program: str, home: str) -> None:
+    """Before every leg after the first: the same, except that `home` keeps the session transcripts `--resume`
+    needs. The previous leg's process has exited; the next one is not started yet."""
+    stack.scrub_agent_user(home)
+    _clean_work(program)
+
+
+def _clean_work(program: str) -> None:
+    r = stack.agent_sh(_WORK_SCRIPT, f"{c.WORK_ROOT}/{program}", c.WORK_ROOT, user="root", timeout=120)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot clean the work tree of {program}: {r.stderr.strip()}")
+
+
+# Claude Code reads CLAUDE.md files from the work dir up to / and from any subdirectory it touches, and settings
+# from .claude/: every copy goes, at any depth (find does not follow links; rm removes a link, not its target).
+_PLANTED = r"\( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude -o -name .mcp.json \)"
+_WORK_SCRIPT = rf"""
+rm -rf -- "$2/CLAUDE.md" "$2/CLAUDE.local.md" "$2/.claude" "$2/.mcp.json"
 chown root:root "$2" && chmod 755 "$2"
 for d in "$2"/*/ "$2"/.[!.]*/; do
-  d=${d%/}; [ -d "$d" ] && [ "$d" != "$1" ] && chown root:root "$d" && chmod 700 "$d"
+  d=${{d%/}}; [ -d "$d" ] && [ "$d" != "$1" ] && chown -h root:root "$d" && chmod 700 "$d"
 done
-mkdir -p "$1" && chown hunter:hunter "$1" && chmod 755 "$1"  # 755: the host reads it (another uid)
+if [ -L "$1" ]; then rm -f -- "$1"; fi
+if [ -d "$1" ]; then find "$1" -mindepth 1 {_PLANTED} -prune -exec rm -rf -- {{}} + ; fi
+rm -f -- "$1/.bh/{c.SYSTEM}"
+mkdir -p "$1" && chown -h hunter:hunter "$1" && chmod 755 "$1"  # 755: the host reads it (another uid)
 """
+
+_SYSTEM_SCRIPT = r"""
+umask 022
+mkdir -p /var/lib && rm -rf -- "$1" && mkdir -m 755 -- "$1" && cat > "$1/$2" && chown -R root:root -- "$1" \
+  && chmod 444 -- "$1/$2"
+"""
+
+
+def push_system_prompt(text: str) -> None:
+    """The hunter's system prompt, out of its reach: written by root under SYSTEM_DIR (see SYSTEM_FILE)."""
+    r = stack.agent_sh(_SYSTEM_SCRIPT, SYSTEM_DIR, c.SYSTEM, user="root", stdin=text)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot write the system prompt in {stack.AGENT}: {r.stderr.strip()}")
 
 
 def rotate_notes(program: str, run_id: int, leg: int | None = None) -> Path:
@@ -344,8 +489,13 @@ def coverage_counts(board: Board, scope: Scope) -> tuple[int, int]:
 
 def pick_cards(board: Board, scope: Scope) -> list[str]:
     """Method cards for this segment, from the attack surface the tools found (none before mapping)."""
-    endpoints = [
-        (e.get("key", ""), e.get("params") or []) for e in c.read_jsonl(paths.work_bh(scope.program) / c.ENDPOINTS)
+    endpoints = [  # the sandbox writes this file: anything but {key: str, params: [str]} is skipped
+        (
+            e["key"],
+            [x for x in e.get("params") or [] if isinstance(x, str)] if isinstance(e.get("params"), list) else [],
+        )
+        for e in c.read_jsonl(paths.work_bh(scope.program) / c.ENDPOINTS)
+        if isinstance(e, dict) and isinstance(e.get("key"), str)
     ]
     recent = [
         cid
@@ -358,8 +508,12 @@ def pick_cards(board: Board, scope: Scope) -> list[str]:
     return classes.select_cards(endpoints, exclude=scope.forbidden_vulns, recently_used=recent)
 
 
-def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
+def prepare_workdir(board: Board, scope: Scope, scope_file: Path, identities: list[str] | None = None) -> None:
+    """Push what the segment reads. `identities`: the live ones offered to the agent (BH_IDENTITIES), the only ones
+    the system prompt names."""
     prog = scope.program
+    if identities is None:
+        identities = live_identities(board, prog, also=[i["name"] for i in scope.identities], scope=scope)
     stage = paths.stage(prog)
     stage.mkdir(parents=True, exist_ok=True)
     board.export_facts(prog, stage / c.FACTS)
@@ -373,7 +527,7 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path) -> None:
     )
     stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(r["key"].split(" ", 1) for r in tested)))
     stack.push_file(f"{cbh}/{c.FACTS}", (stage / c.FACTS).read_text())
-    stack.push_file(f"{cbh}/{c.SYSTEM}", build_system_prompt(scope, live_identities(board, prog)))
+    push_system_prompt(build_system_prompt(scope, identities))
     stack.push_file(f"{cbh}/{c.SCOPE}", Path(scope_file).read_text())
 
 
@@ -441,7 +595,7 @@ def agent_command(
         "/opt/bh/hooks/settings.json",
         "--strict-mcp-config",  # no --mcp-config: no MCP server at all, whatever the work tree holds
         "--append-system-prompt-file",
-        f"{bh}/{c.SYSTEM}",
+        f"{bh_dir}/{c.SYSTEM}" if bh_dir else SYSTEM_FILE,  # the verifier's is pushed by bh.verify
     ]
     if effort:
         cmd += ["--effort", effort]
@@ -466,8 +620,39 @@ def command_kind(cmd: str) -> str:
 def _tool_result_text(block: dict) -> str:
     content = block.get("content")
     if isinstance(content, list):
-        return "\n".join(x.get("text", "") for x in content if isinstance(x, dict))
+        return "\n".join(t for x in content if isinstance(x, dict) and isinstance(t := x.get("text"), str))
     return content if isinstance(content, str) else ""
+
+
+def _str(v) -> str:
+    return v if isinstance(v, str) else ""
+
+
+def _int(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def rate_limit_info(info, now: float | None = None) -> dict:
+    """The stream's `rate_limit_info`, kept only as a dict; a `resetsAt` that is not a time within the next
+    RESET_HORIZON_S is dropped (a forged far reset must not put the hunt to sleep for days)."""
+    if not isinstance(info, dict):
+        return {}
+    now = time.time() if now is None else now
+    out = dict(info)
+    reset = out.get("resetsAt")
+    if "resetsAt" in out and not (
+        isinstance(reset, (int, float)) and not isinstance(reset, bool) and now - 86400 < reset <= now + RESET_HORIZON_S
+    ):
+        del out["resetsAt"]
+    return out
+
+
+_USAGE = (
+    ("input", "input_tokens"),
+    ("cache_read", "cache_read_input_tokens"),
+    ("cache_write", "cache_creation_input_tokens"),
+    ("output", "output_tokens"),
+)
 
 
 def consume_stream(
@@ -475,7 +660,9 @@ def consume_stream(
 ) -> dict | None:
     """Mirror the stream to the run log (the UI tails it), update `res`, return the result event.
     `limit`: once a turn's context exceeds it, `stop()` is called when that turn's tool results are back
-    (the turn in progress ends, the next one is cut) and `res.overflow` is set."""
+    (the turn in progress ends, the next one is cut) and `res.overflow` is set.
+    The hunter can write into this stream: a line that is not a JSON object, or a field of the wrong type, is
+    skipped; what it says about refusals and quota is checked after the segment."""
     result = None
     over = False
     for line in proc.stdout:
@@ -484,55 +671,66 @@ def consume_stream(
             ev = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(ev, dict):
+            continue
         match ev.get("type"):
             case "system" if ev.get("subtype") == "init":
-                res.session_id = ev.get("session_id") or res.session_id
+                res.session_id = _str(ev.get("session_id")) or res.session_id
             case "assistant":
-                msg = ev.get("message", {})
+                msg = ev.get("message")
+                msg = msg if isinstance(msg, dict) else {}
+                mid = _str(msg.get("id"))
                 if msg.get("stop_reason") == "refusal":
-                    res.status = "refusal"
-                if msg.get("id") and msg["id"] not in {t["id"] for t in res.turn_log[-3:]}:
-                    u = msg.get("usage") or {}
-                    res.turn_log.append(
-                        {
-                            "id": msg["id"],
-                            "ts": time.time(),
-                            "input": u.get("input_tokens"),
-                            "cache_read": u.get("cache_read_input_tokens"),
-                            "cache_write": u.get("cache_creation_input_tokens"),
-                            "output": u.get("output_tokens"),
-                        }
-                    )
-                    if limit and not over and (ctx := turn_context(res.turn_log[-1])) > limit:
+                    res.status = "refusal"  # no further leg either way; refusal_confirmed decides what it costs
+                    if res.refusal_id is None:
+                        last = next((t["cmd"] for t in reversed(res.tool_log) if t.get("cmd")), "")
+                        res.refusal_id = mid
+                        res.refusal_cause = refusal_cause(last, res._last_urls)
+                if mid and mid not in {t["id"] for t in res.turn_log[-3:]}:
+                    u = msg.get("usage")
+                    u = u if isinstance(u, dict) else {}
+                    turn = {"id": mid, "ts": time.time(), **{k: _int(u.get(f)) for k, f in _USAGE}}
+                    res.turn_log.append(turn)
+                    if limit and not over and (ctx := turn_context(turn)) > limit:
                         over = True
                         say(f"  ⚠ context {ctx} tokens > {limit}: the leg stops after this turn")
-                for block in msg.get("content", []):
-                    if block.get("type") == "text" and block.get("text", "").strip():
+                content = msg.get("content")
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text" and _str(block.get("text")).strip():
                         say(f"  💬 {one_line(block['text'], 220)}")
                     elif block.get("type") == "tool_use":
                         res.tool_calls += 1
-                        inp = block.get("input", {})
-                        cmd = inp.get("command") or ""
+                        inp = block.get("input")
+                        inp = inp if isinstance(inp, dict) else {}
+                        cmd = _str(inp.get("command"))
                         res.arsenal_calls += c.uses_arsenal(cmd)
                         res.manual_calls += c.uses_manual_http(cmd)
-                        res._pending[block.get("id")] = len(res.tool_log)
+                        if tid := _str(block.get("id")):
+                            res._pending[tid] = len(res.tool_log)
+                        name = _str(block.get("name"))
                         res.tool_log.append(
                             {
                                 "ts": time.time(),
-                                "tool": block.get("name"),
+                                "tool": name,
                                 "kind": command_kind(cmd),
                                 "cmd": cmd[:300],
                                 "ms": None,
                                 "locked": False,
                             }
                         )
-                        say(f"  ⚙ {block.get('name')}: {one_line(cmd or inp.get('description') or inp)}")
+                        say(f"  ⚙ {name}: {one_line(cmd or _str(inp.get('description')) or str(inp))}")
             case "user":
-                for block in (ev.get("message") or {}).get("content") or []:
+                msg = ev.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                for block in content if isinstance(content, list) else []:
                     if not isinstance(block, dict) or block.get("type") != "tool_result":
                         continue
-                    locked = any(m in _tool_result_text(block) for m in (c.LOCK_MARK, c.RULES_MARK))
-                    if (i := res._pending.pop(block.get("tool_use_id"), None)) is not None:
+                    text = _tool_result_text(block)
+                    res._last_urls = _URL.findall(text[:20000])[:5]
+                    locked = any(m in text for m in (c.LOCK_MARK, c.RULES_MARK))
+                    if (i := res._pending.pop(_str(block.get("tool_use_id")), None)) is not None:
                         call = res.tool_log[i]
                         call["ms"], call["locked"] = int((time.time() - call["ts"]) * 1000), locked
                     if locked:
@@ -542,7 +740,7 @@ def consume_stream(
                         res.overflow = True
                         stop()
             case "rate_limit_event":
-                res.rate_limit = ev.get("rate_limit_info") or {}
+                res.rate_limit = rate_limit_info(ev.get("rate_limit_info"))
             case "result":
                 result = ev
     return result
@@ -577,8 +775,12 @@ def run_leg(
         timed_out.set()
         kill()
 
+    killers: list[threading.Thread] = []
+
     def on_overflow() -> None:  # off the reading thread: the stream keeps draining until claude exits
-        threading.Thread(target=kill, daemon=True).start()
+        t = threading.Thread(target=kill, daemon=True)
+        killers.append(t)
+        t.start()
 
     timer = threading.Timer(max(1.0, timeout_s), on_timeout)
     timer.start()
@@ -595,19 +797,25 @@ def run_leg(
     finally:
         timer.cancel()
     proc.wait()
+    # a kill still in flight reads the pid file: it must be done before the next leg's wrapper rewrites it
+    for t in (timer, *killers):
+        if t.is_alive():
+            t.join()
     return result, timed_out.is_set()
 
 
 def merge_result(res: SegmentResult, result: dict | None) -> None:
     if not result:
         return
-    res.session_id = result.get("session_id") or res.session_id
-    res.turns += result.get("num_turns") or 0
-    res.cost_usd += result.get("total_cost_usd") or 0.0
-    for k, v in (result.get("usage") or {}).items():
-        if isinstance(v, int):
+    res.session_id = _str(result.get("session_id")) or res.session_id
+    res.turns += _int(result.get("num_turns")) or 0
+    cost = result.get("total_cost_usd")
+    res.cost_usd += cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0.0
+    usage = result.get("usage")
+    for k, v in (usage if isinstance(usage, dict) else {}).items():
+        if _int(v) is not None:
             res.usage[k] = res.usage.get(k, 0) + v
-    res.text = result.get("result") or ""
+    res.text = _str(result.get("result"))
     if res.status != "refusal":
         sub = result.get("subtype", "")
         res.status = (
@@ -636,6 +844,51 @@ def gate_counts(board: Board, run_id: int) -> dict[str, int]:
     }
 
 
+# ------------------------------------------------------------------ what the stream claims, checked
+# The hunter shares claude's uid: it can write into claude's stdout and stderr (/proc/<pid>/fd), not into the gate's
+# journal. The relay logs every Claude API request of the run (`kind: relay`); when the gate also logs what came back
+# (`status` of the upstream response, `msg_id` of the message it streamed), those fields decide.
+def events_size() -> int:
+    try:
+        return paths.events_log().stat().st_size
+    except OSError:
+        return 0
+
+
+def relay_events(run_id: int, offset: int = 0) -> list[dict]:
+    """The relay's lines for this run in the gate's journal, from `offset` (its size when the segment began)."""
+    try:
+        if paths.events_log().stat().st_size < offset:  # rotated meanwhile: read it all
+            offset = 0
+    except OSError:
+        return []
+    lines = c.read_jsonl(paths.events_log(), offset)
+    return [e for e in lines if isinstance(e, dict) and e.get("kind") == "relay" and e.get("run") == run_id]
+
+
+def refusal_confirmed(res: SegmentResult, relay: list[dict]) -> bool:
+    """A refusal stands when the refused message is one the relay streamed: its id among the relay's `msg_id`s (with
+    `stop_reason`, when logged, `refusal`). While the gate logs no message id, the stream's word stands: wrongly
+    ignoring a real refusal (rephrasing on the CVP account) costs more than a forged one, which the escalation
+    counts once per page (record_refusal)."""
+    seen = {e["msg_id"]: e.get("stop_reason") for e in relay if isinstance(e.get("msg_id"), str)}
+    if not seen:
+        return True
+    return res.refusal_id in seen and seen[res.refusal_id] in (None, "refusal")
+
+
+def quota_confirmed(res: SegmentResult, stderr: str, relay: list[dict]) -> bool:
+    """A quota stop needs the stream's `rate_limit_event` (`rejected`) and a second source: a 429 from upstream in
+    the relay's journal when the gate logs response statuses for this run, else claude's stderr (QUOTA_RE). The
+    model's text never counts: it quotes target pages."""
+    if res.rate_limit.get("status") != "rejected":
+        return False
+    statuses = [s for e in relay if (s := _int(e.get("status"))) is not None]
+    if statuses:
+        return 429 in statuses
+    return bool(QUOTA_RE.search(stderr))
+
+
 def finish(
     board: Board, res: SegmentResult, scope: Scope, before: tuple[int, int], *, effort: str | None, note: str
 ) -> None:
@@ -647,20 +900,28 @@ def finish(
     res.new_facts += facts
     res.new_findings += findings
     res.new_blockers += blockers
-    outcome = ingest.gate_events(board, prog, res.run_id, live_identities(board, prog))
+    outcome = ingest.gate_events(board, prog, res.run_id, live_identities(board, prog, scope=scope))
     res.new_blockers += outcome.blockers
     if res.status == "refusal":
-        # never rephrased: the next task names the command as a closed lead (last_refusal reads the first line)
-        last = next((t["cmd"] for t in reversed(res.tool_log) if t.get("cmd")), "") or "(no command recorded)"
+        # never rephrased: the next task names the command as a closed lead (last_refusal reads the first line). The
+        # blocker aims at the page (or host) the refusal followed: a target that makes the model refuse closes that
+        # page, and the escalation counts it once however often it comes back.
+        cause = res.refusal_cause or refusal_cause(
+            next((t["cmd"] for t in reversed(res.tool_log) if t.get("cmd")), ""), []
+        )
+        last = cause.get("cmd") or "(no command recorded)"
         board.add_blocker(
             prog,
             "refusal",
-            f"run {res.run_id}",
-            f"{one_line(last, 200)}\nlog: {paths.run_log(res.run_id, prog)}",
+            one_line(cause.get("url") or cause.get("host") or f"run {res.run_id}", 200),
+            f"{one_line(last, 200)}\ncause: {one_line(cause.get('key') or '?', 200)}\n"
+            f"log: {paths.run_log(res.run_id, prog)}",
             run_id=res.run_id,
+            host=cause.get("host") or None,
         )
         res.new_blockers += 1
-        record_refusal(board, prog)
+        res.refusal_repeat = refused_before(board, prog, cause.get("key", ""))
+        record_refusal(board, prog, cause=cause.get("key", ""))
     board.record_metrics(res.run_id, res.turn_log, res.tool_log)
     board.run_set(res.run_id, blockers=res.new_blockers, **gate_counts(board, res.run_id))
     board.run_set(res.run_id, rotations=res.rotations, max_context=max(res.leg_context, default=None))
@@ -736,7 +997,14 @@ def auto_handoff(
 
 
 def prepare_rotation(
-    board: Board, scope: Scope, scope_file: Path, res: SegmentResult, *, since: int, context: int
+    board: Board,
+    scope: Scope,
+    scope_file: Path,
+    res: SegmentResult,
+    *,
+    since: int,
+    context: int,
+    identities: list[str] | None = None,
 ) -> bool:
     """Before a fresh session takes over mid-segment: ingest the notes so far, write the HANDOFF if none was
     ingested since fact id `since`, push the updated frontier to the sandbox. True when the runner wrote it."""
@@ -753,7 +1021,7 @@ def prepare_rotation(
         title, summary = auto_handoff(board, prog, res.run_id, since=since, context=context, last_cmd=last)
         board.add_fact(prog, title, summary, kind="handoff", run_id=res.run_id)
     Graph(board, scope).sync(res.run_id)
-    prepare_workdir(board, scope, scope_file)
+    prepare_workdir(board, scope, scope_file, identities)
     return wrote
 
 
@@ -824,8 +1092,14 @@ def _run_locked(
     clean_sandbox(prog, sandbox_home(run_id))
     # before the prompt is written: a recipe identity without a live session is left out of it
     no_session = refresh_identities(board, scope, run_id, None if quiet else (lambda m: print(m, flush=True)))
+    # the live ones only, for BH_IDENTITIES and the system prompt alike
+    identities = [
+        n
+        for n in live_identities(board, prog, also=[i["name"] for i in scope.identities], scope=scope)
+        if n not in no_session
+    ]
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
-    prepare_workdir(board, scope, scope_file)
+    prepare_workdir(board, scope, scope_file, identities)
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
     refused = last_refusal(board, prog, run_id)
@@ -855,14 +1129,14 @@ def _run_locked(
     deadline = time.monotonic() + minutes * 60
     prompt, timed_out, next_session = task, False, session
     limit = CONTEXT_ROTATE_TOKENS
-    identities = [
-        n for n in live_identities(board, prog, also=[i["name"] for i in scope.identities]) if n not in no_session
-    ]
+    events_at = events_size()  # the relay's journal of this segment starts here
     set_active_run(run_id, prog, relay_budget(max_turns))
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             while res.legs < MAX_LEGS:
                 res.legs += 1
+                if res.legs > 1:  # whatever the previous leg planted goes before the next one loads it
+                    clean_leg(prog, sandbox_home(run_id))
                 calls_before, turns_before, facts_before = res.tool_calls, len(res.turn_log), last_fact_id(board)
                 cmd = agent_command(
                     scope,
@@ -932,7 +1206,9 @@ def _run_locked(
                     new_cards = ""
                 if rotate:
                     res.rotations += 1
-                    wrote = prepare_rotation(board, scope, scope_file, res, since=facts_before, context=last_ctx)
+                    wrote = prepare_rotation(
+                        board, scope, scope_file, res, since=facts_before, context=last_ctx, identities=identities
+                    )
                     say(
                         f"  ⟳ context {last_ctx} tokens > {limit}: fresh session from the board"
                         + (" (HANDOFF written by the runner)" if wrote else "")
@@ -970,16 +1246,24 @@ def _run_locked(
         stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
         if timed_out:
             res.status = "timeout"
-        if res.rate_limit.get("status") == "rejected" or (
-            res.status != "ok" and (QUOTA_RE.search(res.text) or QUOTA_RE.search(stderr))
-        ):
+        relay = relay_events(run_id, events_at)
+        if res.status == "refusal" and not refusal_confirmed(res, relay):
+            say(f"  ⚠ the stream reports a refusal of {res.refusal_id or '?'} that the relay never streamed: ignored")
+            res.status = "error"
+        res.quota_claimed = res.rate_limit.get("status") == "rejected"
+        if quota_confirmed(res, stderr, relay):
             res.status = "quota"
+        elif res.quota_claimed:
+            say("  ⚠ the stream reports a quota stop that neither stderr nor the relay confirms: not a quota stop")
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
     # every finding waiting with a proof, not only this segment's: one left 'new' by an earlier stop is picked up
-    # here, and a refused segment's findings are verified too (the refusal closes a lead, not the findings)
-    if res.status != "quota" and (pending := pending_findings(board, prog)):
+    # here, and a refused segment's findings are verified too (the refusal closes a lead, not the findings). After a
+    # quota claim, even an unconfirmed one, nothing is judged: a judge without quota would bury a good finding.
+    if res.status != "quota" and not res.quota_claimed and (pending := pending_findings(board, prog)):
         from bh.verify import VERIFIER_MODEL, verify_pending
 
+        # sessions first: one the gate saw die (or a false mark) is refreshed before the replay leans on it
+        refresh_identities(board, scope, run_id, say)
         say(f"▶ verifying {pending} finding(s) with {VERIFIER_MODEL}")
         set_active_run(run_id, prog)  # the verifier's requests are this run's traffic too
         try:

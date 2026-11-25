@@ -11,13 +11,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bh.board import Board
-from bh.runner.run import ProgramNotReady, SegmentResult, check_automation, recent_refusals, run_segment
+from bh.runner.run import (
+    RESET_HORIZON_S,
+    ProgramNotReady,
+    SegmentResult,
+    check_automation,
+    recent_refusals,
+    run_segment,
+)
 from bh.scope import load_scope
 
 STAGNANT_LIMIT = 2  # segments without a new fact/finding before cooldown
 COOLDOWN_S = 2 * 3600
 # A refusal is never rephrased (CVP account): 1st -> pause, 2nd in the same hunt -> parked until it ends,
-# REFUSAL_LIMIT within 7 days -> excluded at preflight until someone reviews it out of the hunt.
+# REFUSAL_LIMIT within 7 days -> excluded at preflight until someone reviews it out of the hunt. Only refusals on
+# distinct causes (page or command, see run.refusal_cause) climb this ladder: a page that makes the model refuse
+# again is closed by its blocker, and costs the program a plain cooldown, not its place in the hunt.
 REFUSAL_COOLDOWN_S = 6 * 3600
 REFUSALS_TO_PARK = 2
 REFUSAL_LIMIT = 3
@@ -42,9 +51,9 @@ class ProgState:
 
 def quota_wake(res: SegmentResult, now: float) -> float:
     """When to try again after a quota stop: the reset time the API announced (`rate_limit_event.resetsAt`)
-    plus a margin, else QUOTA_SLEEP_S from now."""
+    plus a margin, else QUOTA_SLEEP_S from now. A reset further than RESET_HORIZON_S is not believed."""
     reset = (res.rate_limit or {}).get("resetsAt")
-    if isinstance(reset, (int, float)) and now < reset < now + 8 * 86400:
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool) and now < reset <= now + RESET_HORIZON_S:
         return reset + QUOTA_MARGIN_S
     return now + QUOTA_SLEEP_S
 
@@ -122,6 +131,12 @@ def hunt(
             p.parked = True
             print(f"{p.program}: parked until the end of the hunt ({exc})")
             continue
+        except Exception as exc:  # noqa: BLE001 - e.g. a sandbox file that breaks ingestion: this program only
+            # SystemExit (container down, lock held: the whole stack) and Ctrl-C are not Exceptions: they still stop
+            # the hunt. A failing program would fail again at once (its files stay): parked, the others go on.
+            p.parked = True
+            print(f"{p.program}: parked until the end of the hunt (segment failed: {exc!r})"[:500])
+            continue
         p.resumes = p.resumes + 1 if resume else 0
         if res.status == "quota":
             wake = quota_wake(res, time.time())
@@ -132,7 +147,11 @@ def hunt(
             time.sleep(max(30, wake - time.time()))
             continue
         if res.status == "refusal":
-            _after_refusal(p)
+            if res.refusal_repeat:
+                p.cooldown_until = time.time() + COOLDOWN_S
+                print(f"{p.program}: cooldown until {_fmt(p.cooldown_until)} (refusal on a cause already refused)")
+            else:
+                _after_refusal(p)
             continue
         if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1
