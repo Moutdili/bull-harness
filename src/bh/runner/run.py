@@ -172,6 +172,42 @@ def live_identities(board: Board, program: str, also: list[str] | tuple[str, ...
     return out
 
 
+LOGIN_RETRY_S = 3600  # one login attempt per identity and hour, whatever its outcome
+
+
+def refresh_identities(board: Board, scope: Scope, run_id: int, say=None) -> set[str]:
+    """Before a segment: every identity with an `enroll` recipe whose session is missing or stale (the gate saw it
+    die in an earlier segment: GateOutcome.stale left the `identity-stale` mark) is refreshed through the gate
+    (bh.accounts.enroll.refresh), at most once per hour. A failure is a `login-failed` blocker, never a todo.
+    Returns the recipe identities still without a live session: they stay out of the prompt."""
+    from bh.accounts import enroll as en
+
+    prog = scope.program
+    live = set(live_identities(board, prog))
+    for ident in scope.identities:
+        name = ident["name"]
+        if not ident.get("enroll") or name in live:
+            continue
+        key = f"accounts-attempt:{name}:{prog}"
+        try:
+            last = float(board.meta_get(key, "0") or 0)
+        except ValueError:
+            last = 0.0
+        if time.time() - last < LOGIN_RETRY_S:
+            continue
+        board.meta_set(key, str(time.time()))
+        try:
+            outcome = en.refresh(scope, name, board=board)
+            if say:
+                say(f"  identity {name}: {outcome}")
+        except en.AccountError as exc:
+            board.add_blocker(prog, "login-failed", f"identity {name}", one_line(str(exc), 300), run_id=run_id)
+            if say:
+                say(f"  identity {name}: login failed ({one_line(str(exc), 200)})")
+    live = set(live_identities(board, prog))
+    return {i["name"] for i in scope.identities if i.get("enroll") and i["name"] not in live}
+
+
 def recent_refusals(board: Board, program: str, now: float | None = None) -> list[float]:
     """Timestamps of this program's model refusals within the last 7 days (meta `refusals:<program>`)."""
     now = time.time() if now is None else now
@@ -683,6 +719,8 @@ def _run_locked(
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)
     run_id = board.run_start(prog, model)  # closes a run orphaned by a crash (we hold the lock)
     clean_sandbox(prog, sandbox_home(run_id))
+    # before the prompt is written: a recipe identity without a live session is left out of it
+    no_session = refresh_identities(board, scope, run_id, None if quiet else (lambda m: print(m, flush=True)))
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
     prepare_workdir(board, scope, scope_file)
     before = coverage_counts(board, scope)
@@ -710,7 +748,9 @@ def _run_locked(
 
     deadline = time.monotonic() + minutes * 60
     prompt, timed_out = task, False
-    identities = live_identities(board, prog, also=[i["name"] for i in scope.identities])
+    identities = [
+        n for n in live_identities(board, prog, also=[i["name"] for i in scope.identities]) if n not in no_session
+    ]
     set_active_run(run_id, prog, relay_budget(max_turns))
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log

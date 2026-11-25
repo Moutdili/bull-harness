@@ -86,3 +86,48 @@ def test_pending_findings_counts_every_waiting_proof(tmp_path, monkeypatch):
     done = b.add_finding("p", "judged", proof={"steps": []})
     b.set_finding(done, "rejected")
     assert run.pending_findings(b, "p") == 1
+
+
+def test_identity_without_session_is_refreshed_once_an_hour(tmp_path, monkeypatch):
+    from bh.accounts import enroll as en
+
+    b = _board(tmp_path, monkeypatch)
+    login = {"method": "POST", "url": "http://a.test/login", "json": {"email": "{email}", "password": "{password}"}}
+    recipe = {"login": login, "token": "t", "headers": {"Authorization": "Bearer {token}"}}
+    scope = scope_from_dict(
+        {
+            "program": "p",
+            "platform": "local",
+            "in_scope": ["a.test"],
+            "identities": [{"name": "alice", "enroll": recipe}, {"name": "bob"}],
+        }
+    )
+    calls = []
+
+    def failing(scope, name, board):
+        calls.append(name)
+        raise en.AccountError("login: HTTP 401")
+
+    monkeypatch.setattr(en, "refresh", failing)
+    assert run.refresh_identities(b, scope, 1) == {"alice"}
+    assert run.refresh_identities(b, scope, 2) == {"alice"}  # within the hour: no second attempt
+    assert calls == ["alice"]  # bob has no recipe: never touched
+    blockers = b.rows("SELECT title FROM facts WHERE program='p' AND kind='blocker'")
+    assert [r["title"] for r in blockers] == ["[login-failed] identity alice"]
+    assert not b.rows("SELECT 1 FROM todos WHERE program='p'")
+
+    def ok(scope, name, board):
+        calls.append(name)
+        d = paths.identities_dir("p")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.json").write_text('{"headers": {}}')
+        return "logged in, probe ok"
+
+    monkeypatch.setattr(en, "refresh", ok)
+    b.meta_set("accounts-attempt:alice:p", "0")  # the hour has passed
+    assert run.refresh_identities(b, scope, 3) == set()
+    b.meta_set("identity-stale:alice:p", str(time.time() + 10))  # the gate saw the session die afterwards
+    b.meta_set("accounts-attempt:alice:p", "0")
+    calls.clear()
+    assert run.refresh_identities(b, scope, 4) == {"alice"}  # `ok` rewrote the file before the mark: still stale
+    assert calls == ["alice"]

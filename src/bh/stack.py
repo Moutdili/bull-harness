@@ -48,6 +48,19 @@ def agent_sh(
     )
 
 
+def gate_python(script: str, timeout: float = 60) -> subprocess.CompletedProcess:
+    """Run a Python script (stdin, isolated mode) in the gate, the only container that reaches the targets.
+    Whatever the script needs travels inside `script` on stdin: never in argv (visible in `ps`) or the
+    environment. Raises subprocess.TimeoutExpired past `timeout`."""
+    return subprocess.run(
+        ["podman", "exec", "-i", GATE, "python3", "-I", "-"],
+        input=script,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
 def push_file(container_path: str, text: str, user: str = "hunter") -> None:
     """Write a file inside the agent as `user`. Rootless podman maps the sandbox users to host subuids,
     so the host cannot write the agent's /work directly."""

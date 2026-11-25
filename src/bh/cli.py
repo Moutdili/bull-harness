@@ -453,6 +453,62 @@ def cmd_ui(args) -> int:
     return ui_start_daemon(args.host, args.port)
 
 
+# ---------------------------------------------------------------- accounts
+def _age(seconds: int | None) -> str:
+    if seconds is None:
+        return "-"
+    sign, s = ("-" if seconds < 0 else ""), abs(seconds)
+    return sign + (f"{s // 86400}d" if s >= 86400 else f"{s // 3600}h" if s >= 3600 else f"{s // 60}m")
+
+
+def cmd_accounts(args) -> int:
+    """The harness's own test accounts (issue 25). No secret or session value is ever printed."""
+    from bh.accounts import enroll as en
+
+    scope = _load_scope_or_exit(args.file)
+    declared = [i["name"] for i in scope.identities]
+    if unknown := sorted(set(args.names) - set(declared)):
+        raise SystemExit(f"ERR {scope.program}: no identity {', '.join(unknown)} in {args.file}")
+    board = _board()
+    if args.acmd == "ls":
+        live = stack.container_running(stack.GATE)
+        try:
+            en.check_active(scope.program)
+        except en.AccountError as exc:
+            live = False
+            print(f"(no live probe: {exc})")
+        print(f"{'name':<16} {'recipe':<6} {'cred':<4} {'age':>5} {'expires':>7} {'stale':<5} probe")
+        for n in args.names or declared:
+            r = en.status(scope, n, board=board, live=live)
+            print(
+                f"{n:<16} {'yes' if r['recipe'] else 'no':<6} {'yes' if r['credential'] else 'no':<4} "
+                f"{_age(r['session_age_s']):>5} {_age(r['expires_in_s']):>7} {'yes' if r['stale'] else 'no':<5} "
+                f"{r['probe']}"
+            )
+        return 0
+    from bh.runner.run import activate_scope, run_lock
+
+    if not stack.container_running(stack.GATE):
+        raise SystemExit(f"container {stack.GATE} is not running — start the stack with `bh up`")
+    names = args.names or [i["name"] for i in scope.identities if i.get("enroll")]
+    action = en.enroll if args.acmd == "enroll" else en.refresh
+    rc = 0
+    with run_lock():  # the gate's active scope must be this program's for the whole exchange
+        try:
+            en.check_active(scope.program)
+        except en.AccountError as exc:
+            print(f"{exc}: activating {args.file}")
+            activate_scope(Path(args.file))
+            time.sleep(1)  # the gate reloads the scope on its mtime
+        for n in names:
+            try:
+                print(f"{n}: {action(scope, n, board=board, force=args.force)}")
+            except en.AccountError as exc:
+                print(f"{n}: FAILED {exc}")
+                rc = 1
+    return rc
+
+
 # ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bh", description="bull-harness CLI")
@@ -556,6 +612,20 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("-v", "--verbose", action="store_true")
     b.add_argument("--yes", action="store_true", help="confirm `reset`")
     b.set_defaults(func=cmd_board)
+
+    ac = sub.add_parser("accounts", help="the harness's own test accounts: enroll, refresh, ls (no secret shown)")
+    acs = ac.add_subparsers(dest="acmd", required=True)
+    for name, text in (
+        ("enroll", "sign up (if the program allows it and none exists) and log in"),
+        ("refresh", "probe the session; log in again (or sign up again) only if it is dead"),
+        ("ls", "identities: recipe, credential stored, session age, probe"),
+    ):
+        a = acs.add_parser(name, help=text)
+        a.add_argument("file", help="scope YAML")
+        a.add_argument("names", nargs="*", help="identities (default: every one with an 'enroll' recipe)")
+        if name != "ls":
+            a.add_argument("--force", action="store_true", help="lift the one-login-per-hour limit")
+        a.set_defaults(func=cmd_accounts, force=False)
 
     fl = sub.add_parser("flows", help="last requests seen by the gate (targets only)")
     fl.add_argument("-n", type=int, default=30)

@@ -94,7 +94,7 @@ printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' '<token>' > secrets/agent.env && chmod 600
 uv run bh tools fetch                    # pinned nuclei-templates (the sandbox cannot reach GitHub)
 uv run bh up --build                     # gate + agent (+ UI); the first build takes a while
 podman-compose -f container/compose.yaml --profile lab up -d juiceshop   # optional training target
-podman exec -i bh-gate python3 - < lab/juiceshop/register_identities.py # lab accounts user-a / user-b
+uv run bh accounts enroll scopes/lab/juiceshop.yaml                      # lab accounts user-a / user-b
 ```
 
 To recreate only the agent (never the whole pod while the lab runs):

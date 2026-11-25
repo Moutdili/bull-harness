@@ -74,8 +74,9 @@ class Scope:
     user_agent: str | None = None
     automation_allowed: bool | None = None  # None = unknown -> todo humaine
     scanners_allowed: bool | None = None  # None = unknown -> todo humaine; read it through scanners_on
+    self_signup: bool | None = None  # the harness may create its own test accounts; None = forbidden
     forbidden_vulns: tuple[str, ...] = ()
-    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status}}; never a secret (see _identity)
+    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?}; never a secret
     identities: tuple[dict[str, Any], ...] = ()
     source: str | None = None
     synced_at: str | None = None
@@ -106,6 +107,7 @@ class Scope:
 _TOP_KEYS = {
     "schema",
     "scanners_allowed",
+    "self_signup",
     "program",
     "platform",
     "in_scope",
@@ -285,6 +287,9 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     scanners = doc.get("scanners_allowed")
     if scanners is not None and not isinstance(scanners, bool):
         raise ScopeError(f"{origin}: 'scanners_allowed' must be true, false or null")
+    signup = doc.get("self_signup")
+    if signup is not None and not isinstance(signup, bool):
+        raise ScopeError(f"{origin}: 'self_signup' must be true, false or null")
     identities = doc.get("identities") or []
     if not isinstance(identities, list):
         raise ScopeError(f"{origin}: 'identities' must be a list")
@@ -302,6 +307,7 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         user_agent=doc.get("user_agent"),
         automation_allowed=auto,
         scanners_allowed=scanners,
+        self_signup=signup,
         forbidden_vulns=tuple(doc.get("forbidden_vulns") or ()),
         identities=tuple(identities),
         source=doc.get("source"),
@@ -313,7 +319,7 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     return scope
 
 
-_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe"}
+_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll"}
 # a credential written into the scope file would reach the gate and the agent's prompt: refused by name
 _SECRET_KEY = re.compile(r"passw|pwd|secret|totp|otp|token|cookie|api[_-]?key|credential|session", re.I)
 _IDENTITY_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,39}")  # the shape the gate accepts in X-BH-Identity
@@ -343,15 +349,26 @@ def _identity(ident: Any, ctx: str) -> dict[str, Any]:
         probe = ident["probe"]
         if (
             not isinstance(probe, dict)
-            or set(probe) != {"url", "status"}
+            or not {"url", "status"} <= set(probe) <= {"url", "status", "expect"}
+            or ("expect" in probe and (not isinstance(probe["expect"], str) or not probe["expect"]))
             or not isinstance(probe["url"], str)
             or not _HTTP_URL.match(probe["url"])
             or isinstance(probe["status"], bool)
             or not isinstance(probe["status"], int)
             or not 100 <= probe["status"] <= 599
         ):
-            raise ScopeError(f"{ctx}: 'probe' must be {{url: http(s) URL, status: HTTP status code}}")
-    return dict(ident)
+            raise ScopeError(
+                f"{ctx}: 'probe' must be {{url: http(s) URL, status: HTTP status code, expect?: text in the body}}"
+            )
+    out = dict(ident)
+    if "enroll" in ident:
+        from bh.accounts.recipe import RecipeError, check
+
+        try:
+            out["enroll"] = check(ident["enroll"], f"{ctx}.enroll")
+        except RecipeError as exc:
+            raise ScopeError(str(exc)) from exc
+    return out
 
 
 def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
@@ -359,10 +376,13 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
     from bh.scope.enforce import check  # enforce imports this module
 
     for i, ident in enumerate(scope.identities):
+        recipe = ident.get("enroll") or {}
         for key, u in (
             ("login_url", ident.get("login_url")),
             ("signup_url", ident.get("signup_url")),
             ("probe.url", (ident.get("probe") or {}).get("url")),
+            ("enroll.signup.url", (recipe.get("signup") or {}).get("url")),
+            ("enroll.login.url", (recipe.get("login") or {}).get("url")),
         ):
             if u is not None and not (d := check(scope, u)):
                 raise ScopeError(f"{origin}: identities[{i}].{key} {u!r} is not in scope ({d.reason})")
