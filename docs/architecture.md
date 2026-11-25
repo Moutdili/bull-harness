@@ -87,7 +87,7 @@ Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/age
 - Reflector : message système explicite (« pas d'appel d'outil depuis N tours : choisis une intention du board ou rends la main »), jamais dans la voix de l'utilisateur.
 
 ### 7. `verify/` — vérificateur
-Contexte neuf, il ne reçoit que la PoC. Il rejoue via le gate. Un finding non reproduit n'atteint pas la todo `submit`.
+Conteneur `bh-judge` à lui, contexte neuf. Étage A : rejeu déterministe de la preuve (lectures deux fois, écritures une fois ; étapes navigateur jugées sur le `summary.json` de `bh-browse`, jamais sur un texte qui contient l'URL). Étage B : session Opus, escalade unique vers Mythos si `inconclusive`. Les champs écrits par le chasseur arrivent dans son prompt comme données balisées, bornées, sur une ligne. Contrôle qui répond comme l'attaque : `needs-proof` (le chasseur refait sa preuve, une fois). Rejeu refusé par le gate ou hôte en pause : le finding repasse `new`. Seul `verified` crée la todo `submit`.
 Il tourne dans le conteneur `bh-judge` (service compose `judge`, démarré par `bh up`) : même image et même gate que
 l'agent, mais son propre `/work` (`var/judge` sur l'hôte), qui ne voit pas celui du chasseur (`var/work`). L'hôte y
 pousse la preuve et le prompt (`stack.push_file(..., container=JUDGE_CTR)`) et relit le verdict dans `var/judge`.
@@ -106,7 +106,7 @@ Blocages pendant la chasse : fait `blocker` (`[raison] quoi`, montré 7 jours da
 | Blocage | Traitement autonome |
 |---|---|
 | challenge WAF répété | le gate met l'hôte en pause 1 h (3 challenges en 10 min, règle `waf-cooldown`) ; ses endpoints sortent de la surface non testée |
-| session expirée (401 répétés sous identité) | identité marquée périmée, retirée du prompt et du juge jusqu'à réécriture de son fichier ; relance du login par l'hôte (à venir, issue 26) |
+| session expirée | le gate émet `session-dead` sur redirection vers `login_url`, sonde ratée, ou 401 sur 3 routes distinctes en 10 min (un 401 isolé sous identité est un refus d'accès, jamais une mort) ; l'hôte sonde avant chaque segment, relance le login par recette (`bh accounts`), et retire l'identité du prompt et du juge tant qu'elle est morte |
 | mur de login sans identité, 2ᵉ compte manquant | blocker `auth` / `account` ; comptes créés par l'hôte (à venir, issue 25) |
 | captcha, SMS, KYC, fonction payante, écriture sur un tiers, hors bande | blocker `captcha` / `sms` / `kyc` / `paid` / `write-needed` / `oob-needed` ; jamais de résolution de captcha |
 | actif hors scope | fait `out-of-scope` ; jamais d'élargissement |
@@ -148,7 +148,10 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   60 s, une relecture DNS au plus toutes les 5 s pour une IP refusée ; le gate est aussi sur le réseau du lab, qui
   reste refusé), que les deux appels que fait
   Claude Code (`POST /v1/messages`, `/v1/messages/count_tokens`, mesuré sur 2.1.330), seulement pendant un run, et
-  au plus `3 × max_turns + 30` requêtes par segment. Reste : dans ce budget, un `claude -p` imbriqué consomme le
+  au plus `3 × max_turns + 30` requêtes par segment (plus un budget pendant la vérification). Il lit le corps :
+  outils serveur (`web_search`, `web_fetch`…), `mcp_servers`, sources URL et en-têtes `anthropic-beta` hors liste
+  sont refusés, et chaque conteneur a sa liste de modèles (audit H1). Il journalise statut, id de message et
+  `stop_reason` de chaque réponse, que le runner croise avant de croire un quota ou un refus. Reste : dans ce budget, un `claude -p` imbriqué consomme le
   quota (sans jeton à exfiltrer).
 - **Le sandbox n'est pas une frontière** : hooks, verrou d'outils et fichiers du contrat sont des aides. Les garanties
   dures sont dans le gate (scope jugé sur le nom demandé, méthodes et overrides, identités existantes, ports web,
