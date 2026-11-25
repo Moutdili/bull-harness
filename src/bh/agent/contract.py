@@ -569,7 +569,7 @@ def runs_mapper(cmd: str) -> bool:
     return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl|browse|zap|authz)\b", bare))
 
 
-_MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh|qq?)(?=\s|$)")
+_MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh|qq?|bh-web)(?=\s|$)")
 _HTTP_CLIENT = re.compile(r"^(curl|wget)$")
 _Q_CLIENT = re.compile(r"^qq?$")  # bh.agent.q: `/path` arguments use the origin saved in BH_DIR/q-base
 _BARE_TARGET = re.compile(r"^([a-z0-9-]+(\.[a-z0-9-]+)+|\[[0-9a-f:]+\])(:\d+)?(/\S*)?$", re.I)

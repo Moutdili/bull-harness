@@ -99,3 +99,13 @@ def test_doctrine_forbids_breaking_anti_bot_challenges():
     from bh.runner.prompt import DOCTRINE
 
     assert "never solved, evaded or worked around" in DOCTRINE and "blocked captcha" in DOCTRINE
+
+
+def test_only_a_scope_behind_a_human_challenge_gets_bh_web_and_wait_human():
+    from bh.runner.prompt import scope_block
+
+    base = {"program": "p", "platform": "x", "in_scope": ["app.t.test"]}
+    assert "bh-web" not in scope_block(scope_from_dict(base))
+    withpt = scope_from_dict({**base, "support": [{"value": "challenges.cloudflare.com", "kind": "passthrough"}]})
+    block = scope_block(withpt)
+    assert "bh-web wait-human" in block and "never try to pass it yourself" in block

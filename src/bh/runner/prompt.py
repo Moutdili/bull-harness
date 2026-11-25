@@ -111,6 +111,17 @@ def scope_block(scope: Scope, identities: list[str] | None = None) -> str:
             "This program FORBIDS automated scanners: bh-content, bh-scan, bh-params, bh-sqli, bh-xss and direct "
             "nuclei/sqlmap/ffuf/... are refused. Map with bh-recon and bh-crawl, then test by hand, few requests."
         )
+    if scope.support_hosts(
+        "passthrough"
+    ):  # targets behind a third-party human challenge: bh-browser (docs/research/18)
+        lines.append(
+            "Browser: `bh-web state|goto <url>|fill <css> <text>|click <css>|press <key>|text|wait <css|ms>|wait-human`"
+            " drives the persistent headful browser, logged in as the identity `bh-web state` names; the page stays"
+            " open between calls. One human challenge (Cloudflare Turnstile) per page load: navigate inside the app"
+            " (click, New chat) rather than `goto`. A challenge on screen (exit 3): `bh-web wait-human`, the operator"
+            " solves it himself; never try to pass it yourself. Still pending: `bh-note blocked captcha`, another"
+            " surface, `bh-web state` later."
+        )
     # the runner passes the live identities (sessions checked): only those are announced as usable
     names = sorted(identities) if identities is not None else sorted(i["name"] for i in scope.identities)
     if names:

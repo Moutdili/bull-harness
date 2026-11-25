@@ -18,7 +18,7 @@ def main() -> None:
     args = sys.argv[1:]
     if name == "bh-agent":
         if not args:
-            tools = ", ".join((*TOOLS, "browse", "zap", "authz"))
+            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz"))
             sys.exit(f"usage: bh-agent hook-pre|hook-post|note|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
@@ -42,6 +42,10 @@ def main() -> None:
         from bh.agent import browse
 
         browse.main(args)
+    elif cmd == "web":  # stdlib only: the persistent browser's API on the sandbox network
+        from bh.agent import web
+
+        web.main(args)
     elif cmd == "authz":  # stdlib only: urllib through the gate
         from bh.agent import authz
 

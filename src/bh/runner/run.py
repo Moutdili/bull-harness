@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import IO
 from urllib.parse import urlsplit
 
+from bh.browser_service import watch as browser_watch
 from bh import classes, paths, retention, stack
 from bh.assets import Graph
 from bh.agent import contract as c
@@ -1263,6 +1264,11 @@ def _run_locked(
     ]
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
     prepare_workdir(board, scope, scope_file, identities)
+    # targets behind a third-party challenge: bh-browser holds a live session, the operator is pushed any challenge
+    watcher = None
+    if browser_watch.wanted(scope):
+        browser_watch.prepare(scope, identities, None if quiet else (lambda m: print(m, flush=True)))
+        watcher = browser_watch.ChallengeWatcher()
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
     refused = last_refusal(board, prog, run_id)
@@ -1313,16 +1319,22 @@ def _run_locked(
                     session=next_session,
                     identities=identities,
                 )
-                result, timed_out = run_leg(
-                    cmd,
-                    log,
-                    log_path.with_suffix(".stderr"),
-                    res,
-                    say,
-                    program=prog,
-                    timeout_s=deadline - time.monotonic(),
-                    context_limit=CONTEXT_HARD_FACTOR * limit,
-                )
+                if watcher is not None:
+                    watcher.start()
+                try:
+                    result, timed_out = run_leg(
+                        cmd,
+                        log,
+                        log_path.with_suffix(".stderr"),
+                        res,
+                        say,
+                        program=prog,
+                        timeout_s=deadline - time.monotonic(),
+                        context_limit=CONTEXT_HARD_FACTOR * limit,
+                    )
+                finally:
+                    if watcher is not None:
+                        watcher.stop()
                 merge_result(res, result)
                 leg_turns = res.turn_log[turns_before:]
                 if res.overflow and result is None:  # stopped by the runner: no result event to count from
