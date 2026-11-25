@@ -14,6 +14,10 @@ GATE = "bh-gate"
 # The verifier's own container (compose service `judge`): same image and gate as the agent, its own /work
 # (var/judge on the host), so the hunter can neither read nor prepare anything the judge sees.
 JUDGE_CTR = "bh-judge"
+# Browser logins (compose service `login`, bh.accounts.browser): the agent's image on the sandbox network, behind
+# the gate, no /work, no relay, nothing kept between two logins. Driven by the host only.
+LOGIN_CTR = "bh-login"
+LOGIN_USER = "hunter"
 VERIFY_SUBDIR = ".verify"  # /work/<program>/.verify/F<id>: a verifier's work dir, only in the judge container
 COMPOSE_FILE = "container/compose.yaml"
 
@@ -196,6 +200,39 @@ find /tmp /var/tmp /dev/shm -mindepth 1 -user judge -exec rm -rf -- {} + 2>/dev/
 mkdir -p -- "$1" "$2" && chown -h judge:judge -- "$1" "$2" && chmod 700 "$1" && chmod 755 "$2"
 """
 )
+
+
+# Before and after every browser login: no process of the login user alive (but the keep-alive), no HOME, profile or
+# temporary file of an earlier login left (bh.accounts.browser makes them under /tmp/bh-login-*).
+_LOGIN_RESET = (
+    f'users="{LOGIN_USER}"\n'
+    + _KILL_USERS
+    + rf"""
+rm -rf /tmp/bh-login-* /tmp/playwright* /home/{LOGIN_USER}/.cache/ms-playwright-* 2>/dev/null
+find /tmp /var/tmp /dev/shm -mindepth 1 -user {LOGIN_USER} -exec rm -rf -- {{}} + 2>/dev/null
+true
+"""
+)
+
+
+def reset_login() -> None:
+    """Kill and wipe whatever a browser login left in the login container. Raises SystemExit when it cannot."""
+    r = agent_sh(_LOGIN_RESET, user="root", timeout=60, container=LOGIN_CTR)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot reset {LOGIN_CTR}: {(r.stderr or '').strip()[:200]}")
+
+
+def login_popen(argv: list[str], stderr=None) -> subprocess.Popen:
+    """`podman exec -i` in the login container as the login user, text pipes on stdin/stdout. What the process
+    needs (script, credential) travels on stdin, never in argv or the environment."""
+    return subprocess.Popen(
+        ["podman", "exec", "-i", "--user", LOGIN_USER, LOGIN_CTR, *argv],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr if stderr is not None else subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
 
 
 def prepare_judge(home: str, work_dir: str) -> None:

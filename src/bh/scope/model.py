@@ -76,7 +76,8 @@ class Scope:
     scanners_allowed: bool | None = None  # None = unknown -> todo humaine; read it through scanners_on
     self_signup: bool | None = None  # the harness may create its own test accounts; None = forbidden
     forbidden_vulns: tuple[str, ...] = ()
-    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?, origins?}; never a secret
+    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?, origins?, role?, tenant?};
+    # never a secret
     identities: tuple[dict[str, Any], ...] = ()
     source: str | None = None
     synced_at: str | None = None
@@ -319,7 +320,10 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     return scope
 
 
-_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll", "origins"}
+_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll", "origins", "role", "tenant"}
+# role matrix (`admin`, `member`, `guest` / `A`, `B`): short labels, never secrets; they travel in
+# BH_IDENTITY_ROLES as `name=role@tenant`, so no `=`, `@` or `,` inside
+_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 # a credential written into the scope file would reach the gate and the agent's prompt: refused by name
 _SECRET_KEY = re.compile(r"passw|pwd|secret|totp|otp|token|cookie|api[_-]?key|credential|session", re.I)
 _IDENTITY_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,39}")  # the shape the gate accepts in X-BH-Identity
@@ -366,14 +370,27 @@ def _identity(ident: Any, ctx: str) -> dict[str, Any]:
             raise ScopeError(
                 f"{ctx}: 'probe' must be {{url: http(s) URL, status: HTTP status code, expect?: text in the body}}"
             )
+    for key in ("role", "tenant"):
+        if key in ident and (not isinstance(ident[key], str) or not _LABEL.fullmatch(ident[key])):
+            raise ScopeError(f"{ctx}: '{key}' must match {_LABEL.pattern} (e.g. admin, member, guest / A, B)")
     out = dict(ident)
     if "enroll" in ident:
         from bh.accounts.recipe import RecipeError, check
+        from bh.agent.contract import origin
 
         try:
-            out["enroll"] = check(ident["enroll"], f"{ctx}.enroll")
+            out["enroll"] = recipe = check(ident["enroll"], f"{ctx}.enroll")
         except RecipeError as exc:
             raise ScopeError(str(exc)) from exc
+        if recipe["kind"] == "browser" and "origins" not in ident:
+            # M7: the captured Authorization goes to the pages the login visited, not to every host of the scope
+            # (the gate adds the probe's and the sign-up's origins); an API on another origin is declared in `origins`
+            seen = {origin(s["url"]) for s in recipe["steps"] if s["action"] == "goto"}
+            out["origins"] = [f"{o}/" for o in sorted(o for o in seen if o)]
+        if recipe["kind"] == "oauth_refresh" and not ({"origins", "probe", "login_url"} & set(ident)):
+            raise ScopeError(
+                f"{ctx}: an oauth_refresh identity declares 'origins' (or a probe): where its token may go"
+            )
     return out
 
 
@@ -381,14 +398,14 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
     """Login, signup and probe URLs are visited through the gate: a scope that names one outside itself is broken."""
     from bh.scope.enforce import check  # enforce imports this module
 
+    from bh.accounts.recipe import urls
+
     for i, ident in enumerate(scope.identities):
-        recipe = ident.get("enroll") or {}
         for key, u in (
             ("login_url", ident.get("login_url")),
             ("signup_url", ident.get("signup_url")),
             ("probe.url", (ident.get("probe") or {}).get("url")),
-            ("enroll.signup.url", (recipe.get("signup") or {}).get("url")),
-            ("enroll.login.url", (recipe.get("login") or {}).get("url")),
+            *urls(ident.get("enroll")),  # sign-up, login, every goto of a browser login, the OAuth token URL
             *((f"origins[{j}]", u) for j, u in enumerate(ident.get("origins") or [])),
         ):
             if u is not None and not (d := check(scope, u)):

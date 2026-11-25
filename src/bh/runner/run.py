@@ -301,6 +301,168 @@ def refresh_identities(board: Board, scope: Scope, run_id: int, say=None) -> set
     }
 
 
+# ------------------------------------------------------------------ session keeper (during a segment)
+KEEP_MARGIN_S = float(os.environ.get("BH_KEEP_MARGIN_S", "120"))  # renew this long before a known expiry
+KEEP_EVERY_S = 300.0  # at most one keeper login per identity in this window, whatever its outcome
+KEEP_TICK_S = 15.0
+
+
+def keeper_plan(
+    expires: dict[str, float | None],
+    dead: dict[str, float],
+    last: dict[str, float],
+    now: float,
+    *,
+    margin: float = KEEP_MARGIN_S,
+    every: float = KEEP_EVERY_S,
+) -> list[tuple[str, str]]:
+    """Which identities to renew now, and why (pure). `expires`: name -> session `expires_at` (None: unknown);
+    `dead`: name -> time of its latest `session-dead` event not yet handled; `last`: name -> last keeper login.
+    A dead session goes first (`dead`, probe first), then one within `margin` of its end (`expiry`). One login per
+    identity per `every` seconds: a name inside that window waits for the next tick."""
+    out = []
+    for name in sorted(set(expires) | set(dead)):
+        if now - last.get(name, float("-inf")) < every:
+            continue
+        if name in dead:
+            out.append((name, "dead"))
+        elif (exp := expires.get(name)) is not None and now >= exp - margin:
+            out.append((name, "expiry"))
+    return out
+
+
+class SessionKeeper:
+    """A host thread alive during one segment: keeps the agent's identities logged in without stopping it (the gate
+    re-reads the session file on every request). Renews an identity before its known expiry (`expires_at` minus
+    KEEP_MARGIN_S) and on a `session-dead` event of the gate's journal (probe first: a 401 storm on access rules is
+    no death). At most one login per identity per KEEP_EVERY_S (board meta `accounts-keeper:<name>:<program>`); a
+    failure is a `login-failed` blocker. Only identities with an `enroll` recipe and a session file are kept."""
+
+    def __init__(
+        self,
+        scope: Scope,
+        board_path: Path,
+        run_id: int,
+        names: list[str],
+        say=None,
+        *,
+        events_offset: int = 0,
+        margin: float = KEEP_MARGIN_S,
+        every: float = KEEP_EVERY_S,
+        tick: float = KEEP_TICK_S,
+        renew=None,
+        clock=time.time,
+    ) -> None:
+        declared = {i["name"]: i for i in scope.identities}
+        self.scope, self.board_path, self.run_id, self.say = scope, board_path, run_id, say
+        self.names = [n for n in names if (declared.get(n) or {}).get("enroll")]
+        self.offset, self.margin, self.every, self.tick_s, self.clock = events_offset, margin, every, tick, clock
+        self.dead: dict[str, float] = {}
+        self.renewed: dict[str, float] = {}  # name -> end of its last successful keeper login
+        self._renew = renew or self._refresh
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _refresh(self, board: Board, name: str, reason: str) -> str:
+        from bh.accounts import enroll as en
+
+        return en.refresh(self.scope, name, board=board, force=True, probe_first=reason == "dead")
+
+    def _key(self, name: str) -> str:
+        return f"accounts-keeper:{name}:{self.scope.program}"
+
+    def read_events(self) -> None:
+        """New `session-dead` events of this program's kept identities since the last read (complete lines)."""
+        p = paths.events_log()
+        try:
+            size = p.stat().st_size
+            if size < self.offset:  # rotated: start over
+                self.offset = 0
+            with open(p, "rb") as fh:
+                fh.seek(self.offset)
+                chunk = fh.read()
+        except OSError:
+            return
+        end = chunk.rfind(b"\n") + 1
+        self.offset += end
+        for line in chunk[:end].splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict) or ev.get("kind") != "session-dead":
+                continue
+            name, ts = ev.get("identity"), ev.get("ts")
+            if name not in self.names or ev.get("program") not in (None, self.scope.program):
+                continue
+            ts = float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else self.clock()
+            if ts > self.renewed.get(name, 0.0):  # a death seen before our last login is the old session's
+                self.dead[name] = max(ts, self.dead.get(name, 0.0))
+
+    def tick(self, board: Board) -> list[tuple[str, str, str]]:
+        """One round: read the journal, renew what is due. Returns (name, reason, outcome) per login tried."""
+        from bh.accounts import enroll as en
+        from bh.gate import session as gs
+
+        self.read_events()
+        now = self.clock()
+        expires: dict[str, float | None] = {}
+        last: dict[str, float] = {}
+        for name in self.names:
+            sess = gs.load(paths.identities_dir(self.scope.program) / f"{name}.json", now)
+            if sess is not None:
+                expires[name] = sess.get("expires_at")
+            try:
+                last[name] = float(board.meta_get(self._key(name), "0") or 0)
+            except ValueError:
+                last[name] = 0.0
+        dead = {n: t for n, t in self.dead.items() if n in expires}
+        done = []
+        for name, reason in keeper_plan(expires, dead, last, now, margin=self.margin, every=self.every):
+            board.meta_set(self._key(name), str(now))
+            self.dead.pop(name, None)
+            try:
+                outcome = self._renew(board, name, reason)
+                self.renewed[name] = self.clock()
+            except en.AccountError as exc:
+                outcome = f"login failed ({one_line(str(exc), 200)})"
+                board.add_blocker(
+                    self.scope.program, "login-failed", f"identity {name}", one_line(str(exc), 300), run_id=self.run_id
+                )
+            if self.say:
+                self.say(f"  ⟲ identity {name} ({reason}): {outcome}")
+            done.append((name, reason, outcome))
+        return done
+
+    def _loop(self) -> None:
+        board = Board(self.board_path)  # sqlite: one connection per thread
+        while not self._stop.wait(self.tick_s):
+            try:
+                self.tick(board)
+            except Exception as exc:  # noqa: BLE001 (the keeper must never take the segment down)
+                if self.say:
+                    self.say(f"  ⚠ session keeper: {type(exc).__name__}: {one_line(str(exc), 160)}")
+
+    def start(self) -> SessionKeeper:
+        if self.names and self._thread is None:
+            self._thread = threading.Thread(target=self._loop, name="bh-session-keeper", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(30.0, self.tick_s))
+            self._thread = None
+
+
+def identity_roles(scope: Scope, names: list[str]) -> str:
+    """BH_IDENTITY_ROLES (contract with bh.agent): `name=role@tenant` per name, comma-separated, in the order of
+    `names` (BH_IDENTITIES). An undeclared role or tenant is empty: `user-x=@`, `admin-a=admin@`."""
+    decl = {i["name"]: i for i in scope.identities}
+    return ",".join(f"{n}={(decl.get(n) or {}).get('role', '')}@{(decl.get(n) or {}).get('tenant', '')}" for n in names)
+
+
 def _refusal_log(board: Board, program: str, now: float) -> list[tuple[float, str]]:
     """(timestamp, cause) of this program's model refusals within the last 7 days (meta `refusals:<program>`). An
     entry of the old format (a bare timestamp) is its own cause."""
@@ -558,6 +720,7 @@ def agent_command(
         "BH_RPS": f"{scope.rate:g}",
         "BH_SCANNERS": "1" if scope.scanners_on else "0",
         "BH_IDENTITIES": ",".join(identities),
+        "BH_IDENTITY_ROLES": identity_roles(scope, identities),  # never a secret: role and tenant labels
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
         **(extra_env or {}),
@@ -1131,6 +1294,8 @@ def _run_locked(
     limit = CONTEXT_ROTATE_TOKENS
     events_at = events_size()  # the relay's journal of this segment starts here
     set_active_run(run_id, prog, relay_budget(max_turns))
+    # the agent's sessions are kept alive while it hunts (renewal before expiry and on session-dead)
+    keeper = SessionKeeper(scope, board.path, run_id, identities, say, events_offset=events_at).start()
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             while res.legs < MAX_LEGS:
@@ -1232,6 +1397,7 @@ def _run_locked(
                     next_session = res.session_id
     except BaseException as exc:  # Ctrl-C / SIGTERM, or a harness error: record what the agent already wrote
         with signals_ignored():
+            keeper.stop()
             stopped = isinstance(exc, KeyboardInterrupt)
             res.status = "stopped" if stopped else "error"
             note = "stopped by operator" if stopped else f"harness error: {exc!r}"
@@ -1242,6 +1408,7 @@ def _run_locked(
             say(f"■ run {run_id} {res.status}: {one_line(note, 200)}")
         raise
     with signals_ignored():
+        keeper.stop()
         set_active_run(None)
         stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
         if timed_out:

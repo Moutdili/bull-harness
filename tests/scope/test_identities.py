@@ -64,7 +64,9 @@ def test_identity_urls_must_be_in_scope(ident):
         {"name": "user-a", "enroll": {"headers": {"X": "y"}}},
         {"name": "user-a", "login_url": "ftp://app.example.com/"},
         {"name": "../x"},
-        {"name": "user-a", "role": "admin"},
+        {"name": "user-a", "role": "admin@A"},
+        {"name": "user-a", "tenant": ""},
+        {"name": "user-a", "role": 1},
         "user-a",
     ],
 )
@@ -94,3 +96,12 @@ def test_identity_origins_are_urls_in_scope():
     for bad in (["https://evil.test"], [], "https://api.example.com", ["ftp://api.example.com"]):
         with pytest.raises(ScopeError):
             scope_from_dict({**base, "identities": [{"name": "a", "origins": bad}]})
+
+
+def test_role_and_tenant_are_short_labels_never_secrets():
+    scope = scope_from_dict(_doc({"name": "admin-a", "role": "admin", "tenant": "A"}, {"name": "guest"}))
+    assert scope.identities[0]["role"] == "admin" and scope.identities[0]["tenant"] == "A"
+    assert "role" not in scope.identities[1]
+    for bad in ({"role": "admin,x"}, {"tenant": "A=B"}, {"role": "x" * 33}):
+        with pytest.raises(ScopeError):
+            scope_from_dict(_doc({"name": "a", **bad}))

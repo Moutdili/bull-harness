@@ -145,8 +145,17 @@ def test_self_signup_is_true_false_or_null():
 def test_lab_scope_is_valid():
     scope = load_scope(LAB)
     assert scope.self_signup is True
-    assert [i["name"] for i in scope.identities] == ["user-a", "user-b"]
+    assert [i["name"] for i in scope.identities] == ["user-a", "user-b", "user-c"]
     for ident in scope.identities:
+        assert ident["probe"] == {"url": "http://10.231.0.10:3000/rest/user/whoami", "status": 200, "expect": '"email"'}
+    user_c = scope.identities[2]["enroll"]
+    assert user_c["kind"] == "browser" and user_c["steps"][0] == {
+        "action": "goto",
+        "url": "http://10.231.0.10:3000/#/login",
+    }
+    assert user_c["capture"]["local_storage"] == {"token": {"Authorization": "Bearer {value}"}}
+    for ident in scope.identities[:2]:
+        assert ident["enroll"]["kind"] == "json"
         assert ident["enroll"]["login"]["url"].endswith("/rest/user/login")
         assert ident["enroll"]["token"] == "authentication.token"
         assert ident["probe"] == {"url": "http://10.231.0.10:3000/rest/user/whoami", "status": 200, "expect": '"email"'}

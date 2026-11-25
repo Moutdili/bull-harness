@@ -1,8 +1,8 @@
 # bull-harness runtime. Podman rootless + podman-compose (docker compose compatible).
-#   sandbox : internal network, NO route out. agent + judge + gate.
+#   sandbox : internal network, NO route out. agent + judge + login + gate.
 #   egress  : normal network. gate only.
 #   lab     : internal network for local practice targets (profile "lab"). gate only.
-# The gate is therefore the only path from the agent (and the judge) to anything.
+# The gate is therefore the only path from the agent (and the judge, and the login browser) to anything.
 name: bh
 
 # What the agent and the judge share: same image, same gate (proxy + Claude API relay), same environment.
@@ -118,6 +118,36 @@ services:
       - ./agent/hooks:/opt/bh/hooks:ro,z
       - ../src/bh/__init__.py:/opt/bh/lib/bh/__init__.py:ro,z
       - ../src/bh/agent:/opt/bh/lib/bh/agent:ro,z
+    networks: [sandbox]
+    restart: unless-stopped
+
+  # Browser logins (src/bh/accounts/browser.py): headless Chromium driven by the host through `podman exec -i`,
+  # the script and the credential on stdin. Same image as the agent, sandbox network only, so every request of a
+  # login goes through the gate (scope, rate, required headers). No /work (it never sees the hunter's files), no
+  # Claude relay (no ANTHROPIC_BASE_URL; the gate admits only the agent and the judge by name), no secret at
+  # rest: each login gets a fresh HOME/profile under /tmp/bh-login-*, deleted after it (stack.reset_login).
+  # The gate CA is trusted per login in that HOME's NSS database.
+  login:
+    image: localhost/bh-agent:dev
+    container_name: bh-login
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 512
+    mem_limit: 2g
+    environment:
+      HTTP_PROXY: http://gate:8080
+      HTTPS_PROXY: http://gate:8080
+      http_proxy: http://gate:8080
+      https_proxy: http://gate:8080
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      PLAYWRIGHT_BROWSERS_PATH: /opt/ms-playwright
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
     networks: [sandbox]
     restart: unless-stopped
 

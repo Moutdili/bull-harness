@@ -1,33 +1,49 @@
 """Sign up, log in and check the harness's own test accounts, without a human (issue 25).
 
-The host owns the credential (`bh.accounts.secrets`) and the session file (`bh.gate.session` format). The HTTP
-exchanges run in the gate, the only container that reaches the targets, as one stdlib script per call sent on
-stdin (`stack.gate_python`), through the gate's own proxy (127.0.0.1:8080): scope, rate and required headers apply
-as to any request. The credential travels inside that script on stdin, never in argv or the environment; the
-script answers with statuses, the token and the Set-Cookie of the login, and the host writes the session.
+The host owns the credential (`bh.accounts.secrets`) and the session file (`bh.gate.session` format). Three
+recipe kinds (`bh.accounts.recipe`):
 
-Limits (board meta): one login per identity and hour (`accounts-login:<name>:<program>`), one sign-up per identity
-and hour (`accounts-signup:...`), and a new account (a new address) only while the identity has no credential.
-A password, an answer or a token never appears in a return value, a message or an exception.
+- `json`: the HTTP exchanges run in the gate, the only container that reaches the targets, as one stdlib script per
+  call sent on stdin (`stack.gate_python`), through the gate's own proxy (127.0.0.1:8080): scope, rate and required
+  headers apply as to any request. The credential travels inside that script on stdin, never in argv or the
+  environment; the script answers with statuses, the token and the Set-Cookie of the login.
+- `browser`: an optional HTTP sign-up as above, then headless Chromium in the `bh-login` container, behind the gate
+  (`bh.accounts.browser`). TOTP codes are computed on the host (`bh.accounts.totp`), mailed codes read by the host
+  (`bh.accounts.mail`). The session is the context's in-scope cookies, the first Authorization header seen, and
+  declared localStorage keys rendered as headers.
+- `oauth_refresh`: POST grant_type=refresh_token to the recipe's token URL, through the gate as for `json`. The
+  refresh token (deposited once by a human at onboarding: first consent, MFA) lives in the secrets file; a new one
+  returned by the server replaces it there BEFORE the session is written.
+
+In every case the host writes the session (`session.save` under `session.lock`), with `expires_at` from what is
+known (`bh.accounts.expiry`: JWT `exp`, OAuth `expires_in`, session cookies' Max-Age/Expires).
+
+Limits (board meta): one login per identity and hour (`accounts-login:<name>:<program>`) unless forced (the session
+keeper forces, under its own 5-minute limit), one sign-up per identity and hour (`accounts-signup:...`), and a new
+account (a new address) only while the identity has no credential. A password, an answer, a code or a token never
+appears in a return value, a message or an exception.
 """
 
 from __future__ import annotations
 
-import base64
 import json
+import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from bh import paths, stack
+from bh.accounts import browser, expiry, mail, totp
 from bh.accounts import recipe as rc
 from bh.accounts import secrets
+from bh.agent.contract import origin
 from bh.gate import session
 from bh.scope import Scope
+from bh.scope.psl import is_public_suffix
 
 LOGIN_EVERY_S = 3600
 SIGNUP_EVERY_S = 3600
@@ -37,7 +53,8 @@ GATE_CA = "/gate-ca/mitmproxy-ca-cert.pem"
 
 # Runs in the gate (python3 -I -). Stdlib only: the gate's /opt/bh/src may be older than the host's code.
 # Redirects are not followed (a form login sets its cookie on the 302). Bodies never leave the script: a step
-# reports its status, whether `expect` was found, the token at `token_path` and, if asked, the Set-Cookie values.
+# reports its status, whether `expect` was found, the token at `token_path`, the values at `token_paths` (strings
+# and numbers only) and, if asked, the Set-Cookie values.
 GATE_SCRIPT = r"""
 import json, os, ssl, sys, urllib.error, urllib.parse, urllib.request
 
@@ -86,12 +103,21 @@ def main(raw):
                 rec["gate"] = body.decode("utf-8", "replace").strip()[:200]
             if "expect" in s:
                 rec["match"] = s["expect"].encode() in body
-            if "token_path" in s:
+            if "token_path" in s or "token_paths" in s:
                 try:
-                    tok = _path(json.loads(body or b"null"), s["token_path"])
+                    doc = json.loads(body or b"null")
                 except ValueError:
-                    tok = None
-                rec["token"] = tok if isinstance(tok, str) and tok else None
+                    doc = None
+                if "token_path" in s:
+                    tok = _path(doc, s["token_path"])
+                    rec["token"] = tok if isinstance(tok, str) and tok else None
+                if "token_paths" in s:
+                    vals = {}
+                    for name, path in s["token_paths"].items():
+                        v = _path(doc, path)
+                        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+                            vals[name] = v
+                    rec["tokens"] = vals
             if s.get("cookies"):
                 rec["set_cookies"] = hdrs.get_all("Set-Cookie") or []
         except Exception as e:
@@ -113,10 +139,15 @@ class Identity:
     program: str
     name: str
     decl: dict[str, Any]
+    scope: Scope | None = field(default=None, compare=False, repr=False)
 
     @property
     def recipe(self) -> dict[str, Any] | None:
         return self.decl.get("enroll")
+
+    @property
+    def kind(self) -> str | None:
+        return rc.kind(self.recipe)
 
     @property
     def probe(self) -> dict[str, Any] | None:
@@ -131,7 +162,7 @@ def identity(scope: Scope, name: str) -> Identity:
     decl = next((i for i in scope.identities if i["name"] == name), None)
     if decl is None:
         raise AccountError(f"{scope.program}: no identity {name!r} in the scope file")
-    return Identity(scope.program, name, decl)
+    return Identity(scope.program, name, decl, scope)
 
 
 # ---------------------------------------------------------------- the gate side
@@ -213,17 +244,9 @@ def probe(ident: Identity) -> tuple[bool | None, str]:
     return bool(ok), detail
 
 
-# ---------------------------------------------------------------- login
-def _jwt_exp(token: str) -> float | None:
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-    except (ValueError, TypeError):
-        return None
-    exp = claims.get("exp") if isinstance(claims, dict) else None
-    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+# ---------------------------------------------------------------- session file
+def _jwt_exp(token: str) -> float | None:  # kept for callers of the first version
+    return expiry.jwt_exp(token)
 
 
 def _take(board, key: str, every: float, what: str, now: float) -> None:
@@ -236,35 +259,64 @@ def _take(board, key: str, every: float, what: str, now: float) -> None:
     board.meta_set(key, str(now))
 
 
-def _write_session(ident: Identity, recipe: dict[str, Any], token: str | None, set_cookies: list[str]) -> None:
-    now = time.time()
-    if token is not None and not rc.TOKEN.fullmatch(token):
-        raise AccountError("login: token refused (not 1-4096 printable ASCII characters)")
-    headers = rc.render(recipe["headers"], {"token": token} if token else {})
-    sess: dict[str, Any] = {
-        "headers": headers,
-        "cookies": {},
-        "expires_at": _jwt_exp(token) if token else None,
-        "probe": {"url": ident.probe["url"], "status": ident.probe["status"]} if ident.probe else None,
-        "updated": round(now, 3),
-    }
-    session.merge(sess, recipe["login"]["url"], set_cookies, now)
+def _save_session(ident: Identity, sess: dict[str, Any]) -> None:
     f = ident.session_file
     f.parent.mkdir(parents=True, exist_ok=True)
     with session.lock(f):
         session.save(f, sess)
 
 
-def _login(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
-    """[sign-up,] log in, write the session. Raises AccountError."""
-    recipe = ident.recipe
-    assert recipe is not None
-    values = {
-        "email": cred["email"],
-        "password": cred["password"],
+def _new_session(ident: Identity, headers: dict[str, str], now: float) -> dict[str, Any]:
+    return {
+        "headers": headers,
+        "cookies": {},
+        "expires_at": None,
+        "probe": {"url": ident.probe["url"], "status": ident.probe["status"]} if ident.probe else None,
+        "updated": round(now, 3),
+    }
+
+
+def _write_session(ident: Identity, recipe: dict[str, Any], token: str | None, set_cookies: list[str]) -> None:
+    """json kind: the recipe's headers with the login's token, the login answer's cookies."""
+    now = time.time()
+    if token is not None and not rc.TOKEN.fullmatch(token):
+        raise AccountError("login: token refused (not 1-4096 printable ASCII characters)")
+    sess = _new_session(ident, rc.render(recipe["headers"], {"token": token} if token else {}), now)
+    session.merge(sess, recipe["login"]["url"], set_cookies, now)
+    sess["expires_at"] = expiry.known(tokens=[token], jar=sess["cookies"], now=now)
+    _save_session(ident, sess)
+
+
+# ---------------------------------------------------------------- credentials
+def credential(ident: Identity) -> dict[str, Any] | None:
+    """What the identity logs in with: email + password (json, browser), a refresh token (oauth_refresh)."""
+    if ident.kind == "oauth_refresh":
+        doc = secrets.load_raw(ident.program, ident.name)
+        return doc if doc and isinstance(doc.get("refresh_token"), str) and doc["refresh_token"] else None
+    return secrets.load(ident.program, ident.name)
+
+
+def _secret_values(cred: dict[str, Any]) -> list[str | None]:
+    vals = [cred.get(k) for k in ("password", "answer", "refresh_token", "client_secret")]
+    t = cred.get("totp")
+    vals.append(t if isinstance(t, str) else t.get("secret") if isinstance(t, dict) else None)
+    return [v for v in vals if isinstance(v, str)]
+
+
+def _values(ident: Identity, cred: dict[str, Any]) -> dict[str, str]:
+    return {
+        "email": cred.get("email", ""),
+        "password": cred.get("password", ""),
         "answer": cred.get("answer", ""),
         "name": ident.name,
     }
+
+
+# ---------------------------------------------------------------- json
+def _login_json(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
+    recipe = ident.recipe
+    assert recipe is not None
+    values = _values(ident, cred)
     steps = []
     if signup:
         steps.append({"step": "signup", **rc.render_request(recipe["signup"], values)})
@@ -272,24 +324,224 @@ def _login(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
     if "token" in recipe:
         login["token_path"] = recipe["token"]
     steps.append(login)
+    recs = {r["step"]: r for r in run_steps(steps)}
+    rec = recs.get("login")
+    if rec is None or rec.get("error") or rec.get("gate") or not 200 <= rec.get("status", 0) < 300:
+        extra = f" ({_why(recs.get('signup'), 'signup')})" if signup else ""
+        raise AccountError(_why(rec, "login") + extra)
+    token = rec.get("token")
+    if "token" in recipe and not token:
+        raise AccountError(f"login: HTTP {rec.get('status')} but no token at {recipe['token']!r}")
+    if token is not None and not (isinstance(token, str) and rc.TOKEN.fullmatch(token)):
+        raise AccountError(
+            f"login: the token at {recipe['token']!r} is not 1-4096 printable ASCII characters (refused)"
+        )
+    if not token and not rec.get("set_cookies"):
+        raise AccountError("login: no token and no cookie in the answer")
+    _write_session(ident, recipe, token, rec.get("set_cookies") or [])
+
+
+# ---------------------------------------------------------------- browser
+def _host_ok(ident: Identity, host: str) -> bool:
+    """A cookie domain the session may keep: in scope, or the host of a URL the identity itself declares."""
+    from bh.scope.enforce import check
+
+    if not host or is_public_suffix(host):
+        return False
+    if ident.scope is not None and check(ident.scope, host):
+        return True
+    own = [u for _, u in rc.urls(ident.recipe)] + list(ident.decl.get("origins") or [])
+    return any((o := origin(u)) and o.split("://", 1)[1].rsplit(":", 1)[0].strip("[]") == host for u in own)
+
+
+def browser_jar(ident: Identity, cookies: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:
+    """`context.cookies()` as a session jar: in-scope domains only, values a Cookie header can carry, bounded."""
+    jar: dict[str, dict[str, Any]] = {}
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        name, value, dom = c.get("name"), c.get("value"), c.get("domain")
+        if not (isinstance(name, str) and isinstance(value, str) and isinstance(dom, str)):
+            continue
+        if not session._TOKEN.fullmatch(name) or not rc.COOKIE_VALUE.fullmatch(value):
+            continue
+        host = dom.lstrip(".").lower()
+        if not _host_ok(ident, host):
+            continue
+        exp = c.get("expires")
+        exp = float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0 else None
+        if exp is not None and exp <= now:
+            continue
+        cookies_of = jar.setdefault(host, {}) if host in jar or len(jar) < session.MAX_DOMAINS else None
+        if cookies_of is None or (name not in cookies_of and len(cookies_of) >= session.MAX_COOKIES_PER_DOMAIN):
+            continue
+        path = c.get("path")
+        cookies_of[name] = {
+            "value": value,
+            "path": path if isinstance(path, str) and path.startswith("/") else "/",
+            "expires": exp,
+            "host_only": not dom.startswith("."),
+            "secure": c.get("secure") is True,
+        }
+    return jar
+
+
+def browser_session(ident: Identity, result: dict[str, Any], now: float) -> dict[str, Any]:
+    """The session a browser login's result makes (pure: tested without a browser). Raises AccountError."""
+    recipe = ident.recipe
+    assert recipe is not None
+    cap = recipe["capture"]
+    headers: dict[str, str] = {}
+    tokens: list[str] = []
+    auth, auth_url = result.get("authorization"), result.get("authorization_url")
+    if cap["authorization"] and isinstance(auth, str) and auth:
+        if not rc.HEADER_VALUE.fullmatch(auth):
+            raise AccountError("login: the Authorization header seen is not printable ASCII (refused)")
+        host = (
+            (origin(auth_url) or "").split("://", 1)[-1].rsplit(":", 1)[0].strip("[]")
+            if isinstance(auth_url, str)
+            else ""
+        )
+        if _host_ok(ident, host):
+            headers["Authorization"] = auth
+            tokens.append(auth)
+    ls = result.get("local_storage") if isinstance(result.get("local_storage"), dict) else {}
+    for key, hdrs in cap["local_storage"].items():
+        v = ls.get(key)
+        if not isinstance(v, str) or not v:
+            raise AccountError(f"login: localStorage {key!r} is empty after the steps")
+        if not rc.TOKEN.fullmatch(v):
+            raise AccountError(f"login: localStorage {key!r} is not 1-4096 printable ASCII characters (refused)")
+        tokens.append(v)
+        for name, tmpl in hdrs.items():
+            headers[name] = rc.render(tmpl, {"value": v})
+    sess = _new_session(ident, headers, now)
+    if cap["cookies"]:
+        sess["cookies"] = browser_jar(ident, result.get("cookies") or [], now)
+    if not headers and not sess["cookies"]:
+        raise AccountError("login: the browser ended with no cookie and no header to keep")
+    sess["expires_at"] = expiry.known(tokens=tokens, jar=sess["cookies"], now=now)
+    return sess
+
+
+def _asker(ident: Identity, cred: dict[str, Any], steps: list[dict[str, Any]], since: float, notes: list[str]):
+    """Answers the login script's questions: a TOTP code, a mailed code. A failure is noted, the answer is None."""
+
+    def ask(msg: dict[str, Any]) -> str | None:
+        need = msg.get("need")
+        if need == "totp":
+            if not cred.get("totp"):
+                notes.append("no TOTP seed in the secrets file")
+                return None
+            try:
+                return totp.fresh_code(totp.params(cred["totp"]))
+            except totp.TotpError as exc:
+                notes.append(f"totp: {exc}")
+                return None
+        if need == "email_code":
+            i = msg.get("step")
+            step = steps[i] if isinstance(i, int) and 0 <= i < len(steps) else {}
+            if step.get("action") != "email_code":
+                notes.append("email_code asked for a step that is not one")
+                return None
+            wait = min(step.get("timeout", browser.EMAIL_WAIT_S), browser.EMAIL_WAIT_S)
+            try:
+                code = mail.default().wait(cred["email"], step["from"], since, wait)
+            except mail.MailError as exc:
+                notes.append(f"mailbox: {exc}")
+                return None
+            if code is None:
+                notes.append(f"no mail from {step['from']} within {int(wait)} s (or no mailbox configured)")
+                return None
+            if not re.fullmatch(r"\d{4,10}", code):
+                notes.append("the mail holds a link, not a code")
+                return None
+            return code
+        notes.append(f"unknown question {str(need)[:30]!r}")
+        return None
+
+    return ask
+
+
+def _login_browser(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
+    recipe = ident.recipe
+    assert recipe is not None
+    values = _values(ident, cred)
+    if signup:
+        rec = run_steps([{"step": "signup", **rc.render_request(recipe["signup"], values)}])[0]
+        if rec.get("error") or rec.get("gate") or not 200 <= rec.get("status", 0) < 400:
+            raise AccountError(_why(rec, "signup"))
+    steps = [{**s, "value": rc.render(s["value"], values)} if "value" in s else dict(s) for s in recipe["steps"]]
+    notes: list[str] = []
+    started = time.time() - 30
     try:
-        recs = {r["step"]: r for r in run_steps(steps)}
-        rec = recs.get("login")
-        if rec is None or rec.get("error") or rec.get("gate") or not 200 <= rec.get("status", 0) < 300:
-            extra = f" ({_why(recs.get('signup'), 'signup')})" if signup else ""
-            raise AccountError(_why(rec, "login") + extra)
-        token = rec.get("token")
-        if "token" in recipe and not token:
-            raise AccountError(f"login: HTTP {rec.get('status')} but no token at {recipe['token']!r}")
-        if token is not None and not (isinstance(token, str) and rc.TOKEN.fullmatch(token)):
-            raise AccountError(
-                f"login: the token at {recipe['token']!r} is not 1-4096 printable ASCII characters (refused)"
-            )
-        if not token and not rec.get("set_cookies"):
-            raise AccountError("login: no token and no cookie in the answer")
-        _write_session(ident, recipe, token, rec.get("set_cookies") or [])
+        result = browser.execute(
+            {"steps": steps, "capture": recipe["capture"]}, _asker(ident, cred, recipe["steps"], started, notes)
+        )
+    except browser.BrowserError as exc:
+        raise AccountError(f"browser login: {exc}" + (f" ({'; '.join(notes)})" if notes else "")) from None
+    sess = browser_session(ident, result, time.time())
+    _save_session(ident, sess)
+
+
+# ---------------------------------------------------------------- oauth_refresh
+OAUTH_PATHS = {
+    "access_token": "access_token",
+    "refresh_token": "refresh_token",
+    "expires_in": "expires_in",
+    "error": "error",
+}
+
+
+def _login_oauth(ident: Identity, cred: dict[str, Any]) -> None:
+    recipe = ident.recipe
+    assert recipe is not None
+    form = {"grant_type": "refresh_token", "refresh_token": cred["refresh_token"], "client_id": recipe["client_id"]}
+    if recipe.get("scope"):
+        form["scope"] = recipe["scope"]
+    if isinstance(cred.get("client_secret"), str) and cred["client_secret"]:
+        form["client_secret"] = cred["client_secret"]
+    step = {
+        "step": "token",
+        "method": "POST",
+        "url": recipe["token_url"],
+        "form": form,
+        "token_paths": OAUTH_PATHS,
+        "required": True,
+    }
+    rec = run_steps([step])[0]
+    vals = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
+    if rec.get("error") or rec.get("gate") or not 200 <= rec.get("status", 0) < 300:
+        err = vals.get("error")
+        code = f" ({err})" if isinstance(err, str) and re.fullmatch(r"[a-z_]{1,40}", err) else ""
+        raise AccountError(_why(rec, "token refresh") + code)
+    access = vals.get("access_token")
+    if not isinstance(access, str) or not rc.TOKEN.fullmatch(access):
+        raise AccountError("token refresh: no access_token of 1-4096 printable ASCII characters in the answer")
+    now = time.time()
+    new_rt = vals.get("refresh_token")
+    if isinstance(new_rt, str) and new_rt != cred["refresh_token"]:
+        if not rc.TOKEN.fullmatch(new_rt):
+            raise AccountError("token refresh: the new refresh_token is not printable ASCII (refused, old one kept)")
+        # rotated by the server: the old one may be dead already, so the new one is on disk before anything else
+        secrets.save(ident.program, ident.name, {**cred, "refresh_token": new_rt, "rotated": round(now, 3)})
+    sess = _new_session(ident, rc.render(recipe["headers"], {"access_token": access}), now)
+    sess["expires_at"] = expiry.known(tokens=[access], expires_in=vals.get("expires_in"), now=now)
+    _save_session(ident, sess)
+
+
+# ---------------------------------------------------------------- login
+def _login(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
+    """[sign-up,] log in, write the session. Raises AccountError, never with a secret in it."""
+    try:
+        if ident.kind == "oauth_refresh":
+            _login_oauth(ident, cred)
+        elif ident.kind == "browser":
+            _login_browser(ident, cred, signup=signup)
+        else:
+            _login_json(ident, cred, signup=signup)
     except (AccountError, rc.RecipeError) as exc:
-        raise AccountError(_scrub(str(exc), cred["password"], cred.get("answer"))) from None
+        raise AccountError(_scrub(str(exc), *_secret_values(cred))) from None
 
 
 def _confirmed(ident: Identity) -> str:
@@ -298,6 +550,23 @@ def _confirmed(ident: Identity) -> str:
     if ok is False:
         raise AccountError(f"logged in, but the probe refuses the session ({detail})")
     return "probe ok" if ok else detail
+
+
+def _no_credential(ident: Identity) -> AccountError:
+    if ident.kind == "oauth_refresh":
+        return AccountError(
+            f"{ident.name}: no refresh token stored; deposit it once (onboarding) in "
+            f'secrets/identities/{ident.program}/{ident.name}.json as {{"refresh_token": ...}}'
+        )
+    return AccountError(f"{ident.name}: no credential stored and no 'signup' recipe")
+
+
+def _stamp_login(board, ident: Identity, now: float, force: bool) -> None:
+    key = f"accounts-login:{ident.name}:{ident.program}"
+    if force:
+        board.meta_set(key, str(now))
+    else:
+        _take(board, key, LOGIN_EVERY_S, "login", now)
 
 
 def enroll(scope: Scope, name: str, *, board=None, force: bool = False) -> str:
@@ -309,22 +578,20 @@ def enroll(scope: Scope, name: str, *, board=None, force: bool = False) -> str:
     check_active(scope.program)
     board = _board(board)
     now = time.time()
-    cred, signup = secrets.load(scope.program, name), False
+    cred, signup = credential(ident), False
     if cred is None:
+        if ident.kind == "oauth_refresh" or "signup" not in ident.recipe:
+            raise _no_credential(ident)
         if scope.self_signup is not True:
             raise AccountError(f"{scope.program}: self_signup is not true, no account is created")
-        if "signup" not in ident.recipe:
-            raise AccountError(f"{name}: no credential stored and no 'signup' recipe")
         _take(board, f"accounts-signup:{name}:{scope.program}", SIGNUP_EVERY_S, "sign-up", now)
         cred = secrets.new(ident.recipe["email"], name)
         secrets.save(scope.program, name, cred)  # before the sign-up: a crash must not lose a live account
         signup = True
-    if not force:
-        _take(board, f"accounts-login:{name}:{scope.program}", LOGIN_EVERY_S, "login", now)
-    else:
-        board.meta_set(f"accounts-login:{name}:{scope.program}", str(now))
+    _stamp_login(board, ident, now, force)
     _login(ident, cred, signup=signup)
-    return ("signed up, logged in, " if signup else "logged in, ") + _confirmed(ident)
+    done = "token refreshed, " if ident.kind == "oauth_refresh" else "logged in, "
+    return ("signed up, " if signup else "") + done + _confirmed(ident)
 
 
 def _stale(board, ident: Identity) -> bool:
@@ -336,30 +603,30 @@ def _stale(board, ident: Identity) -> bool:
     return mark > (f.stat().st_mtime if f.exists() else 0.0)
 
 
-def refresh(scope: Scope, name: str, *, board=None, force: bool = False) -> str:
+def refresh(scope: Scope, name: str, *, board=None, force: bool = False, probe_first: bool = True) -> str:
     """Probe first: a good session is only touched (`updated`), which lifts a false `identity-stale` mark.
     Otherwise log in with the stored credential; if that fails and the program allows sign-up, sign the same
-    account up again (a lab that lost its database) and log in; with no credential, enroll."""
+    account up again (a lab that lost its database) and log in; with no credential, enroll.
+    `probe_first=False` (the keeper, before a known expiry) logs in at once."""
     ident = identity(scope, name)
     if not ident.recipe:
         raise AccountError(f"{name}: no 'enroll' recipe in the scope file")
     check_active(scope.program)
     board = _board(board)
-    ok, _ = probe(ident)
-    if ok or (ok is None and ident.session_file.is_file() and not ident.probe and not _stale(board, ident)):
-        session.update(ident.session_file, lambda s: True)
-        return "session ok" if ok else "session kept (no probe declared)"
-    cred = secrets.load(scope.program, name)
+    if probe_first:
+        ok, _ = probe(ident)
+        if ok or (ok is None and ident.session_file.is_file() and not ident.probe and not _stale(board, ident)):
+            session.update(ident.session_file, lambda s: True)
+            return "session ok" if ok else "session kept (no probe declared)"
+    cred = credential(ident)
     if cred is None:
         return enroll(scope, name, board=board, force=force)
     now = time.time()
-    if not force:
-        _take(board, f"accounts-login:{name}:{scope.program}", LOGIN_EVERY_S, "login", now)
-    else:
-        board.meta_set(f"accounts-login:{name}:{scope.program}", str(now))
+    _stamp_login(board, ident, now, force)
+    done = "token refreshed, " if ident.kind == "oauth_refresh" else "logged in, "
     try:
         _login(ident, cred, signup=False)
-        return "logged in, " + _confirmed(ident)
+        return done + _confirmed(ident)
     except AccountError as first:
         if scope.self_signup is not True or "signup" not in ident.recipe:
             raise
@@ -380,7 +647,7 @@ def status(scope: Scope, name: str, *, board=None, live: bool = True) -> dict[st
     row: dict[str, Any] = {
         "name": name,
         "recipe": bool(ident.recipe),
-        "credential": secrets.load(scope.program, name) is not None,
+        "credential": credential(ident) is not None,
         "session_age_s": int(time.time() - f.stat().st_mtime) if sess is not None else None,
         "expires_in_s": int(sess["expires_at"] - time.time()) if sess and sess.get("expires_at") else None,
         "stale": _stale(board, ident),

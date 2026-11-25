@@ -1,6 +1,8 @@
 """Credentials of the harness's own test accounts: `secrets/identities/<program>/<name>.json` on the host.
 
-{"email": "...", "password": "...", "answer": "...", "created": 1764000000.0}
+{"email": "...", "password": "...", "answer": "...", "created": 1764000000.0}       # json, browser recipes
+{..., "totp": "<base32>" | "otpauth://totp/..." | {"secret": ..., "digits": 6, ...}}   # browser, with MFA
+{"refresh_token": "...", "client_secret"?: "...", "rotated"?: 1764000000.0}         # oauth_refresh
 
 Directories 0700, files 0600, written atomically. Never mounted in a container: the gate gets a credential only
 on the stdin of one enrollment script, the agent never.
@@ -36,14 +38,20 @@ def _private_dir(d: Path) -> None:
             os.chmod(full, 0o700)
 
 
-def load(program: str, name: str) -> dict[str, Any] | None:
-    """The stored credential, None when there is none or it is unreadable (never an error that quotes it)."""
-    p = path(program, name)
+def load_raw(program: str, name: str) -> dict[str, Any] | None:
+    """The stored document whatever its fields (an OAuth identity has a refresh token, no password), None when
+    there is none or it is unreadable (never an error that quotes it)."""
     try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
+        doc = json.loads(path(program, name).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(doc, dict) or not all(isinstance(doc.get(k), str) and doc[k] for k in ("email", "password")):
+    return doc if isinstance(doc, dict) else None
+
+
+def load(program: str, name: str) -> dict[str, Any] | None:
+    """The stored email + password credential (and `answer`, `totp` when present), None when there is none."""
+    doc = load_raw(program, name)
+    if doc is None or not all(isinstance(doc.get(k), str) and doc[k] for k in ("email", "password")):
         return None
     return doc
 
