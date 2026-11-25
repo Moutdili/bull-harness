@@ -27,10 +27,18 @@ HEAD, TAIL = 30, 12
 # ------------------------------------------------------------------ PreToolUse
 def rules_decision(cmd: str) -> str | None:
     """Program rules the harness enforces in the sandbox: no automated scanner when the program forbids them,
-    and the verifier re-tests by hand only (no scanners, no mapping tools)."""
-    if c.is_verifier() and (c.runs_scanner(cmd) or c.runs_mapper(cmd)):
-        return f"{c.RULES_MARK} the verifier re-tests with single requests (curl / bh-agent replay), no tools."
-    if not c.scanners_allowed() and c.runs_scanner(cmd):
+    and the verifier re-tests by hand only (no scanners, no mapping tools but bh-browse). A bh-note's text is
+    never taken for a tool run."""
+    if c.is_verifier():
+        # bh-browse renders one page: the only way to re-test a DOM XSS or a client-side route
+        tools = c.without_commands(cmd, ("bh-note", "bh-browse"))
+        if c.runs_scanner(tools) or c.runs_mapper(tools):
+            return (
+                f"{c.RULES_MARK} the verifier re-tests with single requests (curl, q, bh-agent replay, bh-browse), "
+                "no other tools."
+            )
+        return None
+    if not c.scanners_allowed() and c.runs_scanner(c.without_commands(cmd, ("bh-note",))):
         return (
             f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
             "hand-made requests at a low rate; do not try another scanner."

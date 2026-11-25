@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -405,6 +406,45 @@ _SCANNER_EXTRA = re.compile(
 _BROWSE_XSS = re.compile(r"(?<![\w.-])(bh-browse|bh-agent\s+browse)(?![\w.-])[\s\S]*\s--xss\b")
 # bh-zap --active runs ZAP's active scan: a scanner. Same fail-closed reading.
 _ZAP_ACTIVE = re.compile(r"(?<![\w.-])(bh-zap|bh-agent\s+zap)(?![\w.-])[\s\S]*\s--active\b")
+
+
+_SIMPLE_SEP = set(";&|\n()")
+
+
+def without_commands(cmd: str, names: tuple[str, ...]) -> str:
+    """`cmd` minus its simple commands whose first word is in `names` (a bh-note's quoted text is a note, not a
+    tool run). Separators and parentheses split commands, so `bh-note x "$(nuclei ...)"` keeps `nuclei ...` as a
+    command of its own; text inside other commands' quotes stays (`bash -c 'nuclei ...'` is still seen). An
+    unparsable command is returned whole: never less strict."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
+    lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return cmd
+    kept: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok and set(tok) <= _SIMPLE_SEP:
+            kept.append([])
+        else:
+            kept[-1].append(tok)
+    rest = [shlex.join(w) for w in kept if w and w[0] not in names]
+    return " ; ".join(rest + _substitutions(cmd))
+
+
+def _substitutions(cmd: str) -> list[str]:
+    """Bodies of `$(...)` and backquotes anywhere in `cmd`, quoted or not: bash runs them inside double quotes,
+    where a tokenizer sees one word (stricter than bash in single quotes, never looser)."""
+    out, i = [], 0
+    while (i := cmd.find("$(", i)) != -1:
+        depth, j = 1, i + 2
+        while j < len(cmd) and depth:
+            depth += {"(": 1, ")": -1}.get(cmd[j], 0)
+            j += 1
+        out.append(cmd[i + 2 : j - 1])
+        i = j
+    out += re.findall(r"`([^`]*)`", cmd)
+    return [b for b in out if b.strip()]
 
 
 def runs_scanner(cmd: str) -> bool:
