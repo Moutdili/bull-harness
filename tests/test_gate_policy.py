@@ -377,3 +377,10 @@ def test_a_recreated_judge_is_admitted_after_one_fresh_lookup(addon, monkeypatch
     assert not addon._relay_peer_ok("10.89.0.9")  # within the retry delay: no lookup storm from refused peers
     clock[0] += addon.RELAY_IPS_RETRY + 1
     assert addon._relay_peer_ok("10.89.0.9") and not addon._relay_peer_ok("10.89.0.6")
+
+
+def test_prefixed_random_ids_are_ids():
+    from bh.agent.contract import ID_SEGMENT
+
+    assert ID_SEGMENT.match("bk_6c49e125463f") and ID_SEGMENT.match("ord-9f3a2b7c11")
+    assert not ID_SEGMENT.match("user_settings") and not ID_SEGMENT.match("api")

@@ -80,6 +80,7 @@ CLASSES: tuple[VulnClass, ...] = (
         "object's owner or tenant, may: the answer holds that role's or owner's data, or the action takes effect. "
         "Control: the same request as an identity without the right, or without a session, is refused. The same "
         "public answer for everyone, or an answer without the protected data, is not a bypass.",
+        card=True,
         tool=AUTHZ_TOOL,
     ),
     VulnClass(
@@ -130,7 +131,7 @@ CLASSES: tuple[VulnClass, ...] = (
         "executes. Reflection alone, or a payload that is HTML-encoded, is not XSS. Prove execution in a real "
         "browser: `bh-browse '<url with payload>' --xss <marker>` with a payload that calls alert('<marker>'); "
         "only `xss CONFIRMED (marker ...)` is proof. Client-side routes (`/#/...`) and DOM sinks are tested the "
-        "same way; in proof.json such a step carries `\"browse\": {\"xss\": \"<marker>\"}`.",
+        'same way; in proof.json such a step carries `"browse": {"xss": "<marker>"}`.',
         True,
     ),
     VulnClass(

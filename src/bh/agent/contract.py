@@ -99,7 +99,11 @@ FRONTIER, FACTS, SYSTEM, SCOPE, AGENT_PID, RAW, MANUAL_TESTED = (
 
 STATIC_EXT = re.compile(r"\.(js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|otf|mp4|webm|mp3|pdf)$", re.I)
 URL_RE = re.compile(r"https?://[^\s'\"<>|;)`\\]+")
-ID_SEGMENT = re.compile(r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,})$", re.I)
+# ...|prefixed random ids such as bk_6c49e125463f (a digit is required, so user_settings stays a word)
+ID_SEGMENT = re.compile(
+    r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,}|[A-Za-z]{1,8}[_-](?=[A-Za-z0-9]*\d)[A-Za-z0-9]{8,})$",
+    re.I,
+)
 
 
 # ------------------------------------------------------------------ locations
