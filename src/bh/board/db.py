@@ -73,6 +73,8 @@ MIGRATIONS = (
     ("findings", "replay", "TEXT"),  # verifier stage A: deterministic replay result (JSON)
     ("findings", "poc_triager", "TEXT"),  # PoC generated from the replayed proof, sessions as placeholders
     ("runs", "blockers", "INTEGER"),  # blocker facts the segment recorded
+    ("runs", "rotations", "INTEGER"),  # fresh sessions started on the context threshold (runner, 4.2b)
+    ("runs", "max_context", "INTEGER"),  # largest per-turn context of the segment, tokens
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
