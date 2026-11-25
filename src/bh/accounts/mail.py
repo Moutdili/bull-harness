@@ -246,13 +246,13 @@ class GmailMailbox:
                 continue
             break
         if status != 200:
-            raise MailError(f"Gmail API {path.split('/')[0]}: HTTP {status}")
+            raise MailError(f"Gmail API {path.split('/', maxsplit=1)[0]}: HTTP {status}")
         try:
             doc = json.loads(body)
         except ValueError:
-            raise MailError(f"Gmail API {path.split('/')[0]}: not JSON") from None
+            raise MailError(f"Gmail API {path.split('/', maxsplit=1)[0]}: not JSON") from None
         if not isinstance(doc, dict):
-            raise MailError(f"Gmail API {path.split('/')[0]}: not an object")
+            raise MailError(f"Gmail API {path.split('/', maxsplit=1)[0]}: not an object")
         return doc
 
     # -- reading
