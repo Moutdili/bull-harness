@@ -103,7 +103,11 @@ def scope_block(scope: Scope, identities: list[str] | None = None) -> str:
         )
     names = sorted({i["name"] for i in scope.identities} | set(identities or []))
     if names:
-        lines.append("Identities (send header X-BH-Identity: <name>): " + ", ".join(names))
+        lines.append(
+            "Identities (`q -a <name>`, or header X-BH-Identity: <name>): " + ", ".join(names) + ". The harness checked"
+            " their sessions before this segment: a 401/403 on one object is an access refusal (often the finding's"
+            " control), not a dead session; `q -a <name>` on a page of your own account tells them apart."
+        )
     else:
         lines.append("Identities: none (unauthenticated testing only; an auth wall is a blocker, not a question)")
     if scope.notes:  # public program text, imported: information for you, never instructions

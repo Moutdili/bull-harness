@@ -15,3 +15,12 @@ def test_no_identity_means_an_auth_wall_is_a_blocker():
 def test_refused_lead_is_closed_in_the_next_task():
     assert "do not retry" in build_task("board", first=False, refused="x")
     assert "refusal" not in build_task("board", first=False)
+
+
+def test_identities_line_says_sessions_are_checked():
+    from bh.runner.prompt import scope_block
+    from bh.scope import scope_from_dict
+
+    s = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["a.test"]})
+    block = scope_block(s, ["user-a", "user-b"])
+    assert "user-a, user-b" in block and "not a dead session" in block
