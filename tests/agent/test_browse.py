@@ -111,6 +111,69 @@ def test_websockets_go_through_only_to_the_target_when_the_scope_says_so():
     assert any("2 opened to the target" in line for line in b.render(r))
 
 
+COPILOT = Path(__file__).resolve().parents[2] / "scopes" / "msrc" / "copilot.yaml"
+
+
+def test_copilot_sandbox_scope_names_sso_passthrough_and_targets():
+    extra = c.sandbox_scope(COPILOT, env={})
+    assert set(extra.sso) == {"login.live.com", "login.microsoftonline.com"}
+    assert extra.passthrough == ("challenges.cloudflare.com",)
+    assert {"substrate.office.com", "substrate.svc.cloud.microsoft", "copilot.com"} <= set(extra.targets)
+    env = {"BH_SUPPORT_SSO": "login.x.org", "BH_SUPPORT_PASSTHROUGH": "c.x.net", "BH_TARGET_HOSTS": "api.x.com"}
+    got = c.sandbox_scope(COPILOT, env=env)
+    assert (got.sso, got.passthrough, got.targets, got.assets) == (("login.x.org",), ("c.x.net",), ("api.x.com",), ())
+
+
+def test_route_decision_for_sso_and_passthrough():
+    extra = c.sandbox_scope(COPILOT, env={})
+    kw = {"sso": extra.sso, "passthrough": extra.passthrough, "targets": extra.targets}
+    host = "copilot.com"
+    silent = "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/oauth2/v2.0/authorize"
+    assert b.route_decision(silent, "document", host, False, extra.assets, **kw) is None
+    assert b.route_decision("https://login.live.com/", "document", host, False, extra.assets, **kw) is None
+    assert b.support_kind(silent, extra) == "sso"
+    # the challenge loads whatever it needs: never aborted here, not even an image or a source map
+    api = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+    assert b.route_decision(api, "script", host, False, extra.assets, **kw) is None
+    assert b.route_decision("https://challenges.cloudflare.com/i.png", "image", host, False, **kw) is None
+    assert b.route_decision("https://challenges.cloudflare.com/a.js.map", "other", host, False, **kw) is None
+    assert b.support_kind(api, extra) == "passthrough"
+    # other targets of the scope (the chat hub) go through; auth hosts and unknown hosts stay out
+    assert b.route_decision("https://substrate.office.com/x", "xhr", host, False, **kw) is None
+    assert b.route_decision("https://fpt.live.com/", "script", host, False, extra.assets, **kw) == "offsite"
+    assert b.route_decision("https://evil.cloudflare.com/x", "script", host, False, **kw) == "offsite"
+    assert b.ws_through("wss://substrate.office.com/hub", host, True, extra.targets)
+    assert not b.ws_through("wss://challenges.cloudflare.com/x", host, True, extra.targets)
+    assert not b.ws_through("wss://login.live.com/x", host, True, extra.targets)
+
+
+def test_identity_header_never_goes_to_a_passthrough_host():
+    extra = c.sandbox_scope(COPILOT, env={})
+    kw = {"sso": extra.sso, "passthrough": extra.passthrough, "targets": extra.targets}
+    host = "copilot.com"
+    for url in (
+        "https://challenges.cloudflare.com/turnstile/v0/api.js",
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x",
+        "https://res.cdn.office.net/app.js",  # assets: nothing of ours either
+        "https://evil.example/x",
+        "data:text/plain,x",
+    ):
+        assert b.identity_headers(url, host, "user-a", **kw) == {}, url
+    for url in ("https://copilot.com/chat", "https://substrate.office.com/x", "https://login.microsoftonline.com/x"):
+        assert b.identity_headers(url, host, "user-a", **kw) == {c.IDENTITY_HEADER: "user-a"}, url
+    assert b.identity_headers("https://copilot.com/chat", host, None, **kw) == {}
+    # a passthrough host wins over everything, even a page opened on it or a scope that also lists it as a target
+    assert b.identity_headers("https://challenges.cloudflare.com/", "challenges.cloudflare.com", "user-a", **kw) == {}
+    both = {**kw, "targets": ("challenges.cloudflare.com",)}
+    assert b.identity_headers("https://challenges.cloudflare.com/", host, "user-a", **both) == {}
+
+
+def test_summary_counts_sso_and_passthrough():
+    r = b.Result(url="https://copilot.com/", support=Counter({"sso": 3, "passthrough": 2}))
+    assert any("sso 3" in line and "passthrough 2" in line for line in b.render(r))
+    assert not any("passthrough" in line for line in b.render(b.Result(url="https://copilot.com/")))
+
+
 def test_spa_routes_become_endpoints(tmp_path):
     assert b.spa_route("http://h:3000/#/search?q=1") == ("GET /#/search", ["q"])
     assert b.spa_route("http://h/#!/track/42") == ("GET /#/track/{id}", [])

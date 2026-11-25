@@ -171,9 +171,19 @@ def test_ws_limits_from_env():
 # ------------------------------------------------------------------ the Copilot scope
 def test_copilot_scope_targets_and_support():
     s = load_scope(COPILOT)
-    assert {r.value for r in s.in_scope} == {"copilot.microsoft.com", "copilot.com"}
+    assert {r.value for r in s.in_scope} == {
+        "copilot.microsoft.com",
+        "copilot.com",
+        "substrate.office.com",
+        "substrate.svc.cloud.microsoft",
+    }
     assert s.websockets_on
-    assert "login.live.com" in s.support_hosts("auth") and "res.cdn.office.net" in s.support_hosts("assets")
+    assert set(s.support_hosts("sso")) == {"login.live.com", "login.microsoftonline.com"}
+    assert s.support_hosts("passthrough") == ("challenges.cloudflare.com",)
+    assert "login.microsoft.com" in s.support_hosts("auth") and "res.cdn.office.net" in s.support_hosts("assets")
+    entry = next(e for e in s.support if e.rule.value == "login.microsoftonline.com")
+    assert entry.token_path("/9188040d-6c67-4c5b-b112-36a304b66dad/oauth2/v2.0/token")
+    assert not entry.token_path("/9188040d-6c67-4c5b-b112-36a304b66dad/oauth2/v2.0/authorize")
 
 
 def test_copilot_login_keeps_the_cookies_of_its_login_host():
@@ -191,3 +201,21 @@ def test_copilot_login_keeps_the_cookies_of_its_login_host():
         now,
     )
     assert "login.live.com" in jar and "copilot.microsoft.com" in jar and "evil.example" not in jar
+
+
+def test_copilot_login_keeps_the_cookies_of_its_sso_hosts():
+    """The silent sign-in needs login.microsoftonline.com's cookies (not a goto of the recipe): an `sso` host, kept;
+    a parent domain of an sso host too (a domain cookie the browser would send there); an `auth` host is not."""
+    s = load_scope(COPILOT)
+    jar = browser_jar(
+        identity(s, "user-a"),
+        [
+            {"name": "ESTSAUTHPERSISTENT", "value": "e1", "domain": "login.microsoftonline.com", "path": "/"},
+            {"name": "MSPOK", "value": "e2", "domain": ".live.com", "path": "/"},
+            {"name": "fp", "value": "e3", "domain": "fpt.live.com", "path": "/"},
+            {"name": "x", "value": "e4", "domain": "challenges.cloudflare.com", "path": "/"},
+        ],
+        time.time(),
+    )
+    assert "login.microsoftonline.com" in jar and "live.com" in jar
+    assert "fpt.live.com" not in jar and "challenges.cloudflare.com" not in jar

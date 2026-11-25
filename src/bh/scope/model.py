@@ -66,13 +66,32 @@ class Rule:
 # Support hosts: needed by the target's pages or by our own login, never targets themselves (another program's,
 # or the vendor's own infrastructure). `assets`: GET/HEAD from anyone in the sandbox, nothing of ours attached.
 # `auth`: the enrollment sources only (the gate itself and bh-login), never the hunter nor the judge.
-SUPPORT_KINDS = ("auth", "assets")
+# `sso`: the login hosts the application itself calls while in use (a silent sign-in in an iframe, a token exchange):
+# GET/HEAD from anyone, POST only on the declared `token_paths`; an identity gets its own jar's cookies there, never a
+# header of ours. `passthrough`: a third-party anti-bot challenge (its script, its iframe): CONNECT on 443 only, never
+# intercepted, nothing of ours inside; the gate sees a host, a byte count and a duration, nothing else.
+SUPPORT_KINDS = ("auth", "assets", "sso", "passthrough")
+# kinds named host by host: a wildcard would widen a login exchange or a blind tunnel to hosts nobody looked at
+EXACT_KINDS = frozenset({"sso", "passthrough"})
+# `token_paths`: absolute paths, `*` standing for exactly one path segment (`/*/oauth2/v2.0/token`)
+_TOKEN_PATH = re.compile(r"(/(\*|[A-Za-z0-9._~-]+))+")
+_SEGMENT = r"(?!\.+(?:/|$))[A-Za-z0-9._~-]+"  # one segment, never `.` nor `..`
+
+
+def _path_glob(pattern: str) -> re.Pattern[str]:
+    return re.compile("".join("/" + (_SEGMENT if part == "*" else re.escape(part)) for part in pattern.split("/")[1:]))
 
 
 @dataclass(frozen=True)
 class Support:
     kind: str  # one of SUPPORT_KINDS
-    rule: Rule  # a domain or wildcard rule
+    rule: Rule  # a domain or wildcard rule (a domain for EXACT_KINDS)
+    token_paths: tuple[str, ...] = ()  # `sso` only: where a POST may go (the token exchange), nowhere else
+
+    def token_path(self, path: str) -> bool:
+        """Is `path` (the request path, query excluded) a declared token exchange path? Exact segments, `*` = one
+        segment of [A-Za-z0-9._~-]: an encoded, dotted, doubled or empty segment never matches."""
+        return any(_path_glob(p).fullmatch(path) is not None for p in self.token_paths)
 
     def __str__(self) -> str:
         return f"support-{self.kind}:{self.rule.value}"
@@ -153,7 +172,7 @@ _TOP_KEYS = {
     "websockets",
 }
 _RULE_KEYS = {"type", "value", "note"}
-_SUPPORT_KEYS = {"value", "kind", "note", "type"}
+_SUPPORT_KEYS = {"value", "kind", "note", "type", "token_paths"}
 
 
 def support_pattern(rule: Rule) -> str:
@@ -163,8 +182,9 @@ def support_pattern(rule: Rule) -> str:
 
 
 def parse_support(entry: Any, ctx: str) -> Support:
-    """One `support` entry: {value, kind: auth|assets, note?}. Domains and wildcards only: a support host is
-    named, never an IP range or a URL prefix."""
+    """One `support` entry: {value, kind: auth|assets|sso|passthrough, note?, token_paths? (sso only)}. Domains and
+    wildcards only (a support host is named, never an IP range or a URL prefix); `sso` and `passthrough` name one
+    exact host each."""
     if not isinstance(entry, dict):
         raise ScopeError(f"{ctx}: a support entry is a mapping {{value, kind, note}}")
     if unknown := set(entry) - _SUPPORT_KEYS:
@@ -172,10 +192,25 @@ def parse_support(entry: Any, ctx: str) -> Support:
     kind = entry.get("kind")
     if kind not in SUPPORT_KINDS:
         raise ScopeError(f"{ctx}: support kind must be one of {list(SUPPORT_KINDS)}, not {kind!r}")
-    rule = parse_rule({k: v for k, v in entry.items() if k != "kind"}, ctx)
+    rule = parse_rule({k: v for k, v in entry.items() if k not in ("kind", "token_paths")}, ctx)
     if rule.type not in (RuleType.DOMAIN, RuleType.WILDCARD):
         raise ScopeError(f"{ctx}: a support host is a domain or a wildcard, not {rule.type.value} {rule.value!r}")
-    return Support(kind, rule)
+    if kind in EXACT_KINDS and rule.type is not RuleType.DOMAIN:
+        raise ScopeError(f"{ctx}: a `{kind}` support host is one exact domain, not the wildcard {rule.value!r}")
+    paths = entry.get("token_paths")
+    if paths is not None and kind != "sso":
+        raise ScopeError(f"{ctx}: 'token_paths' belongs to `sso` support hosts only")
+    if paths is not None and (
+        not isinstance(paths, list)
+        or not paths
+        or not all(isinstance(x, str) and _TOKEN_PATH.fullmatch(x) for x in paths)
+        or any(seg in (".", "..") for x in paths for seg in x.split("/"))
+    ):
+        raise ScopeError(
+            f"{ctx}: 'token_paths' is a non-empty list of absolute paths, `*` for one whole segment "
+            "(/*/oauth2/v2.0/token)"
+        )
+    return Support(kind, rule, tuple(paths or ()))
 
 
 def _infer_type(value: str) -> RuleType:
@@ -402,7 +437,7 @@ def _support_apart(in_rules: tuple[Rule, ...], support: tuple[Support, ...], ori
     for i, s in enumerate(support):
         for other in support[:i]:
             if other.kind != s.kind and patterns_overlap(support_pattern(s.rule), support_pattern(other.rule)):
-                raise ScopeError(f"{origin}: support[{i}] {s.rule.value!r} is both auth and assets")
+                raise ScopeError(f"{origin}: support[{i}] {s.rule.value!r} is both {other.kind} and {s.kind}")
 
 
 def _derived_origins_on_targets(scope: Scope, raw: list[Any]) -> None:
@@ -498,8 +533,8 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
     from bh.accounts.recipe import urls
 
     for i, ident in enumerate(scope.identities):
-        # where the login goes may be a `support` auth host (enrollment only); the probe and the origins (where the
-        # identity's headers go) must be targets
+        # where the login goes may be a `support` auth or sso host (enrollment reaches both); the probe and the
+        # origins (where the identity's headers go) must be targets
         for key, u, login in (
             ("login_url", ident.get("login_url"), True),
             ("signup_url", ident.get("signup_url"), True),
@@ -510,7 +545,7 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
             if u is None:
                 continue
             d = check(scope, u)
-            if not d and not (login and d.support == "auth"):
+            if not d and not (login and d.support in ("auth", "sso")):
                 raise ScopeError(f"{origin}: identities[{i}].{key} {u!r} is not in scope ({d.reason})")
 
 

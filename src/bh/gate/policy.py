@@ -10,8 +10,13 @@ Classes of destination:
 - support : hosts of the scope's `support` list, never targets. `assets` (what the targets' pages load): GET/HEAD
             without body from any sandbox client, no program headers, no identity, no Cookie / Authorization.
             `auth` (our own login): the enrollment sources only (the gate and bh-login), the login's methods;
-            the hunter and the judge are refused ("login host, enrollment only"). Own rate limit, public IPs
-            only, never a test (flows class `support`, outside the asset graph and the counts).
+            the hunter and the judge are refused ("login host, enrollment only"). `sso` (a login host the
+            application calls while in use: silent sign-in iframe, token exchange): any sandbox client, GET/HEAD
+            without body, POST only on the scope's `token_paths` (the enrollment sources: the login's methods);
+            no program header, only the identity's own jar cookies for that host. `passthrough` (a third-party
+            anti-bot challenge): CONNECT to 443 only, the TLS never intercepted (addon: next_layer -> raw TCP),
+            nothing of ours inside, bounded (PassthroughGuard); a decrypted request to it is refused. Own rate
+            limit, public IPs only, never a test (flows class `support`, outside the asset graph and the counts).
 Websockets (scope `websockets: true`, refused otherwise): the handshake is a target request like any other
 (scope, identity, program headers, rate); then every client message is bounded and journaled (WsGuard).
 Everything else is denied. Decisions are made on the real destination (the CONNECT target or the
@@ -31,7 +36,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
 
 from bh.agent.contract import (
     API_PATH,
@@ -44,7 +49,7 @@ from bh.agent.contract import (
 )
 from bh import redact
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
-from bh.scope.enforce import check_support_resolved
+from bh.scope.enforce import check_support_resolved, support_entry
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
 SYSTEM_HOSTS = ("api.anthropic.com",)
@@ -55,6 +60,10 @@ PASSIVE_RPS = 2.0
 SUPPORT_RPS, SUPPORT_BURST = 4.0, 8.0
 # what an enrollment login may send to an `auth` support host
 SUPPORT_AUTH_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST"})
+# a passthrough tunnel (anti-bot challenge, never intercepted): new tunnels per minute, open at once, bytes both ways
+# and lifetime per tunnel. A challenge loads a script and an iframe: a few tunnels, a few hundred kB.
+PASSTHROUGH_PER_MIN, PASSTHROUGH_OPEN = 20, 6
+PASSTHROUGH_MAX_BYTES, PASSTHROUGH_MAX_SECONDS = 16 << 20, 600.0
 # Ports a domain/wildcard rule authorizes; a CIDR rule (explicit IP range, e.g. a lab) authorizes any port.
 WEB_PORTS = frozenset({80, 443, 8000, 8008, 8080, 8443, 8888})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -138,7 +147,7 @@ class Verdict:
     klass: str  # system | passive | target | support | deny
     reason: str
     rule: str | None = None
-    support: str | None = None  # kind of a `support` verdict: "auth" | "assets"
+    support: str | None = None  # kind of a `support` verdict: "auth" | "assets" | "sso" | "passthrough"
 
 
 def deny(reason: str, rule: str | None = None) -> Verdict:
@@ -185,6 +194,7 @@ class Policy:
     local_ips: frozenset[str] = frozenset()  # the gate's own addresses (never a destination, B3)
     ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # noqa: PLW0108 - defined below
     ws_live: dict[str, WsGuard] = field(default_factory=dict)  # open websocket (flow id) -> its guard
+    passthrough: PassthroughGuard = field(default_factory=lambda: PassthroughGuard())  # noqa: PLW0108 - below
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -234,6 +244,8 @@ class Policy:
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         v = self._target(authority)
         if v is not None and v.klass == "support":
+            if v.support == "passthrough" and port != 443:
+                return deny(f"passthrough host {host}: port {port} (a TLS tunnel to 443 only, never in clear)")
             if port not in (80, 443):
                 return deny(f"support host {host}: port {port} (80 and 443 only)")
             return _support_client(v, host, enroll) or v
@@ -310,7 +322,11 @@ class Policy:
     def _support_request(
         self, v: Verdict, url: str, host: str, method: str, *, host_header: str | None, body_len: int, enroll: bool
     ) -> Verdict:
-        """A request to a support host: never a test. assets: GET/HEAD without body; auth: enrollment sources only."""
+        """A request to a support host: never a test. assets: GET/HEAD without body; auth: enrollment sources only;
+        sso: GET/HEAD without body, POST on the declared token paths (enrollment: the login's methods); passthrough:
+        never decrypted, so a request seen here is refused (the tunnel was intercepted, or it is plain HTTP)."""
+        if v.support == "passthrough":
+            return deny(f"passthrough host {host}: CONNECT to 443 only, never intercepted nor in clear")
         if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
             return deny("support host with a different Host header")
         if _port(url) not in (80, 443):
@@ -321,9 +337,31 @@ class Policy:
             return deny(f"support host {host} (assets): GET/HEAD without body only, not {method}")
         if v.support == "auth" and method not in SUPPORT_AUTH_METHODS:
             return deny(f"support host {host} (login): method {method} not allowed")
+        if v.support == "sso":
+            if enroll:
+                if method not in SUPPORT_AUTH_METHODS:
+                    return deny(f"support host {host} (sso): method {method} not allowed")
+            elif method == "POST":
+                entry = support_entry(self.scope, url) if self.scope is not None else None
+                if entry is None or not entry.token_path(urlsplit(url).path):
+                    return deny(f"support host {host} (sso): POST only to its declared token_paths")
+            elif method not in ("GET", "HEAD") or body_len:
+                return deny(f"support host {host} (sso): GET/HEAD without body, or POST to a token path, not {method}")
         if body_len > MAX_BODY_BYTES:
             return deny(f"request body over {MAX_BODY_BYTES} bytes")
         return v
+
+    def passthrough_redirect(self, url: str, status: int, location: str | None) -> str | None:
+        """A redirect to a passthrough host, answered to a request that named an identity: the browser would carry
+        X-BH-Identity into the tunnel the gate never sees (a route's headers follow its redirects). Reason to refuse
+        that answer, or None."""
+        if status not in (301, 302, 303, 307, 308) or not location or self.scope is None:
+            return None
+        target = urljoin(url, location.strip())
+        d = check(self.scope, target)
+        if d.support == "passthrough":
+            return f"redirect to the passthrough host {urlsplit(target).hostname} under an identity (never followed)"
+        return None
 
     def note_answer(self, url: str, status: int) -> None:
         """Target answers feed the scanner guard (only where the program forbids scanners)."""
@@ -561,6 +599,58 @@ class WsGuard:
 
     def counts(self) -> dict:
         return {"client": self.client, "server": self.server, "binary": self.binary, "bytes": self.bytes_client}
+
+
+@dataclass
+class PassthroughGuard:
+    """Tunnels to `passthrough` hosts (an anti-bot challenge), never decrypted: what the gate can bound is how many
+    open (per minute, at once), how many bytes each carries and for how long. Once a tunnel crosses a bound it is
+    closed for good. The journal keeps the host, the bytes and the duration, nothing else."""
+
+    per_min: int = PASSTHROUGH_PER_MIN
+    max_open: int = PASSTHROUGH_OPEN
+    max_bytes: int = PASSTHROUGH_MAX_BYTES
+    max_seconds: float = PASSTHROUGH_MAX_SECONDS
+    recent: deque = field(default_factory=deque)  # start times of the tunnels of the last minute
+    live: dict[str, dict] = field(default_factory=dict)  # tunnel id -> {host, start, up, down, closed}
+
+    def open(self, tid: str, host: str, now: float) -> str | None:
+        """A tunnel about to start. Refusal reason, or None (it is then counted)."""
+        while self.recent and self.recent[0] <= now - 60:
+            self.recent.popleft()
+        for stale in [k for k, t in self.live.items() if t["start"] < now - self.max_seconds - 60]:
+            del self.live[stale]  # a tunnel whose end the gate never saw does not hold a slot forever
+        if len(self.recent) >= self.per_min:
+            return f"passthrough: over {self.per_min} new tunnels per minute"
+        if tid not in self.live and len(self.live) >= self.max_open:
+            return f"passthrough: {self.max_open} tunnels already open"
+        self.recent.append(now)
+        self.live[tid] = {"host": host, "start": now, "up": 0, "down": 0, "closed": None}
+        return None
+
+    def data(self, tid: str, size: int, *, from_client: bool, now: float) -> str | None:
+        """Bytes relayed on a tunnel. Refusal reason (close it), or None."""
+        t = self.live.get(tid)
+        if t is None:
+            return "passthrough tunnel not opened through the gate's checks"
+        if t["closed"]:
+            return t["closed"]
+        t["up" if from_client else "down"] += size
+        if t["up"] + t["down"] > self.max_bytes:
+            t["closed"] = f"passthrough tunnel over {self.max_bytes} bytes"
+        elif now - t["start"] > self.max_seconds:
+            t["closed"] = f"passthrough tunnel open for over {self.max_seconds:.0f} s"
+        return t["closed"]
+
+    def end(self, tid: str, now: float) -> dict | None:
+        """The journal record of a finished tunnel: host, bytes each way, seconds (and why it was closed)."""
+        t = self.live.pop(tid, None)
+        if t is None:
+            return None
+        rec = {"host": t["host"], "bytes_up": t["up"], "bytes_down": t["down"], "seconds": round(now - t["start"], 3)}
+        if t["closed"]:
+            rec["closed"] = t["closed"]
+        return rec
 
 
 def ws_message_record(content: bytes, *, binary: bool) -> dict:

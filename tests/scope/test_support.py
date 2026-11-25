@@ -127,3 +127,78 @@ def test_support_resolution_public_only():
 )
 def test_patterns_overlap(a, b, overlap):
     assert patterns_overlap(a, b) is overlap and patterns_overlap(b, a) is overlap
+
+
+# ------------------------------------------------------------------ sso and passthrough
+def test_sso_with_token_paths_and_passthrough_parse():
+    s = scope(
+        support=[
+            {"value": "login.example.org", "kind": "sso", "token_paths": ["/*/oauth2/v2.0/token", "/token.srf"]},
+            {"value": "challenges.example.net", "kind": "passthrough", "note": "anti-bot"},
+            {"value": "sso-nopost.example.org", "kind": "sso"},
+        ]
+    )
+    sso, pt, bare = s.support
+    assert (sso.kind, sso.token_paths) == ("sso", ("/*/oauth2/v2.0/token", "/token.srf"))
+    assert sso.token_path("/common/oauth2/v2.0/token") and sso.token_path("/token.srf")
+    assert not sso.token_path("/common/oauth2/v2.0/authorize") and not sso.token_path("/../oauth2/v2.0/token")
+    assert not sso.token_path("/common/oauth2/v2.0/token/") and not sso.token_path("/a/b/oauth2/v2.0/token")
+    assert pt.kind == "passthrough" and pt.token_paths == () and bare.token_paths == ()
+    assert not bare.token_path("/token.srf")  # no token path declared: no POST at all
+    assert check(s, "https://login.example.org/x").support == "sso"
+    assert check(s, "challenges.example.net:443").support == "passthrough"
+    assert s.support_hosts("passthrough") == ("challenges.example.net",)
+
+
+@pytest.mark.parametrize(
+    "entry, match",
+    [
+        ({"value": "*.login.example.org", "kind": "sso"}, "one exact domain"),
+        ({"value": "*.challenges.example.net", "kind": "passthrough"}, "one exact domain"),
+        ({"value": "cdn.example.net", "kind": "assets", "token_paths": ["/t"]}, "sso"),
+        ({"value": "c.example.net", "kind": "passthrough", "token_paths": ["/t"]}, "sso"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": "/token"}, "token_paths"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": []}, "token_paths"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": ["token"]}, "token_paths"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": ["/a/../token"]}, "token_paths"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": ["/a*b/token"]}, "token_paths"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": ["/token?x=1"]}, "token_paths"),
+        ({"value": "l.example.org", "kind": "sso", "token_paths": ["/"]}, "token_paths"),
+    ],
+)
+def test_bad_sso_and_passthrough_entries(entry, match):
+    with pytest.raises(ScopeError, match=match):
+        scope(support=[entry])
+
+
+@pytest.mark.parametrize(
+    "support, match",
+    [
+        ([{"value": "app.example.com", "kind": "sso"}], "overlaps in_scope"),
+        ([{"value": "v1.api.example.com", "kind": "passthrough"}], "overlaps in_scope"),
+        (
+            [{"value": "*.example.org", "kind": "auth"}, {"value": "login.example.org", "kind": "sso"}],
+            "both auth and sso",
+        ),
+        (
+            [{"value": "c.example.net", "kind": "passthrough"}, {"value": "*.example.net", "kind": "assets"}],
+            "both passthrough and assets",
+        ),
+        (
+            [{"value": "l.example.org", "kind": "sso"}, {"value": "l.example.org", "kind": "passthrough"}],
+            "both sso and passthrough",
+        ),
+    ],
+)
+def test_sso_and_passthrough_never_overlap_a_target_or_another_kind(support, match):
+    with pytest.raises(ScopeError, match=match):
+        scope(support=support)
+
+
+def test_login_urls_may_be_sso_support():
+    sup = [{"value": "login.example.org", "kind": "sso"}, {"value": "c.example.net", "kind": "passthrough"}]
+    assert scope(support=sup, identities=[{"name": "a", "login_url": "https://login.example.org/"}])
+    with pytest.raises(ScopeError, match="login_url"):  # a challenge host is never a login
+        scope(support=sup, identities=[{"name": "a", "login_url": "https://c.example.net/"}])
+    with pytest.raises(ScopeError, match="origins"):  # an identity's headers never go to an sso host
+        scope(support=sup, identities=[{"name": "a", "origins": ["https://login.example.org/"]}])

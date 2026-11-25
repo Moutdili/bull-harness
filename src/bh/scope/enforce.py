@@ -28,7 +28,8 @@ class Decision:
     allowed: bool
     reason: str
     rule: str | None = None
-    support: str | None = None  # "auth" | "assets": a support host of the scope (allowed stays False)
+    # "auth" | "assets" | "sso" | "passthrough": a support host of the scope (allowed stays False)
+    support: str | None = None
 
     def __bool__(self) -> bool:
         return self.allowed
@@ -133,6 +134,15 @@ def support_of(scope: Scope, t: Target) -> Support | None:
     if t.host is None:
         return None
     return next((s for s in scope.support if _match(s.rule, t, out=False)), None)
+
+
+def support_entry(scope: Scope, target: str) -> Support | None:
+    """The support entry of a URL or host that is no target and no exclusion (its `token_paths`, its kind)."""
+    try:
+        t = parse_target(target)
+    except TargetError:
+        return None
+    return support_of(scope, t) if check_target(scope, t).support is not None else None
 
 
 def check(scope: Scope, target: str) -> Decision:

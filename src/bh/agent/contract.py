@@ -166,21 +166,50 @@ def host_matches(pattern: str, host: str) -> bool:
 
 @dataclass(frozen=True)
 class SandboxScope:
-    """What bh-browse needs of the scope beyond the target: the `support` hosts of kind `assets` it may load
-    (GET/HEAD, judged again by the gate) and whether websockets to the target are on. Never a boundary: the gate
-    decides; this only keeps the browser from asking for what the gate would refuse anyway."""
+    """What bh-browse needs of the scope beyond the page's own host: the `support` hosts it may load (`assets`:
+    GET/HEAD; `sso`: the application's silent sign-in; `passthrough`: a third-party anti-bot challenge, never
+    intercepted), the other targets of the scope (an API or chat host the page calls) and whether websockets to the
+    targets are on. Never a boundary: the gate decides; this only keeps the browser from asking for what the gate
+    would refuse anyway, and keeps our identity header away from hosts that must never see it."""
 
     assets: tuple[str, ...] = ()
     websockets: bool = False
+    sso: tuple[str, ...] = ()
+    passthrough: tuple[str, ...] = ()
+    targets: tuple[str, ...] = ()  # host patterns of the in-scope domain, wildcard and URL rules
+
+
+SANDBOX_ENV = {  # environment variable -> SandboxScope field (comma-separated host patterns)
+    "BH_SUPPORT_ASSETS": "assets",
+    "BH_SUPPORT_SSO": "sso",
+    "BH_SUPPORT_PASSTHROUGH": "passthrough",
+    "BH_TARGET_HOSTS": "targets",
+}
+
+
+def _rule_host(entry) -> str | None:
+    """Host pattern of an in-scope rule (`x.com`, `*.x.com`, `https://x.com/api/`), None for a CIDR, repo, other."""
+    value = entry.get("value") if isinstance(entry, dict) else entry
+    kind = entry.get("type") if isinstance(entry, dict) else None
+    if not isinstance(value, str) or kind in ("cidr", "repo", "other"):
+        return None
+    value = value.strip().lower()
+    if "://" in value:
+        value = value.split("://", 1)[1].split("/", 1)[0].rsplit(":", 1)[0]
+    if not value or "/" in value or re.fullmatch(r"[0-9.]+|\[?[0-9a-f:]+\]?", value):
+        return None
+    return value.rstrip(".")
 
 
 def sandbox_scope(path: Path | None = None, env=None) -> SandboxScope:
-    """From the environment when the runner sets it (BH_SUPPORT_ASSETS = comma-separated host patterns,
-    BH_WEBSOCKETS = 1), else from the scope.yaml the runner pushes to BH_DIR. Unreadable: nothing extra."""
+    """From the environment when the runner sets it (SANDBOX_ENV: comma-separated host patterns, BH_WEBSOCKETS = 1),
+    else from the scope.yaml the runner pushes to BH_DIR. Unreadable: nothing extra."""
     env = os.environ if env is None else env
-    if "BH_SUPPORT_ASSETS" in env or "BH_WEBSOCKETS" in env:
-        assets = tuple(h.strip().lower() for h in env.get("BH_SUPPORT_ASSETS", "").split(",") if h.strip())
-        return SandboxScope(assets, env.get("BH_WEBSOCKETS") == "1")
+    if any(k in env for k in SANDBOX_ENV) or "BH_WEBSOCKETS" in env:
+        lists = {
+            f: tuple(h.strip().lower() for h in env.get(k, "").split(",") if h.strip()) for k, f in SANDBOX_ENV.items()
+        }
+        return SandboxScope(websockets=env.get("BH_WEBSOCKETS") == "1", **lists)
     import yaml  # python3-yaml in the image; only bh-browse asks
 
     try:
@@ -190,12 +219,17 @@ def sandbox_scope(path: Path | None = None, env=None) -> SandboxScope:
     if not isinstance(doc, dict):
         return SandboxScope()
     support = doc.get("support") if isinstance(doc.get("support"), list) else []
-    assets = tuple(
-        str(e["value"]).strip().lower().rstrip(".")
-        for e in support
-        if isinstance(e, dict) and e.get("kind") == "assets" and isinstance(e.get("value"), str)
-    )
-    return SandboxScope(assets, doc.get("websockets") is True)
+
+    def kind(k: str) -> tuple[str, ...]:
+        return tuple(
+            str(e["value"]).strip().lower().rstrip(".")
+            for e in support
+            if isinstance(e, dict) and e.get("kind") == k and isinstance(e.get("value"), str)
+        )
+
+    ins = doc.get("in_scope") if isinstance(doc.get("in_scope"), list) else []
+    targets = tuple(h for h in (_rule_host(e) for e in ins) if h)
+    return SandboxScope(kind("assets"), doc.get("websockets") is True, kind("sso"), kind("passthrough"), targets)
 
 
 def host_of(url: str) -> str:
