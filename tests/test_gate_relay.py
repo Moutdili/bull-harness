@@ -365,3 +365,12 @@ def test_relay_tap_reports_id_and_stop_reason_and_passes_chunks(addon):
     assert [tap(c) for c in chunks] == chunks  # unchanged, in order
     assert seen == [{"msg_id": "msg_01AbCd", "stop_reason": "refusal"}]
     assert tap(b"garbage \xff") == b"garbage \xff" and len(seen) == 1
+
+
+def test_login_container_counts_as_enrollment(addon, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(addon, "_login_ips", lambda max_age=60.0: frozenset({"10.89.0.40"}))
+    flow = lambda ip: SimpleNamespace(client_conn=SimpleNamespace(peername=(ip, 5555)))  # noqa: E731
+    assert addon._from_gate(flow("10.89.0.40")) and addon._from_gate(flow("127.0.0.1"))
+    assert not addon._from_gate(flow("10.89.0.5"))  # the agent

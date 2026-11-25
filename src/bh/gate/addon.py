@@ -153,9 +153,23 @@ def local_addresses() -> frozenset[str]:
     return frozenset(ips)
 
 
+LOGIN_HOST = os.environ.get("BH_LOGIN_HOST", "login")  # the host-driven browser login container (compose `login`)
+_LOGIN_IPS: tuple[float, frozenset[str]] = (0.0, frozenset())
+
+
+def _login_ips(max_age: float = RELAY_IPS_TTL) -> frozenset[str]:
+    """Addresses of the login container, cached like the relay clients' (it may be down: then none)."""
+    global _LOGIN_IPS
+    if time.time() - _LOGIN_IPS[0] > max_age:
+        _LOGIN_IPS = (time.time(), resolve_hosts((LOGIN_HOST,)))
+    return _LOGIN_IPS[1]
+
+
 def _from_gate(flow: http.HTTPFlow) -> bool:
-    """The request comes from inside the gate container (account enrollment), not from the agent."""
-    return (flow.client_conn.peername or ("?",))[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+    """An enrollment request: from inside the gate (bh.accounts JSON recipes) or from the login container
+    (browser recipes). Never the agent's testing; its bodies carry passwords and tokens."""
+    peer = (flow.client_conn.peername or ("?",))[0]
+    return peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1") or peer in _login_ips()
 
 
 def refuse(flow: http.HTTPFlow, v: Verdict) -> None:
@@ -462,6 +476,8 @@ class Gate:
             return
         req = flow.request
         identity = req.headers.pop(IDENTITY_HEADER, None)
+        if identity is not None and _from_gate(flow):
+            identity = None  # enrollment logs in with its own credentials: it never borrows a stored session
         if identity is not None and self._identity_file(identity) is None:
             self._log(
                 paths.EVENTS,
