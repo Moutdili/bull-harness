@@ -446,7 +446,8 @@ def _asker(ident: Identity, cred: dict[str, Any], steps: list[dict[str, Any]], s
                 return None
             wait = min(step.get("timeout", browser.EMAIL_WAIT_S), browser.EMAIL_WAIT_S)
             try:
-                code = mail.default().wait(cred["email"], step["from"], since, wait)
+                # codes may go to another inbox than the account's address (`code_to`, from `bh accounts set`)
+                code = mail.default().wait(cred.get("code_to") or cred["email"], step["from"], since, wait)
             except mail.MailError as exc:
                 notes.append(f"mailbox: {exc}")
                 return None

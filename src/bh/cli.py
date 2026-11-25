@@ -555,6 +555,8 @@ def cmd_accounts_set(args) -> int:
                 )
             base64.b32decode(totp + "=" * (-len(totp) % 8))
         cred["totp"] = totp
+    if args.code_to:
+        cred["code_to"] = args.code_to.strip()  # where the site sends login codes (read by the mailbox), not secret
     if not cred.get("email") or not cred.get("password"):
         raise SystemExit("ERR an email and a password are needed: nothing written")
     cred.setdefault("created", time.time())
@@ -705,6 +707,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("program", help="program name, as in the scope file (e.g. msrc-copilot)")
     st.add_argument("name", help="identity name (e.g. user-a)")
     st.add_argument("--email", help="the account's email (asked if omitted; it is not a secret)")
+    st.add_argument("--code-to", help="inbox that receives the site's login codes, when it is not --email")
     st.set_defaults(func=cmd_accounts_set)
     acs.add_parser(
         "mail-check", help="Gmail (read-only): refresh the token, count 24 h of mail to the researcher alias"
