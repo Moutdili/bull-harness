@@ -149,7 +149,7 @@ def test_set_cookie_masked_for_the_agent():
 @pytest.mark.parametrize(
     ("method", "url", "status", "location", "expected"),
     [
-        ("GET", URL, 401, None, "401"),
+        ("GET", URL, 401, None, None),  # one 401 is an access rule, not a dead session (H4)
         ("GET", URL, 302, "/login?next=/account", "login-redirect"),
         ("POST", URL, 303, "https://app.example.com/login/", "login-redirect"),
         ("GET", URL, 302, "/dashboard", None),
@@ -169,6 +169,60 @@ def test_session_dead(method, url, status, location, expected):
 
 def test_redirect_without_declared_login_url_is_not_dead():
     assert s.dead_reason("GET", URL, 302, "/login", login_url=None) is None
+
+
+def test_a_single_401_or_401s_on_one_route_never_kill_the_session():
+    """H4: the control of an access test answers 401 to a live session; only distinct routes count."""
+    u = s.Unauthorized()
+    for i in range(10):  # an IDOR test over many ids is one route (/u/{id})
+        assert u.hit("user-a", f"https://app.example.com/api/u/{i}", NOW + i) is None
+    assert u.hit("user-a", "https://app.example.com/api/orders", NOW + 20) is None
+    assert u.hit("user-b", "https://app.example.com/api/me", NOW + 21) is None  # per identity
+    assert u.hit("user-a", "https://app.example.com/api/me/", NOW + 30) == 3
+
+
+def test_401_on_routes_spread_over_more_than_the_window_do_not_count():
+    u = s.Unauthorized()
+    assert u.hit("user-a", "https://app.example.com/a", NOW) is None
+    assert u.hit("user-a", "https://app.example.com/b", NOW + 300) is None
+    assert u.hit("user-a", "https://app.example.com/c", NOW + s.UNAUTH_WINDOW_S + 1) is None  # /a has expired
+    assert u.hit("user-a", "https://other.example.com/a", NOW + s.UNAUTH_WINDOW_S + 2) == 3  # another host
+    assert u.hit("user-a", "https://app.example.com/d", NOW + s.UNAUTH_WINDOW_S + 3) is None  # starts over
+
+
+def test_identity_headers_only_go_to_the_identity_origins():
+    """M7: a bearer token is not handed to another host of the scope."""
+    decl = {
+        "name": "user-a",
+        "login_url": "https://app.example.com/login",
+        "probe": {"url": "https://api.example.com/me", "status": 200},
+        "enroll": {"login": {"url": "https://auth.example.com:8443/token"}},
+        "origins": ["https://cdn.example.com"],
+    }
+    assert s.identity_origins(decl) == {
+        "https://app.example.com:443",
+        "https://api.example.com:443",
+        "https://auth.example.com:8443",
+        "https://cdn.example.com:443",
+    }
+    assert s.headers_go_to(decl, "https://api.example.com/v1/orders?x=1")
+    assert not s.headers_go_to(decl, "https://echo.example.com/headers")
+    assert not s.headers_go_to(decl, "http://app.example.com/")  # another scheme is another origin
+    assert not s.headers_go_to(decl, "https://auth.example.com/")  # another port too
+    # nothing declared: the old behaviour (every in-scope host), documented
+    assert s.identity_origins({"name": "user-a"}) == frozenset()
+    assert s.headers_go_to({"name": "user-a"}, "https://echo.example.com/")
+    assert s.headers_go_to(None, "https://echo.example.com/")
+
+
+def test_a_parent_domain_cookie_never_passes_ahead_of_the_session_cookie():
+    """B12 (a): another host of the scope sets sid for the parent domain with a longer Path."""
+    sess = s.normalize({"headers": {}}, NOW)
+    s.merge(sess, "https://app.example.com/login", ["sid=mine; Path=/"], NOW)
+    s.merge(sess, "https://blog.example.com/x", ["sid=theirs; Domain=example.com; Path=/api/", "t=1; Path=/"], NOW)
+    got = s.cookies_for(sess, "https://app.example.com/api/orders", NOW)
+    assert got[0] == ("sid", "mine") and ("sid", "theirs") not in got
+    assert s.cookies_for(sess, "https://shop.example.com/api/x", NOW) == [("sid", "theirs")]
 
 
 def test_session_dead_at_most_once_a_minute_per_identity():

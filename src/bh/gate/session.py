@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
+from bh.agent.contract import origin, path_key
 from bh.scope.normalize import norm_host, parse_ip
 from bh.scope.psl import is_public_suffix
 
@@ -48,6 +49,8 @@ MAX_DOMAINS = 16  # a hostile target must not grow the session file without boun
 MAX_COOKIES_PER_DOMAIN = 64
 MAX_COOKIE_BYTES = 4096  # name + value, the usual browser limit
 DEAD_WINDOW_S = 60  # at most one session-dead event per identity in this window
+# 401 under an identity: dead only when that many distinct routes answer 401 within the window (H4)
+UNAUTH_ROUTES, UNAUTH_WINDOW_S, UNAUTH_ROUTES_MAX = 3, 600.0, 256
 REDIRECTS = (301, 302, 303, 307, 308)
 _TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # RFC 7230 token: a cookie name
 
@@ -322,7 +325,9 @@ def _path_matches(request_path: str, cookie_path: str) -> bool:
 
 def cookies_for(session: Session, url: str, now: float | None = None) -> list[tuple[str, str]]:
     """(name, value) pairs of the jar that a browser would send to `url`: domain, path, Secure and expiry
-    respected. Longer paths first (RFC 6265 5.4); for one name, the most specific domain wins."""
+    respected. For one name the most specific domain wins, whatever the paths; longer paths first (RFC 6265 5.4).
+    Limit: the jar keeps one cookie per (domain, name), so a host of the scope that sets the same name for the same
+    parent domain replaces the session's value (only a record of the setting host would stop it)."""
     now = time.time() if now is None else now
     parts = urlsplit(url)
     try:
@@ -344,14 +349,18 @@ def cookies_for(session: Session, url: str, now: float | None = None) -> list[tu
             if not _path_matches(path, c["path"]):
                 continue
             hits.append((len(c["path"]), len(dom), name, c["value"]))
-    hits.sort(key=lambda h: (-h[0], -h[1]))
+    # One value per name, the most specific domain first (B12): a cookie that another host of the scope set for
+    # the parent domain, with a longer Path, must not pass ahead of the session's own cookie. Then RFC 6265 5.4
+    # order: longer paths first.
+    hits.sort(key=lambda h: (-h[1], -h[0]))
     seen: set[str] = set()
-    out = []
-    for _, _, name, value in hits:
+    kept = []
+    for plen, _, name, value in hits:
         if name not in seen:
             seen.add(name)
-            out.append((name, value))
-    return out
+            kept.append((plen, name, value))
+    kept.sort(key=lambda h: -h[0])  # stable: same path length keeps the domain order
+    return [(name, value) for _, name, value in kept]
 
 
 def parse_cookie_header(value: str | None) -> list[tuple[str, str]]:
@@ -386,6 +395,32 @@ def mask_set_cookie(header: str, placeholder: str) -> str:
     return f"{name.strip()}={placeholder}{sep}{attrs}" if eq else placeholder
 
 
+# ---------------------------------------------------------------- where an identity's headers may go
+def identity_origins(decl: dict | None) -> frozenset[str]:
+    """Origins (scheme://host:port) an identity's headers and static Cookie may be sent to (M7): those of its
+    `login_url`, `signup_url`, `probe.url`, of its enroll recipe's login and signup URLs (where its token comes
+    from), and of an optional `origins` list. Empty: nothing declared, the headers go to every in-scope host."""
+    if not isinstance(decl, dict):
+        return frozenset()
+    recipe = decl.get("enroll") if isinstance(decl.get("enroll"), dict) else {}
+    urls = [
+        decl.get("login_url"),
+        decl.get("signup_url"),
+        (decl.get("probe") or {}).get("url") if isinstance(decl.get("probe"), dict) else None,
+        *((recipe.get(k) or {}).get("url") for k in ("login", "signup") if isinstance(recipe.get(k), dict)),
+    ]
+    extra = decl.get("origins")
+    if isinstance(extra, list):
+        urls += extra
+    return frozenset(o for u in urls if isinstance(u, str) and (o := origin(u)))
+
+
+def headers_go_to(decl: dict | None, url: str) -> bool:
+    """May the identity's headers and static Cookie be sent to `url`? The jar's cookies follow their own domain."""
+    allowed = identity_origins(decl)
+    return not allowed or origin(url) in allowed
+
+
 # ---------------------------------------------------------------- session-dead
 def _same_page(a: str, b: str) -> bool:
     """Same scheme, host, port and path (trailing slash and query ignored)."""
@@ -410,11 +445,10 @@ def dead_reason(
     login_url: str | None = None,
     probe: dict | None = None,
 ) -> str | None:
-    """Why a response to a request under an identity says its session is dead, None if it does not:
-    `401`; `login-redirect` (a redirect whose Location is the identity's declared login page);
-    `probe` (a GET of the declared probe URL that does not answer the expected status)."""
-    if status == 401:
-        return "401"
+    """Why ONE response to a request under an identity says its session is dead, None if it does not:
+    `login-redirect` (a redirect whose Location is the identity's declared login page); `probe` (a GET of the
+    declared probe URL that does not answer the expected status). A single 401 is no proof (the control of an
+    access test answers 401 to a live session): see Unauthorized for the repeated-401 rule."""
     if status in REDIRECTS and location and login_url and _same_page(urljoin(url, location), login_url):
         return "login-redirect"
     if (
@@ -427,6 +461,45 @@ def dead_reason(
     ):
         return "probe"
     return None
+
+
+class Unauthorized:
+    """401 answers under one identity. The session is dead when they come from UNAUTH_ROUTES distinct routes
+    (host + path template: /u/1 and /u/2 are one route) within UNAUTH_WINDOW_S: one route refusing is an access
+    rule, every route refusing is a dead session. In memory: a gate restart forgets the count."""
+
+    def __init__(self, routes: int = UNAUTH_ROUTES, window: float = UNAUTH_WINDOW_S) -> None:
+        self.routes, self.window = routes, window
+        self._seen: dict[str, dict[str, float]] = {}  # identity -> route -> last 401
+
+    @staticmethod
+    def route(url: str) -> str:
+        parts = urlsplit(url)
+        try:
+            host = f"{norm_host(parts.hostname or '')}:{parts.port or ''}"
+        except ValueError:
+            host = (parts.netloc or "?").lower()
+        path = re.sub(r"/{2,}", "/", parts.path or "/").rstrip("/").lower() or "/"
+        return f"{host} {path_key(path)}"
+
+    def hit(self, identity: str, url: str, now: float | None = None) -> int | None:
+        """Record a 401; the number of distinct routes when it reaches the threshold (then starts over), else None."""
+        now = time.time() if now is None else now
+        seen = self._seen.setdefault(identity, {})
+        for r in [r for r, ts in seen.items() if ts <= now - self.window]:
+            del seen[r]
+        seen[self.route(url)] = now
+        if len(seen) > UNAUTH_ROUTES_MAX:  # bounded memory: keep the most recent routes
+            for r in sorted(seen, key=seen.get)[: len(seen) - UNAUTH_ROUTES_MAX]:
+                del seen[r]
+        if len(seen) < self.routes:
+            return None
+        n = len(seen)
+        seen.clear()
+        return n
+
+    def clear(self, identity: str) -> None:
+        self._seen.pop(identity, None)
 
 
 class DeadLimiter:

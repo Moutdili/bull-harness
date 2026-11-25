@@ -88,6 +88,42 @@ def test_resolved_ip_checks(tmp_path):
     assert not p.check_ip("api.anthropic.com", "127.0.0.1").allowed
 
 
+def test_the_gate_itself_is_never_a_destination(tmp_path):
+    """B3: a scope that covers loopback or the gate's own address (a lab CIDR) still cannot reach the gate."""
+    f = tmp_path / "active-scope.yaml"
+    f.write_text("program: p\nplatform: x\nin_scope: [127.0.0.0/8, '::1/128', 10.231.0.0/24]\n")
+    p = Policy(f, local_ips=frozenset({"10.231.0.2"}))
+    assert p.check_ip("10.231.0.10", "10.231.0.10").allowed  # the lab target itself stays reachable
+    for ip in ("127.0.0.1", "127.8.9.1", "::1", "::ffff:127.0.0.1", "0.0.0.0", "::", "10.231.0.2"):
+        v = p.check_ip("lab.test", ip)
+        assert not v.allowed and v.rule == "self", ip
+    for host in ("127.0.0.1", "10.231.0.2", "[::1]"):
+        assert not p.classify_connect(host, 8080).allowed, host
+        assert not req(p, f"http://{host}:8080/", host.strip("[]")).allowed, host
+    assert not pol.is_self_address("lab.test") and not pol.is_self_address("93.184.216.34")
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "body", "expected"),
+    [
+        (403, {"Server": "cloudflare"}, b"<h1>Forbidden</h1> you cannot read this order", False),  # the app's 403
+        (403, {"Server": "AkamaiGHost"}, b"{}", False),
+        (403, {"cf-mitigated": "challenge"}, b"", True),
+        (403, {}, b"<title>Just a moment...</title>", True),
+        (403, {}, b"<title>Attention Required! | Cloudflare</title>", True),
+        (403, {}, b"error code: 1020", True),
+        (403, {}, b"Access Denied ... You don't have permission ... Reference #18.2f", True),
+        (429, {}, b"Request blocked. ... CloudFront", True),
+        (503, {"Server": "cloudflare"}, b"Service Unavailable", False),  # pushback, not a WAF page
+        (200, {"cf-mitigated": "challenge"}, b"Just a moment...", False),
+        (401, {}, b"Just a moment...", False),
+    ],
+)
+def test_waf_answers_are_the_waf_own_pages_only(status, headers, body, expected):
+    """H3: `Server: cloudflare` on the application's own 403 never counts."""
+    assert pol.is_waf(status, headers, body) is expected
+
+
 def test_broken_scope_fails_closed(tmp_path):
     p = _policy(tmp_path)
     assert req(p, "https://a.example.com/", "a.example.com").allowed
@@ -299,7 +335,7 @@ def addon(monkeypatch):
         mod = importlib.import_module("bh.gate.addon")
     finally:
         os.umask(old)
-    monkeypatch.setattr(mod, "_RELAY_IPS", (0.0, frozenset()))
+    monkeypatch.setattr(mod, "_RELAY_IPS", (0.0, {}))
     yield mod
     sys.modules.pop("bh.gate.addon", None)
 

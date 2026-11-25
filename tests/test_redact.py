@@ -51,3 +51,10 @@ def test_identity_cookies_never_reach_the_agent_in_clear():
     assert "abc123" not in masked and masked.startswith("sid=<identity:user-a>;")
     # session-dead events carry the URL through redact.url: a session token in the query stays out
     assert "abc123" not in redact.url("https://t/x?session=abc123&a=1")
+
+
+def test_url_redaction_never_raises():
+    """The gate redacts the URL of every event it logs (B4), refusals included: a URL urlsplit rejects is cut."""
+    assert redact.url("https://a.t/x?token=abc&q=1") == "https://a.t/x?token=<redacted:token>&q=1"
+    out = redact.url("http://[::1/x?token=abc")
+    assert "abc" not in out and out.startswith("http://[::1") and out.endswith("<redacted:url>")

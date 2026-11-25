@@ -6,14 +6,21 @@ and writes compact JSONL logs that the runner turns into board facts.
 
 Identities (bh.gate.session): a request with X-BH-Identity to an in-scope target gets the identity's headers
 and the cookies of its jar. The Set-Cookie of the answer go into the jar (file rewritten atomically) and reach
-the agent with their value masked. A 401, a redirect to the identity's `login_url` or a failed probe writes one
-`session-dead` event per identity and minute; the runner marks the identity stale and the host logs in again.
+the agent with their value masked. The identity's headers and static Cookie only go to the identity's origins
+(session.identity_origins; none declared: every in-scope host). A redirect to the identity's `login_url`, a failed
+probe, or 401 answers on session.UNAUTH_ROUTES distinct routes within session.UNAUTH_WINDOW_S write one
+`session-dead` event (at most one per identity and minute, `ts` = when it was seen); a single 401 is no proof.
+
+Relay (Claude API, the only holder of the OAuth token): only the agent and judge containers, only the two calls
+Claude Code makes, within the run's budget, and only a body policy.check_relay accepts: client tools only, no
+`mcp_servers` / `container`, no URL source, anthropic-beta values on the list (policy.relay_betas), the model on
+the client's list (policy.relay_models).
 
 Fail closed: mitmproxy only logs exceptions raised by addons and lets the flow continue, so every
 hook here catches its own errors and denies.
 
-mitmdump reloads this file on change, not the modules it imports (policy, session): after changing those,
-restart the gate.
+mitmdump reloads this file on change, not the modules it imports (policy, session, redact): after changing
+those, restart the gate (`podman restart bh-gate`).
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import asyncio
 import contextlib
 import functools
 import inspect
+import ipaddress
 import itertools
 import json
 import os
@@ -39,15 +47,19 @@ from mitmproxy.proxy import mode_specs, server_hooks
 from bh import paths, redact
 from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER
 from bh.gate import session
-from bh.gate.policy import SYSTEM_HOSTS, Policy, Verdict, deny
+from bh.gate.policy import (
+    SYSTEM_HOSTS,
+    Policy,
+    Verdict,
+    check_relay,
+    deny,
+    is_waf,
+    relay_betas,
+    relay_models,
+    split_betas,
+)
 
 MAX_BODY = 16_384
-WAF_MARKERS = re.compile(
-    rb"(Attention Required!? \| Cloudflare|Just a moment\.\.\.|cf-chl-|_Incapsula_Resource|"
-    rb"Request unsuccessful\. Incapsula|Access Denied.{0,200}Reference #|The requested URL was rejected|"
-    rb"Request blocked\..{0,100}(AWS|CloudFront)|Sucuri WebSite Firewall|captcha-delivery\.com|px-captcha)",
-    re.I | re.S,
-)
 PUSHBACK_STATUS = (429, 503)
 os.umask(0o077)  # logs and flow files hold target data and redacted sessions: owner-only
 
@@ -67,8 +79,11 @@ RELAY_DEFAULT_MAX = 200  # requests per activation of a run when the runner name
 METHOD_OVERRIDES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
 
 
+RELAY_ROLES = {AGENT_HOST: "agent", JUDGE_HOST: "judge"}
+RELAY_MODELS = relay_models()  # role -> model ids it may ask for (BH_RELAY_MODELS_AGENT / _JUDGE)
+RELAY_BETAS = relay_betas()  # anthropic-beta values let through (BH_RELAY_BETAS)
 RELAY_IPS_TTL, RELAY_IPS_RETRY = 60.0, 5.0
-_RELAY_IPS: tuple[float, frozenset[str]] = (0.0, frozenset())
+_RELAY_IPS: tuple[float, dict[str, frozenset[str]]] = (0.0, {})
 
 
 def resolve_hosts(hosts, getaddrinfo=None) -> frozenset[str]:
@@ -88,34 +103,59 @@ def relay_client_allowed(peer: str, allowed: frozenset[str]) -> bool:
     return bool(peer) and peer in allowed
 
 
-def _relay_ips(max_age: float = RELAY_IPS_TTL) -> frozenset[str]:
-    """Addresses of the agent and judge containers, cached `max_age` seconds."""
+def _relay_ips(max_age: float = RELAY_IPS_TTL) -> dict[str, frozenset[str]]:
+    """Addresses of the agent and judge containers (per compose service), cached `max_age` seconds."""
     global _RELAY_IPS
     if time.time() - _RELAY_IPS[0] > max_age:
-        _RELAY_IPS = (time.time(), resolve_hosts(RELAY_CLIENT_HOSTS))
+        _RELAY_IPS = (time.time(), {h: resolve_hosts((h,)) for h in RELAY_CLIENT_HOSTS})
     return _RELAY_IPS[1]
 
 
-def _relay_peer_ok(peer: str) -> bool:
+def relay_roles(peer: str, table: dict[str, frozenset[str]]) -> frozenset[str]:
+    """Roles ("agent", "judge") of the relay client at `peer`; empty for anyone else."""
+    return frozenset(RELAY_ROLES.get(h, h) for h, ips in table.items() if relay_client_allowed(peer, ips))
+
+
+def _relay_role(peer: str) -> frozenset[str]:
     """A recreated container gets a new IP: a refused peer triggers one fresh lookup (at most every few seconds)
     before the refusal stands."""
-    return relay_client_allowed(peer, _relay_ips()) or relay_client_allowed(peer, _relay_ips(RELAY_IPS_RETRY))
+    return relay_roles(peer, _relay_ips()) or relay_roles(peer, _relay_ips(RELAY_IPS_RETRY))
+
+
+def _relay_peer_ok(peer: str) -> bool:
+    return bool(_relay_role(peer))
+
+
+def relay_models_for(roles: frozenset[str], path: str) -> frozenset[str]:
+    """Models a request may name. Messages: the client's list (the intersection if one address had two roles).
+    count_tokens spends no generation: any relay model."""
+    if not roles:
+        return frozenset()
+    if path.endswith("/count_tokens"):
+        return frozenset().union(*RELAY_MODELS.values())
+    return frozenset.intersection(*(RELAY_MODELS.get(r, frozenset()) for r in roles))
+
+
+def local_addresses() -> frozenset[str]:
+    """The gate's own addresses (every interface), from /proc: never a destination (policy.is_self_address)."""
+    ips: set[str] = set()
+    with contextlib.suppress(OSError):
+        lines = Path("/proc/net/fib_trie").read_text().splitlines()
+        for prev, line in itertools.pairwise(lines):
+            if "/32 host LOCAL" in line:
+                ips.add(prev.strip().split()[-1])
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        for line in Path("/proc/net/if_inet6").read_text().splitlines():
+            raw = line.split()[0]
+            ips.add(str(ipaddress.ip_address(":".join(raw[i : i + 4] for i in range(0, 32, 4)))))
+    with contextlib.suppress(OSError):
+        ips |= {str(i[4][0]) for i in socket.getaddrinfo(socket.gethostname(), 0)}
+    return frozenset(ips)
 
 
 def _from_gate(flow: http.HTTPFlow) -> bool:
     """The request comes from inside the gate container (account enrollment), not from the agent."""
     return (flow.client_conn.peername or ("?",))[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
-
-
-def _model(req: http.Request) -> str | None:
-    """The `model` a Claude API request asks for (JSON body), None when there is none."""
-    if req.method != "POST" or not req.raw_content or len(req.raw_content) > 32 << 20:
-        return None
-    try:
-        model = json.loads(req.get_content(strict=False) or b"").get("model")
-    except (ValueError, AttributeError):
-        return None
-    return model[:80] if isinstance(model, str) else None
 
 
 def refuse(flow: http.HTTPFlow, v: Verdict) -> None:
@@ -172,6 +212,7 @@ class Gate:
         # and with the eager connection strategy that happens before the TLS / TCP hooks run.
         self._dest: dict[str, str] = {}
         self._dead = session.DeadLimiter()  # one session-dead event per identity per minute
+        self._unauth = session.Unauthorized()  # 401 under an identity, per distinct route
 
     def load(self, loader) -> None:
         loader.add_option("bh_state", str, "/state", "bull-harness state dir")
@@ -181,7 +222,7 @@ class Gate:
             return  # another option changed: keep the policy and its rate-limit buckets
         self.state = Path(ctx.options.bh_state)
         (self.state / paths.FLOWS_DIR).mkdir(parents=True, exist_ok=True)
-        self.policy = Policy(self.state / paths.ACTIVE_SCOPE)
+        self.policy = Policy(self.state / paths.ACTIVE_SCOPE, local_ips=local_addresses())
         self.policy.reload()
         if ctx.options.rawtcp:
             ctx.options.update(rawtcp=False)  # non-HTTP bytes are not relayed (tcp hooks below kill the rest)
@@ -239,7 +280,7 @@ class Gate:
             {
                 "kind": "blocked",
                 "where": where,
-                "url": self._named(flow)[0],
+                "url": redact.url(self._named(flow)[0]),
                 "method": flow.request.method,
                 "reason": v.reason,
                 "rule": v.rule,
@@ -332,20 +373,36 @@ class Gate:
     def _relay(self, flow: http.HTTPFlow) -> None:
         flow.metadata["bh_class"] = "relay"
         peer = (flow.client_conn.peername or ("?",))[0]
-        if not _relay_peer_ok(peer):  # the gate also sits on the lab network: a target must not reach the token
+        roles = _relay_role(peer)
+        if not roles:  # the gate also sits on the lab network: a target must not reach the token
             self._deny(flow, deny(f"relay: only the agent and judge containers may use it (not {peer})"), "relay")
             return
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
         req = flow.request
         path = req.path.split("?")[0]
         run = self._active_run()
-        self._log(paths.EVENTS, {"kind": "relay", "method": req.method, "path": path[:120], "model": _model(req)})
+        betas = split_betas(req.headers.get_all("anthropic-beta"))
+        body = req.get_content(strict=False) if req.method == "POST" else None
+        why, model = check_relay(body, betas, relay_models_for(roles, path), RELAY_BETAS)
+        self._log(
+            paths.EVENTS,
+            {
+                "kind": "relay",
+                "method": req.method,
+                "path": path[:120],
+                "model": model,
+                "client": ",".join(sorted(roles)),
+                "betas": [b[:80] for b in betas[:40]],  # what Claude Code really sends: the allowlist's source
+            },
+        )
         if not token:
             reason = "relay: no token in the gate"
         elif (req.method, path) not in RELAY_PATHS:
             reason = f"relay: {req.method} {path[:60]} is not a call Claude Code makes"
         elif not run:  # between runs the sandbox has no business spending the quota
             reason = "relay: no run in progress"
+        elif why:  # what the body asks Anthropic to do (H1): judged before it costs any budget
+            reason = f"relay: {why}"
         else:
             used = self._relay_used.get(self._run_mtime, 0)
             budget = run.get("relay_max") if isinstance(run.get("relay_max"), int) else RELAY_DEFAULT_MAX
@@ -370,6 +427,7 @@ class Gate:
     async def request(self, flow: http.HTTPFlow) -> None:
         if flow.response is not None:  # already denied at CONNECT
             return
+        self.policy.reload()  # first: the identity file below is looked up under the program in force (B2)
         if self._is_relay(flow):
             self._relay(flow)
             return
@@ -377,7 +435,8 @@ class Gate:
         identity = req.headers.pop(IDENTITY_HEADER, None)
         if identity is not None and self._identity_file(identity) is None:
             self._log(
-                paths.EVENTS, {"kind": "identity-missing", "identity": identity[:60], "url": self._named(flow)[0]}
+                paths.EVENTS,
+                {"kind": "identity-missing", "identity": identity[:60], "url": redact.url(self._named(flow)[0])},
             )
             identity = None  # an unknown name is no identity: it must not unlock writes
         flow.metadata["bh_identity"] = identity
@@ -438,14 +497,20 @@ class Gate:
         url = self._named(flow)[0]
         sess = session.load(path) if path else None
         if sess is None:
-            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": url})
+            self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": redact.url(url)})
             return
         req, mark = flow.request, f"<identity:{name}>"
-        injected = {k: v for k, v in sess["headers"].items() if k.lower() != "cookie"}
+        decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
+        # M7: the identity's headers (a bearer token...) and static Cookie only go to its own origins
+        own = session.headers_go_to(decl, url)
+        if not own:
+            flow.metadata["bh_identity_withheld"] = True
+        headers = sess["headers"] if own else {}
+        injected = {k: v for k, v in headers.items() if k.lower() != "cookie"}
         for k, val in injected.items():
             req.headers[k] = val
         jar = session.cookies_for(sess, url)
-        static = session.parse_cookie_header(next((v for k, v in sess["headers"].items() if k.lower() == "cookie"), ""))
+        static = session.parse_cookie_header(next((v for k, v in headers.items() if k.lower() == "cookie"), ""))
         ident_cookies = jar + [(n, v) for n, v in static if n not in {j for j, _ in jar}]
         redacted = {k.lower(): mark for k in injected}
         if ident_cookies:
@@ -455,7 +520,6 @@ class Gate:
             if replaced:
                 flow.metadata["bh_cookie_replaced"] = replaced
         flow.metadata["bh_redact"] = redacted
-        decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
         flow.metadata["bh_session"] = {
             "file": str(path),
             "login_url": decl.get("login_url"),
@@ -477,6 +541,7 @@ class Gate:
                 session.absorb(Path(info["file"]), url, set_cookies, in_scope=flow.metadata.get("bh_class") == "target")
             except OSError as exc:  # a jar that cannot be written costs a stale session, not the answer
                 ctx.log.error(f"bh-gate: cannot update the session of {ident}: {exc}")
+        seen = _now()  # the event carries the time of the answer, not of its ingestion (H4)
         reason = session.dead_reason(
             flow.request.method,
             url,
@@ -485,18 +550,24 @@ class Gate:
             login_url=info["login_url"],
             probe=info["probe"],
         )
-        if reason and self._dead.allow(ident):
-            self._log(
-                paths.EVENTS,
-                {
-                    "kind": "session-dead",
-                    "identity": ident,
-                    "host": host,
-                    "status": resp.status_code,
-                    "reason": reason,
-                    "url": redact.url(url),
-                },
-            )
+        routes = None
+        if reason is None and resp.status_code == 401:
+            # one 401 is an access rule (the control of an access test); 401 on several routes is a dead session
+            routes = self._unauth.hit(ident, url, seen)
+            reason = "401-repeated" if routes else None
+        if reason and self._dead.allow(ident, seen):
+            rec = {
+                "kind": "session-dead",
+                "ts": seen,
+                "identity": ident,
+                "host": host,
+                "status": resp.status_code,
+                "reason": reason,
+                "url": redact.url(url),
+            }
+            if routes:
+                rec["routes"] = routes
+            self._log(paths.EVENTS, rec)
 
     @fail_closed
     def response(self, flow: http.HTTPFlow) -> None:
@@ -512,13 +583,9 @@ class Gate:
         resp = flow.response
         url, host = self._named(flow)
         self.policy.note_answer(url, resp.status_code)
-        body = resp.raw_content or b""
         server = resp.headers.get("server", "").lower()
-        waf = resp.status_code in (403, *PUSHBACK_STATUS) and bool(
-            "cf-mitigated" in resp.headers
-            or WAF_MARKERS.search(body[:65536])
-            or (resp.status_code == 403 and any(s in server for s in ("cloudflare", "akamai", "awselb")))
-        )
+        # H3: only the WAF's own answers count (cf-mitigated, challenge or block page), never `Server: cloudflare`
+        waf = is_waf(resp.status_code, dict.fromkeys(resp.headers.keys(), ""), resp.raw_content)
         if waf or resp.status_code in PUSHBACK_STATUS:
             self.policy.penalize(host, waf=waf)  # repeated WAF answers pause the host (policy.WAF_LIMIT)
         if waf:
@@ -527,7 +594,7 @@ class Gate:
                 {
                     "kind": "waf",
                     "host": host,
-                    "url": url,
+                    "url": redact.url(url),
                     "status": resp.status_code,
                     "server": server,
                     "flow": fid,
@@ -539,7 +606,7 @@ class Gate:
                 {
                     "kind": "auth",
                     "host": host,
-                    "url": url,
+                    "url": redact.url(url),
                     "flow": fid,
                     "identity": flow.metadata.get("bh_identity"),
                 },
@@ -574,6 +641,8 @@ class Gate:
             "ua": flow.metadata.get("bh_ua", "")[:120],
             "identity": flow.metadata.get("bh_identity"),
         }
+        if flow.metadata.get("bh_identity_withheld"):
+            rec["identity_headers"] = "withheld"  # not one of the identity's origins: jar cookies only
         if replaced := flow.metadata.get("bh_cookie_replaced"):
             rec["cookie_replaced"] = replaced  # agent cookies the identity's jar overrode (names only)
         if req.host_header and parse_authority(req.host_header, check=False)[0] != host:

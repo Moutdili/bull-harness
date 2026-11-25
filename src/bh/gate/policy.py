@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import os
 import re
 import time
 from collections import deque
@@ -60,6 +61,17 @@ MISS_LIMIT, MISS_WINDOW_S = 25, 300
 ID_KEY = re.compile(r"^(pk|key|ref|no|num|number)$|(id|uuid|_no|_number)$", re.I)
 _GRAPHQL_ARG = re.compile(r'\b(\w+)\s*:\s*\\?"?([\w-]+)')
 BODY_SCAN_BYTES = 64 << 10
+# What makes an answer a WAF's own page (challenge, block page), not the application's. Never the Server header
+# alone: Cloudflare or Akamai put their name on every answer they relay, the application's 403 included.
+WAF_MARKERS = re.compile(
+    rb"(Attention Required!? \| Cloudflare|Just a moment\.\.\.|cf-chl-|cf-error-details|error code: 1020|"
+    rb"_Incapsula_Resource|Request unsuccessful\. Incapsula|Access Denied.{0,200}Reference #|"
+    rb"The requested URL was rejected|Request blocked\..{0,100}(AWS|CloudFront)|Sucuri WebSite Firewall|"
+    rb"captcha-delivery\.com|px-captcha)",
+    re.I | re.S,
+)
+WAF_STATUS = (403, 429, 503)
+WAF_SCAN_BYTES = 64 << 10
 
 
 def _now() -> float:
@@ -73,6 +85,28 @@ def _host_key(host: str) -> str:
 
 def is_system(host: str) -> bool:
     return host.lower().rstrip(".") in SYSTEM_HOSTS
+
+
+def is_self_address(ip: str, local: frozenset[str] = frozenset()) -> bool:
+    """The gate itself as a destination: loopback, the unspecified address, or one of the gate's own addresses
+    (`local`). Refused whatever the scope says: an agent that chains the proxy onto itself escapes the flow log."""
+    try:
+        addr = ipaddress.ip_address(ip.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr.is_loopback or addr.is_unspecified or str(addr) in local
+
+
+def is_waf(status: int, headers: dict[str, str] | None, body: bytes | None) -> bool:
+    """An answer the WAF made: `cf-mitigated`, or a challenge / block page in the body. The `Server` header and
+    the status alone never count, so the application's own 403 behind Cloudflare is no WAF answer."""
+    if status not in WAF_STATUS:
+        return False
+    if any(k.lower() == "cf-mitigated" for k in (headers or {})):
+        return True
+    return bool(WAF_MARKERS.search((body or b"")[:WAF_SCAN_BYTES]))
 
 
 def is_public_ip(ip: str) -> bool:
@@ -132,6 +166,7 @@ class Policy:
     # In memory only: a gate restart lifts every pause (acceptable, the window is one hour).
     waf_seen: dict[str, deque] = field(default_factory=dict)  # host -> deque[ts of WAF answers]
     host_blocked_until: dict[str, float] = field(default_factory=dict)  # host -> end of its WAF cooldown
+    local_ips: frozenset[str] = frozenset()  # the gate's own addresses (never a destination, B3)
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -174,6 +209,8 @@ class Policy:
         """CONNECT host:port, before any byte of the tunnel is seen."""
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
+        if is_self_address(host, self.local_ips):
+            return deny(f"{host} is the gate itself", "self")
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         v = self._target(authority)
         if v is not None:
@@ -198,6 +235,8 @@ class Policy:
         method = method.upper()
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
+        if is_self_address(host, self.local_ips):
+            return deny(f"{host} is the gate itself", "self")
         v = self._target(url)
         if v is not None and v.allowed:
             if paused := self._waf_cooldown(host, v):
@@ -286,7 +325,10 @@ class Policy:
         return None
 
     def check_ip(self, host: str, ip: str) -> Verdict:
-        """After resolution, before connecting. Non-targets must resolve to public addresses."""
+        """After resolution, before connecting. Non-targets must resolve to public addresses; nothing may resolve
+        to the gate itself (loopback, its own addresses), whatever the scope."""
+        if is_self_address(ip, self.local_ips):
+            return deny(f"{host} resolves to the gate itself ({ip})", "self")
         if is_system(host) or is_passive(host):
             klass = "system" if is_system(host) else "passive"
             ok = is_public_ip(ip)
@@ -414,3 +456,189 @@ def id_params(url: str, body: bytes | None) -> set[tuple[str, str]]:
 def _route_path(path: str) -> str:
     path = re.sub(r";[^/]*", "", unquote(path)).lower()
     return re.sub(r"/{2,}", "/", path).rstrip("/") or "/"
+
+
+# ------------------------------------------------------------------ Claude API relay: what a request may ask for
+# The relay holds the OAuth token: anything the body asks Anthropic to do runs with Mio's account. Server tools
+# (web_search, web_fetch, code_execution, computer...), remote MCP servers, a code container or a URL source make
+# Anthropic's infrastructure reach the network outside the gate: all refused. Shapes from the Messages API reference,
+# https://platform.claude.com/docs/en/api/messages/create (`tools`: the `Tool object` has `type: optional "custom"
+# or null`, `name` ^[a-zA-Z0-9_-]{1,128}$, `input_schema` {type: "object"}; every other tool variant has a reserved
+# `type` such as `bash_20250124`, `web_search_20260209`, `computer_toolset_20260801`, `mcp_toolset`).
+RELAY_BODY_MAX = 32 << 20
+RELAY_WALK_MAX = 2_000_000  # JSON nodes looked at for URL / file sources; past this the body is refused
+CLIENT_TOOL_KEYS = frozenset(
+    {
+        "type",
+        "name",
+        "description",
+        "input_schema",
+        "cache_control",
+        "defer_loading",
+        "eager_input_streaming",
+        "input_examples",
+        "strict",
+        "allowed_callers",
+    }
+)
+_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,128}")
+# top-level fields that hand Anthropic a network reach or a sandbox of its own
+RELAY_EGRESS_FIELDS = ("mcp_servers", "container")
+# Models per relay client (the container that sent the request), overridable with BH_RELAY_MODELS_AGENT /
+# BH_RELAY_MODELS_JUDGE (comma-separated ids). Exact API ids: Claude Code resolves its aliases before sending.
+# hunter: `sonnet` (DEFAULT_MODEL) or `opus`, as Claude Code 2.1.330 resolves them; judge: `opus`
+# (BH_VERIFIER_MODEL) and the escalation model (BH_ESCALATION_MODEL).
+RELAY_MODELS_DEFAULT = {
+    "agent": ("claude-sonnet-5-5", "claude-opus-5-5"),
+    "judge": ("claude-opus-5-5", "claude-mythos-5-2"),
+}
+# anthropic-beta values the relay lets through (BH_RELAY_BETAS replaces the list). Taken from the beta table of
+# Claude Code 2.1.330 (strings of the binary), keeping only those that change how a request is answered (auth,
+# thinking, caching, context, output shape, fallback) and never what Anthropic does on its own: web search, MCP
+# servers, files, environments, tool provenance (a server_url), tool search, advisor, fast mode, AFK / auto mode,
+# side queries, "dangerous tool use" are left out. A refused value is named in the `blocked` event, and every
+# relayed request logs its values (`relay` event): the list grows from the journal, one reviewed value at a time.
+RELAY_BETAS_DEFAULT = frozenset(
+    {
+        "oauth-2025-04-20",
+        "claude-code-20250219",
+        "interleaved-thinking-2025-05-14",
+        "context-1m-2025-08-07",
+        "context-management-2025-06-27",
+        "structured-outputs-2025-12-15",
+        "effort-2025-11-24",
+        "task-budgets-2026-03-13",
+        "token-counting-2024-11-01",
+        "prompt-caching-scope-2026-01-05",
+        "prompt-caching-evict-2026-05-12",
+        "cache-keepalive-2026-09-03",
+        "extended-cache-ttl-2025-04-11",
+        "cache-diagnosis-2026-04-07",
+        "redact-thinking-2026-02-12",
+        "thinking-resumption-2026-07-17",
+        "resumption-2026-10-08",
+        "thinking-token-count-2026-05-13",
+        "thinking-display-updates-2026-08-18",
+        "thinking-binding-controls-2026-08-01",
+        "context-hint-2026-04-09",
+        "mid-conversation-system-2026-04-07",
+        "mid-conversation-system-clear-at-2026-08-21",
+        "mid-conversation-tool-changes-2026-07-01",
+        "per-turn-control-2026-07-01",
+        "inline-tools-2026-09-15",
+        "timing-2026-09-09",
+        "server-side-fallback-2026-06-01",
+        "server-side-fallback-2026-07-01",
+        "fallback-credit-2026-06-01",
+        "program-use-case-ids-2026-09-17",
+        "message-threads-2026-08-12",
+    }
+)
+
+
+def _csv_env(name: str, env=None) -> tuple[str, ...]:
+    raw = (os.environ if env is None else env).get(name) or ""
+    return tuple(v.strip() for v in raw.split(",") if v.strip())
+
+
+def relay_models(env=None) -> dict[str, frozenset[str]]:
+    """Models each relay client ("agent", "judge") may ask for."""
+    return {
+        role: frozenset(_csv_env(f"BH_RELAY_MODELS_{role.upper()}", env) or default)
+        for role, default in RELAY_MODELS_DEFAULT.items()
+    }
+
+
+def relay_betas(env=None) -> frozenset[str]:
+    return frozenset(_csv_env("BH_RELAY_BETAS", env) or RELAY_BETAS_DEFAULT)
+
+
+def split_betas(values: list[str]) -> list[str]:
+    """anthropic-beta header values (repeated header and/or comma lists) -> one value per entry."""
+    return [b.strip() for v in values for b in v.split(",") if b.strip()]
+
+
+def _client_tool(tool) -> str | None:
+    """None for a client tool (run by Claude Code, in the sandbox, behind this gate), else why not."""
+    if not isinstance(tool, dict):
+        return "a tool that is not an object"
+    kind, name = tool.get("type"), tool.get("name")
+    label = repr(str(kind if kind is not None else name)[:60])
+    if kind not in (None, "custom"):
+        return f"server tool {label}"
+    if extra := sorted(set(tool) - CLIENT_TOOL_KEYS):
+        return f"tool {label} with fields {extra[:5]}"
+    if not isinstance(name, str) or not _TOOL_NAME.fullmatch(name):
+        return f"tool {label} without a client tool name"
+    schema = tool.get("input_schema")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return f"tool {label} without an input_schema object"
+    if tool.get("allowed_callers") not in (None, ["direct"]):
+        return f"tool {label} callable from code execution"
+    return None
+
+
+def _remote_source(obj) -> str | None:
+    """A content block whose `source` makes Anthropic fetch a URL or read an uploaded file."""
+    stack, seen = [obj], 0
+    while stack:
+        node = stack.pop()
+        seen += 1
+        if seen > RELAY_WALK_MAX:
+            return "a body too large to inspect"
+        if isinstance(node, dict):
+            src = node.get("source")
+            if isinstance(src, dict) and src.get("type") in ("url", "file"):
+                return f"a {src.get('type')} source"
+            stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
+    return None
+
+
+def check_relay(
+    body: bytes | None, betas: list[str], models: frozenset[str], allowed_betas: frozenset[str]
+) -> tuple[str | None, str | None]:
+    """Judge one Claude API request on the relay. Returns (refusal reason or None, model asked for).
+
+    `models`: the ids this request may name (the client's list; for count_tokens, every relay model, since counting
+    spends no generation). Refused: an anthropic-beta value off the list, a body that is not a JSON object, a model
+    off the list, any server or non-client tool, `mcp_servers` / `container`, a URL or file source, fallbacks to a
+    model off the list, fast mode."""
+    for b in betas:
+        if b not in allowed_betas:
+            return f"anthropic-beta {b[:80]!r} is not on the gate's list", None
+    if not body or len(body) > RELAY_BODY_MAX:
+        return "unreadable body (empty or over the size limit)", None
+    try:
+        doc = json.loads(body)
+    except (ValueError, RecursionError):
+        return "unreadable body (not JSON)", None
+    if not isinstance(doc, dict):
+        return "unreadable body (not a JSON object)", None
+    model = doc.get("model")
+    model = model[:80] if isinstance(model, str) else None
+    if model not in models:
+        return f"model {model!r} is not allowed for this client (allowed: {sorted(models)})", model
+    for key in RELAY_EGRESS_FIELDS:
+        if doc.get(key) is not None:
+            return f"{key} is not allowed (Anthropic would reach the network outside the gate)", model
+    tools = doc.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            return "tools is not a list", model
+        for tool in tools:
+            if why := _client_tool(tool):
+                return f"{why} is not allowed: client tools only", model
+    fallbacks = doc.get("fallbacks")
+    fallbacks_ok = fallbacks in (None, "default") or (
+        isinstance(fallbacks, list)
+        and all(isinstance(f, dict) and set(f) == {"model"} and f["model"] in models for f in fallbacks)
+    )
+    if not fallbacks_ok:
+        return "fallbacks to a model this client may not use", model
+    if doc.get("speed") is not None:
+        return "speed is not allowed (fast mode spends the quota twice as fast)", model
+    if why := _remote_source([doc.get("system"), doc.get("messages")]):
+        return f"{why} is not allowed (Anthropic would fetch it)", model
+    return None, model
