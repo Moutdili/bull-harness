@@ -352,3 +352,16 @@ def test_the_policy_is_reloaded_before_the_identity_file_is_looked_up(addon, tmp
     asyncio.run(g.request(f))
     assert g.policy.program == "new" and f.metadata["bh_identity"] == "user-a"
     assert not [e for e in _events(tmp_path) if e["kind"] == "identity-missing"]
+
+
+def test_relay_tap_reports_id_and_stop_reason_and_passes_chunks(addon):
+    seen = []
+    tap = addon.RelayTap(seen.append)
+    chunks = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_01Ab',
+        b'Cd","type":"message"}}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n',
+    ]
+    assert [tap(c) for c in chunks] == chunks  # unchanged, in order
+    assert seen == [{"msg_id": "msg_01AbCd", "stop_reason": "refusal"}]
+    assert tap(b"garbage \xff") == b"garbage \xff" and len(seen) == 1

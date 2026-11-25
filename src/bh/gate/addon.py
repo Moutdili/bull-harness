@@ -200,6 +200,31 @@ def fail_closed(hook):
     return wrapper
 
 
+class RelayTap:
+    """Stream filter for the relay's SSE answer: passes every chunk through unchanged and reports the message id
+    (`message_start`) and its `stop_reason` (`message_delta`) once each. Never raises: a parsing problem costs a
+    journal line, not the answer."""
+
+    _ID = re.compile(rb'"type"\s*:\s*"message_start"\s*,\s*"message"\s*:\s*\{\s*"id"\s*:\s*"(msg_[A-Za-z0-9_-]{1,80})"')
+    _STOP = re.compile(rb'"stop_reason"\s*:\s*"([a-z_]{1,40})"')
+
+    def __init__(self, report):
+        self.report, self.tail, self.msg_id, self.stopped = report, b"", None, False
+
+    def __call__(self, chunk: bytes) -> bytes:
+        try:
+            buf = self.tail + chunk
+            if self.msg_id is None and (m := self._ID.search(buf)):
+                self.msg_id = m.group(1).decode()
+            if not self.stopped and (m := self._STOP.search(buf)):
+                self.stopped = True
+                self.report({"msg_id": self.msg_id, "stop_reason": m.group(1).decode()})
+            self.tail = buf[-512:]  # a pattern cut between two chunks is found in the next one
+        except Exception:  # noqa: BLE001 - observation only
+            pass
+        return chunk
+
+
 class Gate:
     def __init__(self) -> None:
         self.policy: Policy | None = None
@@ -420,7 +445,11 @@ class Gate:
     @fail_closed
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         if flow.metadata.get("bh_class") == "relay":
-            flow.response.stream = True  # server-sent events: relay as they come, never buffered or logged
+            # server-sent events: relayed as they come, never buffered or stored. Only the status, the message id
+            # and its stop_reason are journaled, so the runner can check a quota stop (429) or a refusal it read in
+            # claude's output against what really came back (runner.quota_confirmed / refusal_confirmed)
+            self._log(paths.EVENTS, {"kind": "relay", "status": flow.response.status_code})
+            flow.response.stream = RelayTap(lambda rec: self._log(paths.EVENTS, {"kind": "relay", **rec}))
 
     # ---- HTTP hooks
     @fail_closed
