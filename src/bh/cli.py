@@ -510,6 +510,27 @@ def cmd_accounts(args) -> int:
     return rc
 
 
+def cmd_accounts_mail_check(args) -> int:
+    """Refresh the Gmail token and count the last 24 h of mail to the researcher alias. Prints a count only:
+    never a subject, a sender, a body or a token."""
+    from bh.accounts import mail
+
+    alias = _researcher().get("BH_YWH_EMAIL", "").strip()
+    if not alias:
+        raise SystemExit("ERR no BH_YWH_EMAIL in secrets/researcher.env")
+    box = mail.mailbox()
+    if not isinstance(box, mail.GmailMailbox):
+        raise SystemExit(f"ERR no Gmail token with a refresh_token at {mail.token_path()} (BH_GMAIL_TOKEN)")
+    try:
+        box.refresh()
+        n = box.count(alias, time.time() - 86400)
+    except mail.MailError as exc:
+        print(f"ERR {exc}")
+        return 1
+    print(f"token ok, {n} message(s) to {mail.mask(alias)} in 24 h")
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bh", description="bull-harness CLI")
@@ -627,6 +648,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name != "ls":
             a.add_argument("--force", action="store_true", help="lift the one-login-per-hour limit")
         a.set_defaults(func=cmd_accounts, force=False)
+    acs.add_parser(
+        "mail-check", help="Gmail (read-only): refresh the token, count 24 h of mail to the researcher alias"
+    ).set_defaults(func=cmd_accounts_mail_check)
 
     fl = sub.add_parser("flows", help="last requests seen by the gate (targets only)")
     fl.add_argument("-n", type=int, default=30)
