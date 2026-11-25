@@ -56,3 +56,13 @@ def test_program_exclusions_remove_a_class_only_when_they_name_it():
 def test_blind_ssrf_is_a_blocker_not_a_lead_for_someone():
     text = classes.BY_ID["ssrf"].evidence
     assert 'bh-note blocked oob-needed "' in text and "human" not in text
+
+
+def test_access_control_cards_point_at_bh_authz_and_its_proof():
+    for cid in ("idor", "broken-access-control"):
+        tool = classes.BY_ID[cid].tool
+        assert "bh-authz" in tool and "proof.json" in tool and "--proof" in tool, cid
+        assert "bh-authz" not in classes.evidence(cid)  # the verifier's standard does not name a hunter's tool
+    assert "Tool: `bh-authz`" in classes.cards_block(["idor"])
+    assert classes.canonical("Broken Access Control") == "broken-access-control"
+    assert classes.canonical("BOLA") == "idor" and classes.canonical("privilege-escalation") == "auth"

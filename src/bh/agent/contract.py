@@ -349,7 +349,18 @@ def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases:
 # ------------------------------------------------------------------ command classification (metrics)
 # The one table of tools: hooks (program rules, verifier), metrics and builtins all read it.
 # bh-browse maps; with --xss it tests (see _BROWSE_XSS). bh-zap maps (spider + passive); with --active it scans.
-MAPPERS = ("bh-recon", "bh-crawl", "bh-browse", "bh-zap", "katana", "subfinder", "httpx-toolkit", "httpx")
+# bh-authz reads the known endpoints as each identity (a mapper); with --write-own it writes (a scanner, _AUTHZ_WRITE).
+MAPPERS = (
+    "bh-recon",
+    "bh-crawl",
+    "bh-browse",
+    "bh-zap",
+    "bh-authz",
+    "katana",
+    "subfinder",
+    "httpx-toolkit",
+    "httpx",
+)
 SCANNERS = (
     "bh-content",
     "bh-scan",
@@ -406,6 +417,8 @@ _SCANNER_EXTRA = re.compile(
 _BROWSE_XSS = re.compile(r"(?<![\w.-])(bh-browse|bh-agent\s+browse)(?![\w.-])[\s\S]*\s--xss\b")
 # bh-zap --active runs ZAP's active scan: a scanner. Same fail-closed reading.
 _ZAP_ACTIVE = re.compile(r"(?<![\w.-])(bh-zap|bh-agent\s+zap)(?![\w.-])[\s\S]*\s--active\b")
+# bh-authz --write-own sends cross-identity writes: a scanner (programs without scanners refuse it). Same reading.
+_AUTHZ_WRITE = re.compile(r"(?<![\w.-])(bh-authz|bh-agent\s+authz)(?![\w.-])[\s\S]*\s--write-own\b")
 
 
 _SIMPLE_SEP = set(";&|\n()")
@@ -461,12 +474,13 @@ def runs_scanner(cmd: str) -> bool:
         or _SCANNER_EXTRA.search(bare)
         or _BROWSE_XSS.search(bare)
         or _ZAP_ACTIVE.search(bare)
+        or _AUTHZ_WRITE.search(bare)
     )
 
 
 def runs_mapper(cmd: str) -> bool:
     bare = cmd.replace("'", " ").replace('"', " ")
-    return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl|browse|zap)\b", bare))
+    return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl|browse|zap|authz)\b", bare))
 
 
 _MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh|qq?)(?=\s|$)")

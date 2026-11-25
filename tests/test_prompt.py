@@ -84,3 +84,12 @@ def test_only_live_identities_are_announced():
     )
     assert "user-a" in scope_block(s, ["user-a"]) and "user-b" not in scope_block(s, ["user-a"])
     assert "Identities: none" in scope_block(s, [])
+
+
+def test_doctrine_runs_bh_authz_after_mapping_before_manual_access_tests():
+    doc = DOCTRINE.splitlines()
+    i = next(n for n, ln in enumerate(doc) if "bh-authz" in ln)
+    lines = doc[i : i + 2]
+    assert sum("bh-authz" in ln for ln in doc) == 1 and "bh-authz" not in doc[i + 2]
+    assert "proof.json" in lines[0] and "--write-own" in lines[0]
+    assert "2+ identities" in lines[1] and "mapping" in lines[1] and "by hand" in lines[1]

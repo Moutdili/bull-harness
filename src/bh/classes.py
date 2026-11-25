@@ -18,6 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CARDS_DIR = Path(__file__).parent / "cards"
+# first pass of the access-control classes (idor, broken-access-control): the builtin and the proof it leaves
+AUTHZ_TOOL = (
+    "`bh-authz` (after mapping, 2+ identities): every known endpoint as each identity and anonymous; it flags owner "
+    "data seen by another identity (horizontal) or a role's answer given to a lower role (vertical), and with "
+    "`--write-own` a cross-identity PATCH on your own object. It leaves raw/authz-*/proof.json for the best candidate: "
+    "read it, then `bh-note finding ... --class idor|broken-access-control --proof <that path>`."
+)
 MAX_CARDS = 3  # per segment: cards are resent every turn
 
 
@@ -30,6 +37,7 @@ class VulnClass:
     evidence: str = ""
     card: bool = False  # has a method card
     weight: float = 1.0  # < 1 for signals that match broadly (every /api/ route, every login page)
+    tool: str = ""  # the builtin that does the first pass for this class (shown with the card, not to the verifier)
 
     def __post_init__(self) -> None:  # `(r"x")` is a str, not a tuple: accept both
         for name in ("aliases", "path_signals", "param_signals"):
@@ -54,6 +62,25 @@ CLASSES: tuple[VulnClass, ...] = (
         "request for A's own object works and an unauthenticated request is refused. An empty 200, an OPTIONS "
         "or preflight answer, or public data is not access.",
         True,
+        tool=AUTHZ_TOOL,
+    ),
+    VulnClass(
+        "broken-access-control",
+        (
+            "broken-access-control",
+            "access-control",
+            "missing-access-control",
+            "improper-access-control",
+            "bfla",
+            "broken-function-level-authorization",
+            "missing-function-level-access-control",
+            "vertical-privilege-escalation",
+        ),
+        evidence="A lower-privileged identity (or no session) reads or performs what only a higher role, or only the "
+        "object's owner or tenant, may: the answer holds that role's or owner's data, or the action takes effect. "
+        "Control: the same request as an identity without the right, or without a session, is refused. The same "
+        "public answer for everyone, or an answer without the protected data, is not a bypass.",
+        tool=AUTHZ_TOOL,
     ),
     VulnClass(
         "auth",
@@ -297,6 +324,9 @@ def cards_block(class_ids: list[str]) -> str:
     if not class_ids:
         return ""
     cards = [
-        f"{card_text(c)}\nProof standard (the verifier applies exactly this): {BY_ID[c].evidence}" for c in class_ids
+        f"{card_text(c)}\n"
+        + (f"Tool: {BY_ID[c].tool}\n" if BY_ID[c].tool else "")
+        + f"Proof standard (the verifier applies exactly this): {BY_ID[c].evidence}"
+        for c in class_ids
     ]
     return "\n\n".join(["# Method cards for this segment (picked from the attack surface)", *cards])

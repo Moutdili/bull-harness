@@ -41,6 +41,8 @@ Options for all: `--as <identity>` (authenticated), `--timeout <s>`. They run fo
 - `bh-xss <url?p=x>` reflected XSS (dalfox)
 - `bh-browse <url> [--fill CSS=V]... [--click CSS] [--routes] [--xss M]` headless Chromium, text summary first; `--shot` only for a layout or a proof; `Read` an image only to decide
 - `bh-zap <url> [--ajax] [--active] [--max-alerts N]` ZAP daemon: spider + passive alerts; `--active` = active scan (slow, scanner)
+- `bh-authz [<url>...] [--owner <id>] [--write-own]` authorization matrix: every known endpoint as each identity and anonymous, owner data seen by another = IDOR / broken access control (horizontal, vertical); writes a ready proof.json
+  With 2+ identities, run it once mapping is done and before testing access control by hand; `--write-own` = cross-identity PATCH on your own objects (scanner)
 Hand-made requests: use `q` and `qq` rather than long curl lines (each line you write stays in your context).
 - `q [-a <identity>] [-X M] [-d body | -j json] [-H 'K: V'] [-n bytes] [-i] <url|/path>`: one request, prints
   status, size, type and the first 400 bytes (full body saved, path shown). A `/path` reuses the last origin.
