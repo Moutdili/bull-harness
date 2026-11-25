@@ -938,16 +938,16 @@ class Gate:
         if why:
             self._ws_refuse(flow, why, "websocket-message")
             return
-        if msg.from_client:
-            self._log(
-                paths.EVENTS,
-                {
-                    "kind": "ws-message",
-                    "ws": flow.id,
-                    "identity": flow.metadata.get("bh_identity"),
-                    **ws_message_record(content, binary=binary),
-                },
-            )
+        self._log(
+            paths.EVENTS,
+            {
+                "kind": "ws-message",
+                "ws": flow.id,
+                "from": "client" if msg.from_client else "server",
+                "identity": flow.metadata.get("bh_identity"),
+                **ws_message_record(content, binary=binary),
+            },
+        )
 
     @fail_closed
     def websocket_end(self, flow: http.HTTPFlow) -> None:

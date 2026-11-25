@@ -92,7 +92,8 @@ def test_messages_are_journaled_bounded_and_the_connection_closed(addon, tmp_pat
     g.websocket_end(f)
     ev = _events(tmp_path)
     msgs = [e for e in ev if e["kind"] == "ws-message"]
-    assert len(msgs) == 2 and "hunter2" not in json.dumps(msgs) and msgs[1]["binary"] is True
+    assert [m["from"] for m in msgs] == ["client", "client", "server"]  # both directions, redacted alike
+    assert "hunter2" not in json.dumps(msgs) and msgs[1]["binary"] is True
     assert all(len(m["sha256"]) == 64 for m in msgs)
     assert [e for e in ev if e["kind"] == "blocked" and "per minute" in e["reason"]]
     (end,) = [e for e in ev if e["kind"] == "websocket" and e["phase"] == "end"]
