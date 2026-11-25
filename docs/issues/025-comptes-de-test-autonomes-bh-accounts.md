@@ -22,3 +22,7 @@ Conteneur `browser` piloté par l'hôte (jamais par l'agent), recette d'inscript
 Plan : [docs/plan-v3.md](../plan-v3.md)
 
 Fermée le 2026-11-25 : inscription et reconnexion par recette, validées sur Juice Shop et Larkspur. Reste hors issue : lecture Gmail (code prêt, jeton Hermes `invalid_grant`, app OAuth à passer en production).
+
+2026-11-25 (soir) : Gmail branché. L'app OAuth `datk-oauth` est publiée (plus d'expiration à 7 jours) ; le harnais a
+son propre jeton lecture seule (`bh accounts gmail-login` → `secrets/gmail_token.json`, 0600), préféré à celui
+d'Hermes. `bh accounts mail-check` : token ok. Les codes de connexion Microsoft vont à `code_to` (Gmail de Mio).
