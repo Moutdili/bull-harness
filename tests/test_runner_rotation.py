@@ -203,11 +203,10 @@ def test_overflow_at_twice_the_threshold_cuts_the_leg_then_rotates(seg):
     assert board.rows("SELECT title FROM facts WHERE kind='handoff'")[0]["title"].startswith("HANDOFF (runner)")
 
 
-def test_rotation_metrics_need_their_columns(tmp_path, monkeypatch):
+def test_rotation_metrics_are_stored(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     board = Board(tmp_path / "var" / "board.sqlite")
     rid = board.run_start("p", "m")
-    run.run_set_known(board, rid, rotations=2, max_context=31000)  # no such columns yet: nothing written, no error
-    board.db.execute("ALTER TABLE runs ADD COLUMN rotations INTEGER")
-    run.run_set_known(board, rid, rotations=2, max_context=31000)
-    assert board.rows("SELECT rotations FROM runs WHERE id=?", rid)[0]["rotations"] == 2
+    board.run_set(rid, rotations=2, max_context=31000)
+    row = board.rows("SELECT rotations, max_context FROM runs WHERE id=?", rid)[0]
+    assert (row["rotations"], row["max_context"]) == (2, 31000)

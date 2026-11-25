@@ -663,7 +663,7 @@ def finish(
         record_refusal(board, prog)
     board.record_metrics(res.run_id, res.turn_log, res.tool_log)
     board.run_set(res.run_id, blockers=res.new_blockers, **gate_counts(board, res.run_id))
-    run_set_known(board, res.run_id, rotations=res.rotations, max_context=max(res.leg_context, default=None))
+    board.run_set(res.run_id, rotations=res.rotations, max_context=max(res.leg_context, default=None))
     graph = Graph(board, scope)
     graph.sync(res.run_id)
     for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
@@ -699,13 +699,6 @@ def finish(
         locked_calls=res.locked_calls,
         note=one_line(note, 500),
     )
-
-
-def run_set_known(board: Board, run_id: int, **fields) -> None:
-    """Set only the `runs` columns the board has: rotations / max_context wait for their db.py migration."""
-    cols = {r["name"] for r in board.rows("PRAGMA table_info(runs)")}
-    if known := {k: v for k, v in fields.items() if k in cols}:
-        board.run_set(run_id, **known)
 
 
 def last_fact_id(board: Board) -> int:
