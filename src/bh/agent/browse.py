@@ -26,6 +26,7 @@ import re
 import shlex
 import signal
 import struct
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -357,7 +358,35 @@ def _same_document(a: str, b: str) -> bool:
     return (pa.scheme, pa.netloc, pa.path, pa.query) == (pb.scheme, pb.netloc, pb.path, pb.query)
 
 
+GATE_CA = Path("/usr/local/share/ca-certificates/bh-gate.crt")  # installed by the entrypoint
+
+
+def trust_gate_ca(home: Path | None = None, ca: Path = GATE_CA) -> str | None:
+    """Chromium trusts the NSS DB under $HOME, not /etc/ssl/certs, and every segment and judge gets a fresh HOME:
+    put the gate CA there before the first launch (idempotent). Returns an error line, None when trusted."""
+    db = (home or Path.home()) / ".local/share/pki/nssdb"
+    if not ca.is_file():
+        return f"gate CA missing at {ca}: HTTPS pages will fail"
+    if (db / ".bh-gate").is_file():
+        return None
+    try:
+        db.mkdir(parents=True, exist_ok=True)
+        if not (db / "cert9.db").is_file():
+            subprocess.run(["certutil", "-d", f"sql:{db}", "-N", "--empty-password"], check=True, capture_output=True)
+        subprocess.run(
+            ["certutil", "-d", f"sql:{db}", "-A", "-t", "C,,", "-n", "bh-gate", "-i", str(ca)],
+            check=True,
+            capture_output=True,
+        )
+        (db / ".bh-gate").write_text("")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"cannot trust the gate CA in {db}: {exc}"
+    return None
+
+
 def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
+    if err := trust_gate_ca():
+        r.console_errors.append(err)  # shown in the summary: an HTTPS page will then fail on the certificate
     try:
         from playwright.sync_api import Error as PwError
         from playwright.sync_api import TimeoutError as PwTimeout

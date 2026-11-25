@@ -100,8 +100,10 @@ CLASSES: tuple[VulnClass, ...] = (
         (r"/(search|comment|feedback|review|profile|message|post)",),
         (r"q|query|search|message|comment|name|title|text"),
         "The payload reaches an executable context unencoded (HTML tag or attribute, script, javascript: URL) and "
-        "executes. Reflection alone, or a payload that is HTML-encoded, is not XSS. Without a browser, report the "
-        "exact context and say that execution is not proven.",
+        "executes. Reflection alone, or a payload that is HTML-encoded, is not XSS. Prove execution in a real "
+        "browser: `bh-browse '<url with payload>' --xss <marker>` with a payload that calls alert('<marker>'); "
+        "only `xss CONFIRMED (marker ...)` is proof. Client-side routes (`/#/...`) and DOM sinks are tested the "
+        "same way; in proof.json such a step carries `\"browse\": {\"xss\": \"<marker>\"}`.",
         True,
     ),
     VulnClass(

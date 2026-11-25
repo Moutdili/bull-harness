@@ -18,13 +18,21 @@ only the identity, the query or the body differ) and must expect something diffe
 step through the gate (same scope, identities injected by the gate), twice, and reports which
 expectations held. The proof is disproved when a control's answer satisfies its attack's expectation
 (no differential). No LLM involved.
+
+A step that only a rendered page proves (DOM XSS, a client-side route) adds `"browse": {"xss": "<marker>"}`
+(GET only): replay runs `bh-browse <url> --xss <marker>` and its text summary is the step's body, so the attack
+expects `{"contains": ["xss CONFIRMED (marker <marker>)"]}` and its twin control (same route, benign value)
+expects `{"absent": ["xss CONFIRMED"]}`.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -38,6 +46,9 @@ ROLES = ("setup", "attack", "control")
 METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 EXPECT_KEYS = ("status", "contains", "absent", "regex")
 MAX_STEPS, TIMEOUT_S, ROUNDS, SNIPPET, MAX_REGEX = 8, 20, 2, 300, 200
+BROWSE_TIMEOUT_S = 90  # one rendered page through the gate (17-40 s measured on the lab)
+_MARKER = re.compile(r"[A-Za-z0-9_]{4,32}")
+_BROWSE_STATUS = re.compile(r": (\d{3}),")
 _NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*}][^)]*\)\s*[+*{]")  # (a+)+ (x*)* (a{2,})+ : catastrophic backtracking
 
 
@@ -62,6 +73,14 @@ def validate(proof: object) -> list[str]:
             errors.append(f"{where}: url must be an absolute http(s) URL")
         if "$" in str(st.get("url", "")):
             errors.append(f"{where}: url contains an unresolved shell variable")
+        if "browse" in st:
+            b = st["browse"]
+            if not isinstance(b, dict) or set(b) - {"xss"}:
+                errors.append(f'{where}: browse is {{}} or {{"xss": "<marker>"}}')
+            elif "xss" in b and not _MARKER.fullmatch(str(b["xss"])):
+                errors.append(f"{where}: the xss marker is 4-32 characters of [A-Za-z0-9_]")
+            if str(st.get("method", "GET")).upper() != "GET":
+                errors.append(f"{where}: a browse step is a GET (a page load)")
         exp = st.get("expect")
         if not isinstance(exp, dict) or not set(exp) & set(EXPECT_KEYS) or set(exp) - set(EXPECT_KEYS):
             errors.append(f"{where}: expect needs at least one of {', '.join(EXPECT_KEYS)} and nothing else")
@@ -124,6 +143,21 @@ def _expect_holds(exp: dict, status: int, body: str) -> tuple[bool, list[str]]:
     return not misses, misses
 
 
+def _browse(step: dict) -> tuple[int, str, bool]:
+    """A rendered page (bh-browse, through the gate like every builtin): (status, text summary, refused)."""
+    exe = shutil.which("bh-browse") or "/opt/bh/bin/bh-browse"
+    cmd = [exe, str(step["url"]), "--timeout", str(BROWSE_TIMEOUT_S - 10)]
+    if step.get("as"):
+        cmd += ["--as", str(step["as"])]
+    if marker := (step.get("browse") or {}).get("xss"):
+        cmd += ["--xss", str(marker)]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=BROWSE_TIMEOUT_S, env=os.environ.copy())
+    out = p.stdout + p.stderr
+    m = _BROWSE_STATUS.search(out.split("\n", 1)[0])
+    # a page the gate refused has no 2xx status line: the expectation on the summary fails on its own
+    return (int(m.group(1)) if m else 0), out, False
+
+
 def _send(step: dict) -> tuple[int, str, bool]:
     """One request through the environment's proxy (the gate): (status, body, refused by the gate). Redirects are
     not followed: a 302 is an answer. Only the gate sets X-BH-Gate (it strips the header from target answers)."""
@@ -162,7 +196,7 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
         round_, answers = [], []
         for st in proof["steps"]:
             try:
-                status, body, denied = _send(st)
+                status, body, denied = _browse(st) if "browse" in st else _send(st)
                 answers.append((st, status, body))
                 ok, misses = _expect_holds(st["expect"], status, body)
                 round_.append(
@@ -177,7 +211,7 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
                         "snippet": body[:SNIPPET],
                     }
                 )
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 round_.append(
                     {
                         "name": st.get("name", ""),

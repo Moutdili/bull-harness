@@ -151,3 +151,77 @@ def test_missing_playwright_is_an_error_not_a_crash(tmp_path, monkeypatch):
 def test_bh_browse_is_a_link_to_the_entry_point():
     link = ROOT / "container/agent/bin/bh-browse"
     assert link.is_symlink() and os.readlink(link) == "bh-agent"
+
+
+def test_frontier_points_client_routes_to_bh_browse():
+    from bh.agent import contract as c
+
+    assert c.is_client_route("GET /address/saved", {"js"})
+    assert not c.is_client_route("GET /api/Feedbacks", {"js"})
+    assert not c.is_client_route("GET /address/saved", {"js", "crawl"})  # the server answered it directly
+    eps = {("o", "GET /address/saved"): {"params": set(), "sources": {"js"}, "status": None}}
+    out = c.format_surface(eps, list(eps.items()), {}, c.REQUIRED_PHASES)
+    assert "→ bh-browse" in out
+
+
+def _xss_proof(marker="bhX1"):
+    u = "http://10.231.0.10:3000/#/search?q="
+    return {
+        "steps": [
+            {
+                "name": "payload executes",
+                "role": "attack",
+                "url": u + "<iframe>",
+                "browse": {"xss": marker},
+                "expect": {"contains": [f"xss CONFIRMED (marker {marker})"]},
+            },
+            {
+                "name": "benign value",
+                "role": "control",
+                "url": u + marker,
+                "browse": {"xss": marker},
+                "expect": {"absent": ["xss CONFIRMED"]},
+            },
+        ]
+    }
+
+
+def test_browse_proof_steps_validate():
+    from bh.agent import proof
+
+    assert proof.validate(_xss_proof()) == []
+    bad = _xss_proof("x")
+    assert any("marker" in e for e in proof.validate(bad))
+    post = _xss_proof()
+    post["steps"][0]["method"] = "POST"
+    assert any("GET" in e for e in proof.validate(post))
+
+
+def test_browse_proof_replay_uses_the_summary(monkeypatch):
+    from bh.agent import proof
+
+    def fake_browse(step):
+        hit = "<iframe>" in step["url"]
+        line = '  dialogs: 1 — alert("bhX1") ← xss CONFIRMED (marker bhX1)' if hit else "  xss: not confirmed"
+        return 200, f'bh-browse {step["url"]}: 200, title "x", 1.0 s [ok]\n{line}\n', False
+
+    monkeypatch.setattr(proof, "_browse", fake_browse)
+    r = proof.replay(_xss_proof())
+    assert r["reproduced"] and not r["control_disproves"]
+
+    monkeypatch.setattr(proof, "_browse", lambda st: (200, "xss CONFIRMED (marker bhX1)", False))
+    r = proof.replay(_xss_proof())  # the benign twin also "executes": no differential
+    assert r["control_disproves"] and not r["reproduced"]
+
+
+def test_gate_ca_trusted_in_a_fresh_home(tmp_path, monkeypatch):
+    from bh.agent import browse
+
+    calls = []
+    monkeypatch.setattr(browse.subprocess, "run", lambda cmd, **k: calls.append(cmd[:2]))
+    ca = tmp_path / "ca.crt"
+    assert "missing" in browse.trust_gate_ca(tmp_path, ca)
+    ca.write_text("x")
+    assert browse.trust_gate_ca(tmp_path, ca) is None
+    assert len(calls) == 2  # new DB, then the CA
+    assert browse.trust_gate_ca(tmp_path, ca) is None and len(calls) == 2  # idempotent

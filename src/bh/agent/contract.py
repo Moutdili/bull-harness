@@ -302,6 +302,12 @@ def _surface_data(d: Path, also_tested: Tested | None) -> tuple[dict, list, dict
 API_PATH = re.compile(r"/(api|rest|graphql|v\d+)(/|$)", re.I)
 
 
+def is_client_route(key: str, sources: set[str]) -> bool:
+    """A path only seen in JavaScript or in the browser and not API-looking: a single-page app route, which only
+    a rendered page exercises (an HTTP GET returns the same shell for every route)."""
+    return bool(sources) and sources <= {"js", "browse"} and not API_PATH.search(key)
+
+
 def frontier_order(item: tuple[tuple[str, str], dict]) -> tuple:
     """Untested endpoints first by number of parameters, then API routes, then path."""
     (_, key), info = item
@@ -325,6 +331,8 @@ def format_surface(eps: dict, untested: list, cov: dict, phases: tuple[str, ...]
     for (o, key), v in untested[:limit]:
         hint = "  → bh-sqli / bh-xss" if phases == REQUIRED_PHASES else "  → test by hand, low rate"
         params = f" ?{','.join(sorted(v['params']))}{hint}" if v["params"] else ""
+        if not params and is_client_route(key, v["sources"]):
+            params = "  → bh-browse (client-side route: render it, hash routing is /#/path)"
         out.append(f"  - {key}{params}  [{o}; {'+'.join(sorted(v['sources']))}]")
     return "\n".join(out)
 
