@@ -39,6 +39,7 @@ nature `measure` (mesurer avant de décider), `build`, `research-check` (doctrin
 | 28 | [Mesures anti-bot sur le lab](028-mesures-anti-bot-sur-le-lab.md) | `area:gate` `owner:claude` `measure` | open |
 | 29 | [Outil bh-js : bundles JS et source maps (REA en CLI)](029-outil-bh-js-bundles-js-et-source-maps-rea-en-cli.md) | `area:autonomy` `owner:claude` `build` | open |
 | 32 | [Historique d'URL passif (gau / waymore) dans bh-recon](032-historique-d-url-passif-gau-waymore-dans-bh-recon.md) | `area:autonomy` `owner:hermes` `build` | open |
+| 33 | [Proxy-scanner headless : ZAP daemon (Burp Pro en option)](033-proxy-scanner-headless-zap-daemon-burp-pro-en-option.md) | `area:autonomy` `owner:claude` `build` | open |
 
 ## P2
 
