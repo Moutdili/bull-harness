@@ -345,8 +345,8 @@ def surface(d: Path, limit: int = 12, also_tested: Tested | None = None, phases:
 
 # ------------------------------------------------------------------ command classification (metrics)
 # The one table of tools: hooks (program rules, verifier), metrics and builtins all read it.
-# bh-browse maps; with --xss it tests (see _BROWSE_XSS)
-MAPPERS = ("bh-recon", "bh-crawl", "bh-browse", "katana", "subfinder", "httpx-toolkit", "httpx")
+# bh-browse maps; with --xss it tests (see _BROWSE_XSS). bh-zap maps (spider + passive); with --active it scans.
+MAPPERS = ("bh-recon", "bh-crawl", "bh-browse", "bh-zap", "katana", "subfinder", "httpx-toolkit", "httpx")
 SCANNERS = (
     "bh-content",
     "bh-scan",
@@ -401,18 +401,25 @@ _SCANNER_EXTRA = re.compile(
 )
 # bh-browse --xss runs payloads: a scanner. Fail closed: --xss anywhere after bh-browse counts.
 _BROWSE_XSS = re.compile(r"(?<![\w.-])(bh-browse|bh-agent\s+browse)(?![\w.-])[\s\S]*\s--xss\b")
+# bh-zap --active runs ZAP's active scan: a scanner. Same fail-closed reading.
+_ZAP_ACTIVE = re.compile(r"(?<![\w.-])(bh-zap|bh-agent\s+zap)(?![\w.-])[\s\S]*\s--active\b")
 
 
 def runs_scanner(cmd: str) -> bool:
     """Enforcement (fail closed): quotes are removed, not their content, so 'nuclei' or bash -c 'ffuf ...' count;
     a note that merely names a scanner is refused too, which is the safe side."""
     bare = cmd.replace("'", " ").replace('"', " ").replace("\\", "")
-    return bool(_SCANNER_WORDS.search(bare) or _SCANNER_EXTRA.search(bare) or _BROWSE_XSS.search(bare))
+    return bool(
+        _SCANNER_WORDS.search(bare)
+        or _SCANNER_EXTRA.search(bare)
+        or _BROWSE_XSS.search(bare)
+        or _ZAP_ACTIVE.search(bare)
+    )
 
 
 def runs_mapper(cmd: str) -> bool:
     bare = cmd.replace("'", " ").replace('"', " ")
-    return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl|browse)\b", bare))
+    return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl|browse|zap)\b", bare))
 
 
 _MANUAL = re.compile(r"(^|[\s;&|(`])(curl|wget|python3?|node|perl|ruby|nc|ncat|socat|http|xh|qq?)(?=\s|$)")

@@ -42,6 +42,19 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages "playwright==$
  && python3 -I -c "import playwright.sync_api" \
  && ls "$PLAYWRIGHT_BROWSERS_PATH"/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell
 
+# 5b. bh-zap: ZAP from the Kali package `zaproxy` (2.17.0 on 2026-11-25, https://www.kali.org/tools/zaproxy/; it
+#     depends on default-jre, Java 25 in Kali rolling; ZAP 2.17 needs Java 17+). Like the other apt tools it follows
+#     the rolling repo: `dpkg-query` below logs the version that was built. chromium + chromium-driver come from the
+#     same repo at the same version: the AJAX spider (`bh-zap --ajax`) drives them through ZAP's selenium add-on.
+#     The build fails if any is missing (no silent fallback), and /opt/bh/zap.jar points at the jar bh-zap starts.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zaproxy chromium chromium-driver \
+ && rm -rf /var/lib/apt/lists/* \
+ && jar=$( (ls /usr/share/zaproxy/zap-*.jar 2>/dev/null; dpkg -L zaproxy | grep -E '/zap-[0-9][0-9.]*\.jar$') | head -1) \
+ && test -n "$jar" && mkdir -p /opt/bh && ln -sf "$jar" /opt/bh/zap.jar \
+ && dpkg-query -W zaproxy chromium chromium-driver | tee /opt/bh/zap-version.txt \
+ && java -version
+
 # 6. Unprivileged hunter user (claude refuses bypassPermissions as root).
 RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work
 COPY entrypoint.sh check.sh /opt/bh/
