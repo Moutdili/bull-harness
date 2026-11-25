@@ -43,6 +43,8 @@ CREATE INDEX IF NOT EXISTS assets_prog ON assets(program, kind);
 """
 # User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
 MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
+# a scanner's probe with these answers found no path (nuclei alone sent thousands to the lab)
+_ABSENT = frozenset({404, 410, "error"})
 # What makes an endpoint "tested". The gate's word ranks first: a hand-made request it saw ("gate") counts alone;
 # what the sandbox claims (touched.jsonl: "tool", "literal") counts only if the gate saw that endpoint asked at all
 # ("seen", any client). Same for coverage: a phase counts on an origin the gate saw traffic to.
@@ -197,6 +199,8 @@ class Graph:
                 self.host(host, "gate")
             if k := c.endpoint_key(url, str(f.get("method", "GET"))):
                 manual = MANUAL_UA.match(str(f.get("ua") or ""))
+                if not manual and f.get("status") in _ABSENT:
+                    continue  # a scanner's probe that found nothing (404, error) is not an endpoint of the target
                 self.tested(k[0], k[1], "gate" if manual else "seen", f.get("run"))
                 n["tests"] += bool(manual)
         self.b.db.commit()

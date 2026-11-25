@@ -40,6 +40,16 @@ def test_graph_from_sandbox_and_gate(tmp_path, monkeypatch):
                 "method": "GET",
                 "url": "https://a.t.test/search?q=x",
                 "ua": "Fuzz Faster U Fool",
+                "status": 200,
+            },
+            # a scanner probe that found nothing: not an endpoint (nuclei paths flooded the lab frontier)
+            {
+                "run": rid,
+                "class": "target",
+                "method": "GET",
+                "url": "https://a.t.test/_matrix/v1",
+                "ua": "Nuclei",
+                "status": 404,
             },
             {"run": None, "class": "target", "method": "GET", "url": "https://a.t.test/search", "ua": "curl/8.1"},
             {"run": rid, "class": "target", "method": "GET", "url": "https://evil.other.test/", "ua": "katana"},
