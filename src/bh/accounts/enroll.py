@@ -238,6 +238,8 @@ def _take(board, key: str, every: float, what: str, now: float) -> None:
 
 def _write_session(ident: Identity, recipe: dict[str, Any], token: str | None, set_cookies: list[str]) -> None:
     now = time.time()
+    if token is not None and not rc.TOKEN.fullmatch(token):
+        raise AccountError("login: token refused (not 1-4096 printable ASCII characters)")
     headers = rc.render(recipe["headers"], {"token": token} if token else {})
     sess: dict[str, Any] = {
         "headers": headers,
@@ -279,6 +281,10 @@ def _login(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
         token = rec.get("token")
         if "token" in recipe and not token:
             raise AccountError(f"login: HTTP {rec.get('status')} but no token at {recipe['token']!r}")
+        if token is not None and not (isinstance(token, str) and rc.TOKEN.fullmatch(token)):
+            raise AccountError(
+                f"login: the token at {recipe['token']!r} is not 1-4096 printable ASCII characters (refused)"
+            )
         if not token and not rec.get("set_cookies"):
             raise AccountError("login: no token and no cookie in the answer")
         _write_session(ident, recipe, token, rec.get("set_cookies") or [])

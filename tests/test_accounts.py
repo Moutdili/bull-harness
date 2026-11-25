@@ -179,6 +179,18 @@ def test_enroll_signs_up_logs_in_and_writes_the_session(env, monkeypatch):
     assert sess["expires_at"] == 4102444800.0 and sess["probe"] == {"url": PROBE["url"], "status": 200}
 
 
+@pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "has space", "é-token", "x" * 4097])
+def test_a_token_outside_printable_ascii_fails_the_login_without_showing_it(env, monkeypatch, bad):
+    def login_bad(s):
+        return {"step": "login", "status": 200, "token": bad, "set_cookies": []}
+
+    _gate(monkeypatch, signup_ok, login_bad)
+    with pytest.raises(en.AccountError, match="printable ASCII") as exc:
+        en.enroll(_scope(), "user-a", board=env)
+    assert bad not in str(exc.value) and "X-Injected" not in str(exc.value)
+    assert not paths.identities_dir("p").joinpath("user-a.json").exists()
+
+
 def test_self_signup_null_refuses_to_create_an_account(env, monkeypatch):
     fake = _gate(monkeypatch)
     with pytest.raises(en.AccountError, match="self_signup is not true"):

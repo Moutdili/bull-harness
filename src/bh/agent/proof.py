@@ -20,9 +20,18 @@ twice, writes and setup steps once (they create state: a second booking of the s
 is disproved when a control's answer satisfies its attack's expectation (no differential). No LLM involved.
 
 A step that only a rendered page proves (DOM XSS, a client-side route) adds `"browse": {"xss": "<marker>"}`
-(GET only): replay runs `bh-browse <url> --xss <marker>` and its text summary is the step's body, so the attack
-expects `{"contains": ["xss CONFIRMED (marker <marker>)"]}` and its twin control (same route, benign value)
-expects `{"absent": ["xss CONFIRMED"]}`.
+(GET only): replay runs `bh-browse <url> --xss <marker>` in a throwaway work dir, reads the `summary.json` it
+leaves there (status, dialogs, window.__bhxss) and decides itself: confirmed when a dialog's whole message, or
+the sentinel string, is the marker. The step's body is then one canonical line written by the replay, never by
+the page: `xss CONFIRMED (marker <marker>)` or `xss none (marker <marker>)`. So the attack expects
+`{"contains": ["xss CONFIRMED (marker <marker>)"]}` and its twin control (same route, benign value) expects
+`{"absent": ["xss CONFIRMED"]}`; the URL, the title and the console never reach the body. A `"browse": {}` step
+(no marker) has the rendered DOM as its body, like any answer.
+
+Hostile input: the hunter writes the proof. Headers that carry an identity, a session or another method or host
+(X-BH-Identity, Cookie, Authorization, Host, X-HTTP-Method-Override...) are refused: the identity is `as` only.
+A regex runs in a child process with a timeout, and one that can backtrack (nested quantifiers, an alternation
+under a quantifier) is refused when the proof is written.
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from bh.agent import contract as c
+from bh.agent.browse import xss_confirmed
 
 ROLES = ("setup", "attack", "control")
 METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
@@ -49,9 +59,27 @@ SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 EXPECT_KEYS = ("status", "contains", "absent", "regex")
 MAX_STEPS, TIMEOUT_S, ROUNDS, SNIPPET, MAX_REGEX = 8, 20, 2, 300, 200
 BROWSE_TIMEOUT_S = 90  # one rendered page through the gate (17-40 s measured on the lab)
+REGEX_TIMEOUT_S = 5  # one regex search on one answer (at most 1 MiB), in a child process
+MAX_SUMMARY = 1 << 20
 _MARKER = re.compile(r"[A-Za-z0-9_]{4,32}")
-_BROWSE_STATUS = re.compile(r": (\d{3}),")
-_NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*}][^)]*\)\s*[+*{]")  # (a+)+ (x*)* (a{2,})+ : catastrophic backtracking
+# headers a step may not set: the identity goes through `as` only (the gate injects its session); no host or
+# method switch behind the method and URL the control is compared on
+FORBIDDEN_HEADERS = frozenset(
+    h.lower()
+    for h in (
+        c.IDENTITY_HEADER,
+        "Host",
+        "Cookie",
+        "Authorization",
+        "X-HTTP-Method-Override",
+        "X-Method-Override",
+        "X-HTTP-Method",
+    )
+)
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}")
+_HEADER_VALUE = re.compile(r"[\x20-\x7e\t]{0,4096}")
+_REGEX_CHILD = "import re, sys\nbody = sys.stdin.read()\nsys.exit(0 if re.search(sys.argv[1], body) else 1)\n"
+REGEX_TIMED_OUT = "regex timed out"
 
 
 def validate(proof: object) -> list[str]:
@@ -75,6 +103,7 @@ def validate(proof: object) -> list[str]:
             errors.append(f"{where}: url must be an absolute http(s) URL")
         if "$" in str(st.get("url", "")):
             errors.append(f"{where}: url contains an unresolved shell variable")
+        errors += [f"{where}: {e}" for e in _header_problems(st.get("headers"))]
         if str(st.get("method", "GET")).upper() in c.IDENTITY_ONLY_METHODS and not st.get("as"):
             errors.append(
                 f"{where}: the gate refuses PUT/PATCH/DELETE without an identity, so this step can never run; "
@@ -102,8 +131,11 @@ def validate(proof: object) -> list[str]:
                     re.compile(rx)
                 except re.error as exc:
                     errors.append(f"{where}: bad regex: {exc}")
-                if len(rx) > MAX_REGEX or _NESTED_QUANTIFIER.search(rx):  # replay has no regex timeout
-                    errors.append(f"{where}: regex too long or with nested quantifiers; use contains instead")
+                if len(rx) > MAX_REGEX or backtracks(rx):
+                    errors.append(
+                        f"{where}: regex too long, or with a quantified group holding a quantifier or an "
+                        "alternation ((a+)+, (a|ab)*); use contains instead"
+                    )
     roles = [st.get("role") for st in steps if isinstance(st, dict)]
     if "attack" not in roles:
         errors.append("at least one step must have role 'attack' (the request that proves the impact)")
@@ -121,6 +153,78 @@ def validate(proof: object) -> list[str]:
                 "identity, query or body change)"
             )
     return errors
+
+
+def _header_problems(headers: object) -> list[str]:
+    if headers is None:
+        return []
+    if not isinstance(headers, dict):
+        return ["headers is an object {name: value}"]
+    errors = []
+    for k, v in headers.items():
+        name = str(k)
+        if not _HEADER_NAME.fullmatch(name) or not isinstance(v, (str, int, float)):
+            errors.append(f"header {name[:40]!r}: a token name and a string value")
+        elif not _HEADER_VALUE.fullmatch(str(v)):
+            errors.append(f"header {name}: printable value, at most 4096 characters")
+        elif name.lower() in FORBIDDEN_HEADERS:
+            errors.append(
+                f"header {name} is not allowed in a proof: the identity is `as` (the gate injects its session), "
+                "the method and URL are the step's own"
+            )
+    return errors
+
+
+def backtracks(rx: str) -> bool:
+    """A quantified group (+, *, {n,}) whose content holds a quantifier or an alternation, at any depth:
+    (a+)+, (x*)*, (a|a)+, (a|ab)*, ((a|b)c)+. Escapes and character classes are skipped. Conservative: a
+    harmless (GET|POST)+ is refused too; `contains` says the same thing."""
+    stack: list[bool] = []  # per open group: does it hold a quantifier or an alternation?
+    i, n = 0, len(rx)
+    while i < n:
+        ch = rx[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "[":
+            j = i + 1
+            if j < n and rx[j] == "^":
+                j += 1
+            if j < n and rx[j] == "]":
+                j += 1
+            while j < n and rx[j] != "]":
+                j += 2 if rx[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "(":
+            stack.append(False)
+        elif ch == ")":
+            risky = stack.pop() if stack else False
+            nxt = rx[i + 1 : i + 2]
+            unbounded = nxt in ("+", "*") or bool(re.match(r"\{\d*,", rx[i + 1 :]))
+            if risky and unbounded:
+                return True
+            if stack:
+                stack[-1] = stack[-1] or risky or nxt in ("+", "*", "{", "?")
+        elif stack and (ch in "+*{|" or (ch == "?" and rx[i - 1] != "(")):  # `(?` opens an extension
+            stack[-1] = True
+        i += 1
+    return False
+
+
+def _search(rx: str, body: str) -> bool | None:
+    """re.search in a child process killed after REGEX_TIMEOUT_S: True, False, or None (timed out or failed)."""
+    try:
+        p = subprocess.run(
+            [sys.executable, "-I", "-c", _REGEX_CHILD, rx],
+            input=body,
+            capture_output=True,
+            text=True,
+            timeout=REGEX_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return {0: True, 1: False}.get(p.returncode)
 
 
 def _twins(attack: dict, control: dict) -> bool:
@@ -145,34 +249,81 @@ def _expect_holds(exp: dict, status: int, body: str) -> tuple[bool, list[str]]:
     for needle in exp.get("absent") or []:
         if str(needle) in body:
             misses.append(f"present {str(needle)[:60]!r}")
-    if exp.get("regex") and not re.search(str(exp["regex"]), body):
-        misses.append(f"regex {str(exp['regex'])[:60]!r} did not match")
+    if exp.get("regex"):
+        found = _search(str(exp["regex"]), body)
+        if found is None:
+            misses.append(REGEX_TIMED_OUT)
+        elif not found:
+            misses.append(f"regex {str(exp['regex'])[:60]!r} did not match")
     return not misses, misses
 
 
 def _browse(step: dict) -> tuple[int, str, bool]:
-    """A rendered page (bh-browse, through the gate like every builtin): (status, text summary, refused)."""
+    """A rendered page (bh-browse, through the gate like every builtin): (status, canonical body, refused).
+    The text bh-browse prints is never read: it carries the URL, the title and the console."""
     exe = shutil.which("bh-browse") or "/opt/bh/bin/bh-browse"
     cmd = [exe, str(step["url"]), "--timeout", str(BROWSE_TIMEOUT_S - 10)]
     if step.get("as"):
         cmd += ["--as", str(step["as"])]
-    if marker := (step.get("browse") or {}).get("xss"):
+    marker = (step.get("browse") or {}).get("xss")
+    if marker:
         cmd += ["--xss", str(marker)]
     # the replay runs as the judge, whose HOME and default work dir may not exist or be writable: bh-browse
     # gets a throwaway work dir (raw files) and HOME (Chromium profile, gate CA) of its own
     with tempfile.TemporaryDirectory(prefix="bh-replay-") as tmp:
         env = {**os.environ, "BH_DIR": f"{tmp}/bh", "HOME": f"{tmp}/home"}
         Path(env["HOME"]).mkdir()
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=BROWSE_TIMEOUT_S, env=env, cwd=tmp)
-    out = p.stdout + p.stderr
-    m = _BROWSE_STATUS.search(out.split("\n", 1)[0])
-    # a page the gate refused has no 2xx status line: the expectation on the summary fails on its own
-    return (int(m.group(1)) if m else 0), out, False
+        subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=BROWSE_TIMEOUT_S, env=env, cwd=tmp
+        )
+        raw = _browse_raw(Path(env["BH_DIR"]) / c.RAW)
+        summary = _read_summary(raw / "summary.json")
+        dom = "" if marker else _read_text(raw / "dom.html")
+    status, body = browse_body(summary, str(marker) if marker else None, dom)
+    return status, body, False
+
+
+def _browse_raw(root: Path) -> Path:
+    found = sorted(root.glob("browse-*/summary.json")) if root.is_dir() else []
+    if len(found) != 1:
+        raise ValueError("bh-browse left no summary (killed, refused or crashed)")
+    return found[0].parent
+
+
+def _read_text(path: Path) -> str:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(MAX_SUMMARY).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _read_summary(path: Path) -> dict:
+    try:
+        doc = json.loads(_read_text(path) or "null")
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        raise ValueError("bh-browse summary.json is not an object")
+    return doc
+
+
+def browse_body(summary: dict, marker: str | None, dom: str = "") -> tuple[int, str]:
+    """(status, body) of a browse step, decided here from bh-browse's structured summary: with a marker, one
+    canonical line (`xss CONFIRMED (marker m)` / `xss none (marker m)`); without, the rendered DOM."""
+    st = summary.get("status")
+    status = st if isinstance(st, int) and not isinstance(st, bool) and 100 <= st <= 599 else 0
+    if not marker:
+        return status, dom
+    confirmed = xss_confirmed(marker, summary.get("dialogs"), summary.get("sentinel"))
+    return status, f"xss {'CONFIRMED' if confirmed else 'none'} (marker {marker})"
 
 
 def _send(step: dict) -> tuple[int, str, bool]:
     """One request through the environment's proxy (the gate): (status, body, refused by the gate). Redirects are
     not followed: a 302 is an answer. Only the gate sets X-BH-Gate (it strips the header from target answers)."""
+    if problems := _header_problems(step.get("headers")):  # replay never trusts that validate ran
+        raise ValueError(problems[0])
     headers = {str(k): str(v) for k, v in (step.get("headers") or {}).items()}
     if step.get("as"):
         headers[c.IDENTITY_HEADER] = str(step["as"])
@@ -239,7 +390,10 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
         # no differential: a control's answer already satisfies what its attack claims to prove
         for a in (st for st in proof["steps"] if st["role"] == "attack"):
             for k, status, body in answers:
-                if k["role"] == "control" and _twins(a, k) and _expect_holds(a["expect"], status, body)[0]:
+                if k["role"] != "control" or not _twins(a, k):
+                    continue
+                holds, misses = _expect_holds(a["expect"], status, body)
+                if holds or REGEX_TIMED_OUT in misses:  # undecided counts against the proof
                     control_disproves = True
     every = [s for r in results for s in r]
     reproduced = all(s["ok"] for s in every)

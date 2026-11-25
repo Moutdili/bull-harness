@@ -31,6 +31,8 @@ CREDENTIAL = re.compile(
     r"passw|pwd|secret|totp|otp|token|cookie|api[_-]?key|credential|session|auth|answer|pin\b", re.I
 )
 _PATH = re.compile(r"[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*")
+# a token read from a login answer goes into a header: printable ASCII only, no space, no CR/LF (a second request)
+TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")
 
 
 class RecipeError(ValueError):

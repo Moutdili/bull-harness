@@ -133,7 +133,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--submit", action=_Step, metavar="CSS", help="click and wait for the network to settle")
     p.add_argument("--wait-for", metavar="CSS|networkidle", help="what to wait for after the load")
     p.add_argument("--routes", action="store_true", help="follow in-app links and record SPA routes")
-    p.add_argument("--xss", type=_marker, metavar="MARKER", help="record dialogs; CONFIRMED only if MARKER is seen")
+    p.add_argument(
+        "--xss",
+        type=_marker,
+        metavar="MARKER",
+        help="record dialogs; CONFIRMED only if a dialog says MARKER or window.__bhxss = MARKER",
+    )
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="seconds for the whole command")
     p.set_defaults(steps=[])
     return p
@@ -219,10 +224,16 @@ def add_endpoints(d: Path, origin_: str, items: Items) -> list[str]:
     return [r["key"] for r in recs]
 
 
-def xss_confirmed(marker: str | None, dialogs: list[dict], sentinel: str | None) -> bool:
-    if not marker:
+def xss_confirmed(marker: str | None, dialogs: object, sentinel: object) -> bool:
+    """A dialog whose whole message is the marker (alert('<marker>')), or window.__bhxss set to the marker string.
+    A message that merely contains it does not count: a page that shows its own URL in a dialog is not an XSS.
+    Also the replay's own verdict (bh.agent.proof), computed from summary.json: hostile input, checked by type."""
+    if not marker or not MARKER.match(str(marker)):
         return False
-    return any(marker in str(d.get("message", "")) for d in dialogs) or sentinel == marker
+    shown = [d.get("message") for d in (dialogs if isinstance(dialogs, list) else []) if isinstance(d, dict)]
+    return any(isinstance(m, str) and m.strip() == marker for m in shown) or (
+        isinstance(sentinel, str) and sentinel == marker
+    )
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -345,6 +356,20 @@ def render(r: Result) -> list[str]:
         body = [*body[: budget - 1], f"... {len(body) - budget + 1} more lines in raw"]
     lines = [head[:LINE_CHARS], *("  " + b[: LINE_CHARS - 2] for b in body)]
     return [*lines, f"raw: {r.raw}/"]
+
+
+def summary(r: Result) -> dict:
+    """summary.json: the structured result. The replay of a proof reads `status`, `dialogs` and `sentinel` and
+    decides itself; `xss_confirmed` is for a human reading the raw dir. Never the URL, the title or the console."""
+    return {
+        "status": r.status,
+        "state": r.state,
+        "new": r.new_keys,
+        "dialogs": [{"type": str(d.get("type", "")), "message": str(d.get("message", ""))} for d in r.dialogs],
+        "sentinel": r.sentinel,
+        "marker": r.marker,
+        "xss_confirmed": xss_confirmed(r.marker, r.dialogs, r.sentinel),
+    }
 
 
 # ------------------------------------------------------------------ browser
@@ -622,8 +647,8 @@ def main(argv: list[str] | None = None) -> None:
     signal.alarm(a.timeout + 30)
     run(a, job.raw, r)
     signal.alarm(0)
-    with open(job.raw / "summary.json", "w") as fh:
-        json.dump({"status": r.status, "state": r.state, "new": r.new_keys, "dialogs": r.dialogs}, fh)
+    with open(job.raw / "summary.json", "w") as fh:  # what a proof replay reads (bh.agent.proof._browse)
+        json.dump(summary(r), fh)
     if a.xss:
         c.record_touched(c.bh_dir(), [a.url], via="browse-xss")
     c.record_phase(c.bh_dir(), job.origin, "browse", status=r.state, count=len(r.new_keys), raw=str(job.raw))

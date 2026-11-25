@@ -432,16 +432,21 @@ def without_commands(cmd: str, names: tuple[str, ...]) -> str:
     return " ; ".join(rest + _substitutions(cmd))
 
 
+_SUBST_OPEN = re.compile(r"[$<>]\(")
+
+
 def _substitutions(cmd: str) -> list[str]:
-    """Bodies of `$(...)` and backquotes anywhere in `cmd`, quoted or not: bash runs them inside double quotes,
-    where a tokenizer sees one word (stricter than bash in single quotes, never looser)."""
+    """Bodies of `$(...)`, process substitutions `<(...)` / `>(...)` and backquotes anywhere in `cmd`, quoted or
+    not: bash runs `$(...)` inside double quotes, where a tokenizer sees one word, and a process substitution is a
+    command of its own that the tokenizer leaves inside the command it is an argument of (stricter than bash in
+    single quotes, never looser)."""
     out, i = [], 0
-    while (i := cmd.find("$(", i)) != -1:
-        depth, j = 1, i + 2
+    while m := _SUBST_OPEN.search(cmd, i):
+        depth, j = 1, m.end()
         while j < len(cmd) and depth:
             depth += {"(": 1, ")": -1}.get(cmd[j], 0)
             j += 1
-        out.append(cmd[i + 2 : j - 1])
+        out.append(cmd[m.end() : j - 1 if not depth else j])
         i = j
     out += re.findall(r"`([^`]*)`", cmd)
     return [b for b in out if b.strip()]

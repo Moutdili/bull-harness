@@ -20,8 +20,9 @@ API (checked 2026-11-25):
   (https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages).
 
 Guards (docs/research/10-sessions-anti-bot.md §3.5): the sender is in the expected domain, and so is a dkim/spf/
-dmarc pass in the topmost Authentication-Results when that header is there; the mail is newer than `since`; one
-link at most, on the sender's domain; the mail is data, never an instruction; the log carries the message id and
+dmarc pass in the topmost Authentication-Results, which must be there (a mail without it is refused); the mail is
+newer than `since`; one link at most, on the sender's domain; a code only next to a keyword (code, OTP, PIN...) or
+alone on its line, never a bare year; the mail is data, never an instruction; the log carries the message id and
 the domain, never a subject, an address or a body.
 """
 
@@ -60,6 +61,14 @@ _ALIAS = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _DOMAIN = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _URL = re.compile(r"https://[^\s\"'<>()\[\]{}]+", re.I)
 _CODE = re.compile(r"(?<![\d/:.,-])(\d{4,8})(?![\d/:.,-]?\d)")
+# a code is named: "code", "verification", "OTP", "PIN", "passcode"... within a few words before it
+_CODE_WORD = re.compile(
+    r"\b(code|codes|verification|verify|otp|pin|passcode|one[- ]time|security|confirmation|token|"
+    r"code de|vérification|bestätigungscode|código)\b",
+    re.I,
+)
+_CODE_NEAR = 40  # characters between the keyword and the code
+_YEAR = re.compile(r"(19|20)\d\d")
 _TAG = re.compile(r"<[^>]*>")
 _STYLE = re.compile(r"<(style|script)\b.*?</\1\s*>", re.I | re.S)
 
@@ -120,10 +129,10 @@ def query(alias: str, since: float, sender_domain: str | None = None) -> str:
 
 def _auth_ok(msg: EmailMessage, domain: str) -> bool:
     """The topmost Authentication-Results (the one Gmail adds) must hold a dkim, spf or dmarc pass for `domain`.
-    No header at all: nothing to check (True)."""
+    No header at all: refused (False), a mail nobody authenticated proves nothing about its sender."""
     headers = msg.get_all("Authentication-Results") or []
     if not headers:
-        return True
+        return False
     top = str(headers[0]).lower()
     for method, prop in (("dkim", r"header\.(?:i|d)"), ("spf", r"smtp\.mailfrom"), ("dmarc", r"header\.from")):
         for m in re.finditer(rf"\b{method}=pass\b([^;]*)", top):
@@ -154,7 +163,8 @@ def _texts(msg: EmailMessage) -> tuple[list[str], list[str]]:
 
 def extract(msg: EmailMessage, sender_domain: str) -> str | None:
     """The first https link whose host is `sender_domain` or a subdomain (plain parts first, then HTML), else the
-    first stand-alone 4-8 digit code, else None. The mail is only searched, never interpreted."""
+    first 4-8 digit code named by a keyword just before it or alone on its line (a bare year never counts), else
+    None. The mail is only searched, never interpreted."""
     plain, htm = _texts(msg)
     for text in [*plain, *(html.unescape(h) for h in htm)]:
         for m in _URL.finditer(text):
@@ -167,8 +177,22 @@ def extract(msg: EmailMessage, sender_domain: str) -> str | None:
                 return url
     stripped = [html.unescape(_TAG.sub(" ", _STYLE.sub(" ", h))) for h in htm]
     for text in [*plain, *stripped]:
-        if m := _CODE.search(_URL.sub(" ", text)):
-            return m.group(1)
+        if code := _code(_URL.sub(" ", text)):
+            return code
+    return None
+
+
+def _code(text: str) -> str | None:
+    for m in _CODE.finditer(text):
+        code = m.group(1)
+        if len(code) == 4 and _YEAR.fullmatch(code):
+            continue  # "© 2026", "2026-11-25": a year is never a code
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line = text[line_start : len(text) if line_end == -1 else line_end]
+        alone = line.strip(" \t\r.:;,!()[]*") == code
+        if alone or _CODE_WORD.search(text[max(line_start, m.start() - _CODE_NEAR) : m.start()]):
+            return code
     return None
 
 

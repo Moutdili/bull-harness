@@ -140,8 +140,8 @@ def test_mail_failing_authentication_is_ignored(tmp_path):
     auth = "mx.google.com; dkim=pass header.i=@attacker.example; spf=fail smtp.mailfrom=target.example"
     http = FakeHttp({"m1": (SINCE + 5, _mime(auth=auth))})
     assert _box(tmp_path, http).wait(ALIAS, DOMAIN, SINCE, timeout=0) is None
-    http = FakeHttp({"m1": (SINCE + 5, _mime(auth=None))})  # no header: nothing to check
-    assert _box(tmp_path, http).wait(ALIAS, DOMAIN, SINCE, timeout=0) is not None
+    http = FakeHttp({"m1": (SINCE + 5, _mime(auth=None))})  # no header: nobody authenticated it, refused
+    assert _box(tmp_path, http).wait(ALIAS, DOMAIN, SINCE, timeout=0) is None
 
 
 def test_mail_older_than_since_is_ignored(tmp_path):
@@ -159,6 +159,29 @@ def test_numeric_code_when_no_link(tmp_path):
     html = "<style>p{width:1000px}</style><p>Code: <b>482913</b></p>"
     http = FakeHttp({"m1": (SINCE + 5, _mime(plain=plain, html=html))})
     assert _box(tmp_path, http).wait(ALIAS, DOMAIN, SINCE, timeout=0) == "482913"
+
+
+def _plain(text: str) -> EmailMessage:
+    m = EmailMessage()
+    m["From"], m["To"] = f"no-reply@{DOMAIN}", ALIAS
+    m.set_content(text)
+    return m
+
+
+@pytest.mark.parametrize(
+    "text, code",
+    [
+        ("Thanks for signing up.\n\n© 2026 Target Inc.", None),  # a year is never a code
+        ("Order 2026 shipped. Reference 99881 attached.", None),  # no keyword, not alone on its line
+        ("Welcome!\n\n  739104  \n\nIgnore if not you.", "739104"),  # alone on its line
+        ("Your verification code: 5531", "5531"),
+        ("OTP is 66120034, valid 10 min", "66120034"),
+        ("Use PIN 4821 to continue", "4821"),
+        ("Code: 2026", None),  # even after a keyword, a year is not taken
+    ],
+)
+def test_code_needs_a_keyword_or_its_own_line(text, code):
+    assert mail.extract(_plain(text), DOMAIN) == code
 
 
 def test_wait_polls_until_timeout(tmp_path):

@@ -1,6 +1,7 @@
 """bh-browse without a browser: arguments, program rules, the local route filter, endpoints and the summary.
 The live check (Juice Shop, through the gate) runs in the agent container."""
 
+import json
 import os
 import subprocess
 import sys
@@ -98,6 +99,18 @@ def test_xss_verdict_needs_the_marker():
     assert b.xss_confirmed("bhX1", [], "bhX1")
     assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "1"}], None)
     assert not b.xss_confirmed(None, alert, None)
+    # a dialog that merely shows the URL (which holds the marker) is the page talking, not the payload
+    assert not b.xss_confirmed("bhX1", [{"type": "confirm", "message": "Leave http://t/?q=bhX1 ?"}], None)
+    assert not b.xss_confirmed("bhX1", "bhX1", ["bhX1"])  # hostile shapes
+    assert not b.xss_confirmed("bhX1", [], {"bhX1": 1})
+
+
+def test_summary_json_is_structured_and_holds_no_url_or_title():
+    r = _fake(sentinel="bhX1")
+    doc = b.summary(r)
+    assert doc["xss_confirmed"] and doc["marker"] == "bhX1" and doc["sentinel"] == "bhX1"
+    assert doc["dialogs"] == [{"type": "alert", "message": "bhX1"}] and doc["status"] == 200
+    assert "http://h:3000" not in json.dumps(doc) and "Juice" not in json.dumps(doc)
 
 
 def _fake(**kw) -> b.Result:
@@ -202,12 +215,14 @@ def test_browse_proof_replay_uses_the_summary(monkeypatch):
 
     def fake_browse(step):
         hit = "<iframe>" in step["url"]
-        line = '  dialogs: 1 — alert("bhX1") ← xss CONFIRMED (marker bhX1)' if hit else "  xss: not confirmed"
-        return 200, f'bh-browse {step["url"]}: 200, title "x", 1.0 s [ok]\n{line}\n', False
+        summary = {"status": 200, "dialogs": [{"type": "alert", "message": "bhX1"}] if hit else []}
+        return (*proof.browse_body(summary, "bhX1"), False)
 
     monkeypatch.setattr(proof, "_browse", fake_browse)
     r = proof.replay(_xss_proof())
     assert r["reproduced"] and not r["control_disproves"]
+    assert r["rounds"][0][0]["snippet"] == "xss CONFIRMED (marker bhX1)"
+    assert r["rounds"][0][1]["snippet"] == "xss none (marker bhX1)"
 
     monkeypatch.setattr(proof, "_browse", lambda st: (200, "xss CONFIRMED (marker bhX1)", False))
     r = proof.replay(_xss_proof())  # the benign twin also "executes": no differential
