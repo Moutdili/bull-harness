@@ -35,16 +35,21 @@
   manipulation (training data, model weights, data/RAG poisoning), inferential information disclosure.
   Each must affect other users to reach Important/Critical. Model theft severity depends on whether the
   extracted data is confidential training data.
+  **Approximate**: this classification is the speaker's quick summary and differs from the bar's author
+  (e.g. model theft filed under model manipulation; T2 says model stealing "ranges from low all the way up
+  to to critical"). `msrc-ai-bug-bounty` is the reference for categories and severity.
 - ~08:30 [A] System prompt leak: "If you're able to leak such instructions, that's not in scope." Unless
   user-specific and confidential.
 - [A] Input extraction (recreating other users' inputs, e.g. a packet-length side channel) is in scope.
 - ~09:32 [A] "we do have rules of engagement and this is especially true with automated tooling such as Pirate."
 - ~09:47 [A] Two accounts of your own: "you want to make sure that you create two users uh that you holy control" ("holy" = wholly).
-- [A] Server-side execution: contact bounty@microsoft.com before going further; stay at PoC.
+- [A] Server-side execution: "reach out to bounty@microsoft.com if you want additional guidance on should you
+  proceed uh or not" ... "you don't go beyond proof of concept."
 - ~10:21 [A] "Don't do any kind of denial of service testing."
 - ~10:31 [A] "If you're able to bypass the rate limiting, by all means uh let us know" (but do not use it for DoS).
 - ~10:48 [A] "make sure that you uh that you're not abusing it and that you you do abide by the rate limiting that is in place."
-- [A] No social engineering of Microsoft employees, partners or vendors; respect service agreements.
+- [A] No social engineering of Microsoft employees, partners or vendors; use the services "in a way that does
+  not violate our service agreements".
 - ~11:42 [A] "a high quality report will include screenshots, steps to reproduce and a proof of concept."
 
 ## Part 2: PyRIT (Rich, ~12:00-28:00)

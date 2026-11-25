@@ -10,7 +10,8 @@
 
 ## Transcript quality caveats
 
-- **Cut segments.** The text breaks mid-sentence at least six times; content is missing at each cut:
+- **Cut segments.** The text breaks at block boundaries at least six times; content may be lost at a cut
+  (several cuts rejoin without visible loss, e.g. "unauthen" / "unauthenticated"):
   ~18 % ("when we do that," / "things."), ~32 % ("Copilot Studio and Power" / "platform"),
   ~47 % ("and I can do" / "of these things"), ~61 % ("so it can be grounded." / "that data"),
   ~76 % ("I leave it unauthen" / "unauthenticated"), ~90 % ("you can do strings." / "concatenation").
@@ -19,7 +20,8 @@
   "intra tenant" = Entra tenant; "SAS" = SaaS; "voln" = vuln.
 - **"research done by Samsung last year"** on connector consent / zero-click phishing (~86 %): the
   company name is doubtful. Do not cite it in a report without finding the original research.
-- **"Eric"**, the hired top bounty finder (~20 %, ~82 %): name unverified.
+- **"Eric"**, the hired top bounty finder (~20 %, ~82 %): name unverified. What he did is not in doubt
+  (see "Pro-dev extensibility" below).
 - The slides were not transcribed ("Link Soup" of resources promised on LinkedIn, not available here).
 
 ## Points from the talk
@@ -31,6 +33,13 @@
   be, you know, something that could be bountiable."
 - Asserted (Q&A, ~80 %): "our highest bountiable award in the Dynamics and Power Platform, uh, bounty
   program is the cross-tenant information disclosure."
+
+### Pro-dev extensibility: Dataverse plugins and SDK (~20 %)
+- Asserted: "as we go from the low code and and no code systems, we can build into prodev extensibility. So
+  in, in this area, um, this is where a lot of very interesting SDK interactions can occur".
+- Asserted: the hired top bounty finder "was able to leverage, yeah, dataverse plugins to file several, uh,
+  you know, critical vulnerabilities". The only concrete success story of the talk.
+- Asserted (Q&A, ~82 %): on SSRF, "That's what Eric was very good at finding."
 
 ### Dataverse authorization (~7 %)
 - Asserted: Dataverse "authorization model, which is distinct from Entra" ... "there might be some
@@ -140,13 +149,14 @@
 - Inferred: "fair game" means reportable, not permission to explore further; MSRC terms (doc 15) forbid
   accessing other customers' data beyond the PoC. Follow the terms, not this phrase.
 
-### SSRF and IDOR are the top cross-tenant paths (Q&A, ~82 %)
+### SSRF and IDOR as cross-tenant paths (Q&A, ~82 %)
 - Asserted: "I think SSRF is, is probably one of the biggest risks."
 - Asserted: PPAC API endpoints: "are the attributes that, that go into the URI, are they all verified
   properly, or do we have an IDOR vuln?"
 
 ### STRIDE at every boundary (Q&A, ~85 %)
-- Asserted: apply STRIDE "at each one of those boundary crossing conditions"; Copilot Studio is "kind of
+- Asserted: apply STRIDE ("spoofing, tampering, repudiation, information disclosure, denial of service and
+  escalation of privileges") "at each one of those boundary crossing conditions"; Copilot Studio is "kind of
   like a a child that has two homes" (M365 and Power Platform).
 
 ### Connectors: consent abuse and identity (Q&A, ~86-88 %)
@@ -175,3 +185,12 @@
 - Licenses, SKUs, trial procedures, tenant creation steps.
 - Payout amounts for Copilot Studio findings.
 - Exact URLs of bounty pages and the deck's "Link Soup".
+- Lab setup (two tenants, canaries, ALM import as a bypass path, HAR): our construction. The speaker even
+  files ALM as "not so much related to, uh, the Copilot Studio itself".
+- Stop rule on server-side execution: from the PyRIT webinar, not this talk.
+
+## Inferred, flagged in SKILL.md
+- STRIDE is applied **without the D** in the harness: DoS is forbidden by MSRC (doc 15).
+- Where tracing mode sits in the UI ("test pane"): not said.
+- Whether *disable Copilot publishing* is a tenant or environment setting: not said ("you can go into PPAc
+  and you turn that off").

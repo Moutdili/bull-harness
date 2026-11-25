@@ -58,6 +58,22 @@ def test_blind_ssrf_is_a_blocker_not_a_lead_for_someone():
     assert 'bh-note blocked oob-needed "' in text and "human" not in text
 
 
+def test_prompt_injection_card_loads_with_its_cross_user_standard():
+    cls = classes.BY_ID["prompt-injection"]
+    assert cls.card and classes.canonical("Indirect Prompt Injection") == "prompt-injection"
+    text = classes.card_text("prompt-injection")
+    assert text.startswith("## ") and len(text.splitlines()) <= 40
+    for part in ("When:", "Do:", "Watch:", "Never:", "BH-CANARY-<id>", "oob-needed"):
+        assert part in text, part
+    assert "BH-CANARY-<id>" in cls.evidence and "Control:" in cls.evidence
+    block = classes.cards_block(["prompt-injection"])
+    assert text in block and cls.evidence in block
+    assert classes.select_cards([("POST /api/chat", ["prompt"])])[0] == "prompt-injection"
+    # a conditional exclusion ("without impact on another user") stays for a human; the bare name removes it
+    assert classes.exclusion("Prompt injection without impact on another user") is None
+    assert classes.exclusion("Prompt injection") == "prompt-injection"
+
+
 def test_access_control_cards_point_at_bh_authz_and_its_proof():
     for cid in ("idor", "broken-access-control"):
         tool = classes.BY_ID[cid].tool

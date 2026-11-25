@@ -1,6 +1,6 @@
 ---
 name: ai-red-team-pyrit
-description: Load when red-teaming an AI system (a Copilot, an LLM app or an agent we own an account on) or when planning, running or wrapping PyRIT, its attacks/orchestrators, converters, targets, scorers or memory, including multi-turn jailbreaks (Crescendo, PAIR, TAP) and indirect (cross-domain) prompt injection. Also load before deciding whether an AI "jailbreak" is a bounty-grade vulnerability, or before designing a `bh-pyrit` builtin.
+description: Load when red-teaming an AI system (a Copilot, an LLM app or an agent we own an account on) through indirect (cross-domain) prompt injection between two of our accounts, when choosing payload delivery (converters: Base64, Unicode tags, text in image, PDF), or when planning, wrapping or rejecting PyRIT (attacks/orchestrators, converters, targets, scorers, memory) for bull-harness. Whether a finding pays is decided by `msrc-ai-bug-bounty`.
 ---
 
 # AI red teaming with PyRIT (MSRC / Copilot)
@@ -8,165 +8,169 @@ description: Load when red-teaming an AI system (a Copilot, an LLM app or an age
 Source: MSRC webinar "Zero Day Quest - Learn to Red Team AI Systems Using PyRIT", recorded 2 Dec 2024
 (YouTube `jq9DcEL3cHE`, 49 min). Speakers: an AI Red Team member (bounty program, bug bar) and the PyRIT
 engineering lead. Quotes, positions and transcription errors: `references/talk-notes.md`.
-Related skills: `msrc-ai-bug-bounty` (severity, what pays), `msrc-copilot-studio-research`.
+Related skills: **`msrc-ai-bug-bounty`** owns what pays, severity and the report format (§6 there);
+`msrc-copilot-studio-research` owns the Copilot Studio / Power Platform surface.
 Rules for the harness on MSRC: `docs/research/15-msrc-premier-programme.md`.
+Canary name in all three skills: `BH-CANARY-<id>`.
 
 **Dating.** The talk shows PyRIT around v0.5 (late 2024). PyRIT has since moved from `Azure/PyRIT`
 (archived) to **https://github.com/microsoft/PyRIT** (v1.2.1, 2026-11-18; names below checked on `main`
-@ `066b4e7421`, 2026-11-25). v0.10.0 renamed orchestrators to "attacks" (executors). Each name below is
-tagged **[talk]** (heard in the talk; the transcript is automatic, "Pirate" = PyRIT) and/or **[repo]**
-(seen in the current repo). Anything untagged is my inference.
+@ `066b4e7421`, 2026-11-25, not re-checked since). v0.10.0 renamed orchestrators to "attacks" (executors).
+Tags: **[talk]** = heard in the talk (automatic transcript, "Pirate" = PyRIT); **[repo]** = seen in the
+current repo; **[inferred]** = ours. Class spellings for things only *spoken* in the talk are [inferred].
+
+**Decision for v1: no PyRIT** (§6). The concepts below stay useful as vocabulary and as a later option.
 
 ## 1. PyRIT concepts as presented
 
-Five swappable "LEGO block" components [talk]; an attack wires them together.
+Five swappable components: "Each are LEGO block interfaces that can be swapped out" [talk]; an attack wires them.
 
 | Component | Talk (2024) | Current repo (2026) |
 |---|---|---|
-| **Orchestrator** = attack strategy and logic; "the one component that's not an interface" | `PromptSendingOrchestrator` ("prompt sending orchestrator"), `CrescendoOrchestrator`; strategies named: PAIR, TAP, Crescendo, Skeleton Key, Flip attack [talk] | `PromptSendingAttack`, `CrescendoAttack`, `RedTeamingAttack`, `PAIRAttack`, `TAPAttack` / `TreeOfAttacksWithPruningAttack`, `SkeletonKeyAttack`, `ManyShotJailbreakAttack`, `MultiPromptSendingAttack` [repo]. Config objects `AttackAdversarialConfig`, `AttackScoringConfig`, `AttackConverterConfig`, runner `AttackExecutor` [repo]. `FlipAttack` is in the v0.10.0 rename list but not in the current `pyrit.executor.attack` exports (not checked further). |
-| **Datasets** = the prompts / objectives | "seed prompts", "a couple hundred simple jailbreaks", jailbreak templates [talk] | `pyrit/datasets/jailbreak/text_jailbreak.py`, `TextJailbreakConverter` [repo] |
-| **Converters** = transform a prompt (stackable) | Base64, Caesar, translation, image, audio; "emoji converters", "add image text converter", "ASCII smuggler converter", a translation converter, "rap battle" rewrite [talk] | `Base64Converter`, `CaesarConverter`, `TranslationConverter`, `EmojiConverter`, `AddImageTextConverter`, `AsciiSmugglerConverter`, `PDFConverter`, `WordDocConverter`, `VariationConverter`, `ToneConverter`, `LLMGenericTextConverter` [repo]. The class used for "rap battle" was not named; probably an LLM-backed converter (unverified). |
-| **Targets** = what we talk to: an AI endpoint **or** a storage/channel the AI later reads | "OpenAI chat target" (GPT-4o), Hugging Face, Azure Blob storage, SharePoint site; a custom email target [talk] | `OpenAIChatTarget`, `HTTPTarget`, `AzureBlobStorageTarget`, `PlaywrightTarget`, `PlaywrightCopilotTarget` (consumer and M365 Copilot UI), `WebSocketCopilotTarget` (`wss://substrate.svc.cloud.microsoft/...`), `ClaudeChatTarget`, `TextTarget` [repo]. Targets accept `max_requests_per_minute` [repo]. |
-| **Scorers** = was the attack successful / how toxic | "a common way to say was this attack successful"; often unnecessary when success is visible (exfil happened) [talk] | `SubStringScorer`, `RegexScorer`, `SelfAskTrueFalseScorer`, `SelfAskRefusalScorer`, `MarkdownInjectionScorer`, `SecretDisclosureScorer`, `SystemPromptExtractionScorer`, `MessageToolCallScorer`, `TrueFalseCompositeScorer` [repo] |
-| **Memory** | **Not discussed in the talk.** | `SQLiteMemory` (replaced DuckDB in v0.10.0), `AzureSQLMemory`, `CentralMemory`; every run stored as an `AttackResult`; init via `from pyrit.setup import initialize_pyrit_async` [repo, v0.10.0 release notes] |
+| **Orchestrator** = attack strategy; "they're the one component that that's not an interface" [talk] | spoken: "prompt sending orchestrator", "a Crescendo orchestrator"; strategies named: PAIR, TAP, Crescendo, Skeleton Key, Flip attack [talk]. Class spellings `PromptSendingOrchestrator`, `CrescendoOrchestrator` [inferred, match the v0.10.0 rename list] | `PromptSendingAttack`, `CrescendoAttack`, `RedTeamingAttack`, `PAIRAttack`, `TAPAttack` / `TreeOfAttacksWithPruningAttack`, `SkeletonKeyAttack`, `ManyShotJailbreakAttack`, `MultiPromptSendingAttack`; `AttackAdversarialConfig`, `AttackScoringConfig`, `AttackConverterConfig`, `AttackExecutor` [repo]. `FlipAttack` not in current exports (not checked further). |
+| **Datasets** = prompts / objectives | "seed prompts", "a couple hundred simple jailbreaks" [talk] | `pyrit/datasets/jailbreak/text_jailbreak.py`, `TextJailbreakConverter` [repo]. **Excluded from our recipes** (§5). |
+| **Converters** = transform a prompt (stackable) | Base64, Caesar, translation, image, audio; "emoji converters", "add image text converter", "ASCII smuggler converter", "rap battle" [talk] | `Base64Converter`, `CaesarConverter`, `TranslationConverter`, `EmojiConverter`, `AddImageTextConverter`, `AsciiSmugglerConverter`, `PDFConverter`, `WordDocConverter`, `VariationConverter`, `ToneConverter`, `LLMGenericTextConverter` [repo]. "Rap battle" used an LLM on the back end [talk]; class not named. |
+| **Targets** = an AI endpoint **or** a storage/channel the AI later reads | "OpenAI chat target" (GPT-4o), Azure Blob storage, SharePoint; a custom email target "which doesn't exist" [talk] | `OpenAIChatTarget`, `HTTPTarget`, `AzureBlobStorageTarget`, `PlaywrightTarget`, `PlaywrightCopilotTarget`, `WebSocketCopilotTarget` (`wss://substrate.svc.cloud.microsoft/...`), `ClaudeChatTarget`, `TextTarget`; `max_requests_per_minute` [repo]. |
+| **Scorers** = success / toxicity | "a common way to say like was this attack successful or how toxic is this content"; often unneeded: "you can kind of just see if it worked based on exfiltrating data" [talk] | `SubStringScorer`, `RegexScorer`, `SelfAskTrueFalseScorer`, `SelfAskRefusalScorer`, `MarkdownInjectionScorer`, ... [repo] |
+| **Memory** | **Not discussed in the talk.** | `SQLiteMemory` (replaced DuckDB in v0.10.0), `AzureSQLMemory`, `CentralMemory` [repo] |
 
-Crescendo parameters named in the talk: the objective target, "the adversarial chat", "our scoring
-target", converters [talk]. Indirect injection: the 2024 `XPIAOrchestrator` is now `XPIAWorkflow`
-(`attack_setup_target` plants the payload, a processing callback triggers the victim AI) [repo]; the talk
-does not use the term XPIA.
+Crescendo inputs named in the talk: "a target", "the adversarial chat, our scoring target", converters
+[talk]. Indirect injection: the 2024 `XPIAOrchestrator` is now `XPIAWorkflow` [repo]; the talk does not
+use the term XPIA.
 
 ## 2. Red-team method presented
 
-1. **Find the scenario yourself.** PyRIT "won't help you come up with the attack or the scenario". It
-   helps with the injection text, i.e. bypassing AI-specific mitigations (content filters, metaprompt,
-   fine-tuning) [talk].
-2. **Look at the integration, not the model.** How is the model API called, what functions are added on
-   top, is there a human in the loop or a confirmation before an action? Treat the model as a black box
-   and apply app-sec skills [talk, Q&A].
-3. **Map untrusted input -> AI -> privileged output.** "Where you can enter prompts", where input lands
-   and where output goes; a trusted/untrusted mix that someone acts on is "a really good place to dig" [talk].
+1. **Find the scenario yourself.** "Pirate won't help you come up with the attack or the scenario you're
+   trying to do" [talk]. It helps with delivery past AI-specific mitigations (content filters, metaprompt,
+   fine-tuning).
+2. **Look at the integration, not the model.** "I always look at the integration"; "Do we have, for
+   example, human in the loop?"; "you can sort of see the AI as a black box" [talk].
+3. **Map untrusted input -> AI -> privileged output.** Trusted/untrusted mix that someone uses: "that's
+   that's a really good place to to dig" [talk].
 4. **Assume injection is possible.** "Most of these systems will actually be vulnerable to prompt
-   injections"; no single mitigation exists [talk]. The bounty question is the impact.
+   injections" [talk]. The bounty question is the impact on another user.
 5. **Iterate cheaply on delivery, one change at a time** (the email-Copilot walkthrough) [talk]:
-   plain prompt -> jailbreak templates -> payload as image attachment (`AddImageTextConverter`) -> PDF
-   attachment -> ASCII smuggling -> other language (Spanish) -> style rewrite. Converters stack.
-6. **Expect to write code.** The email target and the MSG-template converter "don't exist"; real
-   scenarios need custom targets/converters [talk].
-7. **Validate manually and keep notes** of hypotheses; ask `bounty@microsoft.com` when unsure [talk].
+   plain prompt -> payload as image attachment -> PDF attachment -> ASCII smuggling -> other language ->
+   style rewrite. Converters stack. (The talk also tries the jailbreak dataset first: excluded here, §5.)
+6. **Expect to write code**: the email target and the MSG-template converter "don't exist" [talk].
+7. **Validate manually and keep notes** [talk]; ask `bounty@microsoft.com` when unsure.
 
-## 3. Workflow: testing a Copilot or agent we own
+## 3. Workflow: indirect injection between two accounts we own
 
-Preconditions (hard): two accounts/tenants that are ours (attacker A, victim B); program scope file
-loaded; `automation_allowed` known; no Microsoft employee or third-party content involved.
+Preconditions (hard):
+- Two accounts/tenants that are ours (attacker A, victim B): "create two users uh that you holy control"
+  [talk] ("holy" = wholly). Program scope loaded; `automation_allowed` known.
+- No Microsoft employee, partner, vendor or third-party content involved [talk, doc 15].
+- Use the services "in a way that does not violate our service agreements" [talk]; a throttled or
+  challenged test account ends the run on that surface.
+- Stop rules of §5 known (server-side execution, third-party data).
+- Target UI transport measured (websocket or HTTP, §6). Websocket-only: blocker, stop.
 
-1. **Inventory the surface** with `bh-browse` on B: every channel the AI reads (mail, files, web pages,
-   calendar, chat history, plugins/connectors) and every action it can take (send mail, fetch URL,
-   render markdown/images, write files, call tools). Write it as a table in notes.
-2. **Pick a cross-boundary path**: content A controls -> read by B's Copilot -> action or disclosure
-   visible to A. No path = no bounty; stop or change surface.
-3. **Canary first.** Plant a benign instruction from A that asks B's AI to emit a unique token
-   (`BH-CANARY-<id>`) or fetch a URL on an endpoint we own. Benign payloads only; the token proves
-   instruction-following without harm.
-4. **Trigger as B** with an ordinary user request ("summarize my last mail").
-5. **Observe the side effect** in the gate HAR / OOB log / A's inbox, not in the model's prose.
-6. **If blocked**, vary delivery with small converter stacks (step 2.5), a few prompts per variant,
-   at the program rate. Record each variant and result.
-7. **Escalate impact only on our own data**: replace the canary with B's own test secret (planted by us)
+Steps [inferred, from the talk's method]:
+1. **Inventory the surface** as B: every channel the AI reads (mail, files, web pages, calendar, chat
+   history, plugins/connectors) and every action it can take (send mail, fetch URL, render markdown or
+   images, write files, call tools). Table in notes.
+2. **Pick a cross-boundary path**: content A controls -> read by B's AI -> action in B or B's data
+   visible to A. No path = no bounty; stop or change surface. Mail or file injection supposes an AI that
+   reads B's mailbox or drive, probably behind a licence [inferred]: if so, blocker `paid`.
+3. **Canary first.** A plants a benign instruction asking B's AI to emit `BH-CANARY-<id>` somewhere **A
+   can read** (a reply mail to A, a shared file, a comment on A's object), or to perform a harmless action
+   in B. Benign payloads only.
+4. **Trigger as B** with an ordinary request ("summarize my last mail").
+5. **Observe the side effect**, never the model's prose: A's inbox or object (as A), B's state (as B), the
+   gate HAR. No receiver of ours exists (`bh-oob`, issue 31 open): a proof that needs one = blocker
+   `oob-needed`. Off-host requests from B's browser are counted per host by `bh-browse` (lead only).
+6. **Control**: same request by B without the poisoned source, and same content without the payload.
+   Both must not show the canary or the action.
+7. **If blocked**, vary delivery with small converter stacks (step 2.5), a few variants, at the program rate.
+8. **Escalate impact only on our own data**: replace the canary with B's own test secret (planted by us)
    and show it reaching A. Stop at proof of concept.
-8. **Reproduce twice**, minimal steps, then hand to the judge. Report = screenshots, steps, PoC [talk].
+9. **Repeat N times, report k/N** and the conversation IDs (`msrc-ai-bug-bounty` §6), then hand to the judge.
 
-## 4. What counts as a vulnerability (MSRC bounty sense)
+## 4. What counts
 
-Pays (per the talk; check `msrc-ai-bug-bounty` and the live AI bug bar):
-- **Inference manipulation that crosses the user boundary**: an injection from user A changes what user
-  B's AI does: data exfiltration, privilege escalation, manipulating another user's output [talk].
-- **Data / RAG poisoning affecting other users**, model or training-data theft, inferring other users'
-  inputs (the talk cites a packet-length side channel) [talk].
-- Rate-limit bypass: report it, do not use it [talk].
+Pays / does not pay, severity: **`msrc-ai-bug-bounty` §1-§4** only. One check before calling it a finding:
+can I state the victim (B), what A controlled, what crossed, and what A gained or changed? If one is
+missing, it is not a finding. Rate-limit bypass: not hunted (`msrc-ai-bug-bounty` §3).
 
-Does not pay:
-- Jailbreaks in your own session ("you don't get bounties for convincing Chat GPT to tell you how to make
-  meth") [talk]. PyRIT's Molotov/meth examples are placeholders for your scenario objective.
-- System prompt extraction, unless it holds user-specific confidential data [talk].
-- Fine-tuning or poisoning only your own context [talk].
-- Self-XSS-like issues with no way to reach another user: moderate at best [talk, by analogy].
+## 5. Limits, stop rules, pitfalls
 
-Test: can I state the victim, what the attacker controlled, what crossed, and what the attacker gained
-or changed? If one is missing, it is not a finding.
-
-## 5. Limits and pitfalls
-
-- **Volume.** MSRC forbids automated testing that "generates excessive traffic" and DoS; the talk asks
-  to abide by rate limits with PyRIT specifically. Blasting "a couple hundred" jailbreaks at a
-  production Copilot is the opposite. Small batches, program rate, stop on throttling.
-- **Harm objectives.** Do not use PyRIT's harmful-content datasets as objectives against production
-  services: no impact, policy risk, and it can trip our own model's refusals (blocker `refusal`).
-- **Attacker LLM required** for Crescendo/PAIR/TAP, translation and style converters, and self-ask
-  scorers; setting it up is "one of the biggest hurdles" [talk]. Speaker used GPT-4o; a 2026-09 PyRIT
-  blog finds the attacker model changes success rates a lot (less-aligned models do better) [repo blog].
-- **LLM scorers are not proof.** They can be fooled and can be injected by the target's reply. Prefer a
-  deterministic oracle (canary substring, OOB hit, mail received).
+- **Server-side execution** (traditional bug or one of the AI categories): stop at the first proof.
+  "reach out to bounty@microsoft.com if you want additional guidance on should you proceed uh or not" ...
+  "you don't go beyond proof of concept" [talk]. Harness gesture: `bh-note blocked other "server-side
+  execution: <where>, stopped at PoC"`, leave the lead; Mio decides whether to write to MSRC.
+- **Third-party data seen by accident**: stop, no re-read, `bh-note blocked other "third-party data seen:
+  <where, no content>"`; see `msrc-copilot-studio-research` §6.
+- **Volume.** MSRC forbids automated testing that "generates excessive traffic" and DoS [doc 15]; the talk
+  admits the tool if you "abide by the rate limiting that is in place" [talk]. Small batches, program rate,
+  stop on throttling.
+- **No jailbreak material.** No harmful-content objectives, no jailbreak dataset, no `TextJailbreakConverter`,
+  no DAN-style templates against production: no impact, policy risk, and our own model may refuse
+  (blocker `refusal`, CVP Defense tier).
+- **Attacker LLM required** for Crescendo/PAIR/TAP, translation and style converters, self-ask scorers:
+  "you need to have a generative AI endpoint that you're using for your infrastructure" [talk]. Speaker used
+  GPT-4o; a 2026-09 PyRIT blog finds the attacker model changes success rates a lot [repo blog].
+- **LLM scorers are not proof.** They can be fooled or injected by the target's reply. Deterministic oracle
+  only (canary substring, state change, mail received).
 - **API drift.** Code from the talk or old blogs (`*Orchestrator`, `initialize_pyrit`, DuckDB) does not
-  run on v1.x. Read the repo docs for the installed version.
-- **Copilot targets.** `WebSocketCopilotTarget` uses a websocket (the gate refuses websockets);
-  `PlaywrightCopilotTarget` needs a logged-in browser page. Both automate a production service.
-- **Transcript errors**: see `references/talk-notes.md` (names, URLs, "Integrity", "Garrick").
-- PyRIT executes LLM output as data, but third-party code runs with our rights: pin the version.
+  run on v1.x.
+- **Third-party code** runs with our rights: pin any version we install.
+- **Transcript errors**: `references/talk-notes.md`.
 
-## 6. Integrating with bull-harness (`bh-pyrit`, proposal)
+## 6. Integrating with bull-harness (proposal, not built)
 
-Not built. Fits the existing builtin contract (`docs/architecture.md` §5): stdlib wrapper in
-`src/bh/agent`, PyRIT installed in the agent image, no MCP.
+**Blocking point: the transport.** The gate refuses every websocket upgrade (`src/bh/gate/addon.py`:
+"websockets are not allowed: the gate cannot judge their frames"), and `bh-browse` refuses them locally.
+Copilot chat UIs probably use websockets [inferred, to measure: `WebSocketCopilotTarget` defaults to
+`wss://substrate.svc.cloud.microsoft/m365Copilot/Chathub`]. So:
+- Measure first: one `bh-browse` of the chat page as B; its summary prints "websockets: N refused".
+- Websocket-only chat: **unreachable today**. `bh-note blocked other "websocket-only chat: <url>"`.
+  A bounded websocket mode in the gate (frames judged or capped) is to be designed; decision for Mio.
+- HTTP alternative when it exists: an HTTP API of the same assistant, a channel that answers over plain
+  HTTP, or the injection side only (A writes mail/files over HTTP) with B's trigger through an HTTP surface.
+- `bh-browse` starts one Chromium per command: no persistent page to hand to `PlaywrightTarget` /
+  `PlaywrightCopilotTarget`. Not usable as is. Same for doc 15's "start with Copilot" recommendation.
 
-**Shape.** `bh-pyrit <recipe> --as <identity> [--variants N]` where a recipe is a small YAML/JSON the agent
-writes: target spec, payload text file, converter stack, oracle. Recipes, not free Python: the hooks
-see one Bash command, the lock and program rules apply, and the judge can replay it.
+**v1 without PyRIT: native converters.** In the default mode (no LLM), PyRIT would only bring
+deterministic converters, at the cost of a large third-party dependency in the agent image with an API
+that already broke once. v1 = four converters in `bh-agent` (stdlib; text-in-image may need a tool already
+in the Kali image, to check): **Base64**, **Unicode tags** (ASCII smuggling), **text in image**, **PDF**.
+The hunting agent writes the payload text, translated or restyled versions included, and picks the
+stack. PyRIT comes back only if multi-turn attacks prove necessary (decision for Mio).
 
-**Traffic through the gate.**
-- `HTTPTarget` (httpx) for API-shaped endpoints: proxy from env (`HTTPS_PROXY=gate:8080`) and the gate CA
-  in `verify`/`SSL_CERT_FILE`. Cookies and required headers are injected by the gate from `--as`, never
-  passed to PyRIT. Check that httpx honors the env proxy and CA in this setup before relying on it.
-- Browser-only Copilots: custom target that drives the same proxied Chromium as `bh-browse`
-  (`PlaywrightTarget` / `PlaywrightCopilotTarget` take a page). Not `WebSocketCopilotTarget` (websockets
-  refused by the gate).
-- Indirect injection: the "setup target" is a custom target that writes the payload through A's account
-  (mail, file upload) via the gate; the "processing" step is B's ordinary request. Both identities ours.
+**Shape.** A builtin taking a small recipe (target spec, payload file, converter stack, oracle), one Bash
+command, so hooks, lock and program rules apply. The recipe sets `X-BH-Identity` (`--as A` for the
+planting write, `--as B` for the trigger); cookies are injected by the gate, never in the recipe. Each
+variant records the HAR flow id of its request(s) next to its oracle result.
 
-**Rate.** Gate token bucket is the hard limit. Also set `max_requests_per_minute` on every target, cap
-`--variants` (e.g. 10 per call) and the attempts per surface per run; a 429 or WAF challenge ends the
-call. MSRC scopes have `scanners_allowed: false`: `bh-pyrit` must be classed as a test tool, and the
-cap is what keeps it from being an automated scanner.
+**Rate.** Gate token bucket is the hard limit; also a cap per call, per surface and **per day**. A 429 or
+WAF challenge ends the call. Classing it as a test tool under `scanners_allowed: false` is a reading of
+MSRC rules, not a technical fact (no threshold is published): **Mio's decision, written in the scope**.
 
-**Output.** <= 25 lines: recipe, variants sent, per-variant oracle result (hit/miss/refused/error),
-first hit with its HAR flow id. Raw: `raw/pyrit/<id>/` with the SQLite memory (`SQLiteMemory(db_path=...)`),
-each converted payload, responses, and `recipe.json` for replay. Endpoints touched go to
-`endpoints.jsonl`; coverage to `coverage.json`.
+**Output.** <= 25 lines: recipe, variants sent, per-variant oracle result (hit/miss/refused/error), first
+hit with its HAR flow id. Raw: `raw/inject/<id>/` with each converted payload, responses, `recipe.json`.
+
+**Judge.** The target is a non-deterministic LLM; stage A replays reads twice and writes once
+(`docs/architecture.md` §7). So: fixed threshold k/N (e.g. 2/3 on replay), a replay budget per finding,
+and the planting write (A's mail or file) is replayed once by the judge as A, or the hunter's plant is
+reused if replay would double production traffic (to decide). Payloads and target responses reach the
+judge only as tagged, bounded data; **only the deterministic oracle decides**.
 
 **Which LLM generates attacks and scores?**
-- **Default: none inside PyRIT.** The hunting agent (Claude, already on the relay) writes the payload
-  text and chooses the converter stack. `bh-pyrit` only uses deterministic converters
-  (`AsciiSmugglerConverter`, `Base64Converter`, `AddImageTextConverter`, `PDFConverter`, ...) and
-  deterministic oracles (`SubStringScorer`/`RegexScorer` on the canary, gate/OOB evidence). Cost: zero
-  extra relay requests; quota is the agent's normal turns. The judge replays `recipe.json`.
-- **Not recommended: `ClaudeChatTarget(endpoint="http://gate:8081")`** as adversarial chat / scorer
-  [repo: it takes `endpoint`]. Each Crescendo turn costs one adversarial call plus scoring calls; it
-  draws on the segment's relay budget (`3 x max_turns + 30`) and the shared quota, which the
-  architecture already lists as the nested-`claude -p` residual risk. LiteLLM headers and betas are
-  untested against the relay's allowlist. Asking Claude to write jailbreaks for multi-turn harm
-  objectives also risks refusals -> `refusal` blocker -> program parked (CVP Defense tier).
-- **Third-party attacker model (OpenAI, Azure OpenAI, Grok...)**: never a key in the agent. Only via a
-  second relay in the gate (key stays in the gate, host on the system allowlist, own budget), and only
-  if multi-turn attacks prove necessary. Decision for Mio; out of v1.
-- **Translation / style converters** need an LLM: in v1 the agent writes the translated or restyled text
-  itself and passes it as the payload.
+- **v1: none.** The hunting agent writes payloads; oracles are deterministic. No extra relay requests.
+- **`ClaudeChatTarget` through the relay: excluded.** The relay only injects Claude Code's OAuth token,
+  checks betas, model and body, and counts against the run budget (`addon.py`, `policy.py`); a LiteLLM
+  client is out of that contract.
+- **Third-party attacker model**: never a key in the agent. Only via a second relay in the gate, own
+  budget, if multi-turn proves necessary. Decision for Mio; out of v1.
 
-**Acceptance for a first version.** Against a local mock "assistant" we run (`bh target local`; to build,
-it does not exist yet; `docs/research/12-injection-lab.md` attacks the hunter, not a target): a recipe
-with a canary goes through the gate at the configured rate, the summary is <= 25 lines, the raw dir holds
-the SQLite DB and the payloads, and the judge replays the recipe and sees the same oracle hit.
+**Acceptance for a first version.** Against a local mock assistant we run (`bh target local`; to build):
+state which model plays the assistant and on which budget (a regex fake only tests plumbing). A recipe
+with a canary goes through the gate **over HTTPS** (positive test through the gate's proxy and CA, the
+known blind spot of the HTTP lab), at the configured rate; summary <= 25 lines; raw dir holds payloads and
+responses; the judge reaches the k/N threshold on replay.
 
 ## 7. Verify before use
 
-- PyRIT docs: https://github.com/microsoft/PyRIT (and the docs site linked from its README).
-- v0.10.0 release notes for the orchestrator -> attack map and memory changes.
-- Every class above against the version actually installed (`pip show pyrit`, then its exports).
+- PyRIT: https://github.com/microsoft/PyRIT, v0.10.0 release notes; every class against the installed version.
+- The websocket measurement on the actual target UI, dated.

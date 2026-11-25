@@ -26,6 +26,37 @@ après le correctif. Demander un SLA fait perdre l'éligibilité.
   (« In scope by default »), tout service en ligne Microsoft est éligible si l'impact est démontré. Copilot paie de
   100 $ à 30 000 $.
 
+## Compléments des vidéos MSRC (transcrites le 2026-11-25)
+
+Sources : T1 « Security Research in Copilot Studio », T2 « Zero Day Quest: … AI Research », T3 « … Red Team AI
+Systems Using PyRIT » (2 déc. 2024). Paroles d'orateurs, pas les conditions : les pages officielles priment.
+Détail et citations : skills `msrc-ai-bug-bounty` (barre, rapport), `msrc-copilot-studio-research`,
+`ai-red-team-pyrit`, et leurs `references/talk-notes.md`.
+
+- **Outil automatisé (T3)** : admis s'il respecte les limites de débit (« abide by the rate limiting that is in
+  place »). Aucun seuil publié. Classer un outil d'injection comme « outil de test » sous
+  `scanners_allowed: false` est une décision de Mio, à écrire dans le scope (plafond par appel et par jour).
+  Contourner la limite de débit : ne pas le chercher ; le signaler si vu par hasard.
+- **Exécution côté serveur (T3)** : arrêt à la première preuve ; MSRC demande d'écrire à bounty@microsoft.com
+  avant d'aller plus loin (« don't go beyond proof of concept »). Geste harnais : `bh-note blocked other`, piste
+  close, Mio décide.
+- **Contrats de service (T3)** : utiliser les services « in a way that does not violate our service agreements ».
+  Bridage d'un compte de test : arrêt sur cette surface.
+- **Champs du rapport IA (T2)** : URL ou application exacte, réglages choisis et texte de chaque prompt, preuves
+  (captures, vidéo, identifiant de conversation), taux de reproduction (k/N), si possible preuve que ce n'est pas
+  une hallucination. Liens courts entendus (`aka.ms/secure-ai`, `aka.ms/secure-at`) : divergents, non vérifiés,
+  ne pas les utiliser ; passer par le portail lié depuis bounty-ai.
+- **Donnée d'un tiers vue par accident (T1)** : la signaler tout de suite (« let us know immediately so we can
+  contact our customers »). Pendant la chasse : arrêt, aucune relecture, `bh-note blocked other` sans contenu.
+  Fait dédié, pause du programme et alerte à Mio : à construire.
+- **Websockets** : le gate refuse tout websocket (il ne juge pas les trames) et `bh-browse` aussi. Le chat Copilot
+  passe probablement par websocket (supposé, à mesurer avec `bh-browse`, ligne « websockets: N refused »). Tant
+  que le gate n'a pas de mode websocket borné (à concevoir, décision de Mio), un chat websocket seul est
+  injoignable ; chercher un chemin HTTP vers le même assistant.
+- **Hors bande** : `bh-oob` n'existe pas (issue 31). Preuve sans récepteur (effet vu depuis le compte A ou chez
+  la victime B, à nous) ; à défaut, blocker `oob-needed`. SSRF : la preuve est la requête reçue chez nous, jamais
+  une adresse interne.
+
 ## Zero Day Quest
 
 Deux volets : un Research Challenge ouvert à tous (+50 % pour un Critique ou un scénario à fort impact, cloud et IA)
@@ -47,3 +78,6 @@ lu. Sans challenge ouvert, une soumission suit les programmes normaux.
 Commencer par **Copilot** (copilot.microsoft.com, compte personnel) ou un service Azure précis dans nos tenants :
 périmètre net, identité simple, `bh-browse` adapté, impact entre utilisateurs (deux comptes à nous) prouvable par le
 juge. Les services cloud larges (Azure, Entra ID) viendront après la recette OAuth.
+
+**Réserve (2026-11-25)** : cette recommandation suppose que le chat Copilot soit joignable à travers le
+gate. S'il ne parle qu'en websocket (à mesurer), il ne l'est pas aujourd'hui ; voir « Compléments » ci-dessus.
