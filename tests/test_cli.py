@@ -91,3 +91,25 @@ def test_accounts_set_stores_hidden_values(tmp_path, monkeypatch, capsys):
     assert oct(os.stat(f).st_mode & 0o777) == "0o600"
     d = json.loads(f.read_text())
     assert d["email"] == "msobb-a@outlook.test" and d["password"] == "s3cret-Pw" and d["totp"] == "JBSWY3DPEHPK3PXP"
+
+
+def test_accounts_set_accepts_grouped_keys_and_explains_errors(tmp_path, monkeypatch, capsys):
+    import getpass
+    import json
+
+    import pytest
+
+    from bh import cli
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    nbsp = " "
+    answers = iter(["pw-123456", "pw-123456", f"jbsw{nbsp}y3dp{nbsp}ehpk 3pxp\n"])
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(answers))
+    assert cli.main(["accounts", "set", "p", "user-a", "--email", "a@b.test"]) == 0
+    f = tmp_path / "secrets" / "identities" / "p" / "user-a.json"
+    assert json.loads(f.read_text())["totp"] == "JBSWY3DPEHPK3PXP"
+    answers = iter(["", "123456"])  # the 6-digit code instead of the key
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(answers))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["accounts", "set", "p", "user-a", "--email", "a@b.test"])
+    assert "digit 1" in str(exc.value) and "123456" not in str(exc.value)

@@ -514,6 +514,9 @@ def cmd_accounts(args) -> int:
     return rc
 
 
+_B32 = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+
+
 def cmd_accounts_set(args) -> int:
     """Store a test account's credential typed by Mio (hidden input), for accounts that cannot sign up on their own
     (Microsoft, programs with KYC). Values never reach the screen, the shell history or the arguments."""
@@ -541,11 +544,16 @@ def cmd_accounts_set(args) -> int:
     totp = getpass.getpass("TOTP secret, base32 or otpauth:// URI (hidden, empty: none / keep): ").strip()
     if totp:
         if not totp.startswith("otpauth://"):
-            totp = totp.replace(" ", "").upper()
-            try:
-                base64.b32decode(totp + "=" * (-len(totp) % 8))
-            except ValueError:
-                raise SystemExit("ERR the TOTP secret is not base32: nothing written") from None
+            # pages show the key in groups ("abcd efgh ..."), often with non-breaking spaces or dashes
+            totp = "".join(ch for ch in totp if not ch.isspace() and ch not in "-_").upper().rstrip("=")
+            bad = sorted({("digit " + ch) if ch.isdigit() else "a symbol" for ch in totp if ch not in _B32})
+            if bad or len(totp) < 16:
+                why = f"characters outside A-Z and 2-7 ({', '.join(bad)})" if bad else f"too short ({len(totp)} chars)"
+                raise SystemExit(
+                    f"ERR not a TOTP key: {why}. Paste the text key shown under 'can't scan the code' "
+                    "(letters A-Z and digits 2-7, usually 16 or 32 characters), not the 6-digit code: nothing written"
+                )
+            base64.b32decode(totp + "=" * (-len(totp) % 8))
         cred["totp"] = totp
     if not cred.get("email") or not cred.get("password"):
         raise SystemExit("ERR an email and a password are needed: nothing written")
