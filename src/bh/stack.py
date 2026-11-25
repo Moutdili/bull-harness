@@ -18,6 +18,11 @@ JUDGE_CTR = "bh-judge"
 # the gate, no /work, no relay, nothing kept between two logins. Driven by the host only.
 LOGIN_CTR = "bh-login"
 LOGIN_USER = "hunter"
+# The persistent headful browser with a remote screen (compose service `browser`, profile `browser`;
+# bh.browser_service). Driven by the host through `podman exec -i` and by the agent through its narrow HTTP API.
+BROWSER_CTR = "bh-browser"
+BROWSER_USER = "hunter"
+BROWSER_SERVICE = "browser"
 VERIFY_SUBDIR = ".verify"  # /work/<program>/.verify/F<id>: a verifier's work dir, only in the judge container
 COMPOSE_FILE = "container/compose.yaml"
 

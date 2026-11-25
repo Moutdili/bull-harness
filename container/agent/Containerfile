@@ -86,6 +86,21 @@ RUN apt-get update \
  && dpkg-query -W zaproxy chromium chromium-driver | tee /opt/bh/zap-version.txt \
  && java -version
 
+# 5c. bh-browser (compose service `browser`, docs/research/18): a virtual display, a VNC server on the container's
+#     loopback, and the noVNC client files (/usr/share/novnc, served by the host UI; no server of noVNC runs here).
+#     Versions seen in kali-rolling on 2026-11-25 (https://pkg.kali.org/pkg/<source>): xorg-server 2:21.1.25-2
+#     (binary xvfb), x11vnc 0.9.17-3, novnc 1:1.6.0-3 (it depends on websockify 0.13.0+dfsg1-2, installed, unused).
+#     Pinned: a rolling repo that moved fails the build here; bump the ARGs after checking pkg.kali.org.
+ARG XVFB_VERSION=2:21.1.25-2
+ARG X11VNC_VERSION=0.9.17-3
+ARG NOVNC_VERSION=1:1.6.0-3
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends "xvfb=${XVFB_VERSION}" "x11vnc=${X11VNC_VERSION}" "novnc=${NOVNC_VERSION}" \
+ && rm -rf /var/lib/apt/lists/* \
+ && test -f /usr/share/novnc/core/rfb.js \
+ && command -v Xvfb x11vnc chromium \
+ && dpkg-query -W xvfb x11vnc novnc chromium | tee /opt/bh/browser-versions.txt
+
 # 6. Unprivileged hunter user (claude refuses bypassPermissions as root).
 RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work
 COPY entrypoint.sh check.sh /opt/bh/

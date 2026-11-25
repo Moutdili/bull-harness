@@ -5,11 +5,15 @@ Security model:
 - token login (secrets/ui.token) -> HttpOnly SameSite=Strict cookie;
 - every POST also needs header `X-BH: 1` (forces a CORS preflight from any other origin);
 - strict CSP, no inline script: agent output and target responses are untrusted and the
-  front end only ever renders them with textContent.
+  front end only ever renders them with textContent;
+- /captcha/ (the screen of bh-browser, for a human challenge Mio solves himself) is behind the same login: the
+  page, the noVNC client files and the WebSocket (same origin only) all need the session cookie. The screen comes
+  from the container through a `podman exec` pipe (bh.browser_service.host), never through a published port.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -19,6 +23,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +50,14 @@ CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 )
+# /captcha/ only: the noVNC client draws on a canvas, sets its cursor as a data: URL, and opens a WebSocket to this
+# same origin ('self' covers ws:/wss: of this host, CSP Level 3). Still no inline script or style, no frame.
+CAPTCHA_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
+CAPTCHA_FILES = {"captcha.js": "text/javascript", "captcha.css": "text/css"}
+CAPTCHA_TUNNELS = 2  # screens open at once
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -185,11 +198,11 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f"ui {self.address_string()} - {fmt % args}\n")
 
     # -- plumbing
-    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None, csp: str = CSP) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", csp)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
@@ -240,7 +253,84 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"not found: {exc}"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": str(exc)}, 500)
+        if u.path == "/captcha" or u.path.startswith("/captcha/"):
+            return self._captcha(u.path)
         self._send(404, b"not found", "text/plain")
+
+    # -- /captcha/: the browser's screen (only reached once _authed() said yes)
+    def _captcha(self, path: str) -> None:
+        if path == "/captcha":
+            return self._send(301, b"", "text/plain", {"Location": "/captcha/"})
+        if path == "/captcha/":
+            body = (STATIC / "captcha.html").read_bytes()
+            return self._send(200, body, "text/html; charset=utf-8", csp=CAPTCHA_CSP)
+        name = path.removeprefix("/captcha/")
+        if name in CAPTCHA_FILES:
+            body = (STATIC / name).read_bytes()
+            return self._send(200, body, CAPTCHA_FILES[name] + "; charset=utf-8", csp=CAPTCHA_CSP)
+        if name == "ws":
+            return self._captcha_ws()
+        if name.startswith("novnc/"):
+            try:
+                files = self._novnc_files()
+            except Exception as exc:  # noqa: BLE001
+                return self._send(502, f"noVNC client unavailable: {exc}"[:300].encode(), "text/plain")
+            body = files.get(name.removeprefix("novnc/"))
+            if body is None:
+                return self._send(404, b"not found", "text/plain")
+            ctype = "text/javascript" if name.endswith((".js", ".mjs")) else "application/octet-stream"
+            return self._send(200, body, ctype, {"Cache-Control": "private, max-age=3600"}, csp=CAPTCHA_CSP)
+        return self._send(404, b"not found", "text/plain")
+
+    def _novnc_files(self) -> dict[str, bytes]:
+        loader = getattr(self.server, "novnc_files", None)
+        if loader is None:
+            from bh.browser_service.host import novnc_files as loader
+        return loader()
+
+    def _same_origin(self) -> bool:
+        origin, host = urlparse(self.headers.get("Origin") or ""), self.headers.get("Host") or ""
+        return bool(host) and origin.netloc == host and origin.scheme in ("http", "https")
+
+    def _captcha_ws(self) -> None:
+        from bh.ui import ws
+
+        key = self.headers.get("Sec-WebSocket-Key")
+        if (self.headers.get("Upgrade") or "").lower() != "websocket" or not ws.valid_key(key):
+            return self._send(400, b"websocket only", "text/plain")
+        if not self._same_origin():  # cross-site WebSocket hijacking: the cookie alone is not enough
+            return self._send(403, b"forbidden", "text/plain")
+        slots = self.server.__dict__.setdefault("captcha_slots", threading.BoundedSemaphore(CAPTCHA_TUNNELS))
+        if not slots.acquire(blocking=False):
+            return self._send(429, b"too many screens open", "text/plain")
+        try:
+            opener = getattr(self.server, "open_tunnel", None)
+            if opener is None:
+                from bh.browser_service.host import open_tunnel as opener
+            try:
+                proc = opener()
+            except OSError as exc:
+                return self._send(502, f"tunnel: {type(exc).__name__}".encode(), "text/plain")
+            try:
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", ws.accept_key(key or ""))
+                offered = [p.strip() for p in (self.headers.get("Sec-WebSocket-Protocol") or "").split(",")]
+                if "binary" in offered:
+                    self.send_header("Sec-WebSocket-Protocol", "binary")
+                self.end_headers()
+                self.wfile.flush()
+                self.connection.settimeout(None)  # a screen may stay still for minutes
+                ws.relay(self.rfile, self.wfile, proc.stdin, proc.stdout)
+            finally:
+                self.close_connection = True
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=10)
+        finally:
+            slots.release()
 
     def do_POST(self):
         u = urlparse(self.path)
@@ -280,7 +370,7 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, program, model, started FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1"
             )
             return {
-                "containers": {c: stack.container_running(c) for c in (stack.GATE, stack.AGENT)},
+                "containers": {c: stack.container_running(c) for c in (stack.GATE, stack.AGENT, stack.BROWSER_CTR)},
                 "active_scope": act,
                 "severity": {s: sev.get(s, 0) for s in SEVERITIES},
                 "findings_to_review": b.rows("SELECT COUNT(*) n FROM findings WHERE status IN ('new','verified')")[0][
@@ -334,6 +424,12 @@ class Handler(BaseHTTPRequestHandler):
             ]
         if path == "/api/runs":
             return [dict(r) for r in b.rows("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
+        if path == "/api/captcha/status":
+            if not stack.container_running(stack.BROWSER_CTR):
+                return {"code": 503, "error": f"{stack.BROWSER_CTR} is not running (bh browser up)"}
+            from bh.browser_service import host as bhost
+
+            return bhost.call({"op": "status"}, timeout=60)
         if path == "/api/metrics":
             return self._metrics(b)
         if m := re.fullmatch(r"/api/runs/(\d+)/tools", path):
@@ -438,6 +534,10 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": True}
         if path == "/api/identities":
             return self._save_identity(body)
+        if path == "/api/captcha/done":
+            from bh.browser_service import host as bhost
+
+            return bhost.mark_done()
         if path == "/api/run":
             return self._start_run(body)
         if path == "/api/run/stop":
@@ -521,5 +621,6 @@ def serve(host: str | None = None, port: int = 7340) -> None:
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.token = ui_token()
     srv.daemon_threads = True
+    srv.captcha_slots = threading.BoundedSemaphore(CAPTCHA_TUNNELS)
     print(f"bh ui on http://{host}:{port}/  (log in with the token in secrets/ui.token)", flush=True)
     srv.serve_forever()

@@ -142,6 +142,9 @@ def cmd_up(args) -> int:
     if not (paths.tools_dir() / "nuclei-templates").is_dir():
         print("nuclei templates missing: run `bh tools fetch` first", file=sys.stderr)
         return 2
+    from bh.browser_service import host as bhost
+
+    bhost.ensure_token()  # compose reads secrets/browser.env for the agent (and bh-browser)
     for d in (
         paths.var() / "gate" / "conf",
         paths.state() / "identities",
@@ -174,8 +177,8 @@ def cmd_tools_fetch(args) -> int:
 
 
 def cmd_status(args) -> int:
-    for name in (stack.GATE, stack.AGENT, stack.JUDGE_CTR):
-        print(f"{name:9} {'running' if stack.container_running(name) else 'DOWN'}")
+    for name in (stack.GATE, stack.AGENT, stack.JUDGE_CTR, stack.BROWSER_CTR):
+        print(f"{name:10} {'running' if stack.container_running(name) else 'DOWN'}")
     if paths.active_scope().exists():
         s = _load_scope_or_exit(str(paths.active_scope()))
         print(f"active scope: {s.platform}/{s.program} (rps {s.max_rps})")
@@ -642,6 +645,91 @@ def cmd_accounts_mail_check(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- persistent browser (human challenge)
+def _browser_compose(*args: str) -> int:
+    return stack.compose("--profile", stack.BROWSER_SERVICE, *args)
+
+
+def cmd_browser_up(args) -> int:
+    from bh.browser_service import host as bhost
+
+    if not stack.container_running(stack.GATE):
+        print("the gate is down: `bh up` first (the browser's only way out is the gate)", file=sys.stderr)
+        return 2
+    bhost.ensure_token()
+    # --no-deps: never recreate the gate (or the agent) by side effect
+    rc = _browser_compose("up", "-d", "--no-deps", stack.BROWSER_SERVICE)
+    if rc == 0:
+        print(f"{stack.BROWSER_CTR} up; screen: {bhost.view_url()}")
+    return rc
+
+
+def cmd_browser_down(args) -> int:
+    return _browser_compose("stop", stack.BROWSER_SERVICE)  # the profile volume stays
+
+
+def _browser_reply(out: dict) -> int:
+    if out.get("code") != 200:
+        print(f"ERR {out.get('error', 'no reply')} {out.get('detail', '')}".rstrip(), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_browser_status(args) -> int:
+    from bh.browser_service import host as bhost
+    from bh.browser_service import notify
+
+    if not stack.container_running(stack.BROWSER_CTR):
+        print(f"{stack.BROWSER_CTR} DOWN (bh browser up)")
+        return 1
+    out = bhost.call({"op": "status"})
+    if rc := _browser_reply(out):
+        return rc
+    ch = out.get("challenge") or {}
+    who = f"{out.get('program')}/{out.get('identity')}" if out.get("identity") else "no identity loaded"
+    print(f"url       {out.get('url')}\ntitle     {out.get('title')}")
+    print(f"identity  {who} ({out.get('cookies_loaded')} cookies)")
+    print(f"challenge {'PENDING (' + str(ch.get('reason')) + ')' if ch.get('pending') else 'none'}")
+    if out.get("human_done_at"):
+        print(f"human     done at {time.strftime('%F %T', time.localtime(out['human_done_at']))}")
+    if ch.get("pending"):
+        url = bhost.view_url()
+        print(f"solve it by hand: {url}")
+        notify.captcha(out.get("program"), out.get("identity"), url)
+    return 0
+
+
+def cmd_browser_load(args) -> int:
+    from bh.browser_service import host as bhost
+
+    scope = _load_scope_or_exit(args.scope)
+    req, headers = bhost.identity_payload(scope.program, args.identity)
+    out = bhost.call(req)
+    if rc := _browser_reply(out):
+        return rc
+    print(f"{scope.program}/{args.identity}: {out.get('cookies')} cookie(s) loaded in {stack.BROWSER_CTR}")
+    if headers:
+        print(f"not injected (headers, the browser sends its own): {', '.join(headers)}")
+    return 0
+
+
+def cmd_browser_reset(args) -> int:
+    from bh.browser_service import host as bhost
+
+    if not args.yes:
+        print("reset wipes the browser profile (cookies, storage, history): add --yes", file=sys.stderr)
+        return 2
+    return _browser_reply(bhost.call({"op": "reset"}))
+
+
+def cmd_browser_view(args) -> int:
+    from bh.browser_service import host as bhost
+
+    print(bhost.view_url(args.host, args.port))
+    print("log in to the UI with secrets/ui.token first; solve the challenge by hand, then click « J'ai fini »")
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bh", description="bull-harness CLI")
@@ -771,6 +859,23 @@ def build_parser() -> argparse.ArgumentParser:
     acs.add_parser(
         "mail-check", help="Gmail (read-only): refresh the token, count 24 h of mail to the researcher alias"
     ).set_defaults(func=cmd_accounts_mail_check)
+
+    br = sub.add_parser("browser", help="persistent headful browser with a remote screen (human challenges)")
+    brs = br.add_subparsers(dest="bcmd", required=True)
+    brs.add_parser("up", help="start bh-browser (needs the gate up)").set_defaults(func=cmd_browser_up)
+    brs.add_parser("down", help="stop bh-browser (its profile is kept)").set_defaults(func=cmd_browser_down)
+    brs.add_parser("status", help="URL, title, identity, pending human challenge").set_defaults(func=cmd_browser_status)
+    bl_ = brs.add_parser("load", help="put an identity's session cookies in the browser profile")
+    bl_.add_argument("scope", help="scope YAML (gives the program)")
+    bl_.add_argument("identity", help="identity name, as in var/state/identities/<program>/")
+    bl_.set_defaults(func=cmd_browser_load)
+    rs = brs.add_parser("reset", help="wipe the browser profile and restart Chromium")
+    rs.add_argument("--yes", action="store_true", help="confirm")
+    rs.set_defaults(func=cmd_browser_reset)
+    vw = brs.add_parser("view", help="print the UI page that shows the browser's screen (/captcha/)")
+    vw.add_argument("--host")
+    vw.add_argument("--port", type=int, default=UI_PORT)
+    vw.set_defaults(func=cmd_browser_view)
 
     fl = sub.add_parser("flows", help="last requests seen by the gate (targets only)")
     fl.add_argument("-n", type=int, default=30)

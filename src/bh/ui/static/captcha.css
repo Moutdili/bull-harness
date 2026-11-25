@@ -1,0 +1,12 @@
+:root { color-scheme: dark; --bg: #111418; --fg: #e6e6e6; --muted: #9aa4ae; --warn: #e0a030; --ok: #4caf7a; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid #2a2f36; }
+header a { color: var(--fg); font-weight: 600; text-decoration: none; }
+#where { color: var(--muted); overflow-wrap: anywhere; flex: 1 1 300px; }
+.tag { padding: 2px 8px; border-radius: 4px; background: #222830; }
+.tag.warn { background: var(--warn); color: #111; }
+.tag.ok { background: var(--ok); color: #111; }
+#done { padding: 6px 14px; font: inherit; cursor: pointer; }
+.rule { margin: 8px 16px; color: var(--muted); }
+#screen { height: calc(100vh - 110px); margin: 0 16px 16px; background: #000; }

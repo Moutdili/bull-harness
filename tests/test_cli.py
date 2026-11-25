@@ -113,3 +113,22 @@ def test_accounts_set_accepts_grouped_keys_and_explains_errors(tmp_path, monkeyp
     with pytest.raises(SystemExit) as exc:
         cli.main(["accounts", "set", "p", "user-a", "--email", "a@b.test"])
     assert "digit 1" in str(exc.value) and "123456" not in str(exc.value)
+
+
+def test_browser_subcommands_have_help(capsys):
+    for sub in ("up", "down", "status", "load", "reset", "view"):
+        with pytest.raises(SystemExit) as exc:
+            main(["browser", sub, "--help"])
+        assert exc.value.code == 0, sub
+    with pytest.raises(SystemExit) as exc:
+        main(["browser", "--help"])
+    assert exc.value.code == 0 and "captcha" not in capsys.readouterr().err
+
+
+def test_browser_view_prints_the_captcha_page(capsys):
+    assert main(["browser", "view", "--host", "100.64.0.1"]) == 0
+    assert "http://100.64.0.1:7340/captcha/" in capsys.readouterr().out
+
+
+def test_browser_reset_needs_confirmation(capsys):
+    assert main(["browser", "reset"]) == 2

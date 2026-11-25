@@ -23,5 +23,7 @@ fi
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export NODE_EXTRA_CA_CERTS=$SSL_CERT_FILE REQUESTS_CA_BUNDLE=$SSL_CERT_FILE CURL_CA_BUNDLE=$SSL_CERT_FILE
 chown -R hunter:hunter /work 2>/dev/null || true
+# bh-browser: the profile volume is created root-owned
+if [ -d /profile ] && [ "$(stat -c %U /profile)" != hunter ]; then chown -R hunter:hunter /profile; fi
 export HOME=/home/hunter USER=hunter
 exec runuser -u hunter --preserve-environment -- "$@"
