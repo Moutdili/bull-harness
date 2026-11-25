@@ -7,6 +7,13 @@ Classes of destination:
 - passive : third-party recon sources (archives, CT logs). GET/HEAD without body only, no program
             headers, no identities, own rate limit, public IPs only. Never a target.
 - target  : decided by bh.scope.check / check_resolved. Program headers, identities, rate limit.
+- support : hosts of the scope's `support` list, never targets. `assets` (what the targets' pages load): GET/HEAD
+            without body from any sandbox client, no program headers, no identity, no Cookie / Authorization.
+            `auth` (our own login): the enrollment sources only (the gate and bh-login), the login's methods;
+            the hunter and the judge are refused ("login host, enrollment only"). Own rate limit, public IPs
+            only, never a test (flows class `support`, outside the asset graph and the counts).
+Websockets (scope `websockets: true`, refused otherwise): the handshake is a target request like any other
+(scope, identity, program headers, rate); then every client message is bounded and journaled (WsGuard).
 Everything else is denied. Decisions are made on the real destination (the CONNECT target or the
 absolute request URL), never on the Host header alone.
 """
@@ -15,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import json
 import os
@@ -34,12 +42,19 @@ from bh.agent.contract import (
     origin,
     path_key,
 )
+from bh import redact
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
+from bh.scope.enforce import check_support_resolved
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
 SYSTEM_HOSTS = ("api.anthropic.com",)
 RELAY_PORT = 8081  # gate listener: --mode=reverse:https://api.anthropic.com@8081 (container/compose.yaml)
 PASSIVE_RPS = 2.0
+# support hosts (assets a page loads, our login): their own bucket, so a page's twenty scripts neither wait behind the
+# target's rate nor take from it; bounded all the same
+SUPPORT_RPS, SUPPORT_BURST = 4.0, 8.0
+# what an enrollment login may send to an `auth` support host
+SUPPORT_AUTH_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST"})
 # Ports a domain/wildcard rule authorizes; a CIDR rule (explicit IP range, e.g. a lab) authorizes any port.
 WEB_PORTS = frozenset({80, 443, 8000, 8008, 8080, 8443, 8888})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -120,9 +135,10 @@ def is_public_ip(ip: str) -> bool:
 @dataclass
 class Verdict:
     allowed: bool
-    klass: str  # system | passive | target | deny
+    klass: str  # system | passive | target | support | deny
     reason: str
     rule: str | None = None
+    support: str | None = None  # kind of a `support` verdict: "auth" | "assets"
 
 
 def deny(reason: str, rule: str | None = None) -> Verdict:
@@ -167,6 +183,8 @@ class Policy:
     waf_seen: dict[str, deque] = field(default_factory=dict)  # host -> deque[ts of WAF answers]
     host_blocked_until: dict[str, float] = field(default_factory=dict)  # host -> end of its WAF cooldown
     local_ips: frozenset[str] = frozenset()  # the gate's own addresses (never a destination, B3)
+    ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # noqa: PLW0108 - defined below
+    ws_live: dict[str, WsGuard] = field(default_factory=dict)  # open websocket (flow id) -> its guard
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -201,18 +219,24 @@ class Policy:
         d: Decision = check(self.scope, target)
         if d.allowed:
             return Verdict(True, "target", d.reason, d.rule)
+        if d.support is not None:
+            return Verdict(True, "support", d.reason, None, d.support)
         if d.rule is not None:  # explicit out-of-scope rule wins over everything
             return deny(d.reason, d.rule)
         return None
 
-    def classify_connect(self, host: str, port: int) -> Verdict:
-        """CONNECT host:port, before any byte of the tunnel is seen."""
+    def classify_connect(self, host: str, port: int, *, enroll: bool = False) -> Verdict:
+        """CONNECT host:port, before any byte of the tunnel is seen. `enroll`: the client is an enrollment source."""
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         if is_self_address(host, self.local_ips):
             return deny(f"{host} is the gate itself", "self")
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         v = self._target(authority)
+        if v is not None and v.klass == "support":
+            if port not in (80, 443):
+                return deny(f"support host {host}: port {port} (80 and 443 only)")
+            return _support_client(v, host, enroll) or v
         if v is not None:
             return _web_port(v, port) or self._waf_cooldown(host, v) or v
         if is_passive(host):
@@ -230,14 +254,30 @@ class Policy:
         body_len: int = 0,
         body: bytes | None = None,
         authenticated: bool = False,
+        enroll: bool = False,
+        websocket: bool = False,
     ) -> Verdict:
-        """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent."""
+        """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent.
+        `enroll`: the client is an enrollment source (the gate itself, bh-login). `websocket`: an upgrade handshake."""
         method = method.upper()
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         if is_self_address(host, self.local_ips):
             return deny(f"{host} is the gate itself", "self")
         v = self._target(url)
+        if websocket:  # the scope opts in; then targets only, and the handshake goes through the target rules below
+            if self.scope is None or not self.scope.websockets_on:
+                return deny("websockets are not allowed: this program's scope does not enable them (websockets: true)")
+            if v is None or v.klass != "target":
+                return v if v is not None and not v.allowed else deny("websockets go to the scope's targets only")
+            if method != "GET":
+                return deny(f"websocket handshake with {method}")
+            if len(self.ws_live) >= self.ws_limits.max_open:
+                return deny(f"websockets: {self.ws_limits.max_open} already open (close one first)")
+        if v is not None and v.klass == "support":
+            return self._support_request(
+                v, url, host, method, host_header=host_header, body_len=body_len, enroll=enroll
+            )
         if v is not None and v.allowed:
             if paused := self._waf_cooldown(host, v):
                 return paused
@@ -266,6 +306,24 @@ class Policy:
                 return deny(f"passive source {host}: path not allowed")
             return Verdict(True, "passive", f"passive source {host}")
         return deny(self.scope_error or "not in scope")
+
+    def _support_request(
+        self, v: Verdict, url: str, host: str, method: str, *, host_header: str | None, body_len: int, enroll: bool
+    ) -> Verdict:
+        """A request to a support host: never a test. assets: GET/HEAD without body; auth: enrollment sources only."""
+        if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
+            return deny("support host with a different Host header")
+        if _port(url) not in (80, 443):
+            return deny(f"support host {host}: port {_port(url)} (80 and 443 only)")
+        if why := _support_client(v, host, enroll):
+            return why
+        if v.support == "assets" and (method not in ("GET", "HEAD") or body_len):
+            return deny(f"support host {host} (assets): GET/HEAD without body only, not {method}")
+        if v.support == "auth" and method not in SUPPORT_AUTH_METHODS:
+            return deny(f"support host {host} (login): method {method} not allowed")
+        if body_len > MAX_BODY_BYTES:
+            return deny(f"request body over {MAX_BODY_BYTES} bytes")
+        return v
 
     def note_answer(self, url: str, status: int) -> None:
         """Target answers feed the scanner guard (only where the program forbids scanners)."""
@@ -336,6 +394,9 @@ class Policy:
         self.reload()
         if self.scope is None:
             return deny(self.scope_error or "no scope")
+        if check(self.scope, host).support is not None:
+            d = check_support_resolved(self.scope, host, ip)
+            return Verdict(d.allowed, "support" if d.allowed else "deny", d.reason, d.rule, d.support)
         d = check_resolved(self.scope, host, ip)
         return Verdict(d.allowed, "target" if d.allowed else "deny", d.reason, d.rule)
 
@@ -383,13 +444,131 @@ class Policy:
         )
 
     def bucket(self, klass: str) -> TokenBucket | None:
-        rps = PASSIVE_RPS if klass == "passive" else self.target_rps() if klass == "target" else None
+        rps = {"passive": PASSIVE_RPS, "support": SUPPORT_RPS}.get(klass)
+        if klass == "target":
+            rps = self.target_rps()
         if rps is None:
             return None
         b = self.buckets.get(klass)
         if b is None or b.rps != rps:
-            b = self.buckets[klass] = TokenBucket(rps)
+            b = self.buckets[klass] = TokenBucket(rps, SUPPORT_BURST if klass == "support" else None)
         return b
+
+    # ------------------------------------------------------------------ websockets
+    def ws_start(self, fid: str, now: float | None = None) -> str | None:
+        """A websocket that completed its handshake. Refusal reason, or None (its guard is then live)."""
+        self.reload()
+        if self.scope is None or not self.scope.websockets_on:
+            return "websockets are not allowed by the active scope"
+        if fid not in self.ws_live and len(self.ws_live) >= self.ws_limits.max_open:
+            return f"websockets: {self.ws_limits.max_open} already open"
+        self.ws_live[fid] = WsGuard(self.ws_limits, _now() if now is None else now)
+        return None
+
+    def ws_message(
+        self, fid: str, size: int, *, binary: bool, from_client: bool, now: float | None = None
+    ) -> str | None:
+        """One frame of a live websocket. Refusal reason (drop it and close the connection), or None."""
+        g = self.ws_live.get(fid)
+        if g is None:
+            return "websocket not opened through the gate's checks"
+        return g.message(size, binary=binary, from_client=from_client, now=_now() if now is None else now)
+
+    def ws_end(self, fid: str) -> WsGuard | None:
+        return self.ws_live.pop(fid, None)
+
+
+def _support_client(v: Verdict, host: str, enroll: bool) -> Verdict | None:
+    """A login host is for enrollment only: the hunter and the judge never reach it."""
+    if v.support == "auth" and not enroll:
+        return deny(f"{host}: login host, enrollment only", f"support-auth:{host}")
+    return None
+
+
+# ------------------------------------------------------------------ websockets: bounds per connection
+def _env_num(name: str, default: float, env=None) -> float:
+    raw = (os.environ if env is None else env).get(name)
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+@dataclass(frozen=True)
+class WsLimits:
+    """Per connection: client messages per minute, bytes per client message (server: WS_SERVER_FACTOR times), lifetime;
+    and how many connections may be open at once. Overridable in the gate's environment (BH_WS_*)."""
+
+    msgs_per_min: int = 12
+    max_bytes: int = 64 << 10
+    max_seconds: float = 600.0
+    max_open: int = 2
+
+    @classmethod
+    def from_env(cls, env=None) -> WsLimits:
+        d = cls()
+        return cls(
+            msgs_per_min=int(_env_num("BH_WS_MSGS_PER_MIN", d.msgs_per_min, env)),
+            max_bytes=int(_env_num("BH_WS_MAX_BYTES", d.max_bytes, env)),
+            max_seconds=_env_num("BH_WS_MAX_SECONDS", d.max_seconds, env),
+            max_open=int(_env_num("BH_WS_MAX_OPEN", d.max_open, env)),
+        )
+
+
+WS_PREVIEW_CHARS = 200
+WS_SERVER_FACTOR = 16  # a server frame (a streamed answer) may be this many times the client bound
+
+
+@dataclass
+class WsGuard:
+    """One websocket's counters. Once a bound is crossed the connection is closed for good: every later frame, in
+    either direction, is refused too (fail closed even if the connection outlives the kill)."""
+
+    limits: WsLimits
+    started: float
+    client: int = 0
+    server: int = 0
+    binary: int = 0
+    bytes_client: int = 0
+    recent: deque = field(default_factory=deque)  # timestamps of client messages within the last minute
+    closed: str | None = None
+
+    def message(self, size: int, *, binary: bool, from_client: bool, now: float) -> str | None:
+        if self.closed:
+            return self.closed
+        why = None
+        if now - self.started > self.limits.max_seconds:
+            why = f"websocket open for over {self.limits.max_seconds:.0f} s"
+        elif size > (limit := self.limits.max_bytes * (1 if from_client else WS_SERVER_FACTOR)):
+            why = f"websocket {'client' if from_client else 'server'} message of {size} bytes (over {limit})"
+        elif from_client:
+            while self.recent and self.recent[0] <= now - 60:
+                self.recent.popleft()
+            if len(self.recent) >= self.limits.msgs_per_min:
+                why = f"websocket: over {self.limits.msgs_per_min} client messages per minute"
+        if why:
+            self.closed = why
+            return why
+        if from_client:
+            self.recent.append(now)
+            self.client += 1
+            self.bytes_client += size
+            self.binary += binary
+        else:
+            self.server += 1
+        return None
+
+    def counts(self) -> dict:
+        return {"client": self.client, "server": self.server, "binary": self.binary, "bytes": self.bytes_client}
+
+
+def ws_message_record(content: bytes, *, binary: bool) -> dict:
+    """What the journal keeps of a client message: size, sha256, and (text only) its first characters redacted."""
+    rec = {"len": len(content), "sha256": hashlib.sha256(content).hexdigest(), "binary": binary}
+    if not binary:
+        rec["text"] = redact.text(content.decode("utf-8", "replace")[:WS_PREVIEW_CHARS])
+    return rec
 
 
 def _web_port(v: Verdict, port: int) -> Verdict | None:

@@ -8,9 +8,12 @@ Text first: the summary is at most 25 lines; DOM, ARIA snapshot, HAR, console, d
 screenshot stay in raw/browse-<slug>-<ts>/. Read shot.png only to decide something.
 
 Network: every request goes to the gate (proxy). Requests to a host outside the target host and its
-subdomains are aborted locally (no network) and counted; so are source maps, /favicon.ico (404 guard),
-and images/fonts/media unless a screenshot is asked. Websockets are refused locally (the gate refuses
-them anyway) and counted. Service workers are blocked so every request shows in the HAR and at the gate.
+subdomains are aborted locally (no network) and counted, except the scope's `support` hosts of kind `assets`
+(scripts and styles the app needs; the gate allows them GET/HEAD only, without cookies); login hosts (`auth`)
+stay blocked here and at the gate. Source maps, /favicon.ico (404 guard), and images/fonts/media unless a
+screenshot is asked are aborted too. Websockets are refused locally and counted, unless the scope enables them
+(`websockets: true`): then those to the target host go through the gate, which bounds their frames.
+Service workers are blocked so every request shows in the HAR and at the gate.
 
 Classification: a mapper; with --xss a scanner (refused when the program forbids scanners).
 This is the only sandbox module that imports playwright, inside run(): bh-agent starts without it.
@@ -168,9 +171,10 @@ def same_site(url: str, host: str) -> bool:
     return h == host or h.endswith("." + host)
 
 
-def route_decision(url: str, resource_type: str, host: str, shot: bool) -> str | None:
-    """Why a request is aborted locally, or None to let it go to the gate."""
-    if not same_site(url, host):
+def route_decision(url: str, resource_type: str, host: str, shot: bool, assets: tuple[str, ...] = ()) -> str | None:
+    """Why a request is aborted locally, or None to let it go to the gate. `assets`: host patterns of the scope's
+    `support` assets, the only other hosts a page may load from."""
+    if not same_site(url, host) and not any(c.host_matches(p, c.host_of(url)) for p in assets):
         return "offsite"
     path = urlsplit(url).path
     if path.endswith(".map"):
@@ -180,6 +184,12 @@ def route_decision(url: str, resource_type: str, host: str, shot: bool) -> str |
     if resource_type in HEAVY_TYPES and not shot:
         return resource_type
     return None
+
+
+def ws_through(url: str, host: str, enabled: bool) -> bool:
+    """A websocket the browser may open for real: the scope enables them and it goes to the target host (or a
+    subdomain, as for every other request). The gate judges the handshake and bounds the frames."""
+    return enabled and c.host_of(url) != "" and same_site(url, host)
 
 
 def spa_route(url: str) -> tuple[str, list[str]] | None:
@@ -278,7 +288,8 @@ class Result:
     requests: int = 0
     blocked: Counter = field(default_factory=Counter)  # offsite host or local reason -> count
     gate_denied: int = 0
-    websockets: int = 0
+    websockets: int = 0  # refused locally
+    websockets_open: int = 0  # let through to the target (scope `websockets: true`)
     xhr: list[tuple[str, str, int | None]] = field(default_factory=list)  # (method, url, status)
     steps: list[str] = field(default_factory=list)
     dialogs: list[dict] = field(default_factory=list)
@@ -318,6 +329,8 @@ def render(r: Result) -> list[str]:
     body.append(req)
     if r.websockets:
         body.append(f"websockets: {r.websockets} refused (the gate forbids them; socket.io may fall back to polling)")
+    if r.websockets_open:
+        body.append(f"websockets: {r.websockets_open} opened to the target (frames bounded and journaled by the gate)")
     if r.xhr:
         shown = " · ".join(f"{m} {_short(u)} {s}" for m, u, s in r.xhr[:6])
         body.append(f"xhr: {shown}" + (f" (+{len(r.xhr) - 6} in raw har.json)" if len(r.xhr) > 6 else ""))
@@ -423,6 +436,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
     deadline = t0 + a.timeout - MARGIN_S
     host = urlsplit(a.url).hostname or ""
     r.marker = a.xss
+    extra = c.sandbox_scope()
 
     def left_ms(cap: float | None = None) -> float:
         s = max(1.0, deadline - time.monotonic())
@@ -430,7 +444,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
 
     def on_route(route) -> None:
         req = route.request
-        why = route_decision(req.url, req.resource_type, host, a.shot)
+        why = route_decision(req.url, req.resource_type, host, a.shot, extra.assets)
         if why is None:
             route.continue_()
             return
@@ -495,7 +509,8 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             )
             ctx.set_default_timeout(left_ms(30))
             ctx.route("**/*", on_route)
-            ctx.route_web_socket(re.compile(r".*"), on_ws)
+            # mocked and refused: every websocket, or (scope `websockets: true`) every one not to the target host
+            ctx.route_web_socket(lambda u: not ws_through(u, host, extra.websockets), on_ws)
             ctx.on("request", lambda _req: setattr(r, "requests", r.requests + 1))
             ctx.on("response", on_response)
             if a.routes:
@@ -504,6 +519,12 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             page.on("console", on_console)
             page.on("pageerror", on_pageerror)
             page.on("dialog", on_dialog)
+            page.on(  # mocked ones may show here too: count only those let through
+                "websocket",
+                lambda ws: (
+                    ws_through(ws.url, host, extra.websockets) and setattr(r, "websockets_open", r.websockets_open + 1)
+                ),
+            )
 
             resp = page.goto(a.url, wait_until="domcontentloaded", timeout=left_ms())
             r.status = resp.status if resp else None

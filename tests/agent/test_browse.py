@@ -79,6 +79,38 @@ def test_route_filter_drops_offsite_and_noise():
     assert b.same_site("data:text/plain,x", host)
 
 
+def test_route_filter_lets_support_assets_through_and_keeps_login_hosts_out(tmp_path):
+    (tmp_path / "scope.yaml").write_text((ROOT / "scopes" / "msrc" / "copilot.yaml").read_text())
+    extra = c.sandbox_scope(tmp_path / "scope.yaml", env={})
+    assert "res.cdn.office.net" in extra.assets and extra.websockets
+    host = "copilot.microsoft.com"
+    assert b.route_decision("https://res.cdn.office.net/app.js", "script", host, False, extra.assets) is None
+    assert b.route_decision("https://aadcdn.msftauth.net/x.js", "script", host, False, extra.assets) is None
+    assert b.route_decision("https://res.cdn.office.net/app.js.map", "other", host, False, extra.assets) == "sourcemap"
+    for login in ("https://login.live.com/", "https://login.microsoftonline.com/x", "https://fpt.live.com/"):
+        assert b.route_decision(login, "document", host, False, extra.assets) == "offsite"
+    assert b.route_decision("https://evil.office.net/a.js", "script", host, False, extra.assets) == "offsite"
+    assert b.route_decision("https://res.cdn.office.net/a.js", "script", host, False) == "offsite"  # no scope
+
+
+def test_sandbox_scope_from_env_or_nothing(tmp_path):
+    env = {"BH_SUPPORT_ASSETS": "cdn.x.net, *.y.org", "BH_WEBSOCKETS": "1"}
+    assert c.sandbox_scope(tmp_path / "none.yaml", env=env) == c.SandboxScope(("cdn.x.net", "*.y.org"), True)
+    assert c.sandbox_scope(tmp_path / "none.yaml", env={}) == c.SandboxScope()
+    (tmp_path / "bad.yaml").write_text("[: not yaml")
+    assert c.sandbox_scope(tmp_path / "bad.yaml", env={}) == c.SandboxScope()
+
+
+def test_websockets_go_through_only_to_the_target_when_the_scope_says_so():
+    host = "copilot.microsoft.com"
+    assert b.ws_through("wss://copilot.microsoft.com/c/api/chat", host, True)
+    assert not b.ws_through("wss://copilot.microsoft.com/c/api/chat", host, False)
+    assert not b.ws_through("wss://res.cdn.office.net/x", host, True)
+    assert not b.ws_through("wss://login.live.com/x", host, True)
+    r = b.Result(url="https://copilot.microsoft.com/", websockets_open=2)
+    assert any("2 opened to the target" in line for line in b.render(r))
+
+
 def test_spa_routes_become_endpoints(tmp_path):
     assert b.spa_route("http://h:3000/#/search?q=1") == ("GET /#/search", ["q"])
     assert b.spa_route("http://h/#!/track/42") == ("GET /#/track/{id}", [])

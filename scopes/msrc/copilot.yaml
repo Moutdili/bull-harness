@@ -1,7 +1,8 @@
 # Microsoft MSRC, Copilot (consumer, copilot.microsoft.com) with two personal test accounts of ours.
 # Rules: docs/research/15-msrc-premier-programme.md (own accounts only, no excessive automated traffic, no DoS,
-# stop at the proof, human review of every report). The login hosts below are here for enrollment only and are NOT
-# targets: a hunt on this file must wait for enrollment-only hosts in the gate (see notes).
+# stop at the proof, human review of every report). Targets are in_scope only. The login and asset hosts are
+# `support`, never targets: `auth` is reachable by enrollment only (the gate, bh-login), never by the hunter or
+# the judge; `assets` is GET/HEAD only, without cookies, identity or program headers (docs/architecture.md §2).
 schema: 1
 program: msrc-copilot
 platform: msrc
@@ -9,23 +10,29 @@ automation_allowed: true
 scanners_allowed: false
 self_signup: false
 max_rps: 2
+# the chat talks over websockets (to confirm live): handshakes are target requests, client messages are bounded per
+# connection by the gate (BH_WS_MSGS_PER_MIN, default 12/min) and journaled. MSRC forbids excessive automated
+# traffic, not automation: keep the message rate low, one conversation at a time.
+websockets: true
 forbidden_vulns: [dos]
 in_scope:
   - {value: "copilot.microsoft.com", note: "target (redirects to copilot.com)"}
   - {value: "copilot.com", note: "target: Copilot consumer web"}
-  - {value: "login.live.com", note: "login only, not a target"}
-  - {value: "login.microsoft.com", note: "login only, not a target"}
-  - {value: "fpt.live.com", note: "login anti-fraud fingerprint, not a target"}
-  - {value: "account.live.com", note: "login only, not a target"}
-  - {value: "login.microsoftonline.com", note: "login only, not a target"}
-  - {value: "*.msftauth.net", note: "login page assets, not a target"}
-  - {value: "*.msauth.net", note: "login page assets, not a target"}
-  - {value: "res.cdn.office.net", note: "Copilot app assets (JS), not a target"}
-  - {value: "uhf.microsoft.com", note: "Copilot page assets, not a target"}
-  - {value: "wcpstatic.microsoft.com", note: "page assets, not a target"}
+support:
+  - {value: "login.live.com", kind: auth, note: "Microsoft account login"}
+  - {value: "login.microsoft.com", kind: auth, note: "Microsoft login"}
+  - {value: "fpt.live.com", kind: auth, note: "login anti-fraud fingerprint"}
+  - {value: "account.live.com", kind: auth, note: "Microsoft account pages of the login"}
+  - {value: "login.microsoftonline.com", kind: auth, note: "Entra ID login (redirects of the sign-in)"}
+  - {value: "*.msftauth.net", kind: assets, note: "login page assets"}
+  - {value: "*.msauth.net", kind: assets, note: "login page assets"}
+  - {value: "res.cdn.office.net", kind: assets, note: "Copilot app assets (JS)"}
+  - {value: "uhf.microsoft.com", kind: assets, note: "Copilot page header/footer assets"}
+  - {value: "wcpstatic.microsoft.com", kind: assets, note: "cookie consent assets"}
 out_of_scope: []
 identities:
   - name: user-a
+    origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
     role: member
     tenant: A
     enroll:
@@ -48,6 +55,7 @@ identities:
         - {wait_for: {url: "copilot.com"}, timeout: 40}
       capture: {cookies: true, authorization: true}
   - name: user-b
+    origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
     role: member
     tenant: B
     enroll:
@@ -69,4 +77,4 @@ identities:
         - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
         - {wait_for: {url: "copilot.com"}, timeout: 40}
       capture: {cookies: true, authorization: true}
-notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). Test only our own two personal accounts. Cross-user impact is what pays (see .claude/skills/msrc-ai-bug-bounty). Enrollment test only for now: login hosts must become enrollment-only before any hunt."
+notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). Test only our own two personal accounts. Cross-user impact is what pays (see .claude/skills/msrc-ai-bug-bounty). Login and asset hosts are support hosts, never targets. Websockets on: low message rate, one conversation at a time, never a flood of prompts."

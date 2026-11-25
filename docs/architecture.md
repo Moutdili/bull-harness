@@ -43,7 +43,8 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 
 ### 1. `scope/` — scope en dur (cœur sécurité)
 - Un fichier YAML par programme : `scopes/<platform>/<slug>.yaml`.
-- Champs : `in_scope[]` (hôtes, wildcards, CIDR, apps), `out_of_scope[]`, `required_headers{}`, `user_agent`, `max_rps`, `automation_allowed`, `forbidden_vulns[]`, `identities[]` (références vers des secrets, jamais les secrets eux-mêmes), `source`, `synced_at`, `hash`.
+- Champs : `in_scope[]` (hôtes, wildcards, CIDR, apps), `out_of_scope[]`, `support[]` (hôtes de support, voir §2),
+  `websockets` (`true` pour les ouvrir vers les cibles ; absent ou `null` = refusés), `required_headers{}`, `user_agent`, `max_rps`, `automation_allowed`, `forbidden_vulns[]`, `identities[]` (références vers des secrets, jamais les secrets eux-mêmes), `source`, `synced_at`, `hash`.
 - `enforce(url|host|ip) → allow|deny + raison` : **une seule fonction**, utilisée par le proxy, les builtins et `bh`. Un out-of-scope l'emporte toujours sur un in-scope.
 - Un actif découvert hors scope est consigné (fait `out-of-scope`, un par run), **jamais** ajouté au scope ni ciblé.
 - Sync : API researcher Intigriti (token personnel, bêta), API YesWeHack (bearer + TOTP, non documentée), `bounty-targets-data` pour le diff des programmes publics. Toute modification passe par un diff affiché à l'humain, puis une validation.
@@ -54,6 +55,30 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 - Autre TCP : SOCKS5 avec allowlist ; l'agent passe par `proxychains`. **v1 : pas de scan SYN brut**, seulement des scans connect. C'est cohérent avec les règles YWH/Intigriti qui limitent le scan.
 - Allowlist système séparée : `api.anthropic.com` et ses dépendances (pour `claude`), dépôts de paquets au moment du build seulement.
 - Allowlist **passive** séparée (web.archive.org, CommonCrawl, OTX, urlscan, crt.sh, sources subfinder) : GET seulement, ni cookies ni en-têtes de programme, débit propre. Un hôte passif n'est jamais une cible (voir `research/07-repos-mio.md`).
+- **Hôtes de support** (`support[]` du scope, `{value, kind: auth|assets, note}`, domaine ou joker ; une valeur qui
+  recouvre un `in_scope` est refusée au chargement). `enforce.check` rend une troisième réponse (`allowed: false`,
+  `support: <kind>`, sans règle d'exclusion), que le gate classe `support` :
+  - `assets` (scripts et styles que les pages de la cible chargent, ex. `res.cdn.office.net`) : GET et HEAD sans corps,
+    depuis tout client du sandbox, ports 80/443, IP publiques seulement ; ni en-têtes de programme, ni identité, ni
+    `Cookie` / `Authorization`. `bh-browse` les laisse passer (liste lue dans `scope.yaml` de `BH_DIR`, ou
+    `BH_SUPPORT_ASSETS`).
+  - `auth` (notre propre connexion, ex. `login.live.com`) : seulement depuis les sources d'enrôlement (`_from_gate` :
+    le gate et `bh-login`), méthodes du login (GET, HEAD, OPTIONS, POST), cookies du navigateur de login laissés tels
+    quels. L'agent et le juge sont refusés (« login host, enrollment only »), au CONNECT comme à la requête ;
+    `bh-browse` les bloque aussi localement. Les URL d'un login (`login_url`, `goto` d'une recette) peuvent y pointer ;
+    la sonde et les `origins` d'une identité, jamais.
+  - Les deux : seau de débit propre (`SUPPORT_RPS` 4 req/s, rafale 8), une ligne `class: support` dans `flows.jsonl`,
+    aucun fichier d'échange, jamais compté comme test, jamais dans le graphe d'actifs (`assets.py` ne garde que la
+    classe `target`), ni pause WAF, ni garde d'énumération.
+- **Websockets** : refusés par défaut. Avec `websockets: true` dans le scope : vers les **cibles** seulement (support,
+  passif et hors scope refusés), handshake GET jugé comme une requête cible (scope, Host, identité, en-têtes de
+  programme, débit), au plus `BH_WS_MAX_OPEN` (2) connexions ouvertes. Hooks officiels mitmproxy
+  (`websocket_start` / `websocket_message` / `websocket_end`) : par connexion, au plus `BH_WS_MSGS_PER_MIN` (12)
+  messages client par minute glissante, `BH_WS_MAX_BYTES` (64 Kio) par message client (16 fois plus pour un message
+  serveur), `BH_WS_MAX_SECONDS` (600 s) de vie. Trames binaires comptées comme les autres. Au premier dépassement : la
+  trame est abandonnée (`drop()`), le flux tué, et toute trame suivante de la connexion abandonnée aussi (fail-closed
+  même si la connexion survit au kill). Chaque message client est journalisé (`events.jsonl`, `ws-message` : taille,
+  sha256, 200 premiers caractères caviardés par `redact.text`, rien pour une trame binaire).
 
 ### 3. `agent/` — conteneur Kali
 - `kalilinux/kali-rolling` + `kali-linux-headless` + outils Go ProjectDiscovery + ffuf, etc. La liste des outils est déclarée dans des manifests de plugins, pas en dur dans le Containerfile.
@@ -155,7 +180,8 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   quota (sans jeton à exfiltrer).
 - **Le sandbox n'est pas une frontière** : hooks, verrou d'outils et fichiers du contrat sont des aides. Les garanties
   dures sont dans le gate (scope jugé sur le nom demandé, méthodes et overrides, identités existantes, ports web,
-  énumération sur la route normalisée, garde scanners par rafale de 404, websockets refusés, débit) et sur l'hôte
+  énumération sur la route normalisée, garde scanners par rafale de 404, websockets refusés sauf opt-in du scope et
+  bornés, hôtes de support hors test, débit) et sur l'hôte
   (ingestion typée, preuve revalidée, « testé » confirmé par le gate, secrets caviardés).
 - **Exclusions** : une entrée YWH n'exclut une classe entière que si elle la nomme ; les exclusions conditionnelles
   restent à l'humain. Brute force interdit par la doctrine et, pour les programmes sans scanners, freiné par la garde
@@ -174,6 +200,16 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   (`bh prune`, et au début de chaque segment). Images épinglées par digest ; les paquets apt de Kali suivent le dépôt.
 - **Coût du verrou sur une vraie cible** : crawl + content + scan par origine (~10 min chacun à 2 req/s).
 - **nuclei** : ~1,5 req/s via le gate, cause interne non trouvée ; borné par `--timeout`.
+- **Hôtes de support** : le contenu des `assets` n'est pas jugé (un CDN sert ce qu'on lui demande en GET) ; un chasseur
+  peut y lire des fichiers publics, pas y écrire. La liste que lit `bh-browse` vient de `scope.yaml` dans `BH_DIR`,
+  que le chasseur peut réécrire : sans effet, le gate juge sur son propre scope. Les cookies de `bh-login` posés sur
+  un hôte `auth` hors des `goto` de la recette (ex. `login.microsoftonline.com`) ne sont pas gardés dans la session
+  (`enroll._host_ok`) ; sans effet sur la chasse, le gate n'injecte la jarre que vers les cibles.
+- **Websockets** : le contenu des trames n'est pas jugé (pas de scope dans une trame, pas de garde d'énumération) ;
+  seuls le volume, la taille et la durée sont bornés, et tout est journalisé. Fermeture d'une connexion muette à sa
+  limite de durée : `flow.kill()` depuis un minuteur, effet à mesurer en live ; à défaut, la prochaine trame, dans un
+  sens ou l'autre, est abandonnée et la connexion tuée. Websocket sur HTTP/2 (CONNECT étendu) : méthode CONNECT
+  refusée par la politique, donc refusé.
 - **Rechargement du gate** : mitmdump recharge `addon.py` mais pas `policy.py` ; après une modification de la
   politique, `podman restart bh-gate` (en attendant, le gate refuse : fail-closed).
 - Liste à jour des points ouverts : `docs/TODO.md`, section « Revue hostile du 2026-11-24 ».

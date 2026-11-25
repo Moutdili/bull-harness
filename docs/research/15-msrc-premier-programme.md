@@ -49,10 +49,15 @@ Détail et citations : skills `msrc-ai-bug-bounty` (barre, rapport), `msrc-copil
 - **Donnée d'un tiers vue par accident (T1)** : la signaler tout de suite (« let us know immediately so we can
   contact our customers »). Pendant la chasse : arrêt, aucune relecture, `bh-note blocked other` sans contenu.
   Fait dédié, pause du programme et alerte à Mio : à construire.
-- **Websockets** : le gate refuse tout websocket (il ne juge pas les trames) et `bh-browse` aussi. Le chat Copilot
-  passe probablement par websocket (supposé, à mesurer avec `bh-browse`, ligne « websockets: N refused »). Tant
-  que le gate n'a pas de mode websocket borné (à concevoir, décision de Mio), un chat websocket seul est
-  injoignable ; chercher un chemin HTTP vers le même assistant.
+- **Websockets** (mis à jour le 2026-11-25) : le gate a un mode websocket borné, activé par `websockets: true` dans
+  le scope (refusé sinon) : cibles seulement, handshake jugé comme une requête cible, messages client limités par
+  connexion (12/min, 64 Kio, 10 min, 2 connexions ; variables `BH_WS_*` du gate) et journalisés (taille, empreinte,
+  extrait caviardé). `scopes/msrc/copilot.yaml` l'active, avec consigne de débit bas. `bh-browse` laisse alors passer
+  les websockets vers la cible (ligne « websockets: N opened to the target »). Que le chat Copilot passe par
+  websocket reste à mesurer au premier passage live ; s'il a un chemin HTTP, le préférer (plus de contrôles du gate).
+- **Hôtes de support** : les hôtes de connexion Microsoft (`login.live.com`…) et d'assets (`res.cdn.office.net`…)
+  sont sortis de `in_scope` vers `support` : ils ne sont plus des cibles. `auth` ne sert qu'à l'enrôlement
+  (`bh-login`), `assets` est en GET/HEAD sans cookies ni identité (voir `architecture.md` §2).
 - **Hors bande** : `bh-oob` n'existe pas (issue 31). Preuve sans récepteur (effet vu depuis le compte A ou chez
   la victime B, à nous) ; à défaut, blocker `oob-needed`. SSRF : la preuve est la requête reçue chez nous, jamais
   une adresse interne.
@@ -80,4 +85,5 @@ périmètre net, identité simple, `bh-browse` adapté, impact entre utilisateur
 juge. Les services cloud larges (Azure, Entra ID) viendront après la recette OAuth.
 
 **Réserve (2026-11-25)** : cette recommandation suppose que le chat Copilot soit joignable à travers le
-gate. S'il ne parle qu'en websocket (à mesurer), il ne l'est pas aujourd'hui ; voir « Compléments » ci-dessus.
+gate. S'il ne parle qu'en websocket (à mesurer), il passe par le mode websocket borné (voir « Compléments »), à
+valider en live avant la première chasse.

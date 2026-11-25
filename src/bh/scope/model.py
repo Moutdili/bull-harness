@@ -63,6 +63,21 @@ class Rule:
         return f"{self.type}:{self.value}"
 
 
+# Support hosts: needed by the target's pages or by our own login, never targets themselves (another program's,
+# or the vendor's own infrastructure). `assets`: GET/HEAD from anyone in the sandbox, nothing of ours attached.
+# `auth`: the enrollment sources only (the gate itself and bh-login), never the hunter nor the judge.
+SUPPORT_KINDS = ("auth", "assets")
+
+
+@dataclass(frozen=True)
+class Support:
+    kind: str  # one of SUPPORT_KINDS
+    rule: Rule  # a domain or wildcard rule
+
+    def __str__(self) -> str:
+        return f"support-{self.kind}:{self.rule.value}"
+
+
 @dataclass(frozen=True)
 class Scope:
     program: str
@@ -75,6 +90,9 @@ class Scope:
     automation_allowed: bool | None = None  # None = unknown -> todo humaine
     scanners_allowed: bool | None = None  # None = unknown -> todo humaine; read it through scanners_on
     self_signup: bool | None = None  # the harness may create its own test accounts; None = forbidden
+    # websocket handshakes to targets, frames judged and bounded by the gate; None/False = refused (the default)
+    websockets: bool | None = None
+    support: tuple[Support, ...] = ()  # hosts the targets or the login need, never targets (see Support)
     forbidden_vulns: tuple[str, ...] = ()
     # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?, origins?, role?, tenant?};
     # never a secret
@@ -100,6 +118,15 @@ class Scope:
         return self.scanners_allowed is True or (self.scanners_allowed is None and self.platform == "local")
 
     @property
+    def websockets_on(self) -> bool:
+        """Websockets to targets: only when the scope says `websockets: true` (absent or null = refused)."""
+        return self.websockets is True
+
+    def support_hosts(self, kind: str) -> tuple[str, ...]:
+        """Host patterns (`a.x.com`, `*.x.com`, `api-*.x.com`) of the support entries of `kind`."""
+        return tuple(support_pattern(s.rule) for s in self.support if s.kind == kind)
+
+    @property
     def rate(self) -> float:
         """Effective request rate towards targets (req/s)."""
         return self.max_rps or DEFAULT_RPS
@@ -122,8 +149,33 @@ _TOP_KEYS = {
     "source",
     "synced_at",
     "notes",
+    "support",
+    "websockets",
 }
 _RULE_KEYS = {"type", "value", "note"}
+_SUPPORT_KEYS = {"value", "kind", "note", "type"}
+
+
+def support_pattern(rule: Rule) -> str:
+    """The host pattern enforce matches for a domain or wildcard rule (`*.base` for a leading wildcard)."""
+    assert rule.host is not None
+    return rule.host if rule.type is RuleType.DOMAIN or "*" in rule.host else "*." + rule.host
+
+
+def parse_support(entry: Any, ctx: str) -> Support:
+    """One `support` entry: {value, kind: auth|assets, note?}. Domains and wildcards only: a support host is
+    named, never an IP range or a URL prefix."""
+    if not isinstance(entry, dict):
+        raise ScopeError(f"{ctx}: a support entry is a mapping {{value, kind, note}}")
+    if unknown := set(entry) - _SUPPORT_KEYS:
+        raise ScopeError(f"{ctx}: unknown support keys {sorted(unknown)}")
+    kind = entry.get("kind")
+    if kind not in SUPPORT_KINDS:
+        raise ScopeError(f"{ctx}: support kind must be one of {list(SUPPORT_KINDS)}, not {kind!r}")
+    rule = parse_rule({k: v for k, v in entry.items() if k != "kind"}, ctx)
+    if rule.type not in (RuleType.DOMAIN, RuleType.WILDCARD):
+        raise ScopeError(f"{ctx}: a support host is a domain or a wildcard, not {rule.type.value} {rule.value!r}")
+    return Support(kind, rule)
 
 
 def _infer_type(value: str) -> RuleType:
@@ -275,6 +327,11 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         raise ScopeError(f"{origin}: 'out_of_scope' must be a list")
     in_rules = tuple(parse_rule(e, f"{origin}: in_scope[{i}]") for i, e in enumerate(ins))
     out_rules = tuple(parse_rule(e, f"{origin}: out_of_scope[{i}]") for i, e in enumerate(outs))
+    sup = doc.get("support") or []
+    if not isinstance(sup, list):
+        raise ScopeError(f"{origin}: 'support' must be a list")
+    support = tuple(parse_support(e, f"{origin}: support[{i}]") for i, e in enumerate(sup))
+    _support_apart(in_rules, support, origin)
 
     max_rps = doc.get("max_rps")
     if max_rps is not None and (not isinstance(max_rps, (int, float)) or max_rps <= 0):
@@ -291,6 +348,9 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     signup = doc.get("self_signup")
     if signup is not None and not isinstance(signup, bool):
         raise ScopeError(f"{origin}: 'self_signup' must be true, false or null")
+    websockets = doc.get("websockets")
+    if websockets is not None and not isinstance(websockets, bool):
+        raise ScopeError(f"{origin}: 'websockets' must be true, false or null")
     identities = doc.get("identities") or []
     if not isinstance(identities, list):
         raise ScopeError(f"{origin}: 'identities' must be a list")
@@ -309,6 +369,8 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         automation_allowed=auto,
         scanners_allowed=scanners,
         self_signup=signup,
+        websockets=websockets,
+        support=support,
         forbidden_vulns=tuple(doc.get("forbidden_vulns") or ()),
         identities=tuple(identities),
         source=doc.get("source"),
@@ -316,8 +378,43 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         notes=str(doc.get("notes") or ""),
         digest=_canonical_digest(doc),
     )
+    _derived_origins_on_targets(scope, doc.get("identities") or [])
     _identity_urls_in_scope(scope, origin)
     return scope
+
+
+def _support_apart(in_rules: tuple[Rule, ...], support: tuple[Support, ...], origin: str) -> None:
+    """A host is a target or a support host, never both: a support value that an in-scope rule also covers (or that
+    covers an in-scope host) is an error, so a support host can never be tested through an overlapping rule."""
+    from bh.scope.enforce import patterns_overlap  # enforce imports this module
+
+    for i, s in enumerate(support):
+        mine = support_pattern(s.rule)
+        for rule in in_rules:
+            if rule.host is None:  # cidr / repo / other: no host name to collide with
+                continue
+            theirs = rule.host if rule.type is RuleType.URL else support_pattern(rule)
+            if patterns_overlap(mine, theirs):
+                raise ScopeError(
+                    f"{origin}: support[{i}] {s.rule.value!r} overlaps in_scope {rule.value!r}: a host is a target "
+                    "or a support host, never both"
+                )
+    for i, s in enumerate(support):
+        for other in support[:i]:
+            if other.kind != s.kind and patterns_overlap(support_pattern(s.rule), support_pattern(other.rule)):
+                raise ScopeError(f"{origin}: support[{i}] {s.rule.value!r} is both auth and assets")
+
+
+def _derived_origins_on_targets(scope: Scope, raw: list[Any]) -> None:
+    """A browser login's derived `origins` (its goto pages) keep the targets only: a login host of `support` is
+    visited by the login but never receives the identity's headers (they only go to targets anyway)."""
+    from bh.scope.enforce import check  # enforce imports this module
+
+    for ident, decl in zip(scope.identities, raw, strict=False):
+        if isinstance(decl, dict) and "origins" not in decl and isinstance(ident.get("origins"), list):
+            ident["origins"] = [o for o in ident["origins"] if check(scope, o)]
+            if not ident["origins"]:
+                del ident["origins"]
 
 
 _IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll", "origins", "role", "tenant"}
@@ -401,14 +498,19 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
     from bh.accounts.recipe import urls
 
     for i, ident in enumerate(scope.identities):
-        for key, u in (
-            ("login_url", ident.get("login_url")),
-            ("signup_url", ident.get("signup_url")),
-            ("probe.url", (ident.get("probe") or {}).get("url")),
-            *urls(ident.get("enroll")),  # sign-up, login, every goto of a browser login, the OAuth token URL
-            *((f"origins[{j}]", u) for j, u in enumerate(ident.get("origins") or [])),
+        # where the login goes may be a `support` auth host (enrollment only); the probe and the origins (where the
+        # identity's headers go) must be targets
+        for key, u, login in (
+            ("login_url", ident.get("login_url"), True),
+            ("signup_url", ident.get("signup_url"), True),
+            ("probe.url", (ident.get("probe") or {}).get("url"), False),
+            *((k, u, True) for k, u in urls(ident.get("enroll"))),  # sign-up, login, gotos, the OAuth token URL
+            *((f"origins[{j}]", u, False) for j, u in enumerate(ident.get("origins") or [])),
         ):
-            if u is not None and not (d := check(scope, u)):
+            if u is None:
+                continue
+            d = check(scope, u)
+            if not d and not (login and d.support == "auth"):
                 raise ScopeError(f"{origin}: identities[{i}].{key} {u!r} is not in scope ({d.reason})")
 
 

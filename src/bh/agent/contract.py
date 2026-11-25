@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
@@ -148,6 +149,53 @@ def rps() -> float:
 # ------------------------------------------------------------------ URLs
 def is_passive(host: str) -> bool:
     return host.lower().rstrip(".") in PASSIVE_HOSTS
+
+
+def host_matches(pattern: str, host: str) -> bool:
+    """Same reading as bh.scope.enforce: `*.x` = subdomains of x (not x), `api-*.x` = one label, else exact."""
+    pattern, host = pattern.lower().rstrip("."), host.lower().rstrip(".")
+    if pattern.startswith("*."):
+        return host.endswith("." + pattern[2:])
+    if "*" in pattern:
+        label, _, rest = pattern.partition(".")
+        h_label, _, h_rest = host.partition(".")
+        head, _, tail = label.partition("*")
+        return h_rest == rest and re.fullmatch(re.escape(head) + "[a-z0-9-]+" + re.escape(tail), h_label) is not None
+    return host == pattern
+
+
+@dataclass(frozen=True)
+class SandboxScope:
+    """What bh-browse needs of the scope beyond the target: the `support` hosts of kind `assets` it may load
+    (GET/HEAD, judged again by the gate) and whether websockets to the target are on. Never a boundary: the gate
+    decides; this only keeps the browser from asking for what the gate would refuse anyway."""
+
+    assets: tuple[str, ...] = ()
+    websockets: bool = False
+
+
+def sandbox_scope(path: Path | None = None, env=None) -> SandboxScope:
+    """From the environment when the runner sets it (BH_SUPPORT_ASSETS = comma-separated host patterns,
+    BH_WEBSOCKETS = 1), else from the scope.yaml the runner pushes to BH_DIR. Unreadable: nothing extra."""
+    env = os.environ if env is None else env
+    if "BH_SUPPORT_ASSETS" in env or "BH_WEBSOCKETS" in env:
+        assets = tuple(h.strip().lower() for h in env.get("BH_SUPPORT_ASSETS", "").split(",") if h.strip())
+        return SandboxScope(assets, env.get("BH_WEBSOCKETS") == "1")
+    import yaml  # python3-yaml in the image; only bh-browse asks
+
+    try:
+        doc = yaml.safe_load((path or bh_dir() / SCOPE).read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return SandboxScope()
+    if not isinstance(doc, dict):
+        return SandboxScope()
+    support = doc.get("support") if isinstance(doc.get("support"), list) else []
+    assets = tuple(
+        str(e["value"]).strip().lower().rstrip(".")
+        for e in support
+        if isinstance(e, dict) and e.get("kind") == "assets" and isinstance(e.get("value"), str)
+    )
+    return SandboxScope(assets, doc.get("websockets") is True)
 
 
 def host_of(url: str) -> str:

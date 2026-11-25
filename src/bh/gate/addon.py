@@ -16,6 +16,17 @@ Claude Code makes, within the run's budget, and only a body policy.check_relay a
 `mcp_servers` / `container`, no URL source, anthropic-beta values on the list (policy.relay_betas), the model on
 the client's list (policy.relay_models).
 
+Support hosts (scope `support`, policy docstring): `assets` lose Cookie / Authorization and get no program header
+nor identity; `auth` are reached by the enrollment sources only (`_from_gate`), with their own cookies untouched
+(the login needs them; bh-login keeps its own jar). Logged as class `support`, never a target flow.
+
+Websockets (scope `websockets: true`): the handshake is judged by classify_request like any target request; then
+the official hooks of mitmproxy 12 (https://docs.mitmproxy.org/stable/api/events.html, "WebSocket Events":
+websocket_start, websocket_message, websocket_end; the last message is `flow.websocket.messages[-1]`, with
+`from_client`, `is_text`, `content` and `drop()`) apply policy.WsGuard: a frame past a bound is dropped and the flow
+killed, and every later frame of that connection is dropped too. Each client message is journaled (events `ws-message`:
+size, sha256, 200 first characters redacted).
+
 Fail closed: mitmproxy only logs exceptions raised by addons and lets the flow continue, so every
 hook here catches its own errors and denies.
 
@@ -57,6 +68,7 @@ from bh.gate.policy import (
     relay_betas,
     relay_models,
     split_betas,
+    ws_message_record,
 )
 
 MAX_BODY = 16_384
@@ -184,7 +196,12 @@ def fail_closed(hook):
 
     def on_error(hook_name: str, arg, exc: Exception) -> None:
         ctx.log.error(f"bh-gate: {hook_name} failed, denying: {exc!r}")
-        if isinstance(arg, http.HTTPFlow):
+        if isinstance(arg, http.HTTPFlow) and arg.websocket is not None and hook_name.startswith("websocket"):
+            with contextlib.suppress(Exception):  # the frame in hand is not forwarded, the connection is closed
+                if arg.websocket.messages:
+                    arg.websocket.messages[-1].drop()
+            arg.kill()
+        elif isinstance(arg, http.HTTPFlow):
             refuse(arg, deny(f"gate error in {hook_name}"))
         elif isinstance(arg, (tcp.TCPFlow, udp.UDPFlow)):
             arg.kill()
@@ -329,7 +346,7 @@ class Gate:
     # ---- connection-level hooks
     @fail_closed
     def http_connect(self, flow: http.HTTPFlow) -> None:
-        v = self.policy.classify_connect(flow.request.host, flow.request.port)
+        v = self.policy.classify_connect(flow.request.host, flow.request.port, enroll=_from_gate(flow))
         flow.metadata["bh_class"] = v.klass
         if not v.allowed:
             self._deny(flow, v, "connect")
@@ -488,9 +505,10 @@ class Gate:
         if not req.path.startswith("/"):  # "@other.host/x" would re-parse as another destination
             self._deny(flow, deny("the request target must start with /"), "request")
             return
-        if req.headers.get("upgrade", "").lower() == "websocket":  # frames after the handshake are not judged
-            self._deny(flow, deny("websockets are not allowed: the gate cannot judge their frames"), "request")
-            return
+        # a websocket handshake: refused unless the scope enables websockets, then judged as a target request
+        # (classify_request) and its frames bounded by the websocket_* hooks below
+        websocket = "websocket" in req.headers.get("upgrade", "").lower()
+        flow.metadata["bh_ws"] = websocket
         if req.authority and not (req.is_http2 or req.is_http3):  # absolute form inside a tunnel: sent unjudged
             self._deny(flow, deny("absolute-form request target inside a tunnel"), "request")
             return
@@ -506,8 +524,11 @@ class Gate:
             body_len=len(req.raw_content or b""),
             body=req.raw_content if req.method not in ("GET", "HEAD") else None,
             authenticated=bool(identity or "authorization" in req.headers or "cookie" in req.headers),
+            enroll=_from_gate(flow),
+            websocket=websocket,
         )
         flow.metadata["bh_class"] = v.klass
+        flow.metadata["bh_support"] = v.support
         if not v.allowed:
             self._deny(flow, v, "request")
             return
@@ -523,9 +544,11 @@ class Gate:
                 req.headers["User-Agent"] = scope.user_agent
             if identity:
                 self._apply_identity(flow, identity)
-        elif v.klass == "passive":
+        elif v.klass == "passive" or (v.klass == "support" and v.support == "assets"):
+            flow.metadata["bh_identity"] = None  # never applied off target: the journal must not claim it was
             for k in ("Cookie", "Authorization"):
                 req.headers.pop(k, None)
+        # support `auth`: only enrollment reaches it (policy); its own cookies are the login's, left as they are
 
     def _identity_file(self, name: str) -> Path | None:
         """The identity's file for the active program, None for an unknown or malformed name."""
@@ -619,7 +642,10 @@ class Gate:
         if flow.response is None or flow.metadata.get("bh_denied"):
             return
         flow.response.headers.pop(GATE_HEADER, None)  # only the gate's own refusals carry it
-        if flow.metadata.get("bh_class") not in ("target", "passive"):
+        if flow.metadata.get("bh_class") not in ("target", "passive", "support"):
+            return
+        if flow.metadata.get("bh_class") == "support":  # one journal line, never a test, a jar or a WAF count
+            self._record(flow, flow.response.status_code)
             return
         self._identity_response(flow)
         fid = self._record(flow, flow.response.status_code)
@@ -660,7 +686,7 @@ class Gate:
     @fail_closed
     def error(self, flow: http.HTTPFlow) -> None:
         """Requests that never got a response (timeouts, resets) are part of the audit trail too."""
-        if flow.metadata.get("bh_class") in ("target", "passive") and flow.response is None:
+        if flow.metadata.get("bh_class") in ("target", "passive", "support") and flow.response is None:
             self._record(flow, "error", str(flow.error)[:200] if flow.error else "error")
 
     def _record(self, flow: http.HTTPFlow, status, error: str | None = None) -> str:
@@ -686,6 +712,8 @@ class Gate:
             "ua": flow.metadata.get("bh_ua", "")[:120],
             "identity": flow.metadata.get("bh_identity"),
         }
+        if klass == "support":
+            rec["support"] = flow.metadata.get("bh_support")  # auth | assets: not a target, not a test
         if flow.metadata.get("bh_identity_withheld"):
             rec["identity_headers"] = "withheld"  # not one of the identity's origins: jar cookies only
         if replaced := flow.metadata.get("bh_cookie_replaced"):
@@ -717,6 +745,74 @@ class Gate:
             except OSError as exc:
                 ctx.log.error(f"bh-gate: cannot write flow {fid}: {exc}")
         return fid
+
+    # ---- websockets (scope `websockets: true`): mitmproxy 12 event hooks, see the module docstring
+    def _ws_refuse(self, flow: http.HTTPFlow, why: str, where: str, *, drop: bool = True) -> None:
+        if drop and flow.websocket is not None and flow.websocket.messages:
+            flow.websocket.messages[-1].drop()  # first: the frame in hand never leaves
+        flow.kill()
+        self._log(
+            paths.EVENTS,
+            {"kind": "blocked", "where": where, "url": redact.url(self._named(flow)[0]), "reason": why},
+        )
+
+    @fail_closed
+    def websocket_start(self, flow: http.HTTPFlow) -> None:
+        if flow.metadata.get("bh_class") != "target" or not flow.metadata.get("bh_ws") or _from_gate(flow):
+            self._ws_refuse(flow, "websocket not opened through the gate's handshake checks", "websocket")
+            return
+        if why := self.policy.ws_start(flow.id):
+            self._ws_refuse(flow, why, "websocket")
+            return
+        self._log(
+            paths.EVENTS,
+            {
+                "kind": "websocket",
+                "phase": "start",
+                "ws": flow.id,
+                "url": redact.url(self._named(flow)[0]),
+                "identity": flow.metadata.get("bh_identity"),
+            },
+        )
+        # a silent connection is closed at its time limit too (the frames check it as well)
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().call_later(self.policy.ws_limits.max_seconds + 1, self._ws_expire, flow)
+
+    def _ws_expire(self, flow: http.HTTPFlow) -> None:
+        try:
+            if flow.id in self.policy.ws_live and flow.websocket is not None and flow.websocket.timestamp_end is None:
+                self.policy.ws_live[flow.id].closed = "websocket time limit"
+                self._ws_refuse(flow, "websocket time limit", "websocket", drop=False)  # no frame in hand
+        except Exception as exc:  # noqa: BLE001 - a timer callback must never raise into the loop
+            ctx.log.error(f"bh-gate: websocket expiry failed: {exc!r}")
+
+    @fail_closed
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        msg = flow.websocket.messages[-1]
+        content = msg.content or b""
+        binary = not msg.is_text
+        why = self.policy.ws_message(flow.id, len(content), binary=binary, from_client=msg.from_client)
+        if why:
+            self._ws_refuse(flow, why, "websocket-message")
+            return
+        if msg.from_client:
+            self._log(
+                paths.EVENTS,
+                {
+                    "kind": "ws-message",
+                    "ws": flow.id,
+                    "identity": flow.metadata.get("bh_identity"),
+                    **ws_message_record(content, binary=binary),
+                },
+            )
+
+    @fail_closed
+    def websocket_end(self, flow: http.HTTPFlow) -> None:
+        g = self.policy.ws_end(flow.id)
+        rec = {"kind": "websocket", "phase": "end", "ws": flow.id, "url": redact.url(self._named(flow)[0])}
+        if g is not None:
+            rec.update(g.counts(), closed=g.closed)
+        self._log(paths.EVENTS, rec)
 
 
 addons = [Gate()]
