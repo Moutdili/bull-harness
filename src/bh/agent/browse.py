@@ -1,7 +1,7 @@
 """bh-browse: one headless Chromium per command, through the gate.
 
   bh-browse <url> [--as ID] [--shot] [--clip CSS] [--full]
-            [--fill CSS=VALUE]... [--click CSS]... [--submit CSS]
+            [--fill CSS=VALUE]... [--click CSS]... [--submit CSS] [--press KEY]
             [--wait-for CSS|networkidle] [--routes] [--xss MARKER] [--timeout S]
 
 Text first: the summary is at most 25 lines; DOM, ARIA snapshot, HAR, console, dialogs, routes and the
@@ -106,7 +106,7 @@ def split_fill(spec: str) -> tuple[str, str]:
 
 
 class _Step(argparse.Action):
-    """--fill/--click/--submit run in command-line order: all go to one `steps` list."""
+    """--fill/--click/--submit/--press run in command-line order: all go to one `steps` list."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         value = values
@@ -134,6 +134,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--fill", action=_Step, metavar="CSS=VALUE", help="fill a field (repeatable, in order)")
     p.add_argument("--click", action=_Step, metavar="CSS", help="click an element (repeatable, in order)")
     p.add_argument("--submit", action=_Step, metavar="CSS", help="click and wait for the network to settle")
+    p.add_argument(
+        "--press", action=_Step, metavar="KEY", help="press a key in the focused element (Enter, Tab...), then settle"
+    )
     p.add_argument("--wait-for", metavar="CSS|networkidle", help="what to wait for after the load")
     p.add_argument("--routes", action="store_true", help="follow in-app links and record SPA routes")
     p.add_argument(
@@ -539,6 +542,9 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 try:
                     if kind == "fill":
                         page.fill(value[0], value[1], timeout=left_ms(20))
+                    elif kind == "press":
+                        page.keyboard.press(value)  # a chat box sends on Enter, with no button to click
+                        settle(15)
                     else:
                         page.click(value, timeout=left_ms(20))
                         settle(15 if kind == "submit" else 3)

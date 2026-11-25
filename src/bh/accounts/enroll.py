@@ -308,6 +308,7 @@ def _values(ident: Identity, cred: dict[str, Any]) -> dict[str, str]:
         "email": cred.get("email", ""),
         "password": cred.get("password", ""),
         "answer": cred.get("answer", ""),
+        "code_to": cred.get("code_to") or cred.get("email", ""),  # sites ask to retype it before mailing a code
         "name": ident.name,
     }
 
@@ -447,7 +448,7 @@ def _asker(ident: Identity, cred: dict[str, Any], steps: list[dict[str, Any]], s
             wait = min(step.get("timeout", browser.EMAIL_WAIT_S), browser.EMAIL_WAIT_S)
             try:
                 # codes may go to another inbox than the account's address (`code_to`, from `bh accounts set`)
-                code = mail.default().wait(cred.get("code_to") or cred["email"], step["from"], since, wait)
+                code = mail.default().wait(cred.get("code_to") or cred["email"], step["from"], since, wait, want="code")
             except mail.MailError as exc:
                 notes.append(f"mailbox: {exc}")
                 return None

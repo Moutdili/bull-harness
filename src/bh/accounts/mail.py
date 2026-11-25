@@ -77,7 +77,9 @@ Http = Callable[[str, str, dict[str, str] | None, dict[str, str]], tuple[int, by
 
 
 class Mailbox(Protocol):
-    def wait(self, alias: str, sender_domain: str, since: float, timeout: float) -> str | None: ...
+    def wait(
+        self, alias: str, sender_domain: str, since: float, timeout: float, want: str | None = None
+    ) -> str | None: ...
 
 
 class MailError(RuntimeError):
@@ -87,7 +89,7 @@ class MailError(RuntimeError):
 class NoMailbox:
     """No mailbox is configured: never a link."""
 
-    def wait(self, alias: str, sender_domain: str, since: float, timeout: float) -> str | None:
+    def wait(self, alias: str, sender_domain: str, since: float, timeout: float, want: str | None = None) -> str | None:
         return None
 
 
@@ -161,12 +163,13 @@ def _texts(msg: EmailMessage) -> tuple[list[str], list[str]]:
     return plain, htm
 
 
-def extract(msg: EmailMessage, sender_domain: str) -> str | None:
+def extract(msg: EmailMessage, sender_domain: str, want: str | None = None) -> str | None:
     """The first https link whose host is `sender_domain` or a subdomain (plain parts first, then HTML), else the
     first 4-8 digit code named by a keyword just before it or alone on its line (a bare year never counts), else
-    None. The mail is only searched, never interpreted."""
+    None. `want="code"` skips the links (a sign-in mail carries both), `want="link"` skips the codes. The mail is
+    only searched, never interpreted."""
     plain, htm = _texts(msg)
-    for text in [*plain, *(html.unescape(h) for h in htm)]:
+    for text in [*plain, *(html.unescape(h) for h in htm)] if want != "code" else []:
         for m in _URL.finditer(text):
             url = m.group(0).rstrip(".,;:!?")
             try:
@@ -176,7 +179,7 @@ def extract(msg: EmailMessage, sender_domain: str) -> str | None:
             if parts.username is None and parts.password is None and in_domain(parts.hostname, sender_domain):
                 return url
     stripped = [html.unescape(_TAG.sub(" ", _STYLE.sub(" ", h))) for h in htm]
-    for text in [*plain, *stripped]:
+    for text in [*plain, *stripped] if want != "link" else []:
         if code := _code(_URL.sub(" ", text)):
             return code
     return None
@@ -309,7 +312,7 @@ class GmailMailbox:
         assert isinstance(msg, EmailMessage)
         return received, msg
 
-    def check(self, msg_id: str, alias: str, sender_domain: str, since: float) -> str | None:
+    def check(self, msg_id: str, alias: str, sender_domain: str, since: float, want: str | None = None) -> str | None:
         """The link or code of one message if it passes every guard, else None. Logs the id and domain only."""
         received, msg = self.fetch(msg_id)
         if received <= since:
@@ -325,11 +328,11 @@ class GmailMailbox:
         if not _addressed_to(msg, alias):
             log.info("mail %s (%s): not addressed to the alias, ignored", msg_id, sender_domain)
             return None
-        found = extract(msg, sender_domain)
+        found = extract(msg, sender_domain, want)
         log.info("mail %s (%s): %s", msg_id, sender_domain, "link or code found" if found else "nothing to use")
         return found
 
-    def wait(self, alias: str, sender_domain: str, since: float, timeout: float) -> str | None:
+    def wait(self, alias: str, sender_domain: str, since: float, timeout: float, want: str | None = None) -> str | None:
         q = query(alias, since, sender_domain)
         deadline = self._clock() + max(0.0, timeout)
         seen: set[str] = set()
@@ -338,7 +341,7 @@ class GmailMailbox:
                 if msg_id in seen:
                     continue
                 seen.add(msg_id)
-                if found := self.check(msg_id, alias, sender_domain, since):
+                if found := self.check(msg_id, alias, sender_domain, since, want):
                     return found
             left = deadline - self._clock()
             if left <= 0:

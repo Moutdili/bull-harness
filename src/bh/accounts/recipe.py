@@ -36,8 +36,9 @@ Three kinds (`kind`, default `json`):
       scope: "openid offline_access https://api.example/.default"   # optional
       headers: {Authorization: "Bearer {access_token}"}   # the default
 
-Bodies (`json` or `form`) and `fill`/`select` values use `{email}`, `{password}`, `{answer}`, `{name}`. URLs take
-no placeholder (a secret must never reach a URL, hence a log). A key, or a field selector, that names a
+Bodies (`json` or `form`) and `fill`/`select` values use `{email}`, `{password}`, `{answer}`, `{name}`,
+`{code_to}`. URLs take no placeholder (a secret must never reach a URL, hence a log). A key, or a field
+selector, that names a
 credential must hold a placeholder, never a literal: the scope file reaches the gate and the agent's prompt.
 """
 
@@ -59,7 +60,7 @@ OAUTH_VARS = frozenset({"access_token"})
 MAX_STEPS = 40
 REQUEST_KEYS = {"method", "url", "json", "form"}
 EMAIL_VARS = frozenset({"name", "rand"})
-BODY_VARS = frozenset({"email", "password", "answer", "name"})
+BODY_VARS = frozenset({"email", "password", "answer", "name", "code_to"})  # code_to: inbox for login codes
 HEADER_VARS = frozenset({"token"})
 # body keys and header names that carry a credential: their value must be a template, never a literal
 CREDENTIAL = re.compile(
@@ -211,8 +212,8 @@ def _check_step(step: Any, ctx: str) -> dict[str, Any]:
         raise RecipeError(f"{ctx}: 'from' only goes with email_code")
     if "optional" in step:
         # an MFA prompt is conditional (a site asks for a code only sometimes): its field may be optional too
-        if not isinstance(step["optional"], bool) or action not in ("click", "wait_for", "totp", "email_code"):
-            raise RecipeError(f"{ctx}.optional: true or false, on click, wait_for, totp or email_code only")
+        if not isinstance(step["optional"], bool) or action not in ("click", "fill", "wait_for", "totp", "email_code"):
+            raise RecipeError(f"{ctx}.optional: true or false, on click, fill, wait_for, totp or email_code only")
         out["optional"] = step["optional"]
     if "timeout" in step:
         t = step["timeout"]

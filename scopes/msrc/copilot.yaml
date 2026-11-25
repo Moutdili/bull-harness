@@ -30,6 +30,9 @@ support:
   - {value: "*.msftauth.net", kind: assets, note: "login page assets"}
   - {value: "*.msauth.net", kind: assets, note: "login page assets"}
   - {value: "res.cdn.office.net", kind: assets, note: "Copilot app assets (JS)"}
+  - {value: "res-1.cdn.office.net", kind: assets, note: "Copilot app assets"}
+  - {value: "res.public.onecdn.static.microsoft", kind: assets, note: "Copilot chat app (JS chunks)"}
+  - {value: "static2.sharepointonline.com", kind: assets, note: "Copilot app assets"}
   - {value: "uhf.microsoft.com", kind: assets, note: "Copilot page header/footer assets"}
   - {value: "wcpstatic.microsoft.com", kind: assets, note: "cookie consent assets"}
 out_of_scope: []
@@ -56,6 +59,15 @@ identities:
         - {click: "text=Sign in with Microsoft", optional: true, timeout: 10}
         - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
         - {wait_for: {url: "copilot.com"}, timeout: 40}
+        - {goto: "https://copilot.com/chat"}
+        - {click: "button:has-text('Reject')", optional: true, timeout: 6}
+        - {click: "button:has-text('Send a code'), [role=button]:has-text('Send a code')", optional: true, timeout: 20}
+        - {fill: "#proof-confirmation-email-input", value: "{code_to}", optional: true, timeout: 10}
+        - {click: "button:has-text('Send code')", optional: true, timeout: 8}
+        - {email_code: "#codeEntry-0, input[name=otc], input[autocomplete=one-time-code], input[type=tel], input[inputmode=numeric]", from: "microsoft.com", optional: true, timeout: 120}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
+        - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
       capture: {cookies: true, authorization: true}
   - name: user-b
     origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
@@ -79,5 +91,14 @@ identities:
         - {click: "text=Sign in with Microsoft", optional: true, timeout: 10}
         - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
         - {wait_for: {url: "copilot.com"}, timeout: 40}
+        - {goto: "https://copilot.com/chat"}
+        - {click: "button:has-text('Reject')", optional: true, timeout: 6}
+        - {click: "button:has-text('Send a code'), [role=button]:has-text('Send a code')", optional: true, timeout: 20}
+        - {fill: "#proof-confirmation-email-input", value: "{code_to}", optional: true, timeout: 10}
+        - {click: "button:has-text('Send code')", optional: true, timeout: 8}
+        - {email_code: "#codeEntry-0, input[name=otc], input[autocomplete=one-time-code], input[type=tel], input[inputmode=numeric]", from: "microsoft.com", optional: true, timeout: 120}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
+        - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
       capture: {cookies: true, authorization: true}
 notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). Test only our own two personal accounts. Cross-user impact is what pays (see .claude/skills/msrc-ai-bug-bounty). Login and asset hosts are support hosts, never targets. Websockets on: low message rate, one conversation at a time, never a flood of prompts."

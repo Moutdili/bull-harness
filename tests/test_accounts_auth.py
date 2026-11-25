@@ -116,7 +116,7 @@ def test_browser_recipe_is_checked_and_its_origins_derived():
         ({"steps": [{"click": "#x"}]}, "first step is a goto"),
         ({"steps": [{"goto": f"{BASE}/", "click": "#x"}]}, "exactly one action"),
         ({"steps": [{"goto": f"{BASE}/"}, {"email_code": "#code"}]}, "from"),
-        ({"steps": [{"goto": f"{BASE}/"}, {"fill": "#a", "value": "x", "optional": True}]}, "optional"),
+        ({"steps": [{"goto": f"{BASE}/"}, {"goto": f"{BASE}/x", "optional": True}]}, "optional"),
         ({"capture": {"local_storage": {"token": {"Authorization": "Bearer abc"}}}}, r"\{value\}"),
         ({"capture": {"cookies": False, "authorization": False}}, "nothing to capture"),
         ({"capture": {"local_storage": {"token": {"Bad Header": "{value}"}}}}, "header name"),

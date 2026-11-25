@@ -31,7 +31,7 @@ from bh import stack
 
 GATE_PROXY = "http://gate:8080"
 GATE_CA = "/gate-ca/mitmproxy-ca-cert.pem"
-LOGIN_TIMEOUT_S = 180
+LOGIN_TIMEOUT_S = 360  # a mailed code alone may take two minutes to arrive
 STEP_TIMEOUT_S = 15
 AUTH_WAIT_S = 8  # after the last step: how long to wait for a first authenticated request
 EMAIL_WAIT_S = 120  # how long the host waits for a mailed code
@@ -159,7 +159,9 @@ def run(p, home):
                         v = ask(a, i)
                         if v is None:
                             raise Fail(f"step {i} ({a}): no code from the host")
-                        page.fill(s["selector"], v, timeout=t)
+                        # typed, not filled: split code boxes (one digit each) move the focus themselves
+                        page.locator(s["selector"]).first.click(timeout=t)
+                        page.keyboard.type(v, delay=60)
                 except PwTimeout:
                     if s.get("optional"):
                         continue
