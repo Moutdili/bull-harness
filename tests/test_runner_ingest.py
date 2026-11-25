@@ -73,11 +73,15 @@ def test_auth_walls_are_blockers(tmp_path, monkeypatch):
     routes = [{**same_route[0], "url": f"http://t/{p}/1", "ts": 1000.0 + i} for i, p in enumerate("abc")]
     _write(ev, anon * 4 + same_route + routes)
     out = ingest.gate_events(b, "p", 5, identities=["user-a"])
+    assert out.stale == set() and out.blockers == 0  # 401s under an identity are access tests: the gate decides
+    dead = {"kind": "session-dead", "host": "t", "program": "p", "identity": "user-a", "status": 401}
+    _write(ev, anon * 4 + same_route + routes + [{**dead, "reason": "401-repeated", "ts": 1002.0}])
+    out = ingest.gate_events(b, "p", 6, identities=["user-a"])
     assert out.blockers == 1 and out.stale == {"user-a"}
     assert float(b.meta_get("identity-stale:user-a:p")) == 1002.0  # the event's time, not the ingestion's
     assert _blockers(b) == [
         "[auth] t requires a session (3x 401)",
-        "[auth] identity 'user-a': session dead on t (401 on 3 routes)",
+        "[auth] identity 'user-a': session dead on t (401 on several routes)",
     ]
     assert b.rows("SELECT COUNT(*) n FROM todos")[0]["n"] == 0
 

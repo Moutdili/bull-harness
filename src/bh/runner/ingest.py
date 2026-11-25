@@ -216,10 +216,11 @@ def _identity_dead(
 def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> GateOutcome:
     """One summary fact for denials, blocker facts for walls (WAF, 401) and missing identities.
 
-    `session-dead` with a redirect to the login page or a failed probe -> that identity is stale at once
-    (_identity_dead); with a 401 -> only once DEAD_401_ROUTES distinct routes answered it. `GateOutcome.stale`
-    lists the dead identities: the entry point for logging in again (issue 25).
-    401 sent WITH an identity (`auth` event) -> counted with the 401 session-dead ones, per distinct route.
+    `session-dead` with a redirect to the login page, a failed probe or `401-repeated` (the gate saw 401s on
+    several distinct routes: its own threshold) -> that identity is stale at once (_identity_dead). The older
+    single-401 reason (`401`, logs written before the gate thresholded) needs DEAD_401_ROUTES distinct routes.
+    `GateOutcome.stale` lists the dead identities: the entry point for logging in again (issue 25).
+    A 401 sent WITH an identity (`auth` event) never marks it: it is the control of an access test.
     401 sent WITHOUT one -> blocker only if the program has no identity at all: an agent probing
     unauthenticated access control on purpose has hit no wall."""
     out = GateOutcome()
@@ -250,9 +251,7 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                     out.blockers += 1
             case "auth":
                 host, ident = _s(e.get("host") or "?", 255), _s(e.get("identity"), 80)
-                if ident:  # the same 401 as a session-dead one: counted per distinct route, never per answer
-                    dead401.setdefault(ident, {})[_route(e, host)] = (host, _ts(e, now))
-                else:
+                if not ident:  # a 401 under an identity is an access refusal; the gate decides when it is death
                     auth[host] = auth.get(host, 0) + 1
             case "session-dead":
                 if ident := _s(e.get("identity"), 80):
@@ -261,7 +260,11 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                     if reason == "401" or (not reason and e.get("status") == 401):
                         dead401.setdefault(ident, {})[_route(e, host)] = (host, _ts(e, now))
                         continue
-                    why = {"login-redirect": "a redirect to its login page", "probe": "a failed probe"}
+                    why = {
+                        "login-redirect": "a redirect to its login page",
+                        "probe": "a failed probe",
+                        "401-repeated": "401 on several routes",
+                    }
                     _identity_dead(
                         board,
                         program,
