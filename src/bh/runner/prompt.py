@@ -106,7 +106,8 @@ def scope_block(scope: Scope, identities: list[str] | None = None) -> str:
             "This program FORBIDS automated scanners: bh-content, bh-scan, bh-params, bh-sqli, bh-xss and direct "
             "nuclei/sqlmap/ffuf/... are refused. Map with bh-recon and bh-crawl, then test by hand, few requests."
         )
-    names = sorted({i["name"] for i in scope.identities} | set(identities or []))
+    # the runner passes the live identities (sessions checked): only those are announced as usable
+    names = sorted(identities) if identities is not None else sorted(i["name"] for i in scope.identities)
     if names:
         lines.append(
             "Identities (`q -a <name>`, or header X-BH-Identity: <name>): " + ", ".join(names) + ". The harness checked"

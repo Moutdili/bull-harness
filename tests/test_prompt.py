@@ -68,3 +68,19 @@ def test_verifier_prompt_fences_the_hunters_fields():
     # a fresh tag each time: a hunter cannot close a block it cannot predict
     assert re.findall(r"<(hunter-data-[0-9a-f]{16})>", build_verifier_prompt(scope, finding, replay, "e")) != tags
     assert "untrusted" in p.lower() and "written by the harness" in p
+
+
+def test_only_live_identities_are_announced():
+    from bh.runner.prompt import scope_block
+    from bh.scope import scope_from_dict
+
+    s = scope_from_dict(
+        {
+            "program": "p",
+            "platform": "x",
+            "in_scope": ["a.test"],
+            "identities": [{"name": "user-a"}, {"name": "user-b"}],
+        }
+    )
+    assert "user-a" in scope_block(s, ["user-a"]) and "user-b" not in scope_block(s, ["user-a"])
+    assert "Identities: none" in scope_block(s, [])
