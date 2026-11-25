@@ -76,7 +76,7 @@ class Scope:
     scanners_allowed: bool | None = None  # None = unknown -> todo humaine; read it through scanners_on
     self_signup: bool | None = None  # the harness may create its own test accounts; None = forbidden
     forbidden_vulns: tuple[str, ...] = ()
-    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?}; never a secret
+    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?, origins?}; never a secret
     identities: tuple[dict[str, Any], ...] = ()
     source: str | None = None
     synced_at: str | None = None
@@ -319,7 +319,7 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     return scope
 
 
-_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll"}
+_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll", "origins"}
 # a credential written into the scope file would reach the gate and the agent's prompt: refused by name
 _SECRET_KEY = re.compile(r"passw|pwd|secret|totp|otp|token|cookie|api[_-]?key|credential|session", re.I)
 _IDENTITY_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,39}")  # the shape the gate accepts in X-BH-Identity
@@ -345,6 +345,12 @@ def _identity(ident: Any, ctx: str) -> dict[str, Any]:
     for key in ("login_url", "signup_url"):
         if key in ident and not _HTTP_URL.match(ident[key]):
             raise ScopeError(f"{ctx}: '{key}' must be an http(s) URL")
+    if "origins" in ident and (
+        not isinstance(ident["origins"], list)
+        or not ident["origins"]
+        or not all(isinstance(u, str) and _HTTP_URL.match(u) for u in ident["origins"])
+    ):
+        raise ScopeError(f"{ctx}: 'origins' must be a non-empty list of http(s) URLs (where its headers may go)")
     if "probe" in ident:
         probe = ident["probe"]
         if (
@@ -383,6 +389,7 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
             ("probe.url", (ident.get("probe") or {}).get("url")),
             ("enroll.signup.url", (recipe.get("signup") or {}).get("url")),
             ("enroll.login.url", (recipe.get("login") or {}).get("url")),
+            *((f"origins[{j}]", u) for j, u in enumerate(ident.get("origins") or [])),
         ):
             if u is not None and not (d := check(scope, u)):
                 raise ScopeError(f"{origin}: identities[{i}].{key} {u!r} is not in scope ({d.reason})")

@@ -81,3 +81,16 @@ def test_identity_names_are_unique():
 def test_probe_may_expect_a_text_in_the_body():
     probe = {"url": "https://app.example.com/api/me", "status": 200, "expect": '"email"'}
     assert scope_from_dict(_doc({"name": "user-a", "probe": probe})).identities[0]["probe"] == probe
+
+
+def test_identity_origins_are_urls_in_scope():
+    import pytest
+
+    from bh.scope import ScopeError, scope_from_dict
+
+    base = {"program": "p", "platform": "x", "in_scope": ["*.example.com"]}
+    ok = {**base, "identities": [{"name": "a", "origins": ["https://api.example.com"]}]}
+    assert scope_from_dict(ok).identities[0]["origins"] == ["https://api.example.com"]
+    for bad in (["https://evil.test"], [], "https://api.example.com", ["ftp://api.example.com"]):
+        with pytest.raises(ScopeError):
+            scope_from_dict({**base, "identities": [{"name": "a", "origins": bad}]})
