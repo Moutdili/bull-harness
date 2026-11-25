@@ -93,3 +93,9 @@ def test_doctrine_runs_bh_authz_after_mapping_before_manual_access_tests():
     assert sum("bh-authz" in ln for ln in doc) == 1 and "bh-authz" not in doc[i + 2]
     assert "proof.json" in lines[0] and "--write-own" in lines[0]
     assert "2+ identities" in lines[1] and "mapping" in lines[1] and "by hand" in lines[1]
+
+
+def test_doctrine_forbids_breaking_anti_bot_challenges():
+    from bh.runner.prompt import DOCTRINE
+
+    assert "never solved, evaded or worked around" in DOCTRINE and "blocked captcha" in DOCTRINE

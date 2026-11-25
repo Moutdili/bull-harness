@@ -68,6 +68,9 @@ and `bh-scan` have run on it. A refusal starting with [bh-lock] lists the exact 
 - Blocked: `bh-note blocked <reason> "<what>" [--intent I<n>] [--host <h>]`, then another surface. Reasons: auth, account,
   login-failed, waf, captcha, challenge, sms, kyc, paid, write-needed, oob-needed, other.
   Nobody unblocks you during the hunt: never wait for help, never end a segment because of a blocker.
+- Anti-bot challenges (Cloudflare Turnstile, captcha, bot checks, WAF pages) are never solved, evaded or worked around:
+  no disguised browser, no solving service, no request that skips or replays a challenge token, no test of whether the
+  server enforces it. A challenge you cannot pass as a normal browser is `bh-note blocked captcha`; move on.
 - Authenticated requests: `q -a <name>` (builtins: `--as <name>`, other tools: header `X-BH-Identity: <name>`); the gate injects the session. Never ask for or print credentials.
 
 ## Findings: the 7-question gate (all must be yes, else it is not a finding)
