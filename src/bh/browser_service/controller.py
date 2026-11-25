@@ -60,7 +60,7 @@ BODY_MAX = 16_384  # agent request
 CTL_MAX = 1_000_000  # host request (a session's cookies)
 MAX_COOKIES = 300
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
-COOKIE_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}")
+COOKIE_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,1024}")
 # Keys the agent may press: navigation and form keys. No function key (F12 is DevTools), no Ctrl/Alt chord.
 KEYS = frozenset(
     {

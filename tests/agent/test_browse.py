@@ -117,7 +117,7 @@ COPILOT = Path(__file__).resolve().parents[2] / "scopes" / "msrc" / "copilot.yam
 def test_copilot_sandbox_scope_names_sso_passthrough_and_targets():
     extra = c.sandbox_scope(COPILOT, env={})
     assert set(extra.sso) == {"login.live.com", "login.microsoftonline.com"}
-    assert extra.passthrough == ("challenges.cloudflare.com",)
+    assert extra.passthrough == ("challenges.cloudflare.com", "brunhild.challenges.cloudflare.com")
     assert {"substrate.office.com", "substrate.svc.cloud.microsoft", "copilot.com"} <= set(extra.targets)
     env = {"BH_SUPPORT_SSO": "login.x.org", "BH_SUPPORT_PASSTHROUGH": "c.x.net", "BH_TARGET_HOSTS": "api.x.com"}
     got = c.sandbox_scope(COPILOT, env=env)

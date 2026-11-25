@@ -116,6 +116,9 @@ RELAY_IPS_TTL, RELAY_IPS_RETRY = 60.0, 5.0
 _RELAY_IPS: tuple[float, dict[str, frozenset[str]]] = (0.0, {})
 
 
+_IP_LITERAL = re.compile(r"[0-9.]+|\[?[0-9a-fA-F:]*:[0-9a-fA-F:.]*\]?")
+
+
 def resolve_hosts(hosts, getaddrinfo=None) -> frozenset[str]:
     """Addresses of the compose services `hosts`. A service that is down resolves to nothing and does not
     hide the others (the agent keeps the relay while the judge restarts)."""
@@ -296,6 +299,9 @@ class Gate:
         # server connection id -> hostname asked for. server_connect pins the address to a vetted IP,
         # and with the eager connection strategy that happens before the TLS / TCP hooks run.
         self._dest: dict[str, str] = {}
+        # client connection id -> (hostname, port) of the CONNECT that opened its tunnel. When mitmproxy reopens an
+        # upstream connection inside that tunnel it dials the pinned IP, not the name: the name comes from here.
+        self._tunnel_name: dict[str, tuple[str, int]] = {}
         self._dead = session.DeadLimiter()  # one session-dead event per identity per minute
         self._unauth = session.Unauthorized()  # 401 under an identity, per distinct route
         # server connection id -> passthrough host: the only tunnels whose raw bytes may be relayed
@@ -393,6 +399,8 @@ class Gate:
         if not v.allowed:
             self._deny(flow, v, "connect")
             return
+        if not _IP_LITERAL.fullmatch(flow.request.host):
+            self._tunnel_name[flow.client_conn.id] = (flow.request.host.lower().rstrip("."), flow.request.port)
         if v.support == "passthrough":
             host = flow.request.host.lower().rstrip(".")
             if why := self.policy.passthrough.open(flow.server_conn.id, host, time.time()):
@@ -430,6 +438,9 @@ class Gate:
         host = req.host
         if srv is not None and srv.address and (req.host, req.port) == tuple(srv.address):
             host = self._dest.get(srv.id, req.host)
+        named = self._tunnel_name.get(flow.client_conn.id)
+        if named and named[1] == req.port and _IP_LITERAL.fullmatch(host):
+            host = named[0]  # a reopened upstream connection dialled the pinned IP of the tunnel's name
         dest = (unparse(req.scheme, host, req.port, req.path), host)
         flow.metadata["bh_dest"] = dest
         return dest
@@ -486,6 +497,9 @@ class Gate:
         except Exception as exc:  # noqa: BLE001 - a timer callback must never raise into the loop
             ctx.log.error(f"bh-gate: passthrough expiry failed: {exc!r}")
 
+    def client_disconnected(self, client) -> None:
+        self._tunnel_name.pop(client.id, None)
+
     def server_disconnected(self, data: server_hooks.ServerConnectionHookData) -> None:
         self._dest.pop(data.server.id, None)
         self._tunnel_end(data.server.id)
@@ -501,6 +515,9 @@ class Gate:
         if not data.server.address:
             return
         host, port = data.server.address
+        named = self._tunnel_name.get(data.client.id)
+        if named and named[1] == port and _IP_LITERAL.fullmatch(host):
+            host = named[0]  # reopened inside a tunnel: vet and pin the tunnel's name again, not a stale IP
         infos = await asyncio.get_running_loop().getaddrinfo(
             host, port, proto=socket.IPPROTO_TCP
         )  # no event-loop freeze

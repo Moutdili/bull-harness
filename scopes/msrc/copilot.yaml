@@ -30,6 +30,7 @@ support:
   - {value: "login.microsoftonline.com", kind: sso, token_paths: ["/*/oauth2/v2.0/token"], note: "Entra ID silent sign-in and token exchange"}
   - {value: "login.live.com", kind: sso, token_paths: ["/oauth20_token.srf"], note: "Microsoft account login (enrollment) and silent sign-in"}
   - {value: "challenges.cloudflare.com", kind: passthrough, note: "Cloudflare Turnstile (free accounts' message sending): tunnelled, never intercepted nor touched"}
+  - {value: "brunhild.challenges.cloudflare.com", kind: passthrough, note: "Turnstile's challenge backend (seen live 2026-11-25): tunnelled, never intercepted nor touched"}
   - {value: "login.microsoft.com", kind: auth, note: "Microsoft login"}
   - {value: "fpt.live.com", kind: auth, note: "login anti-fraud fingerprint"}
   - {value: "account.live.com", kind: auth, note: "Microsoft account pages of the login"}

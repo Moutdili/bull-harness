@@ -179,7 +179,7 @@ def test_copilot_scope_targets_and_support():
     }
     assert s.websockets_on
     assert set(s.support_hosts("sso")) == {"login.live.com", "login.microsoftonline.com"}
-    assert s.support_hosts("passthrough") == ("challenges.cloudflare.com",)
+    assert s.support_hosts("passthrough") == ("challenges.cloudflare.com", "brunhild.challenges.cloudflare.com")
     assert "login.microsoft.com" in s.support_hosts("auth") and "res.cdn.office.net" in s.support_hosts("assets")
     entry = next(e for e in s.support if e.rule.value == "login.microsoftonline.com")
     assert entry.token_path("/9188040d-6c67-4c5b-b112-36a304b66dad/oauth2/v2.0/token")

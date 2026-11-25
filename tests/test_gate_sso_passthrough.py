@@ -336,7 +336,7 @@ def _connect(host, port=443, sid="s1"):
         request=SimpleNamespace(host=host, port=port, method="CONNECT", url=f"{host}:{port}"),
         response=None,
         metadata={},
-        client_conn=SimpleNamespace(peername=("10.89.0.5", 40000)),
+        client_conn=SimpleNamespace(id="c1", peername=("10.89.0.5", 40000)),
         server_conn=SimpleNamespace(id=sid, address=("104.16.1.1", port)),
     )
 
@@ -430,3 +430,22 @@ def test_passthrough_patterns_are_anchored_exact_names(addon):
 
 def test_policy_module_bounds_are_positive():
     assert pol.PASSTHROUGH_PER_MIN > 0 and pol.PASSTHROUGH_OPEN > 0 and pol.PASSTHROUGH_MAX_BYTES > 0
+
+
+def test_a_reopened_upstream_connection_keeps_the_tunnels_name(addon, tmp_path, monkeypatch):
+    """Live 2026-11-25: after an upstream close, mitmproxy reopened the connection to the pinned IP and the gate saw
+    GET https://150.171.110.49/chat (not in scope). The tunnel's CONNECT name is kept per client connection."""
+    g = _gate(addon, tmp_path, monkeypatch)
+    g.http_connect(_connect("app.example.com"))
+    flow = SimpleNamespace(
+        request=SimpleNamespace(method="GET", host="104.16.1.1", port=443, scheme="https", path="/chat"),
+        server_conn=SimpleNamespace(id="s-new", address=("104.16.1.9", 443)),
+        client_conn=SimpleNamespace(id="c1"),
+        metadata={},
+    )
+    assert g._named(flow)[1] == "app.example.com"
+    other = SimpleNamespace(**{**flow.__dict__, "client_conn": SimpleNamespace(id="c2"), "metadata": {}})
+    assert g._named(other)[1] == "104.16.1.1"  # another client's tunnel never lends its name
+    g.client_disconnected(SimpleNamespace(id="c1"))
+    flow.metadata = {}
+    assert g._named(flow)[1] == "104.16.1.1"
