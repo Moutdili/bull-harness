@@ -1,9 +1,28 @@
 # bull-harness runtime. Podman rootless + podman-compose (docker compose compatible).
-#   sandbox : internal network, NO route out. agent + gate.
+#   sandbox : internal network, NO route out. agent + judge + gate.
 #   egress  : normal network. gate only.
 #   lab     : internal network for local practice targets (profile "lab"). gate only.
-# The gate is therefore the only path from the agent to anything.
+# The gate is therefore the only path from the agent (and the judge) to anything.
 name: bh
+
+# What the agent and the judge share: same image, same gate (proxy + Claude API relay), same environment.
+x-sandbox-environment: &sandbox_env
+  # placeholder only: the gate relay injects the real token (src/bh/gate/addon.py, RELAY_PORT)
+  CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-bh-relay-placeholder-the-real-token-lives-in-the-gate-only
+  ANTHROPIC_BASE_URL: http://gate:8081
+  HTTP_PROXY: http://gate:8080
+  HTTPS_PROXY: http://gate:8080
+  http_proxy: http://gate:8080
+  https_proxy: http://gate:8080
+  NO_PROXY: localhost,127.0.0.1,gate
+  no_proxy: localhost,127.0.0.1,gate
+  SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+  NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+  REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+  CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  DISABLE_AUTOUPDATER: "1"
+  BH_GATE: http://gate:8080
 
 networks:
   sandbox:
@@ -63,23 +82,7 @@ services:
     cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
     pids_limit: 2048
     mem_limit: 6g
-    environment:
-      # placeholder only: the gate relay injects the real token (src/bh/gate/addon.py, RELAY_PORT)
-      CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-bh-relay-placeholder-the-real-token-lives-in-the-gate-only
-      ANTHROPIC_BASE_URL: http://gate:8081
-      HTTP_PROXY: http://gate:8080
-      HTTPS_PROXY: http://gate:8080
-      http_proxy: http://gate:8080
-      https_proxy: http://gate:8080
-      NO_PROXY: localhost,127.0.0.1,gate
-      no_proxy: localhost,127.0.0.1,gate
-      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
-      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
-      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
-      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-      DISABLE_AUTOUPDATER: "1"
-      BH_GATE: http://gate:8080
+    environment: *sandbox_env
     volumes:
       - ../var/gate-ca:/gate-ca:ro,z
       - ../var/work:/work:z
@@ -90,6 +93,31 @@ services:
       - ../src/bh/agent:/opt/bh/lib/bh/agent:ro,z
       # pinned nuclei templates, fetched on the host: the gate blocks GitHub
       - ../var/tools/nuclei-templates:/opt/bh/nuclei-templates:ro,z
+    networks: [sandbox]
+    restart: unless-stopped
+
+  # The verifier (src/bh/verify.py): replay + claude -p as the Unix user `judge`, in a container of its own.
+  # It reads target answers (prompt injection), so it shares nothing with the hunter but the image and the gate:
+  # its own /work (var/judge, never var/work), its own processes, /tmp and trust store. The gate's relay admits
+  # it by name (BH_JUDGE_HOST, default `judge`). No nuclei templates: the judge does not scan.
+  judge:
+    image: localhost/bh-agent:dev
+    container_name: bh-judge
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 1024
+    mem_limit: 4g
+    environment: *sandbox_env
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+      - ../var/judge:/work:Z
+      - ./agent/bin:/opt/bh/bin:ro,z
+      - ./agent/hooks:/opt/bh/hooks:ro,z
+      - ../src/bh/__init__.py:/opt/bh/lib/bh/__init__.py:ro,z
+      - ../src/bh/agent:/opt/bh/lib/bh/agent:ro,z
     networks: [sandbox]
     restart: unless-stopped
 

@@ -33,6 +33,10 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
  │   · hooks Pre/PostToolUse           │
  │   · /opt/bh/bin : alias + builtins  │
  └─────────────────────────────────────┘
+ ┌─────────────────────────────────────┐
+ │  judge (même image, même gate)      │ ← vérificateur : son /work (var/judge),
+ │   · bh-agent replay + claude -p     │   ses process, son /tmp, user `judge`
+ └─────────────────────────────────────┘
 ```
 
 ## Composants
@@ -84,6 +88,10 @@ Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/age
 
 ### 7. `verify/` — vérificateur
 Contexte neuf, il ne reçoit que la PoC. Il rejoue via le gate. Un finding non reproduit n'atteint pas la todo `submit`.
+Il tourne dans le conteneur `bh-judge` (service compose `judge`, démarré par `bh up`) : même image et même gate que
+l'agent, mais son propre `/work` (`var/judge` sur l'hôte), qui ne voit pas celui du chasseur (`var/work`). L'hôte y
+pousse la preuve et le prompt (`stack.push_file(..., container=JUDGE_CTR)`) et relit le verdict dans `var/judge`.
+Juge arrêté : la vérification est remise à plus tard (statut `new` inchangé, aucune erreur comptée).
 
 ### 8. Pas d'humain pendant la chasse (2026-11-25)
 Mio n'intervient qu'**après le triage**, pour soumettre. Pendant un run, aucun composant n'attend un humain.
@@ -128,7 +136,7 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 ## Limites connues (après les deux revues hostiles du 2026-11-24)
 - **Proxy du gate ouvert à ses réseaux** : `regular@8080` accepte tout client des réseaux du gate, donc aussi Juice
   Shop sur le réseau `lab`. Sans effet sur une cible réelle, qui n'est jamais sur nos réseaux ; le relais Anthropic, lui,
-  n'accepte que l'agent. L'enrôlement des comptes passe volontairement par ce proxy depuis le gate (`127.0.0.1:8080`)
+  n'accepte que l'agent et le juge. L'enrôlement des comptes passe volontairement par ce proxy depuis le gate (`127.0.0.1:8080`)
   pour subir la même politique que l'agent.
 - **Session morte** : un 401 sous identité peut être un refus d'accès légitime (objet d'un autre). La marque « périmée »
   qu'il pose est levée au segment suivant si la sonde de l'identité (`probe`, avec contenu attendu) répond bien.
@@ -136,7 +144,9 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   `--mcp-config`), et un `.mcp.json` laissé dans le dossier de travail est effacé entre deux segments. Raison : les hooks
   ne voient que `Bash`. Les outils tiers entrent comme builtins `bh-*` (`research/08-mcp-arsenal.md`).
 - **Jeton OAuth** : n'existe que dans le gate ; l'agent a un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081`.
-  Le relais n'accepte que le conteneur agent (le gate est aussi sur le réseau du lab), que les deux appels que fait
+  Le relais n'accepte que les conteneurs agent et juge (résolus par nom, `BH_AGENT_HOST` / `BH_JUDGE_HOST`, cache
+  60 s, une relecture DNS au plus toutes les 5 s pour une IP refusée ; le gate est aussi sur le réseau du lab, qui
+  reste refusé), que les deux appels que fait
   Claude Code (`POST /v1/messages`, `/v1/messages/count_tokens`, mesuré sur 2.1.330), seulement pendant un run, et
   au plus `3 × max_turns + 30` requêtes par segment. Reste : dans ce budget, un `claude -p` imbriqué consomme le
   quota (sans jeton à exfiltrer).
@@ -147,10 +157,14 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
 - **Exclusions** : une entrée YWH n'exclut une classe entière que si elle la nomme ; les exclusions conditionnelles
   restent à l'humain. Brute force interdit par la doctrine et, pour les programmes sans scanners, freiné par la garde
   404 du gate. Exclusions sans signature réseau (social engineering, physique) : doctrine seulement.
-- **Vérificateur** : process du chasseur tués, HOME neuf, `python3 -I`, modèle différent (Opus), utilisateur Unix
-  `judge` propriétaire de son dossier et de son HOME (le chasseur lit le verdict mais ne peut pas l'écrire), verdict
-  valable seulement avec le nonce donné au seul process du juge. Reste : même conteneur que le chasseur, et le juge
-  lit des réponses de la cible (injection de prompt possible, comme pour tout relecteur).
+- **Vérificateur** : conteneur à lui (`bh-judge`, issue 3) : le chasseur ne voit ni son `/work`, ni ses process, ni
+  son `/tmp`, et réciproquement ; même durcissement que l'agent, réseau `sandbox` seul, donc toujours derrière le gate
+  (aucun nouveau chemin réseau). Dans ce conteneur : utilisateur Unix `judge`, tous ses process tués, HOME et
+  fichiers temporaires effacés et dossier recréé avant chaque vérification ; `python3 -I`, modèle différent (Opus),
+  verdict valable seulement avec le nonce donné au seul process du juge. Les process du chasseur sont encore tués
+  avant le rejeu (pour l'état de la cible, plus pour l'isolation). Reste : le juge lit des réponses de la cible
+  (injection de prompt possible, comme pour tout relecteur) ; il partage avec le chasseur l'image, le gate, le
+  budget de relais du run et le code sandbox monté en lecture seule.
 - **Énumération** : comptée sur le chemin, la query string, les corps formulaire et JSON et GraphQL (nom de
   paramètre qui désigne un id, valeur qui en a la forme). Un id sous un nom quelconque (`?q=123`) n'est pas compté.
 - **Stockage** : fichiers de flux supprimés après 14 jours, journaux du gate tournés en gzip au-delà de 64 Mo

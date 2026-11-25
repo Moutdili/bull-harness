@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -181,8 +182,8 @@ def test_stage_b_keeps_only_the_verdict_carrying_its_nonce(tmp_path, monkeypatch
     fid = board.add_finding("p", "IDOR", vuln_class="idor", url="https://t.test/basket/7")
     finding = dict(board.rows("SELECT * FROM findings WHERE id=?", fid)[0])
     run_id = board.run_start("p", "m")
-    seen = {}
-    monkeypatch.setattr(stack, "push_file", lambda *a, **k: None)
+    seen = {"pushed": []}
+    monkeypatch.setattr(stack, "push_file", lambda path, text, **k: seen["pushed"].append((path, k)))
 
     def fake_leg(cmd, *a, **k):
         seen["cmd"] = cmd
@@ -199,6 +200,47 @@ def test_stage_b_keeps_only_the_verdict_carrying_its_nonce(tmp_path, monkeypatch
     verdict, reason = v.stage_b(board, scope, finding, {}, run_id=run_id, model="m", effort=None, say=print)
     assert (verdict, reason) == ("rejected", "own")
     assert seen["cmd"][seen["cmd"].index("--user") + 1] == stack.JUDGE
+    # the judge's own container, never the hunter's; the verdict is read from the judge's volume
+    assert stack.JUDGE_CTR in seen["cmd"] and stack.AGENT not in seen["cmd"]
+    assert v.host_verify_dir("p", fid).is_relative_to(tmp_path / "var" / "judge")
+    assert seen["pushed"] and all(k == {"user": stack.JUDGE, "container": stack.JUDGE_CTR} for _, k in seen["pushed"])
+
+
+def test_stage_a_replays_in_the_judge_container(monkeypatch):
+    from bh import stack
+    from bh import verify as v
+
+    calls = []
+    monkeypatch.setattr(stack, "push_file", lambda path, text, **k: calls.append(("push", path, k)))
+
+    def fake_sh(script, *args, **k):
+        calls.append(("sh", args, k))
+        return subprocess.CompletedProcess([], 0, '{"reproduced": true, "control_disproves": false}\n', "")
+
+    monkeypatch.setattr(stack, "agent_sh", fake_sh)
+    assert v.stage_a("p", 3, {"steps": []}) == {"reproduced": True, "control_disproves": False}
+    (_, path, push_kw), (_, args, sh_kw) = calls
+    assert path == "/work/p/.verify/F3/proof.json" and args == (path,)
+    assert push_kw["container"] == sh_kw["container"] == stack.JUDGE_CTR
+    assert push_kw["user"] == sh_kw["user"] == stack.JUDGE
+
+
+def test_no_verification_while_the_judge_container_is_down(tmp_path, monkeypatch):
+    """Not an error of the finding: it stays new, no error counted, nothing runs."""
+    from bh import stack
+    from bh import verify as v
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    monkeypatch.setattr(stack, "container_running", lambda name: name != stack.JUDGE_CTR)
+    monkeypatch.setattr(stack, "prepare_judge", lambda *a: pytest.fail("judge prepared while down"))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    board = Board(tmp_path / "b.sqlite")
+    fid = board.add_finding(
+        "p", "IDOR", vuln_class="idor", url="https://t.test/b/7", proof=idor_proof("https://t.test")
+    )
+    assert v.verify_finding(board, scope, fid, run_id=1, model="m", effort=None, say=lambda *a: None) == "skipped"
+    assert board.rows("SELECT status FROM findings WHERE id=?", fid)[0]["status"] == "new"
+    assert not board.meta_get(f"verify-err:F{fid}:p")
 
 
 # ------------------------------------------------------------------ escalation and errors (no container, no claude)
@@ -218,6 +260,7 @@ def judged(tmp_path, monkeypatch):
     run_id = board.run_start("p", "m")
     for name in ("prepare_judge", "push_file"):
         monkeypatch.setattr(stack, name, lambda *a, **k: None)
+    monkeypatch.setattr(stack, "container_running", lambda name: True)
     monkeypatch.setattr(runner, "clean_sandbox", lambda *a, **k: None)
     monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": True, "control_disproves": False})
     calls, answers = [], []

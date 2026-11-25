@@ -19,6 +19,7 @@ restart the gate.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import inspect
 import itertools
@@ -56,6 +57,9 @@ def _now() -> float:
 
 
 AGENT_HOST = os.environ.get("BH_AGENT_HOST", "agent")
+JUDGE_HOST = os.environ.get("BH_JUDGE_HOST", "judge")  # the verifier's own container (compose service `judge`)
+# the only clients of the relay: the hunter's container and the judge's. Nothing else on the gate's networks.
+RELAY_CLIENT_HOSTS = (AGENT_HOST, JUDGE_HOST)
 # The only Claude API calls Claude Code makes with nonessential traffic off (measured 2026-11-24 on 2.1.330).
 RELAY_PATHS = frozenset({("POST", "/v1/messages"), ("POST", "/v1/messages/count_tokens")})
 RELAY_DEFAULT_MAX = 200  # requests per activation of a run when the runner names no budget
@@ -63,19 +67,39 @@ RELAY_DEFAULT_MAX = 200  # requests per activation of a run when the runner name
 METHOD_OVERRIDES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
 
 
-_AGENT_IPS: tuple[float, frozenset[str]] = (0.0, frozenset())
+RELAY_IPS_TTL, RELAY_IPS_RETRY = 60.0, 5.0
+_RELAY_IPS: tuple[float, frozenset[str]] = (0.0, frozenset())
 
 
-def _agent_ips() -> frozenset[str]:
-    """Addresses of the agent container (compose service name), cached a minute."""
-    global _AGENT_IPS
-    if time.time() - _AGENT_IPS[0] > 60:
-        try:
-            ips = frozenset(i[4][0] for i in socket.getaddrinfo(AGENT_HOST, 0))
-        except OSError:
-            ips = frozenset()
-        _AGENT_IPS = (time.time(), ips)
-    return _AGENT_IPS[1]
+def resolve_hosts(hosts, getaddrinfo=None) -> frozenset[str]:
+    """Addresses of the compose services `hosts`. A service that is down resolves to nothing and does not
+    hide the others (the agent keeps the relay while the judge restarts)."""
+    getaddrinfo = getaddrinfo or socket.getaddrinfo
+    ips: set[str] = set()
+    for host in hosts:
+        with contextlib.suppress(OSError):
+            ips |= {str(i[4][0]) for i in getaddrinfo(host, 0)}
+    return frozenset(ips)
+
+
+def relay_client_allowed(peer: str, allowed: frozenset[str]) -> bool:
+    """The relay serves the agent and the judge containers only: the gate also sits on the lab network, and a
+    target must not reach the token."""
+    return bool(peer) and peer in allowed
+
+
+def _relay_ips(max_age: float = RELAY_IPS_TTL) -> frozenset[str]:
+    """Addresses of the agent and judge containers, cached `max_age` seconds."""
+    global _RELAY_IPS
+    if time.time() - _RELAY_IPS[0] > max_age:
+        _RELAY_IPS = (time.time(), resolve_hosts(RELAY_CLIENT_HOSTS))
+    return _RELAY_IPS[1]
+
+
+def _relay_peer_ok(peer: str) -> bool:
+    """A recreated container gets a new IP: a refused peer triggers one fresh lookup (at most every few seconds)
+    before the refusal stands."""
+    return relay_client_allowed(peer, _relay_ips()) or relay_client_allowed(peer, _relay_ips(RELAY_IPS_RETRY))
 
 
 def _from_gate(flow: http.HTTPFlow) -> bool:
@@ -308,8 +332,8 @@ class Gate:
     def _relay(self, flow: http.HTTPFlow) -> None:
         flow.metadata["bh_class"] = "relay"
         peer = (flow.client_conn.peername or ("?",))[0]
-        if peer not in _agent_ips():  # the gate also sits on the lab network: a target must not reach the token
-            self._deny(flow, deny(f"relay: only the agent container may use it (not {peer})"), "relay")
+        if not _relay_peer_ok(peer):  # the gate also sits on the lab network: a target must not reach the token
+            self._deny(flow, deny(f"relay: only the agent and judge containers may use it (not {peer})"), "relay")
             return
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
         req = flow.request

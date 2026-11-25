@@ -147,6 +147,7 @@ def cmd_up(args) -> int:
         paths.state() / "identities",
         paths.var() / "gate-ca",
         paths.var() / "work",
+        paths.var() / "judge",  # the judge's own /work (bind mount: podman does not create a missing source)
         paths.runs_dir(),
     ):
         d.mkdir(parents=True, exist_ok=True)
@@ -173,7 +174,7 @@ def cmd_tools_fetch(args) -> int:
 
 
 def cmd_status(args) -> int:
-    for name in (stack.GATE, stack.AGENT):
+    for name in (stack.GATE, stack.AGENT, stack.JUDGE_CTR):
         print(f"{name:9} {'running' if stack.container_running(name) else 'DOWN'}")
     if paths.active_scope().exists():
         s = _load_scope_or_exit(str(paths.active_scope()))

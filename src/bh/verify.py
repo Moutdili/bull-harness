@@ -13,6 +13,9 @@ Decision table (deterministic, B can only lower a deterministic success, never i
   A reproduced and B confirmed                       -> verified
   anything else                                      -> inconclusive
 
+Where: the judge has its own container (compose service `judge`, stack.JUDGE_CTR): same image, same gate, its own
+/work (var/judge on the host), its own Unix user. The hunter's /work and processes are not in it; the proof is pushed.
+
 No human verifies during the hunt: an inconclusive finding opens no todo, it stays visible in the Findings tab.
 A technical error sends the finding back to 'new' for a later pass; the second one leaves it inconclusive.
 """
@@ -49,12 +52,17 @@ _PLACEHOLDERS = ",".join("?" * len(ACTIVE))
 
 
 def verify_dir(program: str, fid: int) -> str:
-    """The verifier's own work dir in the sandbox (fresh for every verification)."""
-    return f"{c.WORK_ROOT}/{program}/.verify/F{fid}"
+    """The verifier's own work dir in the judge container (fresh for every verification)."""
+    return f"{c.WORK_ROOT}/{program}/{stack.VERIFY_SUBDIR}/F{fid}"
 
 
 def host_verify_dir(program: str, fid: int) -> Path:
-    return paths.work_bh(program).parent / ".verify" / f"F{fid}"
+    """Host view of verify_dir: the judge's volume (var/judge), never the hunter's (var/work)."""
+    return paths.var() / "judge" / program / stack.VERIFY_SUBDIR / f"F{fid}"
+
+
+def _push(path: str, text: str) -> None:
+    stack.push_file(path, text, user=stack.JUDGE, container=stack.JUDGE_CTR)
 
 
 # ------------------------------------------------------------------ pieces
@@ -77,11 +85,17 @@ def duplicate_of(board: Board, finding: dict) -> int | None:
 
 
 def stage_a(program: str, fid: int, proof: dict) -> dict:
-    """Deterministic replay inside the agent container (so it goes through the gate like the hunter did)."""
+    """Deterministic replay inside the judge container (so it goes through the gate like the hunter did)."""
     path = f"{verify_dir(program, fid)}/proof.json"
-    stack.push_file(path, json.dumps(proof), user=stack.JUDGE)
+    _push(path, json.dumps(proof))
     try:
-        r = stack.agent_sh('/opt/bh/bin/bh-agent replay "$1"', path, user=stack.JUDGE, timeout=REPLAY_TIMEOUT_S)
+        r = stack.agent_sh(
+            '/opt/bh/bin/bh-agent replay "$1"',
+            path,
+            user=stack.JUDGE,
+            timeout=REPLAY_TIMEOUT_S,
+            container=stack.JUDGE_CTR,
+        )
     except subprocess.TimeoutExpired:
         return {"reproduced": False, "control_disproves": False, "error": f"replay over {REPLAY_TIMEOUT_S}s"}
     try:
@@ -96,10 +110,9 @@ def stage_b(
     """Fresh claude session in the verifier role. Returns (verdict, reason); ('inconclusive', why) on failure."""
     prog, fid = scope.program, finding["id"]
     vdir = verify_dir(prog, fid)
-    stack.push_file(
+    _push(
         f"{vdir}/{c.SYSTEM}",
         prompts.build_verifier_prompt(scope, finding, replay, classes.evidence(finding["vuln_class"])),
-        user=stack.JUDGE,
     )
     nonce = secrets.token_hex(16)  # only this claude process gets it: a verdict without it was not written by it
     task = (
@@ -120,6 +133,7 @@ def stage_b(
         # live sessions only: a stale one answers 401 and would read as "not reproduced"
         identities=runner.live_identities(board, prog, also=[i["name"] for i in scope.identities]),
     )
+    cmd = stack.in_container(cmd, stack.JUDGE_CTR)  # run_leg's kill follows: a .verify work dir is the judge's
     log_path = paths.runs_dir() / f"{run_id:05d}-{prog}-verify-F{fid}-{int(time.time())}.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     res = runner.SegmentResult(program=prog, run_id=run_id)
@@ -225,6 +239,9 @@ def verify_finding(
     if not finding.get("proof"):
         board.set_finding(fid, "inconclusive", "no structured proof (finding recorded before the verifier existed)")
         return "inconclusive"
+    if not stack.container_running(stack.JUDGE_CTR):  # not an error of this finding: left for a later pass
+        say(f"  ↳ F{fid} not verified: container {stack.JUDGE_CTR} is not running (`bh up`)")
+        return "skipped"
     if dup := duplicate_of(board, finding):
         board.set_finding(fid, "duplicate", f"same class and resource as F{dup}")
         say(f"  ↳ F{fid} duplicate of F{dup}")
@@ -247,8 +264,9 @@ def verify_finding(
 def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: str, effort: str | None, say) -> str:
     fid = finding["id"]
     proof = json.loads(finding["proof"])
-    # nothing of the hunter survives into the verification: its processes, HOME, user site, the old verdicts.
-    # The verification runs as its own Unix user, in a work dir and HOME the hunter cannot write.
+    # The verification runs in the judge container, as its own Unix user, with a fresh HOME and work dir: the
+    # hunter's container cannot read or write them. The hunter's leftovers (a background job still hitting the
+    # target) die first all the same, so they cannot move the target's state under the replay.
     home = runner.sandbox_home(f"{run_id}-F{fid}")
     runner.clean_sandbox(scope.program, home)
     stack.prepare_judge(home, verify_dir(scope.program, fid))
@@ -290,7 +308,7 @@ def _escalate(
     say(f"  ↳ F{fid} inconclusive for the first judge, second judge {ESCALATION_MODEL}")
     # fresh context: the first judge's processes, HOME and work dir (its notes, its verdict) are gone
     stack.prepare_judge(home, vdir)
-    stack.push_file(f"{vdir}/proof.json", json.dumps(proof), user=stack.JUDGE)
+    _push(f"{vdir}/proof.json", json.dumps(proof))
     verdict, reason = stage_b(
         board, scope, finding, replay, run_id=run_id, model=ESCALATION_MODEL, effort=ESCALATION_EFFORT, say=say
     )

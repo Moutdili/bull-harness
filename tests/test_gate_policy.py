@@ -4,6 +4,8 @@ import shutil
 import time
 from pathlib import Path
 
+import pytest
+
 from bh.gate import policy as pol
 from bh.gate.policy import Policy, TokenBucket
 
@@ -275,3 +277,67 @@ def test_waf_pause_never_touches_passive_or_system_hosts(tmp_path, monkeypatch):
             p.penalize(host, waf=True)
     assert not p.host_blocked_until
     assert req(p, "https://web.archive.org/cdx?url=a.t", "web.archive.org").allowed
+
+
+# ------------------------------------------------------------------ Claude API relay: who may use it
+@pytest.fixture
+def addon(monkeypatch):
+    """bh.gate.addon without mitmproxy (only in the gate image): stub modules, umask restored after import."""
+    import importlib
+    import sys
+    import types
+    from unittest import mock
+
+    for name in ("mitmproxy", "mitmproxy.net", "mitmproxy.net.http", "mitmproxy.net.http.url", "mitmproxy.proxy"):
+        mod = types.ModuleType(name)
+        mod.__getattr__ = lambda attr: mock.MagicMock(name=attr)
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, "bh.gate.addon", raising=False)
+    old = os.umask(0o022)
+    os.umask(old)
+    try:
+        mod = importlib.import_module("bh.gate.addon")
+    finally:
+        os.umask(old)
+    monkeypatch.setattr(mod, "_RELAY_IPS", (0.0, frozenset()))
+    yield mod
+    sys.modules.pop("bh.gate.addon", None)
+
+
+def _dns(table):
+    def getaddrinfo(host, port):
+        if host not in table:
+            raise OSError("unknown host")
+        return [(2, 1, 6, "", (ip, port)) for ip in table[host]]
+
+    return getaddrinfo
+
+
+def test_relay_admits_the_agent_and_the_judge_only(addon, monkeypatch):
+    assert addon.RELAY_CLIENT_HOSTS == ("agent", "judge")
+    dns = _dns({"agent": ["10.89.0.5"], "judge": ["10.89.0.6"], "juiceshop": ["10.231.0.10"]})
+    allowed = addon.resolve_hosts(addon.RELAY_CLIENT_HOSTS, dns)
+    assert allowed == {"10.89.0.5", "10.89.0.6"}
+    assert addon.relay_client_allowed("10.89.0.5", allowed)
+    assert addon.relay_client_allowed("10.89.0.6", allowed)
+    for peer in ("10.231.0.10", "127.0.0.1", "", "?"):  # the lab target, the gate itself, no peer
+        assert not addon.relay_client_allowed(peer, allowed)
+    monkeypatch.setattr(addon.socket, "getaddrinfo", dns)
+    assert addon._relay_peer_ok("10.89.0.6") and not addon._relay_peer_ok("10.231.0.10")
+
+
+def test_a_judge_that_is_down_does_not_cost_the_agent_the_relay(addon):
+    allowed = addon.resolve_hosts(("agent", "judge"), _dns({"agent": ["10.89.0.5"]}))
+    assert allowed == {"10.89.0.5"}
+
+
+def test_a_recreated_judge_is_admitted_after_one_fresh_lookup(addon, monkeypatch):
+    table = {"agent": ["10.89.0.5"], "judge": ["10.89.0.6"]}
+    monkeypatch.setattr(addon.socket, "getaddrinfo", _dns(table))
+    assert addon._relay_peer_ok("10.89.0.6")
+    table["judge"] = ["10.89.0.9"]  # recreated with another IP, the cache still holds the old one
+    clock = [addon.time.time()]
+    monkeypatch.setattr(addon.time, "time", lambda: clock[0])
+    assert not addon._relay_peer_ok("10.89.0.9")  # within the retry delay: no lookup storm from refused peers
+    clock[0] += addon.RELAY_IPS_RETRY + 1
+    assert addon._relay_peer_ok("10.89.0.9") and not addon._relay_peer_ok("10.89.0.6")
