@@ -54,6 +54,8 @@ PASSIVE_DENY_PATHS = {"web.archive.org": ("/save",)}
 IDENTITY_HEADER = "X-BH-Identity"
 GATE_HEADER = "X-BH-Gate"  # set by the gate on its own refusals only (it strips it from target answers)
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
+# Writes the gate allows only under one of our identities (our own objects); the gate and proof checks share it
+IDENTITY_ONLY_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 RULES_MARK = "[bh-rules]"  # prefix of a denial imposed by the program's rules
 SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
 WORK_ROOT = "/work"  # the agent's work volume (var/work on the host)

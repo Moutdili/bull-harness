@@ -74,6 +74,11 @@ def validate(proof: object) -> list[str]:
             errors.append(f"{where}: url must be an absolute http(s) URL")
         if "$" in str(st.get("url", "")):
             errors.append(f"{where}: url contains an unresolved shell variable")
+        if str(st.get("method", "GET")).upper() in c.IDENTITY_ONLY_METHODS and not st.get("as"):
+            errors.append(
+                f"{where}: the gate refuses PUT/PATCH/DELETE without an identity, so this step can never run; "
+                "use another identity (user-b) as the control, not an anonymous request"
+            )
         if "browse" in st:
             b = st["browse"]
             if not isinstance(b, dict) or set(b) - {"xss"}:

@@ -24,7 +24,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from bh.agent.contract import API_PATH, ID_SEGMENT, PASSIVE_DENY_PATHS, is_passive, origin, path_key
+from bh.agent.contract import (
+    API_PATH,
+    ID_SEGMENT,
+    IDENTITY_ONLY_METHODS,
+    PASSIVE_DENY_PATHS,
+    is_passive,
+    origin,
+    path_key,
+)
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
@@ -35,7 +43,6 @@ PASSIVE_RPS = 2.0
 WEB_PORTS = frozenset({80, 443, 8000, 8008, 8080, 8443, 8888})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # Writes that may only be made as one of our identities (our own objects); POST stays open (login, search, forms).
-IDENTITY_ONLY_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 ALLOWED_METHODS = SAFE_METHODS | {"POST"} | IDENTITY_ONLY_METHODS
 BACKOFF_FACTOR, BACKOFF_SECONDS, MIN_RPS = 0.5, 300.0, 0.2
 # A host that keeps answering with a WAF challenge is paused, not retried: WAF_LIMIT challenges within
