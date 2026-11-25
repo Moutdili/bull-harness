@@ -8,12 +8,19 @@ Text first: the summary is at most 25 lines; DOM, ARIA snapshot, HAR, console, d
 screenshot stay in raw/browse-<slug>-<ts>/. Read shot.png only to decide something.
 
 Network: every request goes to the gate (proxy). Requests to a host outside the target host and its
-subdomains are aborted locally (no network) and counted, except the scope's `support` hosts of kind `assets`
-(scripts and styles the app needs; the gate allows them GET/HEAD only, without cookies); login hosts (`auth`)
-stay blocked here and at the gate. Source maps, /favicon.ico (404 guard), and images/fonts/media unless a
-screenshot is asked are aborted too. Websockets are refused locally and counted, unless the scope enables them
-(`websockets: true`): then those to the target host go through the gate, which bounds their frames.
-Service workers are blocked so every request shows in the HAR and at the gate.
+subdomains are aborted locally (no network) and counted, except the scope's other targets and its `support` hosts
+of kind `assets` (scripts and styles the app needs; the gate allows them GET/HEAD only, without cookies), `sso`
+(the application's own silent sign-in: GET/HEAD and the token exchange) and `passthrough` (a third-party anti-bot
+challenge, its script and iframe: never blocked here, never intercepted by the gate; the challenge decides alone,
+we never touch it); login hosts (`auth`) stay blocked here and at the gate. Source maps, /favicon.ico (404 guard),
+and images/fonts/media unless a screenshot is asked are aborted too (never on a passthrough host). Websockets are
+refused locally and counted, unless the scope enables them (`websockets: true`): then those to the target hosts go
+through the gate, which bounds their frames. Service workers are blocked so every request shows in the HAR and at
+the gate.
+
+Identity (--as): X-BH-Identity is added request by request in the route handler (identity_headers), only towards
+the targets and the `sso` hosts, never globally: a passthrough host never receives anything of ours. A websocket
+handshake cannot be given a header this way (Playwright routes it apart), so it carries no identity.
 
 Classification: a mapper; with --xss a scanner (refused when the program forbids scanners).
 This is the only sandbox module that imports playwright, inside run(): bh-agent starts without it.
@@ -174,10 +181,42 @@ def same_site(url: str, host: str) -> bool:
     return h == host or h.endswith("." + host)
 
 
-def route_decision(url: str, resource_type: str, host: str, shot: bool, assets: tuple[str, ...] = ()) -> str | None:
-    """Why a request is aborted locally, or None to let it go to the gate. `assets`: host patterns of the scope's
-    `support` assets, the only other hosts a page may load from."""
-    if not same_site(url, host) and not any(c.host_matches(p, c.host_of(url)) for p in assets):
+def _matches(url: str, patterns: tuple[str, ...]) -> bool:
+    h = c.host_of(url)
+    return bool(h) and any(c.host_matches(p, h) for p in patterns)
+
+
+def support_kind(url: str, extra: c.SandboxScope) -> str | None:
+    """`passthrough`, `sso` or `assets` for a support host of the scope, None otherwise. Passthrough first: a host
+    that must never see anything of ours is recognised before anything else."""
+    for kind in ("passthrough", "sso", "assets"):
+        if _matches(url, getattr(extra, kind)):
+            return kind
+    return None
+
+
+def is_target(url: str, host: str, targets: tuple[str, ...] = ()) -> bool:
+    """The page's host (or a subdomain) or another target of the scope."""
+    return bool(c.host_of(url)) and (same_site(url, host) or _matches(url, targets))
+
+
+def route_decision(
+    url: str,
+    resource_type: str,
+    host: str,
+    shot: bool,
+    assets: tuple[str, ...] = (),
+    *,
+    sso: tuple[str, ...] = (),
+    passthrough: tuple[str, ...] = (),
+    targets: tuple[str, ...] = (),
+) -> str | None:
+    """Why a request is aborted locally, or None to let it go to the gate. `assets`, `sso`, `passthrough`: host
+    patterns of the scope's `support` hosts; `targets`: the scope's other targets. A passthrough host (an anti-bot
+    challenge) is never aborted, whatever it loads: we never stand in the challenge's way."""
+    if _matches(url, passthrough):
+        return None
+    if not same_site(url, host) and not any(_matches(url, p) for p in (assets, sso, targets)):
         return "offsite"
     path = urlsplit(url).path
     if path.endswith(".map"):
@@ -189,10 +228,29 @@ def route_decision(url: str, resource_type: str, host: str, shot: bool, assets: 
     return None
 
 
-def ws_through(url: str, host: str, enabled: bool) -> bool:
+def identity_headers(
+    url: str,
+    host: str,
+    identity: str | None,
+    *,
+    sso: tuple[str, ...] = (),
+    passthrough: tuple[str, ...] = (),
+    targets: tuple[str, ...] = (),
+) -> dict[str, str]:
+    """The header that names our identity, for this request only: towards a target or an `sso` host, never a
+    passthrough host (checked first), an assets host or anything else."""
+    if not identity or not c.host_of(url) or _matches(url, passthrough):
+        return {}
+    if is_target(url, host, targets) or _matches(url, sso):
+        return {c.IDENTITY_HEADER: identity}
+    return {}
+
+
+def ws_through(url: str, host: str, enabled: bool, targets: tuple[str, ...] = ()) -> bool:
     """A websocket the browser may open for real: the scope enables them and it goes to the target host (or a
-    subdomain, as for every other request). The gate judges the handshake and bounds the frames."""
-    return enabled and c.host_of(url) != "" and same_site(url, host)
+    subdomain, as for every other request) or another target of the scope (a chat hub). The gate judges the
+    handshake and bounds the frames."""
+    return enabled and is_target(url, host, targets)
 
 
 def spa_route(url: str) -> tuple[str, list[str]] | None:
@@ -293,6 +351,7 @@ class Result:
     gate_denied: int = 0
     websockets: int = 0  # refused locally
     websockets_open: int = 0  # let through to the target (scope `websockets: true`)
+    support: Counter = field(default_factory=Counter)  # requests let through to `sso` / `passthrough` hosts
     xhr: list[tuple[str, str, int | None]] = field(default_factory=list)  # (method, url, status)
     steps: list[str] = field(default_factory=list)
     dialogs: list[dict] = field(default_factory=list)
@@ -330,6 +389,11 @@ def render(r: Result) -> list[str]:
     if r.gate_denied:
         req += f"; gate denied {r.gate_denied}"
     body.append(req)
+    if r.support["sso"] or r.support["passthrough"]:
+        body.append(
+            f"support: sso {r.support['sso']} (the app's own sign-in), passthrough {r.support['passthrough']} "
+            "(anti-bot challenge, not intercepted; never solve nor work around it: blocked = bh-note blocked captcha)"
+        )
     if r.websockets:
         body.append(f"websockets: {r.websockets} refused (the gate forbids them; socket.io may fall back to polling)")
     if r.websockets_open:
@@ -445,11 +509,21 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
         s = max(1.0, deadline - time.monotonic())
         return 1000 * (min(s, cap) if cap else s)
 
+    hosts = {"sso": extra.sso, "passthrough": extra.passthrough, "targets": extra.targets}
+
     def on_route(route) -> None:
         req = route.request
-        why = route_decision(req.url, req.resource_type, host, a.shot, extra.assets)
+        why = route_decision(req.url, req.resource_type, host, a.shot, extra.assets, **hosts)
         if why is None:
-            route.continue_()
+            kind = support_kind(req.url, extra)
+            if kind in ("sso", "passthrough"):
+                r.support[kind] += 1
+            # per request, never global: a passthrough host gets nothing of ours (identity_headers)
+            ident = identity_headers(req.url, host, a.identity, **hosts)
+            if ident:
+                route.continue_(headers={**req.headers, **ident})
+            else:
+                route.continue_()
             return
         r.blocked[c.host_of(req.url) if why == "offsite" else why] += 1
         route.abort("blockedbyclient")
@@ -507,13 +581,13 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 viewport=VIEWPORT,
                 service_workers="block",
                 record_har_path=str(raw / "har.json"),
-                extra_http_headers={c.IDENTITY_HEADER: a.identity} if a.identity else None,
+                # no extra_http_headers: the identity is added request by request in on_route (identity_headers)
                 storage_state=str(state_file) if state_file.is_file() else None,
             )
             ctx.set_default_timeout(left_ms(30))
             ctx.route("**/*", on_route)
-            # mocked and refused: every websocket, or (scope `websockets: true`) every one not to the target host
-            ctx.route_web_socket(lambda u: not ws_through(u, host, extra.websockets), on_ws)
+            # mocked and refused: every websocket, or (scope `websockets: true`) every one not to a target host
+            ctx.route_web_socket(lambda u: not ws_through(u, host, extra.websockets, extra.targets), on_ws)
             ctx.on("request", lambda _req: setattr(r, "requests", r.requests + 1))
             ctx.on("response", on_response)
             if a.routes:
@@ -525,7 +599,8 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             page.on(  # mocked ones may show here too: count only those let through
                 "websocket",
                 lambda ws: (
-                    ws_through(ws.url, host, extra.websockets) and setattr(r, "websockets_open", r.websockets_open + 1)
+                    ws_through(ws.url, host, extra.websockets, extra.targets)
+                    and setattr(r, "websockets_open", r.websockets_open + 1)
                 ),
             )
 

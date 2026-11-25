@@ -18,7 +18,25 @@ the client's list (policy.relay_models).
 
 Support hosts (scope `support`, policy docstring): `assets` lose Cookie / Authorization and get no program header
 nor identity; `auth` are reached by the enrollment sources only (`_from_gate`), with their own cookies untouched
-(the login needs them; bh-login keeps its own jar). Logged as class `support`, never a target flow.
+(the login needs them; bh-login keeps its own jar). `sso` (a login host the application calls while in use) gets no
+program header and no identity header; under X-BH-Identity it gets that identity's jar cookies for its host only, and
+its Set-Cookie go back to the jar, masked to the client like a target's. Logged as class `support`, never a target
+flow.
+
+Passthrough hosts (a third-party anti-bot challenge): the CONNECT is judged (name, port 443, rate, open tunnels),
+then the TLS is never intercepted. Mechanism, mitmproxy 12.3.1 (the gate image): the passthrough hosts of the active
+scope go to the official options `ignore_hosts` (`^host:443$`, "Ignore host and forward all traffic without
+processing it", matched on the ClientHello's SNI: https://docs.mitmproxy.org/stable/howto/ignore-domains/) and
+`show_ignored_hosts` ("Record ignored flows ... even if we do not perform TLS interception"), so an ignored tunnel
+still raises the TCP events (https://docs.mitmproxy.org/stable/api/events.html, "TCP Events": tcp_start, tcp_message)
+and its bytes can be counted and bounded (policy.PassthroughGuard), then dropped from memory. Not `tls_clienthello` +
+`ignore_connection`: that path relays through `TCPLayer(ignore=True)`, which has no flow and raises no event
+(mitmproxy/proxy/layers/tls.py, ClientTLSLayer.receive_handshake_data; layers/tcp.py, TCPLayer.__init__), so nothing
+could be counted. Raw TCP stays refused for every tunnel the CONNECT check did not register as passthrough (an SNI
+that names a passthrough host inside another CONNECT is blackholed), and a tunnel whose first bytes are no TLS
+ClientHello too. A passthrough tunnel's SNI that is not its host is not ignored, so it is intercepted, and every request
+in it is refused (policy: a passthrough host is never seen decrypted). Journal: event `passthrough` {host, bytes_up,
+bytes_down, seconds, closed?}.
 
 Websockets (scope `websockets: true`): the handshake is judged by classify_request like any target request; then
 the official hooks of mitmproxy 12 (https://docs.mitmproxy.org/stable/api/events.html, "WebSocket Events":
@@ -184,6 +202,17 @@ def _from_gate(flow: http.HTTPFlow) -> bool:
     return peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1") or peer in _login_ips()
 
 
+def passthrough_patterns(hosts) -> list[str]:
+    """mitmproxy `ignore_hosts` regexes for the passthrough hosts: the exact name on port 443, anchored (mitmproxy
+    matches them with re.search on `host:port`, the SNI included). Exact hosts only (the scope refuses wildcards)."""
+    return sorted({f"^{re.escape(h.lower().rstrip('.'))}:443$" for h in hosts if h and "*" not in h})
+
+
+def starts_like_tls_hello(data: bytes) -> bool:
+    """A TLS handshake record (0x16, version 3.x) carrying a ClientHello (handshake type 1)."""
+    return len(data) > 5 and data[0] == 0x16 and data[1] == 0x03 and data[2] <= 0x04 and data[5] == 0x01
+
+
 def refuse(flow: http.HTTPFlow, v: Verdict) -> None:
     """The gate's refusal: a 403 marked X-BH-Gate, and a metadata flag a target response cannot fake."""
     body = f"bh-gate: DENIED ({v.reason}{' / ' + v.rule if v.rule else ''})\n".encode()
@@ -269,6 +298,8 @@ class Gate:
         self._dest: dict[str, str] = {}
         self._dead = session.DeadLimiter()  # one session-dead event per identity per minute
         self._unauth = session.Unauthorized()  # 401 under an identity, per distinct route
+        # server connection id -> passthrough host: the only tunnels whose raw bytes may be relayed
+        self._tunnels: dict[str, str] = {}
 
     def load(self, loader) -> None:
         loader.add_option("bh_state", str, "/state", "bull-harness state dir")
@@ -282,6 +313,15 @@ class Gate:
         self.policy.reload()
         if ctx.options.rawtcp:
             ctx.options.update(rawtcp=False)  # non-HTTP bytes are not relayed (tcp hooks below kill the rest)
+        self._sync_passthrough()
+
+    def _sync_passthrough(self) -> None:
+        """mitmproxy's `ignore_hosts` = the active scope's passthrough hosts on 443 (module docstring); nothing else
+        is ever left unintercepted. Called after every scope reload a CONNECT may see."""
+        scope = self.policy.scope if self.policy else None
+        wanted = passthrough_patterns(scope.support_hosts("passthrough") if scope else ())
+        if list(ctx.options.ignore_hosts or []) != wanted:
+            ctx.options.update(ignore_hosts=wanted, show_ignored_hosts=bool(wanted))
 
     def running(self) -> None:
         """Publish only the public CA cert for the agent; the CA key stays in the gate's confdir."""
@@ -347,9 +387,30 @@ class Gate:
     @fail_closed
     def http_connect(self, flow: http.HTTPFlow) -> None:
         v = self.policy.classify_connect(flow.request.host, flow.request.port, enroll=_from_gate(flow))
+        self._sync_passthrough()  # classify_connect reloaded the scope: the ignored hosts follow it
         flow.metadata["bh_class"] = v.klass
+        flow.metadata["bh_support"] = v.support
         if not v.allowed:
             self._deny(flow, v, "connect")
+            return
+        if v.support == "passthrough":
+            host = flow.request.host.lower().rstrip(".")
+            if why := self.policy.passthrough.open(flow.server_conn.id, host, time.time()):
+                self._deny(flow, deny(why), "connect")
+                return
+            self._tunnels[flow.server_conn.id] = host
+
+    @fail_closed
+    def http_connect_error(self, flow: http.HTTPFlow) -> None:
+        """A CONNECT that failed (upstream unreachable, refused): its passthrough slot is freed."""
+        self._tunnel_end(flow.server_conn.id)
+
+    def _tunnel_end(self, sid: str) -> None:
+        host = self._tunnels.pop(sid, None)
+        if host is None:
+            return
+        rec = self.policy.passthrough.end(sid, time.time())
+        self._log(paths.EVENTS, {"kind": "passthrough", **(rec or {"host": host})})
 
     def _destination(self, server) -> tuple[str | None, int | None]:
         """(hostname asked for, port) of a server connection, even after the address was pinned to an IP."""
@@ -375,7 +436,15 @@ class Gate:
 
     @fail_closed
     def tcp_start(self, flow: tcp.TCPFlow) -> None:
-        """Raw TCP (non-HTTP bytes in a tunnel, CRLF tricks, other ports) never leaves."""
+        """Raw TCP (non-HTTP bytes in a tunnel, CRLF tricks, other ports) never leaves; except a passthrough tunnel
+        that the CONNECT check registered (module docstring)."""
+        if flow.server_conn.id in self._tunnels:
+            flow.metadata["bh_passthrough"] = self._tunnels[flow.server_conn.id]
+            with contextlib.suppress(RuntimeError):  # a silent tunnel is closed at its time limit too
+                asyncio.get_running_loop().call_later(
+                    self.policy.passthrough.max_seconds + 1, self._tunnel_expire, flow
+                )
+            return
         flow.kill()
         host, port = self._destination(flow.server_conn)
         self._log(
@@ -385,12 +454,41 @@ class Gate:
 
     @fail_closed
     def tcp_message(self, flow: tcp.TCPFlow) -> None:
-        """kill() in tcp_start does not stop the first message: drop every byte of the tunnel."""
-        flow.messages[-1].content = b""
-        flow.kill()
+        """kill() in tcp_start does not stop the first message: drop every byte of the tunnel. A passthrough tunnel:
+        its first client bytes must be a TLS ClientHello; then only the byte count is kept, never the bytes."""
+        msg = flow.messages[-1]
+        sid = flow.server_conn.id
+        host = flow.metadata.get("bh_passthrough")
+        why = None if host and sid in self._tunnels else "raw TCP is not allowed"
+        if why is None and msg.from_client and not flow.metadata.get("bh_tls_seen"):
+            flow.metadata["bh_tls_seen"] = True
+            if not starts_like_tls_hello(msg.content or b""):
+                why = "passthrough: the tunnel does not start with a TLS ClientHello"
+                self.policy.passthrough.live.get(sid, {})["closed"] = why
+        if why is None:
+            size = len(msg.content or b"")
+            why = self.policy.passthrough.data(sid, size, from_client=msg.from_client, now=time.time())
+        flow.messages.clear()  # never kept: the relay sends the message it holds, the flow keeps no copy
+        if why:
+            msg.content = b""
+            flow.kill()
+            if host and not flow.metadata.get("bh_pt_refused"):
+                flow.metadata["bh_pt_refused"] = True
+                self._log(paths.EVENTS, {"kind": "blocked", "where": "passthrough", "host": host, "reason": why})
+            return
+
+    def _tunnel_expire(self, flow: tcp.TCPFlow) -> None:
+        try:
+            t = self.policy.passthrough.live.get(flow.server_conn.id)
+            if t is not None and not t["closed"]:
+                t["closed"] = "passthrough tunnel time limit"
+                flow.kill()  # the next message of either side is dropped (tcp_message), the slot freed at disconnect
+        except Exception as exc:  # noqa: BLE001 - a timer callback must never raise into the loop
+            ctx.log.error(f"bh-gate: passthrough expiry failed: {exc!r}")
 
     def server_disconnected(self, data: server_hooks.ServerConnectionHookData) -> None:
         self._dest.pop(data.server.id, None)
+        self._tunnel_end(data.server.id)
 
     @fail_closed
     def udp_start(self, flow: udp.UDPFlow) -> None:
@@ -493,6 +591,7 @@ class Gate:
             return
         req = flow.request
         identity = req.headers.pop(IDENTITY_HEADER, None)
+        flow.metadata["bh_identity_asked"] = identity is not None  # the client sent one (see passthrough_redirect)
         if identity is not None and _from_gate(flow):
             identity = None  # enrollment logs in with its own credentials: it never borrows a stored session
         if identity is not None and self._identity_file(identity) is None:
@@ -544,6 +643,11 @@ class Gate:
                 req.headers["User-Agent"] = scope.user_agent
             if identity:
                 self._apply_identity(flow, identity)
+        elif v.klass == "support" and v.support == "sso":
+            # the application's own sign-in: no program header, no UA override, no identity header; under an
+            # identity, that identity's jar cookies for this host (the browser of our test account, nothing more)
+            if identity:
+                self._apply_identity(flow, identity, cookies_only=True)
         elif v.klass == "passive" or (v.klass == "support" and v.support == "assets"):
             flow.metadata["bh_identity"] = None  # never applied off target: the journal must not claim it was
             for k in ("Cookie", "Authorization"):
@@ -557,10 +661,11 @@ class Gate:
         path = self.state / paths.IDENTITIES / self.policy.program / f"{name}.json"
         return path if path.is_file() else None
 
-    def _apply_identity(self, flow: http.HTTPFlow, name: str) -> None:
+    def _apply_identity(self, flow: http.HTTPFlow, name: str, *, cookies_only: bool = False) -> None:
         """Inject the identity's headers and the cookies its jar holds for this URL (bh.gate.session).
         Cookies: the jar (fresh, rotated by Set-Cookie) beats a static `Cookie` of `headers`; both beat an agent
-        cookie of the same name (session.combine), whose name is then recorded in the flow."""
+        cookie of the same name (session.combine), whose name is then recorded in the flow.
+        `cookies_only` (an `sso` host): the jar's cookies for this URL and nothing else, never a header."""
         path = self._identity_file(name)
         url = self._named(flow)[0]
         sess = session.load(path) if path else None
@@ -570,7 +675,7 @@ class Gate:
         req, mark = flow.request, f"<identity:{name}>"
         decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
         # M7: the identity's headers (a bearer token...) and static Cookie only go to its own origins
-        own = session.headers_go_to(decl, url)
+        own = session.headers_go_to(decl, url) and not cookies_only
         if not own:
             flow.metadata["bh_identity_withheld"] = True
         headers = sess["headers"] if own else {}
@@ -600,15 +705,8 @@ class Gate:
         ident, info = flow.metadata.get("bh_identity"), flow.metadata.get("bh_session")
         if not ident or not info:
             return  # no identity applied (none asked, unknown name, or not a target): nothing to keep
+        self._identity_cookies(flow)
         resp, (url, host) = flow.response, self._named(flow)
-        set_cookies = resp.headers.get_all("set-cookie")
-        if set_cookies:
-            # mask first: whatever happens to the jar, the agent never receives an identity's cookie value
-            resp.headers.set_all("set-cookie", [session.mask_set_cookie(v, f"<identity:{ident}>") for v in set_cookies])
-            try:
-                session.absorb(Path(info["file"]), url, set_cookies, in_scope=flow.metadata.get("bh_class") == "target")
-            except OSError as exc:  # a jar that cannot be written costs a stale session, not the answer
-                ctx.log.error(f"bh-gate: cannot update the session of {ident}: {exc}")
         seen = _now()  # the event carries the time of the answer, not of its ingestion (H4)
         reason = session.dead_reason(
             flow.request.method,
@@ -637,6 +735,24 @@ class Gate:
                 rec["routes"] = routes
             self._log(paths.EVENTS, rec)
 
+    def _identity_cookies(self, flow: http.HTTPFlow) -> None:
+        """Under an applied identity, on a target or an `sso` host: its Set-Cookie go into the identity's jar and
+        reach the client with their value masked (the agent never holds a session value of our accounts)."""
+        ident, info = flow.metadata.get("bh_identity"), flow.metadata.get("bh_session")
+        if not ident or not info:
+            return
+        resp, url = flow.response, self._named(flow)[0]
+        set_cookies = resp.headers.get_all("set-cookie")
+        if not set_cookies:
+            return
+        # mask first: whatever happens to the jar, the agent never receives an identity's cookie value
+        resp.headers.set_all("set-cookie", [session.mask_set_cookie(v, f"<identity:{ident}>") for v in set_cookies])
+        kept = flow.metadata.get("bh_class") == "target" or flow.metadata.get("bh_support") == "sso"
+        try:
+            session.absorb(Path(info["file"]), url, set_cookies, in_scope=kept)
+        except OSError as exc:  # a jar that cannot be written costs a stale session, not the answer
+            ctx.log.error(f"bh-gate: cannot update the session of {ident}: {exc}")
+
     @fail_closed
     def response(self, flow: http.HTTPFlow) -> None:
         if flow.response is None or flow.metadata.get("bh_denied"):
@@ -644,7 +760,17 @@ class Gate:
         flow.response.headers.pop(GATE_HEADER, None)  # only the gate's own refusals carry it
         if flow.metadata.get("bh_class") not in ("target", "passive", "support"):
             return
-        if flow.metadata.get("bh_class") == "support":  # one journal line, never a test, a jar or a WAF count
+        if flow.metadata.get("bh_identity_asked") and (
+            why := self.policy.passthrough_redirect(
+                self._named(flow)[0], flow.response.status_code, flow.response.headers.get("location")
+            )
+        ):
+            self._identity_cookies(flow)  # a rotated cookie of ours still goes to the jar, never to the client
+            self._deny(flow, deny(why), "response")
+            return
+        if flow.metadata.get("bh_class") == "support":  # one journal line, never a test nor a WAF count
+            if flow.metadata.get("bh_support") == "sso":
+                self._identity_cookies(flow)  # the identity's own sign-in cookies rotate in its jar
             self._record(flow, flow.response.status_code)
             return
         self._identity_response(flow)

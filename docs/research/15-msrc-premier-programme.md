@@ -57,7 +57,40 @@ Détail et citations : skills `msrc-ai-bug-bounty` (barre, rapport), `msrc-copil
   websocket reste à mesurer au premier passage live ; s'il a un chemin HTTP, le préférer (plus de contrôles du gate).
 - **Hôtes de support** : les hôtes de connexion Microsoft (`login.live.com`…) et d'assets (`res.cdn.office.net`…)
   sont sortis de `in_scope` vers `support` : ils ne sont plus des cibles. `auth` ne sert qu'à l'enrôlement
-  (`bh-login`), `assets` est en GET/HEAD sans cookies ni identité (voir `architecture.md` §2).
+  (`bh-login`), `assets` est en GET/HEAD sans cookies ni identité (voir `architecture.md` §2). `login.live.com` et
+  `login.microsoftonline.com` sont devenus `sso` (ci-dessous).
+- **Copilot en usage réel (constat live du 2026-11-25)** : `bh-login` va jusqu'au chat connecté, et sous `user-a` le
+  chat s'affiche connecté dans `bh-browse`. Mais l'appli obtient ses jetons d'API par une connexion silencieuse
+  (iframe `GET login.microsoftonline.com/9188040d-…/oauth2/v2.0/authorize`, `/savedusers`, puis échange PKCE
+  `POST …/oauth2/v2.0/token`), refusée tant que ces hôtes étaient `auth` : sans jeton, aucun appel aux API du chat.
+  Le chat passe par `wss://substrate.office.com/…` (et peut-être `wss://substrate.svc.cloud.microsoft/…`), et
+  Cloudflare Turnstile (`challenges.cloudflare.com/turnstile/v0/api.js`) protège l'envoi de messages des comptes
+  gratuits.
+- **Ce qui a changé** (voir `architecture.md` §2) :
+  - deux kinds de support. `sso` pour `login.microsoftonline.com` et `login.live.com` : GET/HEAD de tout client, POST
+    seulement sur `token_paths` (`/*/oauth2/v2.0/token`, `/oauth20_token.srf`), sous identité les seuls cookies de
+    la jarre pour cet hôte, jamais d'en-tête de programme ni d'identité, classe `support`. `passthrough` pour
+    `challenges.cloudflare.com` : CONNECT 443, TLS jamais intercepté (options mitmproxy `ignore_hosts` +
+    `show_ignored_hosts`), débit et volume bornés, journal hôte + octets + durée ;
+  - `substrate.office.com` et `substrate.svc.cloud.microsoft` sont des cibles (« Copilot chat hub (wss), our own
+    conversations only ») ;
+  - l'enrôlement garde les cookies de `login.microsoftonline.com` (hôte `sso`) ;
+  - `bh-browse` pose `X-BH-Identity` requête par requête, vers les cibles et les hôtes `sso` seulement.
+- **Ligne éthique sur le challenge (règle de Mio, non négociable)** : on ne casse jamais le challenge. Pas de
+  navigateur déguisé (webdriver masqué, plugin stealth, faux user-agent), pas de service de résolution, pas de requête
+  qui saute ou rejoue un jeton de challenge, pas de test pour savoir si le serveur le vérifie. On arrête seulement de
+  l'empêcher nous-mêmes : pas d'interception TLS sur l'hôte du challenge (l'empreinte TLS vue par Cloudflare est celle
+  de Chromium, pas celle de mitmproxy, cf. `10-sessions-anti-bot.md` §4), son script n'est pas bloqué, et le
+  challenge décide seul. S'il refuse le navigateur headless de l'agent, c'est un `bh-note blocked captcha` ; un humain
+  (Mio) peut le résoudre lui-même dans le navigateur persistant de l'agent (brique P1). Le gate reste la seule
+  frontière dure : chaque ouverture est minimale, journalisée et testée.
+- **Notes de la page MSRC reprises dans le scope** : la page déclare « copilot.microsoft.com and copilot.ai … when
+  tested using a personal account » (`copilot.ai` n'est pas encore une cible du YAML) ; « MSOBB » dans le nom du
+  compte si possible ; identifiant de conversation obtenu par `/id` dans la conversation, à joindre au rapport.
+- **À valider en live** : jetons obtenus (POST token 200 sous `user-a`, aucun refus `token_paths` ni pré-vol `OPTIONS`
+  refusé dans `events.jsonl`), `/savedusers` en GET, websocket substrate ouvert et borné, événement `passthrough` avec
+  des octets, aucune requête déchiffrée vers `challenges.cloudflare.com`, et le comportement de Turnstile dans
+  `bh-browse` headless (attendu : refus possible, sans contournement).
 - **Hors bande** : `bh-oob` n'existe pas (issue 31). Preuve sans récepteur (effet vu depuis le compte A ou chez
   la victime B, à nous) ; à défaut, blocker `oob-needed`. SSRF : la preuve est la requête reçue chez nous, jamais
   une adresse interne.

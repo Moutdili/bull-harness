@@ -344,12 +344,16 @@ def _login_json(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
 
 # ---------------------------------------------------------------- browser
 def _host_ok(ident: Identity, host: str) -> bool:
-    """A cookie domain the session may keep: in scope, or the host of a URL the identity itself declares."""
+    """A cookie domain the session may keep: in scope, the host of a URL the identity itself declares, or an `sso`
+    support host (or a parent domain of one): the application signs in silently there while in use, and the gate
+    hands the identity's own cookies to that host only (bh.gate.addon)."""
     from bh.scope.enforce import check
 
     if not host or is_public_suffix(host):
         return False
     if ident.scope is not None and check(ident.scope, host):
+        return True
+    if ident.scope is not None and any(h == host or h.endswith("." + host) for h in ident.scope.support_hosts("sso")):
         return True
     own = [u for _, u in rc.urls(ident.recipe)] + list(ident.decl.get("origins") or [])
     return any((o := origin(u)) and o.split("://", 1)[1].rsplit(":", 1)[0].strip("[]") == host for u in own)
