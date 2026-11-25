@@ -144,6 +144,12 @@ class Board:
     def reset_program(self, program: str) -> dict[str, int]:
         """Forget everything about one program (training labs). Returns affected rows per table."""
         out = {t: self.db.execute(f"DELETE FROM {t} WHERE program=?", (program,)).rowcount for t in PROGRAM_TABLES}
+        # the asset graph (bh.assets) lives in the same file: without this a reset lab keeps its old surface
+        if self.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='assets'"):
+            ids = "SELECT id FROM assets WHERE program=?"
+            for t in ("coverage", "tests", "asset_links"):
+                self.db.execute(f"DELETE FROM {t} WHERE asset_id IN ({ids})", (program,))
+            out["assets"] = self.db.execute("DELETE FROM assets WHERE program=?", (program,)).rowcount
         archived = f"{program}~{time.strftime('%Y%m%d-%H%M%S')}"
         out["runs (archived)"] = self.db.execute(
             "UPDATE runs SET program=? WHERE program=?", (archived, program)

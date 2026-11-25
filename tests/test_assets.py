@@ -105,3 +105,18 @@ def test_blocked_host_leaves_untested_until_its_deadline(tmp_path, monkeypatch):
     assert "a.t.test: blocked (waf) until " in block and "/api/a" not in block
     g.mark_blocked("a.t.test", "waf", time.time() - 1)  # deadline passed: back in the list
     assert len(g.surface(c.REQUIRED_PHASES)[1]) == 2 and "blocked" not in g.render(c.REQUIRED_PHASES)
+
+
+def test_program_reset_forgets_the_asset_graph(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    b = Board(tmp_path / "board.sqlite")
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["a.t.test"]})
+    g = Graph(b, scope)
+    g.tested("https://a.t.test", "GET /api/x", "gate", None)
+    other = Graph(b, scope_from_dict({"program": "q", "platform": "x", "in_scope": ["b.t.test"]}))
+    other.tested("https://b.t.test", "GET /api/y", "gate", None)
+    b.db.commit()
+    assert b.reset_program("p")["assets"] >= 1
+    assert not b.rows("SELECT 1 FROM assets WHERE program='p'")
+    assert b.rows("SELECT 1 FROM assets WHERE program='q'")  # other programs keep theirs
+    assert b.rows("SELECT COUNT(*) n FROM tests")[0]["n"] == 1
