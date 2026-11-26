@@ -1,0 +1,136 @@
+# Microsoft MSRC, Copilot (consumer, copilot.microsoft.com) with two personal test accounts of ours.
+# Rules: docs/research/15-msrc-premier-programme.md (own accounts only, no excessive automated traffic, no DoS,
+# stop at the proof, human review of every report). Targets are in_scope only. The login and asset hosts are
+# `support`, never targets: `auth` is reachable by enrollment only (the gate, bh-login), never by the hunter or
+# the judge; `assets` is GET/HEAD only, without cookies, identity or program headers; `sso` is the app's own silent
+# sign-in (GET/HEAD, POST only on `token_paths`, the identity's own jar cookies, no header of ours); `passthrough` is
+# the Cloudflare Turnstile challenge: tunnelled, never intercepted, never solved nor worked around by us, a human
+# may solve it in the agent's browser (docs/architecture.md §2, docs/research/15-msrc-premier-programme.md).
+schema: 1
+program: msrc-copilot
+platform: msrc
+automation_allowed: true
+scanners_allowed: false
+self_signup: false
+max_rps: 2
+# the chat talks over websockets (to confirm live): handshakes are target requests, client messages are bounded per
+# connection by the gate (BH_WS_MSGS_PER_MIN, default 12/min) and journaled. MSRC forbids excessive automated
+# traffic, not automation: keep the message rate low, one conversation at a time.
+websockets: true
+forbidden_vulns: [dos]
+in_scope:
+  - {value: "copilot.microsoft.com", note: "target (redirects to copilot.com)"}
+  - {value: "copilot.com", note: "target: Copilot consumer web"}
+  # substrate is the whole Microsoft 365 back end: only the paths the Copilot app was seen calling (2026-11-25), never
+  # the rest of the tenant API (mail, files, people). Our own conversations only.
+  - {value: "https://substrate.office.com/m365Copilot/", note: "Copilot chat hub (wss Chathub), usage, client events"}
+  - {value: "https://substrate.office.com/search/api/v1/userconfig", note: "Copilot app config"}
+  - {value: "https://substrate.office.com/search/api/v1/prompts", note: "prompt gallery and its activity"}
+  - {value: "https://substrate.office.com/search/api/v1/suggestions", note: "composer suggestions"}
+  - {value: "https://substrate.svc.cloud.microsoft/m365Copilot/", note: "alternate chat hub host (in the app's code, not seen live)"}
+# chat traffic only from bh-browser (audit B2): a prompt reaches Copilot through the one browser where the operator solves
+# the Turnstile challenge, never by a direct websocket or API call from the agent's container
+browser_only:
+  - "https://substrate.office.com/m365Copilot/Chathub/"
+  - "https://substrate.svc.cloud.microsoft/m365Copilot/Chathub/"
+support:
+  # sso: the app signs in silently while in use (iframe GET .../oauth2/v2.0/authorize, /savedusers, then the PKCE
+  # code exchange POST .../oauth2/v2.0/token); seen live 2026-11-25 on login.microsoftonline.com, tenant
+  # 9188040d-6c67-4c5b-b112-36a304b66dad (Microsoft accounts). The login.live.com token path is the MSA one, to confirm.
+  - {value: "login.microsoftonline.com", kind: sso, token_paths: ["/*/oauth2/v2.0/token"], note: "Entra ID silent sign-in and token exchange"}
+  - {value: "login.live.com", kind: sso, token_paths: ["/oauth20_token.srf"], note: "Microsoft account login (enrollment) and silent sign-in"}
+  - {value: "challenges.cloudflare.com", kind: passthrough, note: "Cloudflare Turnstile (free accounts' message sending): tunnelled, never intercepted nor touched"}
+  - {value: "brunhild.challenges.cloudflare.com", kind: passthrough, note: "Turnstile's challenge backend (seen live 2026-11-25): tunnelled, never intercepted nor touched"}
+  - {value: "login.microsoft.com", kind: auth, note: "Microsoft login"}
+  - {value: "fpt.live.com", kind: auth, note: "login anti-fraud fingerprint"}
+  - {value: "account.live.com", kind: auth, note: "Microsoft account pages of the login"}
+  - {value: "ms-sso.copilot.microsoft.com", kind: auth, note: "Copilot single sign-on bridge"}
+  - {value: "ms-sso.copilot.com", kind: auth, note: "Copilot single sign-on bridge"}
+  - {value: "df.cfp.microsoft.com", kind: auth, note: "login anti-fraud"}
+  - {value: "*.msftauth.net", kind: assets, note: "login page assets"}
+  - {value: "*.msauth.net", kind: assets, note: "login page assets"}
+  - {value: "res.cdn.office.net", kind: assets, note: "Copilot app assets (JS)"}
+  - {value: "res-1.cdn.office.net", kind: assets, note: "Copilot app assets"}
+  - {value: "res.public.onecdn.static.microsoft", kind: assets, note: "Copilot chat app (JS chunks)"}
+  - {value: "static2.sharepointonline.com", kind: assets, note: "Copilot app assets"}
+  - {value: "uhf.microsoft.com", kind: assets, note: "Copilot page header/footer assets"}
+  - {value: "wcpstatic.microsoft.com", kind: assets, note: "cookie consent assets"}
+out_of_scope: []
+identities:
+  - name: user-a
+    origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
+    role: member
+    tenant: A
+    # measured 2026-11-26: signed in, /chat is 200 (JSON for a client without Accept: text/html); signed out, a 302
+    probe: {url: "https://copilot.com/chat", status: 200}
+    enroll:
+      kind: browser
+      steps:
+        - {goto: "https://login.live.com/"}
+        - {fill: "input[type=email]", value: "{email}"}
+        - {click: "button[type=submit], input[type=submit]"}
+        - {click: "text=Use your password", optional: true, timeout: 8}
+        - {fill: "input[type=password]", value: "{password}"}
+        - {click: "button[type=submit], input[type=submit]"}
+        - {email_code: "input[name=otc], input[autocomplete=one-time-code]", from: "microsoft.com", optional: true, timeout: 10}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {goto: "https://copilot.microsoft.com/"}
+        - {wait_for: {url: "copilot"}}
+        - {click: "button:has-text('Reject')", optional: true, timeout: 8}
+        - {click: "button:has-text('Sign in')", optional: true, timeout: 20}
+        - {click: "text=Sign in with Microsoft", optional: true, timeout: 10}
+        - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
+        - {wait_for: {url: "copilot.com"}, timeout: 40}
+        - {goto: "https://copilot.com/chat"}
+        - {click: "button:has-text('Reject')", optional: true, timeout: 6}
+        - {click: "button:has-text('Send a code'), [role=button]:has-text('Send a code')", optional: true, timeout: 20}
+        - {fill: "#proof-confirmation-email-input", value: "{code_to}", optional: true, timeout: 10}
+        - {click: "button:has-text('Send code')", optional: true, timeout: 8}
+        # an account with an authenticator app (user-b, 2026-11-26) asks for its code here: take the e-mail option
+        - {click: "text=/Use a different verification option|Other ways to sign in|I can.t use/i", optional: true, timeout: 8}
+        - {click: "[role=button]:has-text('Email'), button:has-text('Email'), div:has-text('Email') >> nth=-1", optional: true, timeout: 8}
+        - {click: "button:has-text('Send code'), button:has-text('Send a code')", optional: true, timeout: 8}
+        - {email_code: "#codeEntry-0, input[name=otc], input[autocomplete=one-time-code], input[type=tel], input[inputmode=numeric]", from: "microsoft.com", optional: true, timeout: 120}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
+        - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
+      capture: {cookies: true, authorization: true}
+  - name: user-b
+    origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
+    role: member
+    tenant: B
+    # measured 2026-11-26: signed in, /chat is 200 (JSON for a client without Accept: text/html); signed out, a 302
+    probe: {url: "https://copilot.com/chat", status: 200}
+    enroll:
+      kind: browser
+      steps:
+        - {goto: "https://login.live.com/"}
+        - {fill: "input[type=email]", value: "{email}"}
+        - {click: "button[type=submit], input[type=submit]"}
+        - {click: "text=Use your password", optional: true, timeout: 8}
+        - {fill: "input[type=password]", value: "{password}"}
+        - {click: "button[type=submit], input[type=submit]"}
+        - {email_code: "input[name=otc], input[autocomplete=one-time-code]", from: "microsoft.com", optional: true, timeout: 10}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {goto: "https://copilot.microsoft.com/"}
+        - {wait_for: {url: "copilot"}}
+        - {click: "button:has-text('Reject')", optional: true, timeout: 8}
+        - {click: "button:has-text('Sign in')", optional: true, timeout: 20}
+        - {click: "text=Sign in with Microsoft", optional: true, timeout: 10}
+        - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
+        - {wait_for: {url: "copilot.com"}, timeout: 40}
+        - {goto: "https://copilot.com/chat"}
+        - {click: "button:has-text('Reject')", optional: true, timeout: 6}
+        - {click: "button:has-text('Send a code'), [role=button]:has-text('Send a code')", optional: true, timeout: 20}
+        - {fill: "#proof-confirmation-email-input", value: "{code_to}", optional: true, timeout: 10}
+        - {click: "button:has-text('Send code')", optional: true, timeout: 8}
+        # an account with an authenticator app (user-b, 2026-11-26) asks for its code here: take the e-mail option
+        - {click: "text=/Use a different verification option|Other ways to sign in|I can.t use/i", optional: true, timeout: 8}
+        - {click: "[role=button]:has-text('Email'), button:has-text('Email'), div:has-text('Email') >> nth=-1", optional: true, timeout: 8}
+        - {click: "button:has-text('Send code'), button:has-text('Send a code')", optional: true, timeout: 8}
+        - {email_code: "#codeEntry-0, input[name=otc], input[autocomplete=one-time-code], input[type=tel], input[inputmode=numeric]", from: "microsoft.com", optional: true, timeout: 120}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
+        - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
+      capture: {cookies: true, authorization: true}
+notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). The MSRC page declares in scope 'copilot.microsoft.com and copilot.ai ... when tested using a personal account': test only our own two personal accounts, with 'MSOBB' in the account name where possible. Cross-user impact is what pays (see .claude/skills/msrc-ai-bug-bounty). Every report gives the conversation identifier, obtained by typing /id in the conversation. Login and asset hosts are support hosts, never targets. substrate.* hosts are the chat hub: our own conversations only. Websockets on: low message rate, one conversation at a time, never a flood of prompts. Cloudflare Turnstile guards message sending for free accounts: never solved, evaded or worked around by the agent; a human may solve it in the agent's browser, else bh-note blocked captcha."

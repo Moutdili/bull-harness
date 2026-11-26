@@ -29,7 +29,79 @@ RUN npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/clau
 # 4. Python tools not packaged by Kali.
 RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install semgrep==1.186.0
 
-# 5. Unprivileged hunter user (claude refuses bypassPermissions as root).
+# 4b. bh-recon archive step (issue 32): gau + gf patterns. Kali's `getallurls` package is gau 1.0.7
+#     (https://www.kali.org/tools/getallurls/: no urlscan provider, no --timeout/--config), so the upstream release
+#     is used, pinned by version and by the SHA256 listed in gau_2.2.4_checksums.txt of
+#     https://github.com/lc/gau/releases/tag/v2.2.4 (checked against the downloaded archives on 2026-11-25).
+#     gf patterns are plain JSON regex files, pinned by commit (the commit id pins the content): the examples of
+#     tomnomnom/gf and 1ndianl33t/Gf-Patterns, copied to /opt/bh/gf. bh-recon applies them itself; the gf binary
+#     is not installed (no release, it would need a Go toolchain): `grep -iE` with the same patterns does the same.
+ARG GAU_VERSION=2.2.4
+ARG GAU_SHA256_AMD64=10e2e248c37cafb0be3f6d2931125296b95cd4186066d596d47fa417237529a9
+ARG GAU_SHA256_ARM64=c194992df360d3a24e021c6dc5a5a0576cfd769be1d19cccb29adc1d3759637d
+ARG GF_COMMIT=dcd4c361f9f5ba302294ed38b8ce278e8ba69006
+ARG GF_PATTERNS_COMMIT=f686f06ae647726578920084c894100d702496cc
+RUN set -e; arch=$(dpkg --print-architecture); \
+    case "$arch" in amd64) sum=$GAU_SHA256_AMD64 ;; arm64) sum=$GAU_SHA256_ARM64 ;; \
+      *) echo "gau: no pinned build for $arch" >&2; exit 1 ;; esac; \
+    tmp=$(mktemp -d); \
+    curl -fsSL -o "$tmp/gau.tgz" "https://github.com/lc/gau/releases/download/v${GAU_VERSION}/gau_${GAU_VERSION}_linux_${arch}.tar.gz"; \
+    echo "$sum  $tmp/gau.tgz" | sha256sum -c -; \
+    tar -xzf "$tmp/gau.tgz" -C "$tmp" gau; \
+    install -m 0755 "$tmp/gau" /usr/local/bin/gau; \
+    HOME="$tmp" gau --version | grep -qx "gau version: ${GAU_VERSION}"; \
+    for spec in "tomnomnom/gf $GF_COMMIT gf" "1ndianl33t/Gf-Patterns $GF_PATTERNS_COMMIT gfp"; do \
+      set -- $spec; git init -q "$tmp/$3"; \
+      git -C "$tmp/$3" fetch -q --depth 1 "https://github.com/$1" "$2"; \
+      git -C "$tmp/$3" checkout -q FETCH_HEAD; \
+      test "$(git -C "$tmp/$3" rev-parse HEAD)" = "$2"; \
+    done; \
+    mkdir -p /opt/bh/gf; cp "$tmp"/gf/examples/*.json "$tmp"/gfp/*.json /opt/bh/gf/; chmod -R a+rX /opt/bh/gf; \
+    rm -rf "$tmp"; \
+    for n in sqli xss ssrf redirect idor lfi rce ssti; do python3 -I -c "import json,sys; json.load(open(sys.argv[1]))" "/opt/bh/gf/$n.json"; done
+
+# 5. Headless browser for bh-browse: Playwright Python for the system python3 (bh-agent runs `python3 -I`, which
+#    keeps the system site-packages) + chrome-headless-shell, all fetched at build time, none at runtime.
+#    1.65.2: latest on PyPI per docs/research/09-vision-headless.md §2 (2026-11-14). The API used by browse.py was
+#    checked against the 1.62.0 wheel (route_web_socket, aria_snapshot, service_workers, record_har_path).
+ARG PLAYWRIGHT_VERSION=1.65.2
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN python3 -m pip install --no-cache-dir --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
+ && python3 -m playwright install --with-deps --only-shell chromium \
+ && rm -rf /var/lib/apt/lists/* \
+ && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH" \
+ && python3 -I -c "import playwright.sync_api" \
+ && ls "$PLAYWRIGHT_BROWSERS_PATH"/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell
+
+# 5b. bh-zap: ZAP from the Kali package `zaproxy` (2.17.0 on 2026-11-25, https://www.kali.org/tools/zaproxy/; it
+#     depends on default-jre, Java 25 in Kali rolling; ZAP 2.17 needs Java 17+). Like the other apt tools it follows
+#     the rolling repo: `dpkg-query` below logs the version that was built. chromium + chromium-driver come from the
+#     same repo at the same version: the AJAX spider (`bh-zap --ajax`) drives them through ZAP's selenium add-on.
+#     The build fails if any is missing (no silent fallback), and /opt/bh/zap.jar points at the jar bh-zap starts.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zaproxy chromium chromium-driver \
+ && rm -rf /var/lib/apt/lists/* \
+ && jar=$( (ls /usr/share/zaproxy/zap-*.jar 2>/dev/null; dpkg -L zaproxy | grep -E '/zap-[0-9][0-9.]*\.jar$') | head -1) \
+ && test -n "$jar" && mkdir -p /opt/bh && ln -sf "$jar" /opt/bh/zap.jar \
+ && dpkg-query -W zaproxy chromium chromium-driver | tee /opt/bh/zap-version.txt \
+ && java -version
+
+# 5c. bh-browser (compose service `browser`, docs/research/18): a virtual display, a VNC server on the container's
+#     loopback, and the noVNC client files (/usr/share/novnc, served by the host UI; no server of noVNC runs here).
+#     Versions seen in kali-rolling on 2026-11-25 (https://pkg.kali.org/pkg/<source>): xorg-server 2:21.1.25-2
+#     (binary xvfb), x11vnc 0.9.17-3, novnc 1:1.6.0-3 (it depends on websockify 0.13.0+dfsg1-2, installed, unused).
+#     Pinned: a rolling repo that moved fails the build here; bump the ARGs after checking pkg.kali.org.
+ARG XVFB_VERSION=2:21.1.25-2
+ARG X11VNC_VERSION=0.9.17-3
+ARG NOVNC_VERSION=1:1.6.0-3
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends "xvfb=${XVFB_VERSION}" "x11vnc=${X11VNC_VERSION}" "novnc=${NOVNC_VERSION}" \
+ && rm -rf /var/lib/apt/lists/* \
+ && test -f /usr/share/novnc/core/rfb.js \
+ && command -v Xvfb x11vnc chromium \
+ && dpkg-query -W xvfb x11vnc novnc chromium | tee /opt/bh/browser-versions.txt
+
+# 6. Unprivileged hunter user (claude refuses bypassPermissions as root).
 RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work
 COPY entrypoint.sh check.sh /opt/bh/
 RUN chmod 755 /opt/bh/entrypoint.sh /opt/bh/check.sh

@@ -4,6 +4,8 @@ import shutil
 import time
 from pathlib import Path
 
+import pytest
+
 from bh.gate import policy as pol
 from bh.gate.policy import Policy, TokenBucket
 
@@ -86,6 +88,42 @@ def test_resolved_ip_checks(tmp_path):
     assert not p.check_ip("api.anthropic.com", "127.0.0.1").allowed
 
 
+def test_the_gate_itself_is_never_a_destination(tmp_path):
+    """B3: a scope that covers loopback or the gate's own address (a lab CIDR) still cannot reach the gate."""
+    f = tmp_path / "active-scope.yaml"
+    f.write_text("program: p\nplatform: x\nin_scope: [127.0.0.0/8, '::1/128', 10.231.0.0/24]\n")
+    p = Policy(f, local_ips=frozenset({"10.231.0.2"}))
+    assert p.check_ip("10.231.0.10", "10.231.0.10").allowed  # the lab target itself stays reachable
+    for ip in ("127.0.0.1", "127.8.9.1", "::1", "::ffff:127.0.0.1", "0.0.0.0", "::", "10.231.0.2"):
+        v = p.check_ip("lab.test", ip)
+        assert not v.allowed and v.rule == "self", ip
+    for host in ("127.0.0.1", "10.231.0.2", "[::1]"):
+        assert not p.classify_connect(host, 8080).allowed, host
+        assert not req(p, f"http://{host}:8080/", host.strip("[]")).allowed, host
+    assert not pol.is_self_address("lab.test") and not pol.is_self_address("93.184.216.34")
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "body", "expected"),
+    [
+        (403, {"Server": "cloudflare"}, b"<h1>Forbidden</h1> you cannot read this order", False),  # the app's 403
+        (403, {"Server": "AkamaiGHost"}, b"{}", False),
+        (403, {"cf-mitigated": "challenge"}, b"", True),
+        (403, {}, b"<title>Just a moment...</title>", True),
+        (403, {}, b"<title>Attention Required! | Cloudflare</title>", True),
+        (403, {}, b"error code: 1020", True),
+        (403, {}, b"Access Denied ... You don't have permission ... Reference #18.2f", True),
+        (429, {}, b"Request blocked. ... CloudFront", True),
+        (503, {"Server": "cloudflare"}, b"Service Unavailable", False),  # pushback, not a WAF page
+        (200, {"cf-mitigated": "challenge"}, b"Just a moment...", False),
+        (401, {}, b"Just a moment...", False),
+    ],
+)
+def test_waf_answers_are_the_waf_own_pages_only(status, headers, body, expected):
+    """H3: `Server: cloudflare` on the application's own 403 never counts."""
+    assert pol.is_waf(status, headers, body) is expected
+
+
 def test_broken_scope_fails_closed(tmp_path):
     p = _policy(tmp_path)
     assert req(p, "https://a.example.com/", "a.example.com").allowed
@@ -133,12 +171,13 @@ def test_token_bucket_rate():
 def test_id_enumeration_is_refused(tmp_path):
     p = _policy(tmp_path)
     url = "https://a.example.com/api/baskets/{}"
-    for i in range(1, 5):
+    assert pol.ID_LIMIT == 12
+    for i in range(1, pol.ID_LIMIT + 1):
         assert req(p, url.format(i), "a.example.com", authenticated=True).allowed, i
-    v = req(p, url.format(5), "a.example.com", authenticated=True)
+    v = req(p, url.format(pol.ID_LIMIT + 1), "a.example.com", authenticated=True)
     assert not v.allowed and "enumeration" in v.reason
     assert req(p, url.format(2), "a.example.com", authenticated=True).allowed  # an id already seen
-    for i in range(1, 9):  # public, non-API pages (blog posts, products) are not limited
+    for i in range(1, pol.ID_LIMIT * 2):  # public, non-API pages (blog posts, products) are not limited
         assert req(p, f"https://a.example.com/blog/{i}", "a.example.com").allowed
 
 
@@ -176,56 +215,141 @@ def test_web_ports_on_every_request_not_only_connect(tmp_path):
 
 def test_id_enumeration_sees_through_path_variants(tmp_path):
     p = _policy(tmp_path)
-    for i in range(1, 5):
+    for i in range(1, pol.ID_LIMIT + 1):
         assert req(p, f"https://a.example.com/api/baskets/{i}", "a.example.com", authenticated=True).allowed
-    for variant in ("/api/baskets/5/", "/API/baskets/6", "/api//baskets/7", "/api/baskets/8;x=1", "/api/baskets/%39"):
+    for variant in (
+        "/api/baskets/50/",
+        "/API/baskets/60",
+        "/api//baskets/70",
+        "/api/baskets/80;x=1",
+        "/api/baskets/%39%39",
+    ):
         v = req(p, "https://a.example.com" + variant, "a.example.com", authenticated=True)
         assert not v.allowed and "enumeration" in v.reason, variant
 
 
-def test_id_enumeration_in_query_body_and_graphql(tmp_path):
+def test_id_enumeration_counts_path_ids_only(tmp_path):
+    """I6: a parameter (telemetry `eventid`, a body id) is not an object read; only the path's ids count."""
     p = _policy(tmp_path)
     host = "a.example.com"
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/api/order?id={i}&page=2", host).allowed, i
-    v = req(p, f"https://{host}/api/order?id=5&page=2", host)
-    assert not v.allowed and "?id" in v.reason
-    assert req(p, f"https://{host}/api/order?id=3&page=9", host).allowed  # an id already seen, other params free
-
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/api/cart", host, "POST", body=b'{"cart": {"basketId": %d}}' % i).allowed
-    assert not req(p, f"https://{host}/api/cart", host, "POST", body=b'{"cart": {"basketId": 5}}').allowed
-
-    gql = b'{"query": "query { user(id: %d) { email } }"}'
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/graphql", host, "POST", body=gql % i).allowed, i
-    assert not req(p, f"https://{host}/graphql", host, "POST", body=gql % 5).allowed
-    variables = b'{"query": "query($u: ID!) { user(id: $u) { email } }", "variables": {"userId": "%d"}}'
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/graphql", host, "POST", body=variables % (100 + i)).allowed, i
-    assert not req(p, f"https://{host}/graphql", host, "POST", body=variables % 200).allowed
+    for i in range(1, pol.ID_LIMIT * 3):
+        assert req(p, f"https://{host}/api/events?eventid={i}", host, authenticated=True).allowed, i
+        body = b'{"query": "query { user(id: %d) { email } }"}' % i
+        assert req(p, f"https://{host}/graphql", host, "POST", body=body, authenticated=True).allowed, i
 
 
-def test_id_enumeration_batch_in_one_request(tmp_path):
-    p = _policy(tmp_path)
-    batch = b"[%s]" % b",".join(b'{"query": "{ user(id: %d) { email } }"}' % i for i in range(1, 7))
-    v = req(p, "https://a.example.com/graphql", "a.example.com", "POST", body=batch)
-    assert not v.allowed and "enumeration" in v.reason
-    # anonymous, non-API pages stay free: search filters are not object reads
-    for i in range(1, 9):
-        assert req(p, f"https://a.example.com/shop?categoryId={i}", "a.example.com").allowed
+def _waf_policy(tmp_path, monkeypatch, clock):
+    f = tmp_path / "active-scope.yaml"
+    f.write_text("program: p\nplatform: x\nin_scope: [a.t, b.t]\n")
+    monkeypatch.setattr(pol, "_now", lambda: clock[0])
+    return Policy(f)
 
 
-def test_id_enumeration_in_a_form_body_when_authenticated(tmp_path):
-    p = _policy(tmp_path)
-    for i in range(1, 5):
-        assert req(
-            p,
-            "https://a.example.com/account/show",
-            "a.example.com",
-            "POST",
-            body=b"account_id=%d&x=1" % i,
-            authenticated=True,
-        ).allowed
-    v = req(p, "https://a.example.com/account/show", "a.example.com", "POST", body=b"account_id=5", authenticated=True)
-    assert not v.allowed and "?account_id" in v.reason
+def test_repeated_waf_pauses_only_that_host(tmp_path, monkeypatch):
+    clock = [1_000_000.0]
+    p = _waf_policy(tmp_path, monkeypatch, clock)
+    for _ in range(pol.WAF_LIMIT - 1):
+        p.penalize("a.t", waf=True)
+        clock[0] += 10
+    assert req(p, "https://a.t/", "a.t").allowed  # two challenges: slowed down, not paused
+    p.penalize("A.T.", waf=True)
+    v = req(p, "https://a.t/x", "a.t")
+    assert not v.allowed and v.reason.startswith("waf-cooldown: a.t until ") and v.rule == "waf-cooldown"
+    assert not req(p, "https://a.t/u/1", "a.t", "DELETE", identity="user-a").allowed  # an identity changes nothing
+    assert not p.classify_connect("a.t", 443).allowed
+    assert req(p, "https://b.t/", "b.t").allowed
+    clock[0] += pol.WAF_COOLDOWN_S + 1
+    assert req(p, "https://a.t/", "a.t").allowed and p.classify_connect("a.t", 443).allowed
+
+
+def test_waf_answers_spread_over_the_window_do_not_pause(tmp_path, monkeypatch):
+    clock = [1_000_000.0]
+    p = _waf_policy(tmp_path, monkeypatch, clock)
+    for _ in range(2 * pol.WAF_LIMIT):
+        p.penalize("a.t", waf=True)
+        clock[0] += pol.WAF_WINDOW_S / (pol.WAF_LIMIT - 1) + 1
+    assert req(p, "https://a.t/", "a.t").allowed
+    for _ in range(pol.WAF_LIMIT):
+        p.penalize("a.t")  # 429 / 503 without a challenge: global slowdown only
+    assert req(p, "https://a.t/", "a.t").allowed
+    assert p.target_rps() == max(pol.MIN_RPS, p.scope.rate * pol.BACKOFF_FACTOR)
+
+
+def test_waf_pause_never_touches_passive_or_system_hosts(tmp_path, monkeypatch):
+    p = _waf_policy(tmp_path, monkeypatch, [1_000_000.0])
+    for host in ("web.archive.org", "api.anthropic.com"):
+        for _ in range(pol.WAF_LIMIT):
+            p.penalize(host, waf=True)
+    assert not p.host_blocked_until
+    assert req(p, "https://web.archive.org/cdx?url=a.t", "web.archive.org").allowed
+
+
+# ------------------------------------------------------------------ Claude API relay: who may use it
+@pytest.fixture
+def addon(monkeypatch):
+    """bh.gate.addon without mitmproxy (only in the gate image): stub modules, umask restored after import."""
+    import importlib
+    import sys
+    import types
+    from unittest import mock
+
+    for name in ("mitmproxy", "mitmproxy.net", "mitmproxy.net.http", "mitmproxy.net.http.url", "mitmproxy.proxy"):
+        mod = types.ModuleType(name)
+        mod.__getattr__ = lambda attr: mock.MagicMock(name=attr)
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, "bh.gate.addon", raising=False)
+    old = os.umask(0o022)
+    os.umask(old)
+    try:
+        mod = importlib.import_module("bh.gate.addon")
+    finally:
+        os.umask(old)
+    monkeypatch.setattr(mod, "_RELAY_IPS", (0.0, {}))
+    yield mod
+    sys.modules.pop("bh.gate.addon", None)
+
+
+def _dns(table):
+    def getaddrinfo(host, port):
+        if host not in table:
+            raise OSError("unknown host")
+        return [(2, 1, 6, "", (ip, port)) for ip in table[host]]
+
+    return getaddrinfo
+
+
+def test_relay_admits_the_agent_the_judge_and_the_auditor_only(addon, monkeypatch):
+    assert addon.RELAY_CLIENT_HOSTS == ("agent", "judge", "audit")
+    dns = _dns({"agent": ["10.89.0.5"], "judge": ["10.89.0.6"], "juiceshop": ["10.231.0.10"]})
+    allowed = addon.resolve_hosts(addon.RELAY_CLIENT_HOSTS, dns)  # the auditor is down: no address, nothing admitted
+    assert allowed == {"10.89.0.5", "10.89.0.6"}
+    assert addon.relay_client_allowed("10.89.0.5", allowed)
+    assert addon.relay_client_allowed("10.89.0.6", allowed)
+    for peer in ("10.231.0.10", "127.0.0.1", "", "?"):  # the lab target, the gate itself, no peer
+        assert not addon.relay_client_allowed(peer, allowed)
+    monkeypatch.setattr(addon.socket, "getaddrinfo", dns)
+    assert addon._relay_peer_ok("10.89.0.6") and not addon._relay_peer_ok("10.231.0.10")
+
+
+def test_a_judge_that_is_down_does_not_cost_the_agent_the_relay(addon):
+    allowed = addon.resolve_hosts(("agent", "judge"), _dns({"agent": ["10.89.0.5"]}))
+    assert allowed == {"10.89.0.5"}
+
+
+def test_a_recreated_judge_is_admitted_after_one_fresh_lookup(addon, monkeypatch):
+    table = {"agent": ["10.89.0.5"], "judge": ["10.89.0.6"]}
+    monkeypatch.setattr(addon.socket, "getaddrinfo", _dns(table))
+    assert addon._relay_peer_ok("10.89.0.6")
+    table["judge"] = ["10.89.0.9"]  # recreated with another IP, the cache still holds the old one
+    clock = [addon.time.time()]
+    monkeypatch.setattr(addon.time, "time", lambda: clock[0])
+    assert not addon._relay_peer_ok("10.89.0.9")  # within the retry delay: no lookup storm from refused peers
+    clock[0] += addon.RELAY_IPS_RETRY + 1
+    assert addon._relay_peer_ok("10.89.0.9") and not addon._relay_peer_ok("10.89.0.6")
+
+
+def test_prefixed_random_ids_are_ids():
+    from bh.agent.contract import ID_SEGMENT
+
+    assert ID_SEGMENT.match("bk_6c49e125463f") and ID_SEGMENT.match("ord-9f3a2b7c11")
+    assert not ID_SEGMENT.match("user_settings") and not ID_SEGMENT.match("api")

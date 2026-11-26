@@ -5,11 +5,15 @@ Security model:
 - token login (secrets/ui.token) -> HttpOnly SameSite=Strict cookie;
 - every POST also needs header `X-BH: 1` (forces a CORS preflight from any other origin);
 - strict CSP, no inline script: agent output and target responses are untrusted and the
-  front end only ever renders them with textContent.
+  front end only ever renders them with textContent;
+- /captcha/ (the screen of bh-browser, for a human challenge Mio solves himself) is behind the same login: the
+  page, the noVNC client files and the WebSocket (same origin only) all need the session cookie. The screen comes
+  from the container through a `podman exec` pipe (bh.browser_service.host), never through a published port.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -19,6 +23,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +50,15 @@ CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 )
+# /captcha/ only: the noVNC client draws on a canvas, sets its cursor as a data: URL, and opens a WebSocket to this
+# same origin ('self' covers ws:/wss: of this host, CSP Level 3). Still no inline script or style, no frame.
+CAPTCHA_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
+CAPTCHA_FILES = {"captcha.js": "text/javascript", "captcha.css": "text/css"}
+CAPTCHA_TUNNELS = 2  # screens open at once
+VIEWING_REFRESH_S = 240  # under the controller's VIEWING_TTL_S (600)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -55,13 +69,51 @@ def ui_run_pidfile() -> Path:
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 
 
+def token_path() -> Path:
+    return paths.secrets_dir() / "ui.token"
+
+
+def _write_token(tok: str) -> None:
+    """0600 from creation, then renamed over the old file: never a moment with a readable or half-written token."""
+    p = token_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(tok)
+    os.replace(tmp, p)
+
+
 def ui_token() -> str:
-    p = paths.secrets_dir() / "ui.token"
+    p = token_path()
     if not p.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(secrets.token_urlsafe(24))
-        p.chmod(0o600)
+        _write_token(secrets.token_urlsafe(24))
     return p.read_text().strip()
+
+
+def rotate_token() -> None:
+    """A new secrets/ui.token. Every session cookie is an HMAC of the token, so all of them die at once; a running
+    UI started by serve() reads the new token at its next request (UIServer.token)."""
+    _write_token(secrets.token_urlsafe(24))
+
+
+class UIServer(ThreadingHTTPServer):
+    """The UI's server: `token` follows secrets/ui.token (re-read when the file changes), so rotate_token() takes
+    effect without a restart."""
+
+    daemon_threads = True
+    _tok: tuple[tuple[int, int], str] | None = None
+
+    @property
+    def token(self) -> str:
+        try:
+            st = token_path().stat()
+            key = (st.st_mtime_ns, st.st_ino)
+        except OSError:
+            key = (0, 0)
+        if self._tok is None or self._tok[0] != key:
+            self._tok = (key, ui_token())
+        return self._tok[1]
 
 
 def new_session(token: str, now: float | None = None) -> str:
@@ -185,11 +237,11 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f"ui {self.address_string()} - {fmt % args}\n")
 
     # -- plumbing
-    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None, csp: str = CSP) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", csp)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
@@ -240,7 +292,135 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"not found: {exc}"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": str(exc)}, 500)
+        if u.path == "/captcha" or u.path.startswith("/captcha/"):
+            return self._captcha(u.path)
         self._send(404, b"not found", "text/plain")
+
+    # -- /captcha/: the browser's screen (only reached once _authed() said yes)
+    def _captcha(self, path: str) -> None:
+        if path == "/captcha":
+            return self._send(301, b"", "text/plain", {"Location": "/captcha/"})
+        if path == "/captcha/":
+            body = (STATIC / "captcha.html").read_bytes()
+            return self._send(200, body, "text/html; charset=utf-8", csp=CAPTCHA_CSP)
+        name = path.removeprefix("/captcha/")
+        if name in CAPTCHA_FILES:
+            body = (STATIC / name).read_bytes()
+            return self._send(200, body, CAPTCHA_FILES[name] + "; charset=utf-8", csp=CAPTCHA_CSP)
+        if name == "ws":
+            return self._captcha_ws()
+        if name.startswith("novnc/"):
+            try:
+                files = self._novnc_files()
+            except Exception as exc:  # noqa: BLE001
+                return self._send(502, f"noVNC client unavailable: {exc}"[:300].encode(), "text/plain")
+            body = files.get(name.removeprefix("novnc/"))
+            if body is None:
+                return self._send(404, b"not found", "text/plain")
+            ctype = "text/javascript" if name.endswith((".js", ".mjs")) else "application/octet-stream"
+            return self._send(200, body, ctype, {"Cache-Control": "private, max-age=3600"}, csp=CAPTCHA_CSP)
+        return self._send(404, b"not found", "text/plain")
+
+    def _novnc_files(self) -> dict[str, bytes]:
+        loader = getattr(self.server, "novnc_files", None)
+        if loader is None:
+            from bh.browser_service.host import novnc_files as loader
+        return loader()
+
+    def _same_origin(self) -> bool:
+        origin, host = urlparse(self.headers.get("Origin") or ""), self.headers.get("Host") or ""
+        return bool(host) and origin.netloc == host and origin.scheme in ("http", "https")
+
+    # -- "the operator is at the screen": the agent may only read meanwhile (controller op human_viewing)
+    def _tell_viewing(self, on: bool) -> None:
+        tell = getattr(self.server, "human_viewing", None)
+        if tell is None:
+            from bh.browser_service import host as bhost
+
+            def tell(v: bool) -> None:
+                bhost.call({"op": "human_viewing", "on": v}, timeout=20)
+
+        try:
+            tell(on)
+        except Exception as exc:  # noqa: BLE001 (said, the screen still works)
+            sys.stderr.write(f"ui: human_viewing {on}: {type(exc).__name__}\n")
+
+    def _viewing_lock(self) -> threading.Lock:
+        return self.server.__dict__.setdefault("viewing_lock", threading.Lock())  # dict.setdefault: atomic
+
+    def _viewing_start(self) -> threading.Event:
+        """Count this screen in and tell the controller; a ticker re-asserts it every VIEWING_REFRESH_S while this
+        screen stays open (the controller forgets it after its own VIEWING_TTL_S). Every tell happens under the
+        lock, and a ticker checks its stop flag under it: a closed screen's late `on` never lands after the
+        last screen's `off`."""
+        srv = self.server.__dict__
+        lock = self._viewing_lock()
+        with lock:
+            srv["viewers"] = srv.get("viewers", 0) + 1
+            self._tell_viewing(True)
+        stop = threading.Event()
+
+        def tick() -> None:
+            while not stop.wait(VIEWING_REFRESH_S):
+                with lock:
+                    if stop.is_set():
+                        return
+                    self._tell_viewing(True)
+
+        threading.Thread(target=tick, daemon=True).start()
+        return stop
+
+    def _viewing_stop(self, stop: threading.Event) -> None:
+        stop.set()
+        srv = self.server.__dict__
+        with self._viewing_lock():
+            srv["viewers"] = max(0, srv.get("viewers", 1) - 1)
+            if srv["viewers"] == 0:
+                self._tell_viewing(False)
+
+    def _captcha_ws(self) -> None:
+        from bh.ui import ws
+
+        key = self.headers.get("Sec-WebSocket-Key")
+        if (self.headers.get("Upgrade") or "").lower() != "websocket" or not ws.valid_key(key):
+            return self._send(400, b"websocket only", "text/plain")
+        if not self._same_origin():  # cross-site WebSocket hijacking: the cookie alone is not enough
+            return self._send(403, b"forbidden", "text/plain")
+        slots = self.server.__dict__.setdefault("captcha_slots", threading.BoundedSemaphore(CAPTCHA_TUNNELS))
+        if not slots.acquire(blocking=False):
+            return self._send(429, b"too many screens open", "text/plain")
+        try:
+            opener = getattr(self.server, "open_tunnel", None)
+            if opener is None:
+                from bh.browser_service.host import open_tunnel as opener
+            try:
+                proc = opener()
+            except OSError as exc:
+                return self._send(502, f"tunnel: {type(exc).__name__}".encode(), "text/plain")
+            try:
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", ws.accept_key(key or ""))
+                offered = [p.strip() for p in (self.headers.get("Sec-WebSocket-Protocol") or "").split(",")]
+                if "binary" in offered:
+                    self.send_header("Sec-WebSocket-Protocol", "binary")
+                self.end_headers()
+                self.wfile.flush()
+                self.connection.settimeout(None)  # a screen may stay still for minutes
+                viewing = self._viewing_start()
+                try:
+                    ws.relay(self.rfile, self.wfile, proc.stdin, proc.stdout)
+                finally:
+                    self._viewing_stop(viewing)
+            finally:
+                self.close_connection = True
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=10)
+        finally:
+            slots.release()
 
     def do_POST(self):
         u = urlparse(self.path)
@@ -280,13 +460,18 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, program, model, started FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1"
             )
             return {
-                "containers": {c: stack.container_running(c) for c in (stack.GATE, stack.AGENT)},
+                "containers": {c: stack.container_running(c) for c in (stack.GATE, stack.AGENT, stack.BROWSER_CTR)},
                 "active_scope": act,
                 "severity": {s: sev.get(s, 0) for s in SEVERITIES},
                 "findings_to_review": b.rows("SELECT COUNT(*) n FROM findings WHERE status IN ('new','verified')")[0][
                     "n"
                 ],
-                "open_todos": b.rows("SELECT COUNT(*) n FROM todos WHERE status='open'")[0]["n"],
+                "to_submit": b.rows("SELECT COUNT(*) n FROM todos WHERE status='open' AND kind='submit'")[0]["n"],
+                "inconclusive": b.rows("SELECT COUNT(*) n FROM findings WHERE status='inconclusive'")[0]["n"],
+                "needs_proof": b.rows("SELECT COUNT(*) n FROM findings WHERE status='needs-proof'")[0]["n"],
+                "blockers_24h": b.rows(
+                    "SELECT COUNT(*) n FROM facts WHERE kind='blocker' AND created>=?", time.time() - 86400
+                )[0]["n"],
                 "facts": b.rows("SELECT COUNT(*) n FROM facts")[0]["n"],
                 "runs": b.rows("SELECT COUNT(*) n FROM runs")[0]["n"],
                 "running": dict(running[0]) if running else None,
@@ -314,10 +499,27 @@ class Handler(BaseHTTPRequestHandler):
             f["flows"] = flows
             return f
         if path == "/api/todos":
+            # Submissions only: todos of the retired kinds are history (status obsolete), not work.
             st = q.get("status", "open")
-            return [dict(r) for r in b.rows("SELECT * FROM todos WHERE status=? ORDER BY id DESC", st)]
+            return [
+                dict(r) for r in b.rows("SELECT * FROM todos WHERE kind='submit' AND status=? ORDER BY id DESC", st)
+            ]
+        if path == "/api/blockers":
+            return [
+                dict(r)
+                for r in b.rows(
+                    "SELECT id, program, run_id, title, summary, evidence, created FROM facts "
+                    "WHERE kind='blocker' ORDER BY id DESC LIMIT 100"
+                )
+            ]
         if path == "/api/runs":
             return [dict(r) for r in b.rows("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
+        if path == "/api/captcha/status":
+            if not stack.container_running(stack.BROWSER_CTR):
+                return {"code": 503, "error": f"{stack.BROWSER_CTR} is not running (bh browser up)"}
+            from bh.browser_service import host as bhost
+
+            return bhost.call({"op": "status"}, timeout=60)
         if path == "/api/metrics":
             return self._metrics(b)
         if m := re.fullmatch(r"/api/runs/(\d+)/tools", path):
@@ -414,10 +616,18 @@ class Handler(BaseHTTPRequestHandler):
             b.set_finding(int(m.group(1)), body["status"], body.get("verdict") or None)
             return {"ok": True}
         if m := re.fullmatch(r"/api/todos/(\d+)/done", path):
-            b.close_todo(int(m.group(1)))
+            tid = int(m.group(1))
+            # Mio ticks a submission done; an obsolete todo of a retired kind stays as it was.
+            if not b.rows("SELECT 1 FROM todos WHERE id=? AND kind='submit' AND status='open'", tid):
+                raise KeyError(f"open submit todo T{tid}")
+            b.close_todo(tid)
             return {"ok": True}
         if path == "/api/identities":
             return self._save_identity(body)
+        if path == "/api/captcha/done":
+            from bh.browser_service import host as bhost
+
+            return bhost.mark_done()
         if path == "/api/run":
             return self._start_run(body)
         if path == "/api/run/stop":
@@ -451,8 +661,6 @@ class Handler(BaseHTTPRequestHandler):
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps({"headers": headers, "updated": time.time()}))
         p.chmod(0o600)
-        if body.get("todo_id"):
-            Board().close_todo(int(body["todo_id"]))
         return {"ok": True, "identity": name, "headers": sorted(headers)}
 
     def _start_run(self, body: dict) -> dict:
@@ -500,8 +708,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str | None = None, port: int = 7340) -> None:
     host = host or default_host()
-    srv = ThreadingHTTPServer((host, port), Handler)
-    srv.token = ui_token()
-    srv.daemon_threads = True
+    ui_token()  # created now if missing, before the first login
+    srv = UIServer((host, port), Handler)
+    srv.captcha_slots = threading.BoundedSemaphore(CAPTCHA_TUNNELS)
     print(f"bh ui on http://{host}:{port}/  (log in with the token in secrets/ui.token)", flush=True)
     srv.serve_forever()

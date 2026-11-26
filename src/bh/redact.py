@@ -44,7 +44,14 @@ def header(name: str, value: str) -> str:
 
 
 def url(u: str) -> str:
-    parts = urlsplit(u)
+    """A URL with credential-like query values and JWTs replaced. Never raises: the gate calls it while it logs a
+    refusal, and a URL urlsplit cannot read keeps only what precedes its path."""
+    try:
+        parts = urlsplit(u)
+        parse_qsl(parts.query, keep_blank_values=True)
+    except ValueError:
+        head = re.match(r"[^/?#]*(//[^/?#]*)?", u)
+        return JWT.sub(placeholder("jwt"), head.group(0) if head else "")[:300] + "/" + placeholder("url")
     if not parts.query:
         return JWT.sub(placeholder("jwt"), u)
     q = [

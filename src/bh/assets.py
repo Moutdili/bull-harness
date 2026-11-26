@@ -8,7 +8,8 @@
 Authority: the gate's observations (flows tagged with the run, hand-made User-Agents) rank above what
 the sandbox writes (endpoints.jsonl, coverage.json, touched.jsonl can be edited by the agent; they feed
 the map, they never widen the scope). Every host is checked against the hard scope when it enters the
-graph: an out-of-scope host is kept as such (in_scope=0) and raises a scope-question todo, never a target.
+graph: an out-of-scope host is kept as such (in_scope=0): it is recorded, never a target. A host the gate cools
+down (WAF) is marked blocked until a deadline: its untested endpoints leave the agent's list until then.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ CREATE INDEX IF NOT EXISTS assets_prog ON assets(program, kind);
 """
 # User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
 MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
+# a scanner's probe with these answers found no path (nuclei alone sent thousands to the lab)
+_ABSENT = frozenset({404, 410, "error"})
 # What makes an endpoint "tested". The gate's word ranks first: a hand-made request it saw ("gate") counts alone;
 # what the sandbox claims (touched.jsonl: "tool", "literal") counts only if the gate saw that endpoint asked at all
 # ("seen", any client). Same for coverage: a phase counts on an origin the gate saw traffic to.
@@ -59,6 +62,37 @@ def _origin(e) -> str | None:
     return c.origin(e["origin"]) if isinstance(e, dict) and isinstance(e.get("origin"), str) else None
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _typed_endpoint(e: dict) -> bool:
+    """Every field of an endpoints.jsonl entry has the type SQL and the graph expect (M4): a dict or a list where a
+    string is expected drops the entry, it never raises."""
+    return (
+        isinstance(e.get("source"), str | None)
+        and (e.get("params") is None or isinstance(e.get("params"), list))
+        and (e.get("status") is None or _is_int(e.get("status")))
+    )
+
+
+def _coverage_row(phase, entry) -> tuple[str, str | None, float | None, str | None] | None:
+    """(phase, status, ts, raw) of a coverage.json entry, typed for SQL; None when a value has the wrong type."""
+    if not isinstance(phase, str) or not phase or len(phase) > 40 or not isinstance(entry, dict):
+        return None
+    status, ts, raw = entry.get("status"), entry.get("ts"), entry.get("raw")
+    if not isinstance(status, str | None) or not isinstance(raw, str | None):
+        return None
+    if ts is not None:
+        if isinstance(ts, bool) or not isinstance(ts, int | float):
+            return None
+        try:
+            ts = float(ts)  # an integer too large for SQLite would raise at bind time
+        except OverflowError:
+            return None
+    return phase, status[:200] if status else status, ts, raw[:2000] if raw else raw
+
+
 def ensure(board: Board) -> None:
     board.db.executescript(SCHEMA)
 
@@ -71,7 +105,7 @@ class Graph:
 
     # ------------------------------------------------------------------ upserts
     def _upsert(
-        self, kind: str, key: str, parent: int | None, source: str, in_scope: bool = True, meta: dict | None = None
+        self, kind: str, key: str, parent: int | None, source: str, *, in_scope: bool = True, meta: dict | None = None
     ) -> int:
         now = time.time()
         row = self.b.db.execute(
@@ -99,14 +133,24 @@ class Graph:
         hid = self._upsert("host", name, None, source, in_scope=allowed)
         if not allowed and not exists:
             self.new_out_of_scope.append(name)
-            self.b.add_todo(
-                "scope-question",
-                f"{name} discovered, not in scope",
-                f"found by {source}; add it to the scope file only if the program lists it",
-                program=self.program,
-                dedup=f"{self.program}:oos-host:{name}",
-            )
         return hid
+
+    def mark_blocked(self, name: str, reason: str, until: float) -> None:
+        """Set a host aside until `until` (epoch seconds); the latest mark wins."""
+        self.host(name, "gate")
+        self._upsert("host", name.lower().rstrip("."), None, "gate", meta={"blocked": reason, "until": until})
+        self.b.db.commit()
+
+    def blocked(self) -> dict[str, tuple[str, float]]:
+        """Hosts blocked right now: host -> (reason, until). An expired mark is ignored."""
+        now, out = time.time(), {}
+        for r in self.b.rows(
+            "SELECT key, meta FROM assets WHERE program=? AND kind='host' AND meta LIKE '%\"blocked\"%'", self.program
+        ):
+            meta = json.loads(r["meta"] or "{}")
+            if isinstance(until := meta.get("until"), int | float) and until > now:
+                out[r["key"]] = (str(meta.get("blocked")), float(until))
+        return out
 
     def origin(self, origin_: str, source: str) -> int:
         host = origin_.split("://", 1)[1].rsplit(":", 1)[0].strip("[]")
@@ -147,13 +191,11 @@ class Graph:
         n = {"endpoints": 0, "coverage": 0, "tests": 0, "skipped": 0}
         for e in c.read_jsonl(d / c.ENDPOINTS):
             o, key = _origin(e), _text(e, "key") if isinstance(e, dict) else None
-            if not o or not key or c.STATIC_EXT.search(key):
+            if not o or not key or c.STATIC_EXT.search(key) or not _typed_endpoint(e):
                 n["skipped"] += isinstance(e, dict) and not c.STATIC_EXT.search(key or "")
                 continue
-            params = (
-                [p for p in e.get("params") or [] if isinstance(p, str)] if isinstance(e.get("params"), list) else []
-            )
-            status = e.get("status") if isinstance(e.get("status"), int) else None
+            params = [p[:200] for p in e.get("params") or [] if isinstance(p, str)][:200]
+            status = e.get("status") if _is_int(e.get("status")) else None
             self.endpoint(o, c.family(key), _text(e, "source") or "tool", params, status)
             n["endpoints"] += 1
         coverage = c.read_json(d / c.COVERAGE, {})
@@ -163,17 +205,20 @@ class Graph:
                 continue
             oid = self.origin(o, "tool")
             for phase, entry in phases.items():
-                if not isinstance(entry, dict):
+                row = _coverage_row(phase, entry)
+                if row is None:
                     n["skipped"] += 1
                     continue
                 self.b.db.execute(
                     "INSERT INTO coverage(asset_id, phase, status, ts, raw) VALUES (?,?,?,?,?) "
                     "ON CONFLICT(asset_id, phase) DO UPDATE SET "
                     "status=excluded.status, ts=excluded.ts, raw=excluded.raw",
-                    (oid, phase, entry.get("status"), entry.get("ts"), entry.get("raw")),
+                    (oid, *row),
                 )
                 n["coverage"] += 1
         for t in c.read_jsonl(d / c.TOUCHED):
+            if not isinstance(t, dict) or not isinstance(t.get("via"), str | None):
+                continue
             if (o := _origin(t)) and (key := _text(t, "key")):
                 self.tested(o, key, "tool" if t.get("via") != "manual" else "literal", run_id)
                 n["tests"] += 1
@@ -186,6 +231,8 @@ class Graph:
                 self.host(host, "gate")
             if k := c.endpoint_key(url, str(f.get("method", "GET"))):
                 manual = MANUAL_UA.match(str(f.get("ua") or ""))
+                if not manual and f.get("status") in _ABSENT:
+                    continue  # a scanner's probe that found nothing (404, error) is not an endpoint of the target
                 self.tested(k[0], k[1], "gate" if manual else "seen", f.get("run"))
                 n["tests"] += bool(manual)
         self.b.db.commit()
@@ -208,6 +255,9 @@ class Graph:
                 seen_origins.add(origin_)
             if "gate" in ev or (ev & _CLAIMS and "seen" in ev):
                 tested.add((origin_, key))
+        # An untested endpoint of a blocked host is set aside (neither counted nor listed): retrying it wastes turns.
+        blocked = self.blocked()
+        eps = {k: v for k, v in eps.items() if k in tested or urlsplit(k[0]).hostname not in blocked}
         untested = [(k, v) for k, v in eps.items() if k not in tested]
         untested.sort(key=c.frontier_order)
         cov: dict[str, dict] = {}
@@ -232,7 +282,16 @@ class Graph:
                 self.program,
             )
         ]
-        block = c.format_surface(eps, untested, cov, phases, limit)
+        lines = c.format_surface(eps, untested, cov, phases, limit).split("\n")
+        for host, (reason, until) in self.blocked().items():
+            mark = f"blocked ({reason}) until {time.strftime('%H:%M', time.localtime(until))}, do not retry"
+            hits = [
+                i for i, ln in enumerate(lines) if ln[:2] == "- " and urlsplit(ln[2:].split(": ")[0]).hostname == host
+            ]
+            for i in hits:
+                lines[i] += f" · {mark}"
+            if not hits:
+                lines.append(f"- {host}: {mark}")
         if oos:
-            block += "\n- discovered, NOT in scope (never touch, a human decides): " + ", ".join(oos)
-        return block
+            lines.append("- discovered, NOT in scope (never touch): " + ", ".join(oos))
+        return "\n".join(ln for ln in lines if ln)

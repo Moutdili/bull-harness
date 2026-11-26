@@ -1,0 +1,898 @@
+"""bh-browse: one headless Chromium per command, through the gate.
+
+  bh-browse <url> [--as ID] [--shot] [--clip CSS] [--full]
+            [--fill CSS=VALUE]... [--click CSS]... [--submit CSS] [--press KEY]
+            [--wait-for CSS|networkidle] [--routes] [--xss MARKER] [--timeout S]
+
+Text first: the summary is at most 25 lines; DOM, ARIA snapshot, HAR, console, dialogs, routes and the
+screenshot stay in raw/browse-<slug>-<ts>/. Read shot.png only to decide something.
+
+Network: every request goes to the gate (proxy). Requests to a host outside the target host and its
+subdomains are aborted locally (no network) and counted, except the scope's other targets and its `support` hosts
+of kind `assets` (scripts and styles the app needs; the gate allows them GET/HEAD only, without cookies), `sso`
+(the application's own silent sign-in: GET/HEAD and the token exchange) and `passthrough` (a third-party anti-bot
+challenge, its script and iframe: never blocked here, never intercepted by the gate; the challenge decides alone,
+we never touch it); login hosts (`auth`) stay blocked here and at the gate. Source maps, /favicon.ico (404 guard),
+and images/fonts/media unless a screenshot is asked are aborted too (never on a passthrough host). Websockets are
+refused locally and counted, unless the scope enables them (`websockets: true`): then those to the target hosts go
+through the gate, which bounds their frames. Service workers are blocked so every request shows in the HAR and at
+the gate.
+
+Identity (--as): X-BH-Identity is added request by request in the route handler (identity_headers), only towards
+the targets and the `sso` hosts, never globally: a passthrough host never receives anything of ours. A websocket
+handshake cannot be given a header this way (Playwright routes it apart), so it carries no identity.
+
+Classification: a mapper; with --xss a scanner (refused when the program forbids scanners).
+This is the only sandbox module that imports playwright, inside run(): bh-agent starts without it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from bh.agent import contract as c
+import contextlib
+
+SUMMARY_LINES = 25
+LINE_CHARS = 240
+DEFAULT_TIMEOUT = 120
+VIEWPORT = {"width": 1024, "height": 768}
+# On top of Playwright's own background-traffic switches (docs/research/09-vision-headless.md §2, §4.5).
+TELEMETRY_ARGS = ("--no-pings", "--disable-domain-reliability")
+HEAVY_TYPES = frozenset({"image", "font", "media"})
+MARKER = re.compile(r"^[A-Za-z0-9_]{4,32}$")
+# A payload may prove execution without a dialog: window.__bhxss = '<marker>'. A string, so that HTML injection
+# alone (<a id=__bhxss>, named access on window gives an element) never confirms.
+SENTINEL = "__bhxss"
+# Links never followed by --routes: they change state.
+RISKY_LINK = re.compile(r"log-?out|sign-?out|delete|remove|destroy|unsubscribe|reset|deactivate", re.I)
+MAX_ROUTE_VISITS = 25
+MARGIN_S = 8  # seconds kept at the end of the budget to write the artifacts
+SELECTOR_ENGINE = re.compile(r"^(css|xpath|text|role|id|data-test(?:-?id)?|alt|placeholder|label|title)=")
+A11Y_ROLES = ("heading", "textbox", "searchbox", "combobox", "button", "link", "checkbox")
+A11Y_LINE = re.compile(rf'^\s*- ({"|".join(A11Y_ROLES)}) "([^"]*)"(?:[^:]*: (.*))?')
+
+# Records URLs set by pushState/replaceState and hash changes (SPA routes), read back by --routes.
+ROUTE_HOOK = """(() => {
+  const seen = (window.__bhRoutes = window.__bhRoutes || []);
+  const note = () => { try { seen.push(String(location.href)); } catch (e) {} };
+  for (const k of ['pushState', 'replaceState']) {
+    const orig = history[k];
+    history[k] = function (...a) { const r = orig.apply(this, a); note(); return r; };
+  }
+  window.addEventListener('hashchange', note);
+})();"""
+
+FORMS_JS = """() => {
+  const names = (root) => [...root.querySelectorAll('input,select,textarea')]
+    .filter(e => e.type !== 'hidden' || e.name).map(e => e.name || e.id || e.type).filter(Boolean);
+  const out = [...document.forms].map(f => ({
+    id: f.id || f.getAttribute('name') || '', method: (f.getAttribute('method') || 'GET').toUpperCase(),
+    action: f.getAttribute('action') ? f.action : '', fields: names(f)}));
+  const loose = [...document.querySelectorAll('input,select,textarea')].filter(e => !e.form)
+    .map(e => e.name || e.id || e.getAttribute('aria-label') || e.type).filter(Boolean);
+  if (loose.length) out.push({id: '(no form)', method: '', action: '', fields: loose});
+  return out;
+}"""
+
+
+# ------------------------------------------------------------------ arguments
+def split_fill(spec: str) -> tuple[str, str]:
+    """`CSS=VALUE`: the first `=` outside brackets and quotes, after an optional `engine=` selector prefix
+    (`role=textbox[name="Email"]=a@b`)."""
+    m = SELECTOR_ENGINE.match(spec)
+    start = m.end() if m else 0
+    depth, quote = 0, ""
+    for i in range(start, len(spec)):
+        ch = spec[i]
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth = max(0, depth - 1)
+        elif ch == "=" and depth == 0 and i > 0:
+            return spec[:i], spec[i + 1 :]
+    raise argparse.ArgumentTypeError(f"--fill wants CSS=VALUE, got {spec!r}")
+
+
+class _Step(argparse.Action):
+    """--fill/--click/--submit/--press run in command-line order: all go to one `steps` list."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        value = values
+        if self.dest == "fill":
+            try:
+                value = split_fill(str(values))
+            except argparse.ArgumentTypeError as exc:
+                parser.error(str(exc))
+        namespace.steps = [*(getattr(namespace, "steps", None) or []), (self.dest, value)]
+
+
+def _marker(value: str) -> str:
+    if not MARKER.match(value):
+        raise argparse.ArgumentTypeError("the marker is 4-32 characters of [A-Za-z0-9_]")
+    return value
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="bh-browse", description=__doc__.split("\n\n")[0], allow_abbrev=False)
+    p.add_argument("url", help="page to load (https:// is assumed without a scheme)")
+    p.add_argument("--as", dest="identity", help="identity name, sent as X-BH-Identity")
+    p.add_argument("--shot", action="store_true", help="PNG of the 1024x768 viewport")
+    p.add_argument("--clip", metavar="CSS", help="screenshot of one element (implies --shot)")
+    p.add_argument("--full", action="store_true", help="full-page screenshot (implies --shot, costs more tokens)")
+    p.add_argument("--fill", action=_Step, metavar="CSS=VALUE", help="fill a field (repeatable, in order)")
+    p.add_argument("--click", action=_Step, metavar="CSS", help="click an element (repeatable, in order)")
+    p.add_argument("--submit", action=_Step, metavar="CSS", help="click and wait for the network to settle")
+    p.add_argument(
+        "--press", action=_Step, metavar="KEY", help="press a key in the focused element (Enter, Tab...), then settle"
+    )
+    p.add_argument("--wait-for", metavar="CSS|networkidle", help="what to wait for after the load")
+    p.add_argument("--routes", action="store_true", help="follow in-app links and record SPA routes")
+    p.add_argument(
+        "--xss",
+        type=_marker,
+        metavar="MARKER",
+        help="record dialogs; CONFIRMED only if a dialog says MARKER or window.__bhxss = MARKER",
+    )
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="seconds for the whole command")
+    p.set_defaults(steps=[])
+    return p
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    a = parser().parse_args(argv)
+    a.shot = a.shot or bool(a.clip) or a.full
+    a.timeout = max(15, a.timeout)
+    if "://" not in a.url:
+        a.url = "https://" + a.url
+    return a
+
+
+def phase_kind(a: argparse.Namespace) -> str:
+    """Program rules: one page rendered with a marker (--xss alone) is an observation, so a mapper; a marker carried
+    across the routes it walks (--xss with --routes) is a scan (Mio's decision, audit I14)."""
+    return "scanner" if a.xss and a.routes else "mapper"
+
+
+# ------------------------------------------------------------------ pure helpers
+def same_site(url: str, host: str) -> bool:
+    """The target host or one of its subdomains. URLs without a host (data:, blob:) never reach the network."""
+    h = c.host_of(url).rstrip(".")
+    if not h:
+        return True
+    host = host.lower().rstrip(".")
+    return h == host or h.endswith("." + host)
+
+
+def _matches(url: str, patterns: tuple[str, ...]) -> bool:
+    h = c.host_of(url)
+    return bool(h) and any(c.host_matches(p, h) for p in patterns)
+
+
+def support_kind(url: str, extra: c.SandboxScope) -> str | None:
+    """`passthrough`, `sso` or `assets` for a support host of the scope, None otherwise. Passthrough first: a host
+    that must never see anything of ours is recognised before anything else."""
+    for kind in ("passthrough", "sso", "assets"):
+        if _matches(url, getattr(extra, kind)):
+            return kind
+    return None
+
+
+def is_target(url: str, host: str, targets: tuple[str, ...] = ()) -> bool:
+    """The page's host (or a subdomain) or another target of the scope."""
+    return bool(c.host_of(url)) and (same_site(url, host) or _matches(url, targets))
+
+
+def route_decision(
+    url: str,
+    resource_type: str,
+    host: str,
+    shot: bool,
+    assets: tuple[str, ...] = (),
+    *,
+    sso: tuple[str, ...] = (),
+    passthrough: tuple[str, ...] = (),
+    targets: tuple[str, ...] = (),
+) -> str | None:
+    """Why a request is aborted locally, or None to let it go to the gate. `assets`, `sso`, `passthrough`: host
+    patterns of the scope's `support` hosts; `targets`: the scope's other targets. A passthrough host (an anti-bot
+    challenge) is never aborted, whatever it loads: we never stand in the challenge's way."""
+    if _matches(url, passthrough):
+        return None
+    if not same_site(url, host) and not any(_matches(url, p) for p in (assets, sso, targets)):
+        return "offsite"
+    path = urlsplit(url).path
+    if path.endswith(".map"):
+        return "sourcemap"
+    if path == "/favicon.ico":
+        return "favicon"
+    if resource_type in HEAVY_TYPES and not shot:
+        return resource_type
+    return None
+
+
+def identity_headers(
+    url: str,
+    host: str,
+    identity: str | None,
+    *,
+    sso: tuple[str, ...] = (),
+    passthrough: tuple[str, ...] = (),
+    targets: tuple[str, ...] = (),
+) -> dict[str, str]:
+    """The header that names our identity, for this request only: towards a target or an `sso` host, never a
+    passthrough host (checked first), an assets host or anything else."""
+    if not identity or not c.host_of(url) or _matches(url, passthrough):
+        return {}
+    if is_target(url, host, targets) or _matches(url, sso):
+        return {c.IDENTITY_HEADER: identity}
+    return {}
+
+
+def ws_through(url: str, host: str, enabled: bool, targets: tuple[str, ...] = ()) -> bool:
+    """A websocket the browser may open for real: the scope enables them and it goes to the target host (or a
+    subdomain, as for every other request) or another target of the scope (a chat hub). The gate judges the
+    handshake and bounds the frames."""
+    return enabled and is_target(url, host, targets)
+
+
+def spa_route(url: str) -> tuple[str, list[str]] | None:
+    """`#/path?x=1` (or `#!/path`) -> ("GET /#/path", ["x"]); None without a fragment route."""
+    p = urlsplit(url)
+    frag = p.fragment.removeprefix("!")
+    if not frag.startswith("/"):
+        return None
+    fpath, _, fquery = frag.partition("?")
+    return f"GET {c.path_key(p.path)}#{c.path_key(fpath)}", c.query_params("http://x/?" + fquery)
+
+
+Seen = list[tuple[str, str, int | None]]  # (method, url, status)
+Items = list[tuple[str, str, list[str], int | None]]  # (key, url, params, status)
+
+
+def endpoint_items(urls: Seen, origin_: str) -> Items:
+    """(method, url, status) -> (key, url, params, status) on the target origin; SPA routes keep their fragment."""
+    out = []
+    for method, url, status in urls:
+        if c.origin(url) != origin_:
+            continue
+        if route := spa_route(url):
+            out.append((route[0], url, route[1], status))
+        if k := c.endpoint_key(url, method):
+            out.append((k[1], url.split("#")[0], c.query_params(url), status))
+    return out
+
+
+def add_endpoints(d: Path, origin_: str, items: Items) -> list[str]:
+    """New (origin, key) pairs go to endpoints.jsonl with source `browse`; returns their keys."""
+    known = {(e.get("origin"), e.get("key")) for e in c.read_jsonl(d / c.ENDPOINTS)}
+    recs = []
+    for key, url, params, status in items:
+        if (origin_, key) in known or c.STATIC_EXT.search(key.split("#")[0]):
+            continue
+        known.add((origin_, key))
+        rec = {"origin": origin_, "key": key, "url": url, "params": sorted(set(params)), "status": status}
+        recs.append({**rec, "source": "browse"})
+    if recs:
+        c.append_jsonl(d / c.ENDPOINTS, *recs)
+    return [r["key"] for r in recs]
+
+
+def xss_confirmed(marker: str | None, dialogs: object, sentinel: object) -> bool:
+    """A dialog whose whole message is the marker (alert('<marker>')), or window.__bhxss set to the marker string.
+    A message that merely contains it does not count: a page that shows its own URL in a dialog is not an XSS.
+    Also the replay's own verdict (bh.agent.proof), computed from summary.json: hostile input, checked by type."""
+    if not marker or not MARKER.match(str(marker)):
+        return False
+    shown = [d.get("message") for d in (dialogs if isinstance(dialogs, list) else []) if isinstance(d, dict)]
+    return any(isinstance(m, str) and m.strip() == marker for m in shown) or (
+        isinstance(sentinel, str) and sentinel == marker
+    )
+
+
+def png_size(path: Path) -> tuple[int, int]:
+    try:
+        head = path.read_bytes()[:24]
+        return struct.unpack(">II", head[16:24]) if head[:8] == b"\x89PNG\r\n\x1a\n" else (0, 0)
+    except OSError:
+        return 0, 0
+
+
+def image_tokens(w: int, h: int) -> int:
+    """Estimate for one image read: the long edge is cut to 1568 px and the area to ~1.15 MP, then w*h/750."""
+    if not w or not h:
+        return 0
+    s = min(1.0, 1568 / max(w, h), math.sqrt(1_150_000 / (w * h)))
+    return round(w * s * h * s / 750)
+
+
+def a11y_summary(aria: str, limit: int = 8) -> list[str]:
+    out = []
+    for line in aria.splitlines():
+        if m := A11Y_LINE.match(line):
+            role, name, value = m.groups()
+            if name or value:
+                out.append(f'{role} "{name[:40]}"' + (f" = {value[:20]}" if value else ""))
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ------------------------------------------------------------------ result and summary
+@dataclass
+class Result:
+    url: str
+    identity: str | None = None
+    status: int | None = None
+    title: str = ""
+    seconds: float = 0.0
+    state: str = "ok"
+    error: str = ""
+    final_url: str = ""
+    requests: int = 0
+    blocked: Counter = field(default_factory=Counter)  # offsite host or local reason -> count
+    gate_denied: int = 0
+    websockets: int = 0  # refused locally
+    websockets_open: int = 0  # let through to the target (scope `websockets: true`)
+    support: Counter = field(default_factory=Counter)  # requests let through to `sso` / `passthrough` hosts
+    xhr: list[tuple[str, str, int | None]] = field(default_factory=list)  # (method, url, status)
+    steps: list[str] = field(default_factory=list)
+    dialogs: list[dict] = field(default_factory=list)
+    marker: str | None = None
+    sentinel: str | None = None
+    console_errors: list[str] = field(default_factory=list)
+    forms: list[dict] = field(default_factory=list)
+    routes: list[str] = field(default_factory=list)
+    new_keys: list[str] = field(default_factory=list)
+    a11y: list[str] = field(default_factory=list)
+    shot: tuple[str, int, int] | None = None
+    raw: str = ""
+
+
+def _short(url: str) -> str:
+    p = urlsplit(url)
+    return (p.path or "/") + (f"?{p.query}" if p.query else "") + (f"#{p.fragment}" if p.fragment else "")
+
+
+def render(r: Result) -> list[str]:
+    """The summary the model reads: at most SUMMARY_LINES lines, each at most LINE_CHARS characters."""
+    who = f" as={r.identity}" if r.identity else ""
+    status = r.status if r.status is not None else "no response"
+    head = f'bh-browse {r.url}{who}: {status}, title "{r.title[:60]}", {r.seconds:.1f} s [{r.state}]'
+    body: list[str] = []
+    if r.error:
+        body.append(f"error: {r.error}")
+    if r.final_url and r.final_url != r.url:
+        body.append(f"final url: {r.final_url}")
+    n_blocked = sum(r.blocked.values())
+    blocked = ", ".join(f"{k} ×{v}" for k, v in r.blocked.most_common(4))
+    more = f", +{len(r.blocked) - 4} more" if len(r.blocked) > 4 else ""
+    req = f"requests: {r.requests} (in scope {r.requests - n_blocked}, blocked locally {n_blocked}"
+    req += f": {blocked}{more})" if n_blocked else ")"
+    if r.gate_denied:
+        req += f"; gate denied {r.gate_denied}"
+    body.append(req)
+    if r.support["sso"] or r.support["passthrough"]:
+        body.append(
+            f"support: sso {r.support['sso']} (the app's own sign-in), passthrough {r.support['passthrough']} "
+            "(anti-bot challenge, not intercepted; never solve nor work around it: blocked = bh-note blocked captcha)"
+        )
+    if r.websockets:
+        body.append(f"websockets: {r.websockets} refused (the gate forbids them; socket.io may fall back to polling)")
+    if r.websockets_open:
+        body.append(f"websockets: {r.websockets_open} opened to the target (frames bounded and journaled by the gate)")
+    if r.xhr:
+        shown = " · ".join(f"{m} {_short(u)} {s}" for m, u, s in r.xhr[:6])
+        body.append(f"xhr: {shown}" + (f" (+{len(r.xhr) - 6} in raw har.json)" if len(r.xhr) > 6 else ""))
+    body += [f"step: {s}" for s in r.steps[:4]]
+    confirmed = xss_confirmed(r.marker, r.dialogs, r.sentinel)
+    verdict = f"xss CONFIRMED (marker {r.marker})" if confirmed else ""
+    if r.dialogs:
+        shown = " · ".join(f'{d.get("type")}("{str(d.get("message", ""))[:40]}")' for d in r.dialogs[:3])
+        body.append(f"dialogs: {len(r.dialogs)} — {shown}" + (f" ← {verdict}" if verdict else ""))
+    if verdict and not r.dialogs:
+        body.append(f"{verdict} via window.{SENTINEL}")
+    if r.marker and not confirmed:
+        body.append(f"xss: marker {r.marker} not seen (no dialog, no window.{SENTINEL}): not confirmed")
+    if r.console_errors:
+        body.append(f"console: {len(r.console_errors)} errors ({r.console_errors[0][:120]})")
+    for f in r.forms[:3]:
+        target = f" → {f.get('method') or 'GET'} {_short(f['action'])}" if f.get("action") else ""
+        body.append(f"form {f.get('id') or '?'}: ({', '.join(f.get('fields', [])[:8])}){target}")
+    if len(r.forms) > 3:
+        body.append(f"forms: +{len(r.forms) - 3} in raw dom.html")
+    routes = [k.split(" ", 1)[1] for k in r.new_keys if "#" in k]
+    if routes:
+        extra = f" (+{len(routes) - 10} in raw)" if len(routes) > 10 else ""
+        body.append(f"new routes: {' '.join(routes[:10])}{extra}")
+    if r.new_keys:
+        body.append(f"new endpoints: {len(r.new_keys)} (endpoints.jsonl, source browse)")
+    elif r.routes:
+        body.append(f"routes: {len(r.routes)} seen, none new (raw routes.txt)")
+    if r.a11y:
+        body.append("a11y: " + " · ".join(r.a11y))
+    if r.shot:
+        path, w, h = r.shot
+        body.append(f"shot: {path} {w}x{h} ≈ {image_tokens(w, h)} tokens (Read it only if needed)")
+    budget = SUMMARY_LINES - 2  # headline + raw line
+    if len(body) > budget:
+        body = [*body[: budget - 1], f"... {len(body) - budget + 1} more lines in raw"]
+    lines = [head[:LINE_CHARS], *("  " + b[: LINE_CHARS - 2] for b in body)]
+    return [*lines, f"raw: {r.raw}/"]
+
+
+def summary(r: Result) -> dict:
+    """summary.json: the structured result. The replay of a proof reads `status`, `dialogs` and `sentinel` and
+    decides itself; `xss_confirmed` is for a human reading the raw dir. Never the URL, the title or the console."""
+    return {
+        "status": r.status,
+        "state": r.state,
+        "new": r.new_keys,
+        "dialogs": [{"type": str(d.get("type", "")), "message": str(d.get("message", ""))} for d in r.dialogs],
+        "sentinel": r.sentinel,
+        "marker": r.marker,
+        "xss_confirmed": xss_confirmed(r.marker, r.dialogs, r.sentinel),
+    }
+
+
+# ------------------------------------------------------------------ browser
+def _state_file(identity: str | None) -> Path:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", identity or "anon")[:40]
+    return c.bh_dir() / c.RAW / f"browse-state-{name}.json"
+
+
+# ------------------------------------------------------------------ what the hunter may read back (I19)
+# Keys of a response or a stored value that carry a credential of our test accounts. Narrower than redact's
+# SENSITIVE_KEY on purpose: a target's answer keeps its emails and user names (they are what an IDOR shows).
+CRED_KEY = re.compile(r"token|secret|password|passwd|credential|assertion|client_info|^code$|session", re.I)
+# Only bh/agent is mounted in the sandbox (not bh.redact): the same rules, kept here.
+CRED_HEADER = re.compile(
+    r"^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-auth-token|x-access-token|"
+    r"x-csrf-token|x-xsrf-token|x-session-id|x-amz-security-token|x-ms-token-aad-.*)$",
+    re.I,
+)
+JWT = re.compile(r"\beyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]*")
+_CRED_PAIR = re.compile(
+    r"""(?i)(["']?[\w-]*(?:token|secret|password|passwd|credential|assertion|session)[\w-]*["']?\s*[:=]\s*["']?)"""
+    r"""([^"'&\s,}]+)"""
+)
+
+
+def _ph(name: str) -> str:
+    return f"<redacted:{name}>"
+
+
+def _no_jwt(s: str) -> str:
+    return JWT.sub(_ph("jwt"), s)
+
+
+def _cred_url(u: str) -> str:
+    parts = urlsplit(u)
+    if not parts.query:
+        return _no_jwt(u)
+    q = [(k, _ph(k) if CRED_KEY.search(k) else _no_jwt(v)) for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+    return urlunsplit(parts._replace(query=urlencode(q, safe="<>:")))
+
+
+def _cred_data(obj):
+    if isinstance(obj, dict):
+        return {k: (_ph(k) if CRED_KEY.search(str(k)) else _cred_data(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cred_data(v) for v in obj]
+    if isinstance(obj, str):
+        return _no_jwt(obj)
+    return obj
+
+
+def _cred_text(s: str) -> str:
+    """A body or a stored value: JSON with credential keys replaced, else JWTs and key=value credentials."""
+    try:
+        parsed = json.loads(s)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(_cred_data(parsed))
+    return _no_jwt(_CRED_PAIR.sub(lambda m: m.group(1) + _ph("value"), s))
+
+
+def _ours(url: str, host: str, sso: tuple[str, ...], targets: tuple[str, ...]) -> bool:
+    return is_target(url, host, targets) or _matches(url, sso)
+
+
+def scrub_har(path: Path, host: str, sso: tuple[str, ...] = (), targets: tuple[str, ...] = ()) -> None:
+    """har.json rewritten in place: no Authorization/Cookie/Set-Cookie (or other credential header) anywhere, no
+    cookie value, and on the targets and `sso` hosts no token in a URL, a request body or a response body (an `sso`
+    host's answers are the token endpoint's)."""
+    try:
+        har = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    for e in (har.get("log") or {}).get("entries") or []:
+        req, resp = e.get("request") or {}, e.get("response") or {}
+        url = str(req.get("url") or "")
+        ours = _ours(url, host, sso, targets)
+        for part in (req, resp):
+            for h in part.get("headers") or []:
+                if isinstance(h, dict) and CRED_HEADER.match(str(h.get("name", ""))):
+                    h["value"] = _ph(str(h.get("name", "")).lower())
+            for ck in part.get("cookies") or []:
+                if isinstance(ck, dict):
+                    ck["value"] = _ph("cookie")
+        if not ours:
+            continue
+        req["url"] = _cred_url(url)
+        for q in req.get("queryString") or []:
+            if isinstance(q, dict) and CRED_KEY.search(str(q.get("name", ""))):
+                q["value"] = _ph(str(q.get("name")))
+        post = req.get("postData") or {}
+        if isinstance(post.get("text"), str):
+            post["text"] = _cred_text(post["text"])
+        for p in post.get("params") or []:
+            if isinstance(p, dict) and CRED_KEY.search(str(p.get("name", ""))):
+                p["value"] = _ph(str(p.get("name")))
+        content = resp.get("content") or {}
+        if isinstance(content.get("text"), str):
+            if content.get("encoding") == "base64":
+                content["text"] = _ph("body")  # binary: never read for a token, dropped whole
+                content.pop("encoding", None)
+            else:
+                content["text"] = _cred_text(content["text"])
+    path.write_text(json.dumps(har))
+
+
+def scrub_state(
+    path: Path, host: str, identity: str | None, sso: tuple[str, ...] = (), targets: tuple[str, ...] = ()
+) -> None:
+    """browse-state-<identity>.json rewritten in place. Under an identity, the cookies of the targets and `sso`
+    hosts are dropped (the gate adds the identity's own jar to every request) and their localStorage and
+    sessionStorage values that hold a credential (the MSAL cache) are replaced: the next bh-browse signs in again
+    through the `sso` host, and the hunter never reads a token of our accounts. Logged out, nothing of ours is
+    in it and it is kept as it is."""
+    if not identity:
+        return
+    try:
+        st = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    st["cookies"] = [
+        k
+        for k in st.get("cookies") or []
+        if not _ours("https://" + str(k.get("domain", "")).lstrip(".") + "/", host, sso, targets)
+    ]
+    for o in st.get("origins") or []:
+        if not _ours(str(o.get("origin", "")), host, sso, targets):
+            continue
+        for kind in ("localStorage", "sessionStorage"):
+            for item in o.get(kind) or []:
+                if not isinstance(item, dict):
+                    continue
+                name, value = str(item.get("name", "")), str(item.get("value", ""))
+                if CRED_KEY.search(name):
+                    item["value"] = _ph("token")
+                else:
+                    item["value"] = _cred_text(value)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, path)
+
+
+def _same_document(a: str, b: str) -> bool:
+    pa, pb = urlsplit(a), urlsplit(b)
+    return (pa.scheme, pa.netloc, pa.path, pa.query) == (pb.scheme, pb.netloc, pb.path, pb.query)
+
+
+GATE_CA = Path("/usr/local/share/ca-certificates/bh-gate.crt")  # installed by the entrypoint
+
+
+def trust_gate_ca(home: Path | None = None, ca: Path = GATE_CA) -> str | None:
+    """Chromium trusts the NSS DB under $HOME, not /etc/ssl/certs, and every segment and judge gets a fresh HOME:
+    put the gate CA there before the first launch (idempotent). Returns an error line, None when trusted."""
+    db = (home or Path.home()) / ".local/share/pki/nssdb"
+    if not ca.is_file():
+        return f"gate CA missing at {ca}: HTTPS pages will fail"
+    if (db / ".bh-gate").is_file():
+        return None
+    try:
+        db.mkdir(parents=True, exist_ok=True)
+        if not (db / "cert9.db").is_file():
+            subprocess.run(["certutil", "-d", f"sql:{db}", "-N", "--empty-password"], check=True, capture_output=True)
+        subprocess.run(
+            ["certutil", "-d", f"sql:{db}", "-A", "-t", "C,,", "-n", "bh-gate", "-i", str(ca)],
+            check=True,
+            capture_output=True,
+        )
+        (db / ".bh-gate").write_text("")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"cannot trust the gate CA in {db}: {exc}"
+    return None
+
+
+def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
+    if err := trust_gate_ca():
+        r.console_errors.append(err)  # shown in the summary: an HTTPS page will then fail on the certificate
+    try:
+        from playwright.sync_api import Error as PwError
+        from playwright.sync_api import TimeoutError as PwTimeout
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        r.state, r.error = "error rc=127", "playwright is not installed in this image (rebuild the agent image)"
+        return
+    t0 = time.monotonic()
+    deadline = t0 + a.timeout - MARGIN_S
+    host = urlsplit(a.url).hostname or ""
+    r.marker = a.xss
+    extra = c.sandbox_scope()
+
+    def left_ms(cap: float | None = None) -> float:
+        s = max(1.0, deadline - time.monotonic())
+        return 1000 * (min(s, cap) if cap else s)
+
+    hosts = {"sso": extra.sso, "passthrough": extra.passthrough, "targets": extra.targets}
+
+    def on_route(route) -> None:
+        req = route.request
+        why = route_decision(req.url, req.resource_type, host, a.shot, extra.assets, **hosts)
+        if why is None:
+            kind = support_kind(req.url, extra)
+            if kind in ("sso", "passthrough"):
+                r.support[kind] += 1
+            # per request, never global: a passthrough host gets nothing of ours (identity_headers)
+            ident = identity_headers(req.url, host, a.identity, **hosts)
+            if ident:
+                route.continue_(headers={**req.headers, **ident})
+            else:
+                route.continue_()
+            return
+        r.blocked[c.host_of(req.url) if why == "offsite" else why] += 1
+        route.abort("blockedbyclient")
+
+    sockets: list = []  # mocked (never connected); closed from the main flow: close() inside the handler hangs
+
+    def on_ws(ws) -> None:
+        r.websockets += 1
+        sockets.append(ws)
+
+    def refuse_sockets() -> None:
+        while sockets:
+            with contextlib.suppress(PwError):
+                sockets.pop().close(code=1008, reason="bh: websockets are refused")
+
+    def on_response(resp) -> None:
+        req = resp.request
+        if resp.headers.get(c.GATE_HEADER.lower()):
+            r.gate_denied += 1
+        if req.resource_type in ("xhr", "fetch"):
+            r.xhr.append((req.method, resp.url, resp.status))
+
+    console: list[str] = []
+
+    def on_console(msg) -> None:
+        line = f"{msg.type}: {msg.text}"
+        console.append(line)
+        if msg.type == "error" and "ERR_BLOCKED_BY_CLIENT" not in msg.text:  # our own local blocks
+            r.console_errors.append(msg.text.splitlines()[0] if msg.text else "error")
+
+    def on_pageerror(exc) -> None:
+        console.append(f"pageerror: {exc}")
+        r.console_errors.append(f"pageerror: {str(exc).splitlines()[0] if str(exc) else exc}")
+
+    def on_dialog(dialog) -> None:
+        rec = {"type": dialog.type, "message": dialog.message}
+        r.dialogs.append(rec)
+        c.append_jsonl(raw / "dialogs.jsonl", rec)
+        with contextlib.suppress(PwError):
+            dialog.dismiss()
+
+    def settle(cap: float | None) -> None:
+        refuse_sockets()
+        with contextlib.suppress(PwTimeout):
+            page.wait_for_load_state("networkidle", timeout=left_ms(cap))
+        refuse_sockets()
+
+    state_file = _state_file(a.identity)
+    seen_urls: Seen = []
+    browser = ctx = page = None
+    with sync_playwright() as pw:
+        try:
+            browser = pw.chromium.launch(headless=True, proxy={"server": c.gate()}, args=list(TELEMETRY_ARGS))
+            ctx = browser.new_context(
+                viewport=VIEWPORT,
+                service_workers="block",
+                record_har_path=str(raw / "har.json"),
+                # no extra_http_headers: the identity is added request by request in on_route (identity_headers)
+                storage_state=str(state_file) if state_file.is_file() else None,
+            )
+            ctx.set_default_timeout(left_ms(30))
+            ctx.route("**/*", on_route)
+            # mocked and refused: every websocket, or (scope `websockets: true`) every one not to a target host
+            ctx.route_web_socket(lambda u: not ws_through(u, host, extra.websockets, extra.targets), on_ws)
+            ctx.on("request", lambda _req: setattr(r, "requests", r.requests + 1))
+            ctx.on("response", on_response)
+            if a.routes:
+                ctx.add_init_script(ROUTE_HOOK)
+            page = ctx.new_page()
+            page.on("console", on_console)
+            page.on("pageerror", on_pageerror)
+            page.on("dialog", on_dialog)
+            page.on(  # mocked ones may show here too: count only those let through
+                "websocket",
+                lambda ws: (
+                    ws_through(ws.url, host, extra.websockets, extra.targets)
+                    and setattr(r, "websockets_open", r.websockets_open + 1)
+                ),
+            )
+
+            resp = page.goto(a.url, wait_until="domcontentloaded", timeout=left_ms())
+            r.status = resp.status if resp else None
+            if a.wait_for == "networkidle":
+                settle(None)
+            elif a.wait_for:
+                page.wait_for_selector(a.wait_for, timeout=left_ms())
+            else:
+                settle(15)
+
+            for i, (kind, value) in enumerate(a.steps, 1):
+                try:
+                    if kind == "fill":
+                        page.fill(value[0], value[1], timeout=left_ms(20))
+                    elif kind == "press":
+                        page.keyboard.press(value)  # a chat box sends on Enter, with no button to click
+                        settle(15)
+                    else:
+                        page.click(value, timeout=left_ms(20))
+                        settle(15 if kind == "submit" else 3)
+                except PwError as exc:
+                    sel = value[0] if kind == "fill" else value
+                    r.steps.append(f"{i} --{kind} {sel} failed: {str(exc).splitlines()[0][:120]}")
+                    r.state = f"error step {i}"
+                    break
+
+            if a.xss:
+                page.wait_for_timeout(min(1500, left_ms()))
+                r.sentinel = _sentinel(page, PwError)
+
+            links = _links(page, PwError)
+            seen_urls.append(("GET", page.url, r.status))
+            if a.routes:
+                seen_urls += _explore(page, links, host=host, deadline=deadline, err=PwError, settle=settle)
+                if a.xss and r.sentinel != a.xss:
+                    r.sentinel = _sentinel(page, PwError)
+            seen_urls += [("GET", u, None) for u in links if same_site(u, host)]
+
+            r.final_url = page.url
+            r.title = page.title()
+            (raw / "dom.html").write_text(page.content())
+            try:
+                aria = page.locator("body").aria_snapshot(timeout=left_ms(15))
+                (raw / "aria.yml").write_text(aria)
+                r.a11y = a11y_summary(aria)
+            except PwError as exc:
+                (raw / "aria.yml").write_text(f"# aria snapshot failed: {exc}\n")
+            try:
+                r.forms = page.evaluate(FORMS_JS)
+            except PwError:
+                r.forms = []
+            if a.shot:
+                shot = raw / "shot.png"
+                if a.clip:
+                    page.locator(a.clip).first.screenshot(path=str(shot), timeout=left_ms(20))
+                else:
+                    page.screenshot(path=str(shot), full_page=a.full, timeout=left_ms(20))
+                r.shot = (str(shot), *png_size(shot))
+            ctx.storage_state(path=str(state_file))
+        except PwTimeout as exc:
+            r.state, r.error = "partial (timeout)", str(exc).splitlines()[0][:200]
+        except PwError as exc:
+            r.state, r.error = "error rc=1", str(exc).splitlines()[0][:200]
+        finally:
+            r.seconds = time.monotonic() - t0
+            for closing in (ctx, browser):  # closing the context writes the HAR
+                if closing is not None:
+                    with contextlib.suppress(PwError):
+                        closing.close()
+            # before the hunter can read them: no credential of our accounts in the HAR or the stored state
+            scrub_har(raw / "har.json", host, extra.sso, extra.targets)
+            scrub_state(state_file, host, a.identity, extra.sso, extra.targets)
+            (raw / "console.log").write_text("\n".join(console) + ("\n" if console else ""))
+    r.routes = sorted({u for _, u, _ in seen_urls if same_site(u, host)})
+    (raw / "routes.txt").write_text("\n".join(r.routes) + ("\n" if r.routes else ""))
+    seen_urls += [(m, u, s) for m, u, s in r.xhr]
+    for f in r.forms:
+        if f.get("action"):
+            seen_urls.append((f.get("method") or "GET", f["action"], None))
+    origin_ = c.origin(a.url) or ""
+    items = endpoint_items(seen_urls, origin_)
+    form_fields = {f["action"].split("#")[0]: f.get("fields") or [] for f in r.forms if f.get("action")}
+    items = [(k, u, p + form_fields.get(u, []), s) for k, u, p, s in items]
+    r.new_keys = add_endpoints(c.bh_dir(), origin_, items)
+
+
+def _sentinel(page, err) -> str | None:
+    for frame in page.frames:
+        try:
+            v = frame.evaluate("n => (typeof window[n] === 'string' ? window[n] : null)", SENTINEL)
+        except err:
+            continue
+        if v:
+            return v
+    return None
+
+
+def _links(page, err) -> list[str]:
+    try:
+        return list(dict.fromkeys(page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")))
+    except err:
+        return []
+
+
+def _explore(page, links: list[str], *, host: str, deadline: float, err, settle) -> Seen:
+    """Visit in-app hash routes of the current document (no new page load), breadth first, without links that
+    change state. Other same-site links are recorded, not visited."""
+    found: Seen = []
+    queue = [u for u in links if same_site(u, host)]
+    visited: set[str] = {page.url}
+    visits = 0
+    while queue and visits < MAX_ROUTE_VISITS and time.monotonic() < deadline - 5:
+        u = queue.pop(0)
+        if u in visited or RISKY_LINK.search(u) or not spa_route(u) or not _same_document(u, page.url):
+            continue
+        visited.add(u)
+        visits += 1
+        try:
+            page.evaluate("h => { location.href = h; }", u)
+            settle(3)
+            found.append(("GET", page.url, None))
+            queue += [x for x in _links(page, err) if x not in visited and same_site(x, host)]
+        except err:
+            continue
+    with contextlib.suppress(err):
+        found += [("GET", x, None) for x in page.evaluate("() => window.__bhRoutes || []")]
+    return found
+
+
+# ------------------------------------------------------------------ CLI
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    a = parse_args(argv)
+    if phase_kind(a) == "scanner" and not c.scanners_allowed():
+        sys.exit(f"{c.RULES_MARK} bh-browse --xss: this program forbids automated scanners")
+    from bh.agent.tools import Job  # raw dir and origin check, same scheme as the other builtins
+
+    job = Job("browse", a.url, a.identity, a.timeout)
+    (job.raw / "cmd.txt").write_text(shlex.join(["bh-browse", *argv]) + "\n")
+    r = Result(url=a.url, identity=a.identity, raw=str(job.raw))
+
+    def hard_stop(_sig, _frm) -> None:  # the sync API can hang past its own timeouts: never past the budget
+        print(f"bh-browse {a.url}: killed after {a.timeout + 30} s [error rc=124]\nraw: {job.raw}/", flush=True)
+        os._exit(124)
+
+    signal.signal(signal.SIGALRM, hard_stop)
+    signal.alarm(a.timeout + 30)
+    run(a, job.raw, r)
+    signal.alarm(0)
+    with open(job.raw / "summary.json", "w") as fh:  # what a proof replay reads (bh.agent.proof._browse)
+        json.dump(summary(r), fh)
+    if a.xss:
+        c.record_touched(c.bh_dir(), [a.url], via="browse-xss")
+    c.record_phase(c.bh_dir(), job.origin, "browse", status=r.state, count=len(r.new_keys), raw=str(job.raw))
+    print("\n".join(render(r)))
+    if r.state.startswith("error"):
+        sys.exit(1)

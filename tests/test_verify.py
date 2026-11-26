@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -181,8 +182,8 @@ def test_stage_b_keeps_only_the_verdict_carrying_its_nonce(tmp_path, monkeypatch
     fid = board.add_finding("p", "IDOR", vuln_class="idor", url="https://t.test/basket/7")
     finding = dict(board.rows("SELECT * FROM findings WHERE id=?", fid)[0])
     run_id = board.run_start("p", "m")
-    seen = {}
-    monkeypatch.setattr(stack, "push_file", lambda *a, **k: None)
+    seen = {"pushed": []}
+    monkeypatch.setattr(stack, "push_file", lambda path, text, **k: seen["pushed"].append((path, k)))
 
     def fake_leg(cmd, *a, **k):
         seen["cmd"] = cmd
@@ -199,3 +200,222 @@ def test_stage_b_keeps_only_the_verdict_carrying_its_nonce(tmp_path, monkeypatch
     verdict, reason = v.stage_b(board, scope, finding, {}, run_id=run_id, model="m", effort=None, say=print)
     assert (verdict, reason) == ("rejected", "own")
     assert seen["cmd"][seen["cmd"].index("--user") + 1] == stack.JUDGE
+    # the judge's own container, never the hunter's; the verdict is read from the judge's volume
+    assert stack.JUDGE_CTR in seen["cmd"] and stack.AGENT not in seen["cmd"]
+    assert v.host_verify_dir("p", fid).is_relative_to(tmp_path / "var" / "judge")
+    assert seen["pushed"] and all(k == {"user": stack.JUDGE, "container": stack.JUDGE_CTR} for _, k in seen["pushed"])
+
+
+def test_stage_a_replays_in_the_judge_container(monkeypatch):
+    from bh import stack
+    from bh import verify as v
+
+    calls = []
+    monkeypatch.setattr(stack, "push_file", lambda path, text, **k: calls.append(("push", path, k)))
+
+    def fake_sh(script, *args, **k):
+        calls.append(("sh", args, k))
+        return subprocess.CompletedProcess([], 0, '{"reproduced": true, "control_disproves": false}\n', "")
+
+    monkeypatch.setattr(stack, "agent_sh", fake_sh)
+    assert v.stage_a("p", 3, {"steps": []}) == {"reproduced": True, "control_disproves": False}
+    (_, path, push_kw), (_, args, sh_kw) = calls
+    assert path == "/work/p/.verify/F3/proof.json" and args == (path,)
+    assert push_kw["container"] == sh_kw["container"] == stack.JUDGE_CTR
+    assert push_kw["user"] == sh_kw["user"] == stack.JUDGE
+
+
+def test_no_verification_while_the_judge_container_is_down(tmp_path, monkeypatch):
+    """Not an error of the finding: it stays new, no error counted, nothing runs."""
+    from bh import stack
+    from bh import verify as v
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    monkeypatch.setattr(stack, "container_running", lambda name: name != stack.JUDGE_CTR)
+    monkeypatch.setattr(stack, "prepare_judge", lambda *a: pytest.fail("judge prepared while down"))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    board = Board(tmp_path / "b.sqlite")
+    fid = board.add_finding(
+        "p", "IDOR", vuln_class="idor", url="https://t.test/b/7", proof=idor_proof("https://t.test")
+    )
+    assert v.verify_finding(board, scope, fid, run_id=1, model="m", effort=None, say=lambda *a: None) == "skipped"
+    assert board.rows("SELECT status FROM findings WHERE id=?", fid)[0]["status"] == "new"
+    assert not board.meta_get(f"verify-err:F{fid}:p")
+
+
+# ------------------------------------------------------------------ escalation and errors (no container, no claude)
+@pytest.fixture
+def judged(tmp_path, monkeypatch):
+    """A finding with a proof, a stage A that reproduces, and a stage B scripted by `answers` (one per call)."""
+    from bh import stack
+    from bh import verify as v
+    from bh.runner import run as runner
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    board = Board(tmp_path / "b.sqlite")
+    fid = board.add_finding(
+        "p", "IDOR", vuln_class="idor", url="https://t.test/basket/7", proof=idor_proof("https://t.test")
+    )
+    run_id = board.run_start("p", "m")
+    for name in ("prepare_judge", "push_file"):
+        monkeypatch.setattr(stack, name, lambda *a, **k: None)
+    monkeypatch.setattr(stack, "container_running", lambda name: True)
+    monkeypatch.setattr(runner, "clean_sandbox", lambda *a, **k: None)
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": True, "control_disproves": False})
+    calls, answers = [], []
+
+    def fake_b(board, scope, finding, replay, *, run_id, model, effort, say):
+        calls.append((model, effort))
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(v, "stage_b", fake_b)
+
+    def verify():
+        return v.verify_finding(board, scope, fid, run_id=run_id, model="opus", effort=None, say=lambda *a: None)
+
+    def state():
+        row = board.rows("SELECT status, verdict FROM findings WHERE id=?", fid)[0]
+        return row["status"], row["verdict"], [r["kind"] for r in board.rows("SELECT kind FROM todos")]
+
+    return verify, state, calls, answers, board, fid
+
+
+def test_inconclusive_escalates_to_the_second_judge_which_verifies(judged):
+    from bh.verify import ESCALATION_EFFORT, ESCALATION_MODEL
+
+    verify, state, calls, answers, *_ = judged
+    answers += [("inconclusive", "cannot tell"), ("confirmed", "reads another user's basket")]
+    assert verify() == "verified"
+    status, verdict, todos = state()
+    assert status == "verified" and todos == ["submit"]
+    assert calls == [("opus", None), (ESCALATION_MODEL, ESCALATION_EFFORT)]
+    assert verdict.startswith(f"[judge {ESCALATION_MODEL}]") and "[judge opus]" in verdict
+
+
+def test_two_inconclusive_judges_leave_it_inconclusive_without_todo(judged):
+    from bh.verify import ESCALATION_MODEL
+
+    verify, state, _calls, answers, *_ = judged
+    answers += [("inconclusive", "a"), ("inconclusive", "b")]
+    assert verify() == "inconclusive"
+    status, verdict, todos = state()
+    assert status == "inconclusive" and todos == []
+    assert verdict.startswith("neither judge decided") and "[judge opus]" in verdict and ESCALATION_MODEL in verdict
+
+
+def test_the_second_judge_can_reject(judged):
+    verify, state, _calls, answers, *_ = judged
+    answers += [("inconclusive", "a"), ("rejected", "public by design")]
+    assert verify() == "rejected"
+    assert state()[0] == "rejected" and state()[2] == []
+
+
+def test_a_finding_is_escalated_only_once(judged):
+    verify, state, calls, answers, board, fid = judged
+    answers += [("inconclusive", "a"), RuntimeError("container gone")]  # the crash hits the second judge
+    assert verify() == "new"
+    assert board.meta_get(f"escalated:F{fid}:p")
+    answers += [("inconclusive", "again")]
+    assert verify() == "inconclusive"
+    assert len(calls) == 3 and calls[-1][0] == "opus"  # no second escalation
+    assert state()[2] == []
+
+
+def test_one_error_puts_the_finding_back_in_the_queue(judged):
+    verify, state, _calls, answers, *_ = judged
+    answers += [RuntimeError("podman exec failed")]
+    assert verify() == "new"
+    status, verdict, todos = state()
+    assert status == "new" and "verification error 1/2" in verdict and todos == []
+
+
+def test_two_errors_end_inconclusive_without_escalation(judged):
+    verify, state, calls, answers, *_ = judged
+    answers += [RuntimeError("one"), RuntimeError("two")]
+    verify()
+    assert verify() == "inconclusive"
+    status, verdict, todos = state()
+    assert status == "inconclusive" and "verification error 2/2" in verdict and todos == []
+    assert [m for m, _ in calls] == ["opus", "opus"]
+
+
+# ------------------------------------------------------------------ the gate in the way (M1)
+def _refused_replay():
+    step = {"name": "attack", "role": "attack", "status": 403, "ok": False, "misses": ["refused by the gate"]}
+    return {"reproduced": False, "control_disproves": False, "rounds": [[step]]}
+
+
+def test_a_replay_refused_by_the_gate_goes_back_to_new_without_any_judge(judged, monkeypatch):
+    from bh import verify as v
+
+    verify, state, calls, _answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: _refused_replay())
+    for i in range(1, v.MAX_GATE_DEFERRALS + 1):
+        assert verify() == "new"
+        assert f"({i}/{v.MAX_GATE_DEFERRALS} refused replays)" in state()[1]
+    assert verify() == "inconclusive"  # past the bound: no endless loop
+    assert calls == [] and not board.meta_get(f"escalated:F{fid}:p") and state()[2] == []
+
+
+def test_a_waf_pause_on_the_finding_host_defers_without_replay(judged, monkeypatch):
+    import time
+
+    from bh import verify as v
+    from bh.assets import Graph
+    from bh.scope import scope_from_dict
+
+    verify, state, calls, _answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: pytest.fail("replayed during a WAF pause"))
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    Graph(board, scope).mark_blocked("t.test", "waf", time.time() + 3600)
+    for _ in range(v.MAX_GATE_DEFERRALS + 2):  # a pause ends by itself: it is never counted
+        assert verify() == "new"
+    assert "WAF pause on t.test" in state()[1] and calls == []
+    assert not board.meta_get(f"gate-deferred:F{fid}:p")
+
+
+# ------------------------------------------------------------------ a control that answers like the attack (issue 34)
+def test_no_differential_asks_the_hunter_for_a_new_proof_once(judged, monkeypatch):
+    from bh import verify as v
+
+    verify, state, calls, _answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": False, "control_disproves": True})
+    assert verify() == "needs-proof"
+    assert state()[0] == "needs-proof" and state()[2] == [] and calls == []
+    facts = board.rows("SELECT kind, title, summary FROM facts")
+    assert len(facts) == 1 and facts[0]["kind"] == "harness" and facts[0]["title"].startswith(f"F{fid} ")
+    assert "marker only the attacker gets" in facts[0]["summary"] and "bh-note finding" in facts[0]["summary"]
+    scope = scope_from_dict({"program": "p", "platform": "x", "in_scope": ["t.test"]})
+    pending = v.verify_pending(board, scope, run_id=1, model="m", effort=None, say=lambda *a: None)
+    assert pending == {}  # needs-proof waits for the hunter
+    board.set_finding(fid, "new")  # what ingest does when the new proof arrives under the same title
+    assert verify() == "rejected"  # the second proof has no differential either
+    assert "again" in state()[1] and len(board.rows("SELECT 1 FROM facts")) == 1
+
+
+def test_a_better_proof_after_needs_proof_is_verified(judged, monkeypatch):
+    from bh import verify as v
+
+    verify, state, _calls, answers, board, fid = judged
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": False, "control_disproves": True})
+    assert verify() == "needs-proof"
+    board.set_finding(fid, "new")
+    monkeypatch.setattr(v, "stage_a", lambda *a: {"reproduced": True, "control_disproves": False})
+    answers += [("confirmed", "reads another user's basket")]
+    assert verify() == "verified" and state()[2] == ["submit"]
+
+
+def test_rejected_and_needs_proof_findings_are_not_duplicates_targets(tmp_path):
+    b = Board(tmp_path / "b.sqlite")
+    f1 = b.add_finding("p", "IDOR basket", vuln_class="idor", url="https://t.test/basket/7")
+    f2 = b.add_finding("p", "IDOR basket v2", vuln_class="idor", url="https://t.test/basket/9")
+    row = lambda fid: dict(b.rows("SELECT * FROM findings WHERE id=?", fid)[0])  # noqa: E731
+    for status in ("rejected", "needs-proof"):
+        b.set_finding(f1, status)
+        assert duplicate_of(b, row(f2)) is None
+    b.set_finding(f1, "inconclusive")
+    assert duplicate_of(b, row(f2)) == f1
