@@ -1,9 +1,12 @@
 """Audit Mythos 2026-11-26, S3 part: doctrine, cards, observation proofs, stop on third-party data, judge model,
 CLI fences. No podman, no Claude, no network."""
 
+import importlib
 import json
 import re
+import sys
 import time
+import types
 
 import pytest
 
@@ -12,10 +15,20 @@ from bh.agent import contract as c
 from bh.agent import hooks
 from bh.board import Board
 from bh.runner import observation, run
-from bh.runner.prompt import DOCTRINE, build_system_prompt, build_task, build_verifier_prompt
+from bh.runner.prompt import OPENINGS, build_system_prompt, build_task, build_verifier_prompt, doctrine
 from bh.scope import scope_from_dict
 
 PT = [{"value": "challenges.cloudflare.com", "kind": "passthrough"}]
+
+
+@pytest.fixture(autouse=True)
+def recall_shipped(monkeypatch):
+    """The default opening names bh-recall (W2-C ships bh.agent.recall): a stand-in until that lot is merged."""
+    monkeypatch.delenv("BH_DOCTRINE_OPENING", raising=False)
+    try:
+        importlib.import_module("bh.agent.recall")
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "bh.agent.recall", types.ModuleType("bh.agent.recall"))
 
 
 def _scope(**kw):
@@ -23,7 +36,9 @@ def _scope(**kw):
 
 
 # ------------------------------------------------------------------ doctrine (B7, I8, R1-R10)
-def test_general_doctrine_keeps_no_human_channel_and_moves_anti_bot_under_network():
+@pytest.mark.parametrize("opening", sorted(OPENINGS))
+def test_general_doctrine_keeps_no_human_channel_and_moves_anti_bot_under_network(opening):
+    DOCTRINE = doctrine(True, opening)
     low = DOCTRINE.lower()
     assert "human" not in low and "todo" not in low and "wait-human" not in low
     network = DOCTRINE.split("## Network (hard rules)")[1].split("## Data safety")[0]
@@ -31,7 +46,9 @@ def test_general_doctrine_keeps_no_human_channel_and_moves_anti_bot_under_networ
     assert "never solved" not in DOCTRINE.split("## Board")[1]  # no longer buried in the Board section
 
 
-def test_doctrine_r6_and_no_stop_priming():
+@pytest.mark.parametrize("opening", sorted(OPENINGS))
+def test_doctrine_r6_and_no_stop_priming(opening):
+    DOCTRINE = doctrine(True, opening)
     assert "name the file or the output line that shows it; a question without one is a no" in DOCTRINE
     assert "Before you stop" not in DOCTRINE
     task = build_task("board", first=False)

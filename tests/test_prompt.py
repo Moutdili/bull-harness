@@ -1,8 +1,26 @@
-from bh.runner.prompt import DOCTRINE, build_system_prompt, build_task
+import importlib
+import sys
+import types
+
+import pytest
+
+from bh.runner.prompt import OPENINGS, build_system_prompt, build_task, doctrine
 from bh.scope import scope_from_dict
 
 
-def test_doctrine_never_offers_a_human_channel():
+@pytest.fixture(autouse=True)
+def recall_shipped(monkeypatch):
+    """The default opening names bh-recall (W2-C ships bh.agent.recall): a stand-in until that lot is merged."""
+    monkeypatch.delenv("BH_DOCTRINE_OPENING", raising=False)
+    try:
+        importlib.import_module("bh.agent.recall")
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "bh.agent.recall", types.ModuleType("bh.agent.recall"))
+
+
+@pytest.mark.parametrize("opening", sorted(OPENINGS))
+def test_doctrine_never_offers_a_human_channel(opening):
+    DOCTRINE = doctrine(True, opening)
     assert "todo" not in DOCTRINE.lower() and "human" not in DOCTRINE.lower()
     assert "bh-note blocked" in DOCTRINE
 
@@ -65,6 +83,7 @@ def test_identities_without_a_probe_are_said_unchecked():
 
 
 def test_hunter_needs_proof_line():
+    DOCTRINE = doctrine(True)
     assert "needs-proof" in DOCTRINE and "same title" in DOCTRINE
 
 
@@ -125,7 +144,7 @@ def test_only_live_identities_are_announced():
 
 
 def test_doctrine_runs_bh_authz_after_mapping_before_manual_access_tests():
-    doc = DOCTRINE.splitlines()
+    doc = doctrine(True).splitlines()
     i = next(n for n, ln in enumerate(doc) if "bh-authz" in ln)
     lines = doc[i : i + 2]
     assert sum("bh-authz" in ln for ln in doc) == 1 and "bh-authz" not in doc[i + 2]
@@ -134,7 +153,7 @@ def test_doctrine_runs_bh_authz_after_mapping_before_manual_access_tests():
 
 
 def test_doctrine_forbids_breaking_anti_bot_challenges():
-    from bh.runner.prompt import DOCTRINE
+    from bh.runner.prompt import DOCTRINE  # the module attribute, built when read
 
     assert "never solved, evaded or worked around" in DOCTRINE and "blocked captcha" in DOCTRINE
 

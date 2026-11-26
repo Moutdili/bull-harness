@@ -3,20 +3,24 @@ the scope block (D27, R31, R26, R46), the judge's prompt (R32, T1, T3, R6) and t
 No podman, no Claude, no network."""
 
 import hashlib
+import importlib
 import json
 import re
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
+from bh.agent import contract as c
 from bh.browser_service import AGENT_OPS
 from bh.gate import policy
 from bh.runner import prompt
 from bh.runner.prompt import (
     BROWSER_BLOCK,
     HUNTER_FIELD_MAX,
+    OPENINGS,
     VERIFIER_DOCTRINE,
     _flat,
     build_system_prompt,
@@ -36,6 +40,16 @@ def gate_bounds(monkeypatch):
     """The gate's id bound after the W1 merge (lot D: six ids in ten minutes), whatever this tree's policy says."""
     monkeypatch.setattr(policy, "ID_LIMIT", 6)
     monkeypatch.setattr(policy, "ID_WINDOW_S", 600)
+
+
+@pytest.fixture(autouse=True)
+def recall_shipped(monkeypatch):
+    """The default opening names bh-recall (W2-C ships bh.agent.recall): a stand-in until that lot is merged."""
+    monkeypatch.delenv("BH_DOCTRINE_OPENING", raising=False)
+    try:
+        importlib.import_module("bh.agent.recall")
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "bh.agent.recall", types.ModuleType("bh.agent.recall"))
 
 
 def _scope(**kw):
@@ -70,8 +84,18 @@ HARD = (
     "never enumerate ids to find them",
     "No DoS, no brute force, no spam, no destructive actions, no social engineering.",
 )
-# measured on this commit with ID_LIMIT 6 and ID_WINDOW_S 600: every line added to the doctrine is paid each turn
-SIZE = {True: (10615, 104), False: (10323, 102)}
+# measured with ID_LIMIT 6 and ID_WINDOW_S 600, opening `legacy`: every line added to the doctrine is paid each turn.
+# W2-E: +3 lines in the Board section (lot A's --quote, bh-recall/--kind/--recall, -k dead-end --why, cover, think).
+SIZE = {True: (11093, 107), False: (10801, 105)}
+# D17: each opening raises the bound by its own exact size (bytes, lines), no more
+OPENING_SIZE = {"legacy": (0, 0), "a": (2392, 32), "b": (1041, 12), "c": (553, 6)}
+OPENING_SHA = {
+    "legacy": hashlib.sha256(b"").hexdigest(),
+    "a": "f145a8d34ee3268f8258b3817fccf36e807935ec550ebe61c9110ef7b736fcaa",
+    "b": "955d32844ecdbdd5b54b0268e30fe5a2b1a1ba0ea05af80fcb89af1b5b3517d6",
+    "c": "37ce52783d943a7b6cc0c4d7d73416e96589b5aeb570a71b222e579b05457c1c",
+}
+ALL_OPENINGS = sorted(OPENING_SIZE)
 SECTIONS = {
     "## Network (hard rules)": "e9d8a4201977b90bb3f5d8aa5e9fe2a8d8de7842f3ef97fe65baa2dee4f091d9",
     "## Data safety": "0eb70cb49a221334a1a3f9f8db8ac27d40e92ef120fc0b5bf6f10546ee4cff4b",
@@ -83,25 +107,119 @@ def _section(doc: str, head: str) -> str:
     return head + body.split("\n## ", 1)[0]
 
 
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
 @pytest.mark.parametrize("scanners", [True, False])
-def test_hard_sentences_are_all_there(scanners):
-    doc = doctrine(scanners)
+def test_hard_sentences_are_all_there(scanners, opening):
+    doc = doctrine(scanners, opening)
     missing = [p for p in HARD if p not in doc]
     assert not missing, missing
 
 
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
 @pytest.mark.parametrize("scanners", [True, False])
-def test_doctrine_size_is_bounded(scanners):
-    doc = doctrine(scanners)
+def test_doctrine_size_is_bounded(scanners, opening):
+    doc = doctrine(scanners, opening)
     size, lines = len(doc.encode()), len(doc.splitlines())
-    assert size <= SIZE[scanners][0] and lines <= SIZE[scanners][1], (size, lines)
+    extra = OPENING_SIZE[opening]
+    assert (len(OPENINGS[opening].encode()), len(OPENINGS[opening].splitlines())) == extra
+    assert size <= SIZE[scanners][0] + extra[0] and lines <= SIZE[scanners][1] + extra[1], (size, lines)
 
 
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
 @pytest.mark.parametrize("scanners", [True, False])
 @pytest.mark.parametrize("head", list(SECTIONS))
-def test_hard_rule_sections_are_frozen(scanners, head):
-    text = _section(doctrine(scanners), head)
+def test_hard_rule_sections_are_frozen(scanners, head, opening):
+    text = _section(doctrine(scanners, opening), head)
     assert hashlib.sha256(text.encode()).hexdigest() == SECTIONS[head], text
+
+
+# ------------------------------------------------------------------ D17: the opening
+FIRST3 = (
+    "# bull-harness agent\n"
+    "You hunt for real, reportable vulnerabilities on ONE authorized bug bounty program, inside a Kali sandbox.\n"
+    "Authorization: the program's published policy below. Stay strictly inside it.\n"
+)
+
+
+def test_default_opening_is_a():
+    assert doctrine() == doctrine(True, "a") and doctrine(False) == doctrine(False, "a")
+    assert "## The relay\nYou are one runner in a long relay: this program is hunted by a line of agents" in doctrine()
+
+
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
+def test_opening_is_read_from_the_environment(monkeypatch, opening):
+    monkeypatch.setenv("BH_DOCTRINE_OPENING", opening.upper())
+    assert doctrine(True) == doctrine(True, opening)
+    assert doctrine(True, opening) == prompt.DOCTRINE
+
+
+def test_unknown_opening_is_an_error(monkeypatch):
+    with pytest.raises(ValueError, match="expected one of a, b, c, legacy"):
+        doctrine(True, "d")
+    monkeypatch.setenv("BH_DOCTRINE_OPENING", "relay")
+    with pytest.raises(ValueError, match="BH_DOCTRINE_OPENING='relay'"):
+        doctrine(True)
+
+
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
+def test_opening_text_is_word_for_word(opening):
+    assert hashlib.sha256(OPENINGS[opening].encode()).hexdigest() == OPENING_SHA[opening]
+
+
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
+@pytest.mark.parametrize("scanners", [True, False])
+def test_opening_sits_after_the_three_first_lines_above_the_hard_rules(scanners, opening):
+    doc = doctrine(scanners, opening)
+    assert doc.startswith(FIRST3 + OPENINGS[opening] + "\n## Network (hard rules)\n")
+    assert doctrine(True, opening).split("## Network (hard rules)")[0] == doc.split("## Network (hard rules)")[0]
+    legacy = doctrine(scanners, "legacy")
+    assert doc.replace(OPENINGS[opening], "", 1) == legacy  # nothing else moves
+
+
+@pytest.mark.parametrize("opening", ["a", "b"])
+def test_relay_openings_need_bh_recall(monkeypatch, opening):
+    assert '`bh-recall "<idea>"`' in OPENINGS[opening]
+    monkeypatch.setitem(sys.modules, "bh.agent.recall", None)  # import of it raises ImportError
+    with pytest.raises(RuntimeError, match=r"names bh-recall, but bh\.agent\.recall is not importable"):
+        doctrine(True, opening)
+    monkeypatch.setenv("BH_DOCTRINE_OPENING", opening)
+    with pytest.raises(RuntimeError, match="BH_DOCTRINE_OPENING=c or legacy"):
+        doctrine(False)
+    # the prompt module itself, and the judge's prompt, never depend on it
+    assert build_verifier_prompt(_scope(), {"id": 1, "title": "t", "proof": "{}"}, {}, "e")
+
+
+def test_default_without_bh_recall_is_c_and_warns(monkeypatch):
+    """Nothing asked and bh.agent.recall missing: the default promises no bh-recall (C), and says so; with it, A."""
+    assert doctrine(True) == doctrine(True, "a")
+    monkeypatch.setitem(sys.modules, "bh.agent.recall", None)
+    with pytest.warns(RuntimeWarning, match="default doctrine opening 'a' replaced by 'c'"):
+        doc = doctrine(True)
+    assert doc == doctrine(True, "c") and "bh-recall" not in doc.split("## Network (hard rules)")[0]
+
+
+@pytest.mark.parametrize("opening", ["c", "legacy"])
+def test_other_openings_build_without_bh_recall(monkeypatch, opening):
+    monkeypatch.setitem(sys.modules, "bh.agent.recall", None)
+    assert "bh-recall" not in OPENINGS[opening]
+    assert doctrine(True, opening) and doctrine(False, opening)
+
+
+def test_relay_a_names_think_and_recall():
+    assert '`bh-note think "<idea>" --why "<reason>"`' in OPENINGS["a"] and "`bh-recall" in OPENINGS["a"]
+
+
+@pytest.mark.parametrize("opening", ALL_OPENINGS)
+def test_no_opening_names_a_scanner_or_an_agent(opening):
+    text = OPENINGS[opening]
+    assert not (c._SCANNER_WORDS.search(text) or c._SCANNER_EXTRA.search(text) or c._ZAP_ACTIVE.search(text))
+    assert not c._AUTHZ_WRITE.search(text)
+    low = text.lower()
+    for banned in ("beat your predecessor", "never stop", "summary", "score", "#0", "registered as"):
+        assert banned not in low, banned
+    assert not re.search(r"\b\d+ findings?\b", low)
+    if text:  # the hard rules stay above the wish to contribute
+        assert "outrank" in low or "come first" in low
 
 
 # ------------------------------------------------------------------ R11 / D26: the gate's id bound, never a number
