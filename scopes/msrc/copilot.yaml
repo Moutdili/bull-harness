@@ -56,6 +56,8 @@ identities:
     origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
     role: member
     tenant: A
+    # measured 2026-11-26: signed in, /chat is 200 and carries signInState; signed out it is a 302 to the login
+    probe: {url: "https://copilot.com/chat", status: 200, expect: "signInState"}
     enroll:
       kind: browser
       steps:
@@ -79,6 +81,10 @@ identities:
         - {click: "button:has-text('Send a code'), [role=button]:has-text('Send a code')", optional: true, timeout: 20}
         - {fill: "#proof-confirmation-email-input", value: "{code_to}", optional: true, timeout: 10}
         - {click: "button:has-text('Send code')", optional: true, timeout: 8}
+        # an account with an authenticator app (user-b, 2026-11-26) asks for its code here: take the e-mail option
+        - {click: "text=/Use a different verification option|Other ways to sign in|I can.t use/i", optional: true, timeout: 8}
+        - {click: "[role=button]:has-text('Email'), button:has-text('Email'), div:has-text('Email') >> nth=-1", optional: true, timeout: 8}
+        - {click: "button:has-text('Send code'), button:has-text('Send a code')", optional: true, timeout: 8}
         - {email_code: "#codeEntry-0, input[name=otc], input[autocomplete=one-time-code], input[type=tel], input[inputmode=numeric]", from: "microsoft.com", optional: true, timeout: 120}
         - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
         - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
@@ -88,6 +94,8 @@ identities:
     origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
     role: member
     tenant: B
+    # measured 2026-11-26: signed in, /chat is 200 and carries signInState; signed out it is a 302 to the login
+    probe: {url: "https://copilot.com/chat", status: 200, expect: "signInState"}
     enroll:
       kind: browser
       steps:
@@ -111,6 +119,10 @@ identities:
         - {click: "button:has-text('Send a code'), [role=button]:has-text('Send a code')", optional: true, timeout: 20}
         - {fill: "#proof-confirmation-email-input", value: "{code_to}", optional: true, timeout: 10}
         - {click: "button:has-text('Send code')", optional: true, timeout: 8}
+        # an account with an authenticator app (user-b, 2026-11-26) asks for its code here: take the e-mail option
+        - {click: "text=/Use a different verification option|Other ways to sign in|I can.t use/i", optional: true, timeout: 8}
+        - {click: "[role=button]:has-text('Email'), button:has-text('Email'), div:has-text('Email') >> nth=-1", optional: true, timeout: 8}
+        - {click: "button:has-text('Send code'), button:has-text('Send a code')", optional: true, timeout: 8}
         - {email_code: "#codeEntry-0, input[name=otc], input[autocomplete=one-time-code], input[type=tel], input[inputmode=numeric]", from: "microsoft.com", optional: true, timeout: 120}
         - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
         - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
