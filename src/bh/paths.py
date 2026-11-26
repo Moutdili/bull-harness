@@ -75,6 +75,11 @@ def run_log(run_id: int, program: str) -> Path:
     return runs_dir() / f"{run_id:05d}-{program}.jsonl"
 
 
+def run_text(run_id: int, kind: str) -> Path:
+    """var/runs/<run_id>.<kind>.txt: the system prompt (`system`) and the task (`task`) a segment started with."""
+    return runs_dir() / f"{run_id}.{kind}.txt"
+
+
 def work_bh(program: str) -> Path:
     """Host view of the agent's /work/<program>/.bh (owned by the container user: read-only here)."""
     return var() / "work" / program / ".bh"

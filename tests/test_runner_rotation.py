@@ -81,8 +81,10 @@ def seg(tmp_path, monkeypatch):
     scope_file = tmp_path / "p.yaml"
     scope_file.write_text("program: p\n")
     monkeypatch.setattr(run, "CONTEXT_ROTATE_TOKENS", LIMIT)
-    for name in ("activate_scope", "clean_sandbox", "prepare_workdir", "set_active_run"):
+    for name in ("activate_scope", "clean_sandbox", "prepare_workdir", "set_active_run", "push_budget"):
         monkeypatch.setattr(run, name, lambda *a, **k: None)
+    monkeypatch.setattr(run, "browser_status", lambda call=None: None)
+    monkeypatch.setattr(run.identity, "claude_version", lambda: "2.1.330")
     state = {"legs": [], "cmds": [], "limits": [], "cleaned": []}
     monkeypatch.setattr(run, "clean_leg", lambda prog, home: state["cleaned"].append((len(state["cmds"]), home)))
 

@@ -154,8 +154,10 @@ def seg(tmp_path, monkeypatch):
     scope = scope_from_dict({"program": "p", "platform": "local", "in_scope": ["a.test"]})
     scope_file = tmp_path / "p.yaml"
     scope_file.write_text("program: p\n")
-    for name in ("activate_scope", "clean_sandbox", "clean_leg", "prepare_workdir", "set_active_run"):
+    for name in ("activate_scope", "clean_sandbox", "clean_leg", "prepare_workdir", "set_active_run", "push_budget"):
         monkeypatch.setattr(run, name, lambda *a, **k: None)
+    monkeypatch.setattr(run, "browser_status", lambda call=None: None)
+    monkeypatch.setattr(run.identity, "claude_version", lambda: "2.1.330")
     monkeypatch.setattr(run.retention, "prune", lambda: None)
     monkeypatch.setattr(run.stack, "kill_agent", lambda *a, **k: None)
     monkeypatch.setattr(run, "pick_cards", lambda *a: [])

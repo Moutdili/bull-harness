@@ -183,6 +183,10 @@ def cmd_status(args) -> int:
         s = _load_scope_or_exit(str(paths.active_scope()))
         print(f"active scope: {s.platform}/{s.program} (rps {s.max_rps})")
     b = _board()
+    from bh.runner import supervisor
+
+    if line := supervisor.status_line(b, time.time()):
+        print(line)
     for r in b.rows(
         "SELECT id, program, status, turns, cost_usd, arsenal_calls, manual_calls, locked_calls, "
         "datetime(started,'unixepoch','localtime') AS t FROM runs ORDER BY id DESC LIMIT 5"
@@ -216,6 +220,7 @@ def cmd_run(args) -> int:
         extra_task=args.task or "",
         effort=args.effort,
         quiet=args.quiet,
+        phase=getattr(args, "phase", None),
     )
     if args.quiet:  # a driven run (audit I16): counts only, never a word the hunter wrote
         print(
@@ -298,6 +303,8 @@ def cmd_hunt(args) -> int:
         model=args.model,
         max_turns=args.max_turns,
         effort=args.effort,
+        phase=args.phase,
+        runs=args.runs,
     )
     return 0
 
@@ -736,7 +743,22 @@ def cmd_browser_up(args) -> int:
     rc = _browser_compose("up", "-d", "--no-deps", stack.BROWSER_SERVICE)
     if rc == 0:
         print(f"{stack.BROWSER_CTR} up; screen: {bhost.view_url()}")
+        if name := browser_reload():
+            print(f"identity {name} reloaded in {stack.BROWSER_CTR}")
     return rc
+
+
+def browser_reload() -> str | None:
+    """R36: the identity the profile was marked with, loaded again after a start (None: nothing reloaded, or a
+    controller without reload_marked). Never fails the start."""
+    try:
+        from bh.browser_service import watch
+
+        reload = getattr(watch, "reload_marked", None)
+        return reload() if reload is not None else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"no identity reloaded ({type(exc).__name__}: {str(exc)[:120]})", file=sys.stderr)
+        return None
 
 
 def cmd_browser_down(args) -> int:
@@ -869,6 +891,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(fresh is the default: cheaper, the board + HANDOFF carry the state)",
     )
     r.add_argument("--task", help="extra operator instruction for this segment")
+    r.add_argument("--phase", help="phase this run counts in (required on a real program: 33 runs a day, held in code)")
     r.add_argument(
         "--quiet",
         action="store_true",
@@ -897,7 +920,9 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("hunt", help="autonomous supervisor rotating over programs")
     h.add_argument("scopes", nargs="+")
     run_opts(h)
-    h.add_argument("--hours", type=float, default=8)
+    h.add_argument("--hours", type=float, default=8, help="maximal duration of the session")
+    h.add_argument("--phase", help="phase name: the hunt is one session of 11 runs of it (required on a real program)")
+    h.add_argument("--runs", type=int, help="runs in this session, at most 11 (it only lowers the session)")
     h.set_defaults(func=cmd_hunt)
 
     t = sub.add_parser("todo", help="post-triage todo: verified findings to submit")
