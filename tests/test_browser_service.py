@@ -52,8 +52,32 @@ class FakeDriver:
     def wait_ms(self, ms):
         self.calls.append(("wait_ms", ms))
 
-    def text(self):
+    def text(self, css=None):
         return self.page_text
+
+    def outline(self, css=None):
+        return '- textbox "Message Copilot"\n- button "Submit"'
+
+    def attr(self, css, name):
+        return self.attrs.get((css, name)) if hasattr(self, "attrs") else None
+
+    def upload(self, css, name, mime, data):
+        self.calls.append(("upload", css, name, mime, data))
+
+    def tabs(self):
+        return {"tabs": [{"url": "https://app.example/", "title": "App"}], "current": 0}
+
+    def select_tab(self, index):
+        self.calls.append(("select_tab", index))
+
+    def net(self):
+        return list(getattr(self, "net_rows", []))
+
+    def frames(self):
+        return list(getattr(self, "frame_rows", []))
+
+    def cookie_values(self):
+        return [c["value"] for c in self.cookies] + list(getattr(self, "late_cookies", []))
 
     def snapshot(self):
         return self.snap
@@ -131,7 +155,8 @@ def test_the_host_door_takes_host_ops_only():
 
 def test_host_and_agent_sets_do_not_overlap():
     assert not AGENT_OPS & HOST_OPS
-    assert {"goto", "fill", "click", "press", "text", "wait", "state"} == AGENT_OPS
+    assert {"goto", "fill", "click", "press", "text", "wait", "state"} <= AGENT_OPS
+    assert {"outline", "attr", "net", "tabs", "upload", "frames", "switch"} <= AGENT_OPS
 
 
 # ---------------------------------------------------------------- challenge detection

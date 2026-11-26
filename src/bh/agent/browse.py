@@ -42,7 +42,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from bh.agent import contract as c
 import contextlib
@@ -167,8 +167,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def phase_kind(a: argparse.Namespace) -> str:
-    """Program rules: payloads (--xss) make it a scanner, otherwise it only maps."""
-    return "scanner" if a.xss else "mapper"
+    """Program rules: one page rendered with a marker (--xss alone) is an observation, so a mapper; a marker carried
+    across the routes it walks (--xss with --routes) is a scan (Mio's decision, audit I14)."""
+    return "scanner" if a.xss and a.routes else "mapper"
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -458,6 +459,141 @@ def _state_file(identity: str | None) -> Path:
     return c.bh_dir() / c.RAW / f"browse-state-{name}.json"
 
 
+# ------------------------------------------------------------------ what the hunter may read back (I19)
+# Keys of a response or a stored value that carry a credential of our test accounts. Narrower than redact's
+# SENSITIVE_KEY on purpose: a target's answer keeps its emails and user names (they are what an IDOR shows).
+CRED_KEY = re.compile(r"token|secret|password|passwd|credential|assertion|client_info|^code$|session", re.I)
+# Only bh/agent is mounted in the sandbox (not bh.redact): the same rules, kept here.
+CRED_HEADER = re.compile(
+    r"^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-auth-token|x-access-token|"
+    r"x-csrf-token|x-xsrf-token|x-session-id|x-amz-security-token|x-ms-token-aad-.*)$",
+    re.I,
+)
+JWT = re.compile(r"\beyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]*")
+_CRED_PAIR = re.compile(
+    r"""(?i)(["']?[\w-]*(?:token|secret|password|passwd|credential|assertion|session)[\w-]*["']?\s*[:=]\s*["']?)"""
+    r"""([^"'&\s,}]+)"""
+)
+
+
+def _ph(name: str) -> str:
+    return f"<redacted:{name}>"
+
+
+def _no_jwt(s: str) -> str:
+    return JWT.sub(_ph("jwt"), s)
+
+
+def _cred_url(u: str) -> str:
+    parts = urlsplit(u)
+    if not parts.query:
+        return _no_jwt(u)
+    q = [(k, _ph(k) if CRED_KEY.search(k) else _no_jwt(v)) for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+    return urlunsplit(parts._replace(query=urlencode(q, safe="<>:")))
+
+
+def _cred_data(obj):
+    if isinstance(obj, dict):
+        return {k: (_ph(k) if CRED_KEY.search(str(k)) else _cred_data(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cred_data(v) for v in obj]
+    if isinstance(obj, str):
+        return _no_jwt(obj)
+    return obj
+
+
+def _cred_text(s: str) -> str:
+    """A body or a stored value: JSON with credential keys replaced, else JWTs and key=value credentials."""
+    try:
+        parsed = json.loads(s)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(_cred_data(parsed))
+    return _no_jwt(_CRED_PAIR.sub(lambda m: m.group(1) + _ph("value"), s))
+
+
+def _ours(url: str, host: str, sso: tuple[str, ...], targets: tuple[str, ...]) -> bool:
+    return is_target(url, host, targets) or _matches(url, sso)
+
+
+def scrub_har(path: Path, host: str, sso: tuple[str, ...] = (), targets: tuple[str, ...] = ()) -> None:
+    """har.json rewritten in place: no Authorization/Cookie/Set-Cookie (or other credential header) anywhere, no
+    cookie value, and on the targets and `sso` hosts no token in a URL, a request body or a response body (an `sso`
+    host's answers are the token endpoint's)."""
+    try:
+        har = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    for e in (har.get("log") or {}).get("entries") or []:
+        req, resp = e.get("request") or {}, e.get("response") or {}
+        url = str(req.get("url") or "")
+        ours = _ours(url, host, sso, targets)
+        for part in (req, resp):
+            for h in part.get("headers") or []:
+                if isinstance(h, dict) and CRED_HEADER.match(str(h.get("name", ""))):
+                    h["value"] = _ph(str(h.get("name", "")).lower())
+            for ck in part.get("cookies") or []:
+                if isinstance(ck, dict):
+                    ck["value"] = _ph("cookie")
+        if not ours:
+            continue
+        req["url"] = _cred_url(url)
+        for q in req.get("queryString") or []:
+            if isinstance(q, dict) and CRED_KEY.search(str(q.get("name", ""))):
+                q["value"] = _ph(str(q.get("name")))
+        post = req.get("postData") or {}
+        if isinstance(post.get("text"), str):
+            post["text"] = _cred_text(post["text"])
+        for p in post.get("params") or []:
+            if isinstance(p, dict) and CRED_KEY.search(str(p.get("name", ""))):
+                p["value"] = _ph(str(p.get("name")))
+        content = resp.get("content") or {}
+        if isinstance(content.get("text"), str):
+            if content.get("encoding") == "base64":
+                content["text"] = _ph("body")  # binary: never read for a token, dropped whole
+                content.pop("encoding", None)
+            else:
+                content["text"] = _cred_text(content["text"])
+    path.write_text(json.dumps(har))
+
+
+def scrub_state(
+    path: Path, host: str, identity: str | None, sso: tuple[str, ...] = (), targets: tuple[str, ...] = ()
+) -> None:
+    """browse-state-<identity>.json rewritten in place. Under an identity, the cookies of the targets and `sso`
+    hosts are dropped (the gate adds the identity's own jar to every request) and their localStorage and
+    sessionStorage values that hold a credential (the MSAL cache) are replaced: the next bh-browse signs in again
+    through the `sso` host, and the hunter never reads a token of our accounts. Logged out, nothing of ours is
+    in it and it is kept as it is."""
+    if not identity:
+        return
+    try:
+        st = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    st["cookies"] = [
+        k
+        for k in st.get("cookies") or []
+        if not _ours("https://" + str(k.get("domain", "")).lstrip(".") + "/", host, sso, targets)
+    ]
+    for o in st.get("origins") or []:
+        if not _ours(str(o.get("origin", "")), host, sso, targets):
+            continue
+        for kind in ("localStorage", "sessionStorage"):
+            for item in o.get(kind) or []:
+                if not isinstance(item, dict):
+                    continue
+                name, value = str(item.get("name", "")), str(item.get("value", ""))
+                if CRED_KEY.search(name):
+                    item["value"] = _ph("token")
+                else:
+                    item["value"] = _cred_text(value)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, path)
+
+
 def _same_document(a: str, b: str) -> bool:
     pa, pb = urlsplit(a), urlsplit(b)
     return (pa.scheme, pa.netloc, pa.path, pa.query) == (pb.scheme, pb.netloc, pb.path, pb.query)
@@ -672,6 +808,9 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 if closing is not None:
                     with contextlib.suppress(PwError):
                         closing.close()
+            # before the hunter can read them: no credential of our accounts in the HAR or the stored state
+            scrub_har(raw / "har.json", host, extra.sso, extra.targets)
+            scrub_state(state_file, host, a.identity, extra.sso, extra.targets)
             (raw / "console.log").write_text("\n".join(console) + ("\n" if console else ""))
     r.routes = sorted({u for _, u, _ in seen_urls if same_site(u, host)})
     (raw / "routes.txt").write_text("\n".join(r.routes) + ("\n" if r.routes else ""))

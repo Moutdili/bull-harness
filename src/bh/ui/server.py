@@ -58,6 +58,7 @@ CAPTCHA_CSP = (
 )
 CAPTCHA_FILES = {"captcha.js": "text/javascript", "captcha.css": "text/css"}
 CAPTCHA_TUNNELS = 2  # screens open at once
+VIEWING_REFRESH_S = 240  # under the controller's VIEWING_TTL_S (600)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -68,13 +69,51 @@ def ui_run_pidfile() -> Path:
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 
 
+def token_path() -> Path:
+    return paths.secrets_dir() / "ui.token"
+
+
+def _write_token(tok: str) -> None:
+    """0600 from creation, then renamed over the old file: never a moment with a readable or half-written token."""
+    p = token_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(tok)
+    os.replace(tmp, p)
+
+
 def ui_token() -> str:
-    p = paths.secrets_dir() / "ui.token"
+    p = token_path()
     if not p.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(secrets.token_urlsafe(24))
-        p.chmod(0o600)
+        _write_token(secrets.token_urlsafe(24))
     return p.read_text().strip()
+
+
+def rotate_token() -> None:
+    """A new secrets/ui.token. Every session cookie is an HMAC of the token, so all of them die at once; a running
+    UI started by serve() reads the new token at its next request (UIServer.token)."""
+    _write_token(secrets.token_urlsafe(24))
+
+
+class UIServer(ThreadingHTTPServer):
+    """The UI's server: `token` follows secrets/ui.token (re-read when the file changes), so rotate_token() takes
+    effect without a restart."""
+
+    daemon_threads = True
+    _tok: tuple[tuple[int, int], str] | None = None
+
+    @property
+    def token(self) -> str:
+        try:
+            st = token_path().stat()
+            key = (st.st_mtime_ns, st.st_ino)
+        except OSError:
+            key = (0, 0)
+        if self._tok is None or self._tok[0] != key:
+            self._tok = (key, ui_token())
+        return self._tok[1]
 
 
 def new_session(token: str, now: float | None = None) -> str:
@@ -292,6 +331,46 @@ class Handler(BaseHTTPRequestHandler):
         origin, host = urlparse(self.headers.get("Origin") or ""), self.headers.get("Host") or ""
         return bool(host) and origin.netloc == host and origin.scheme in ("http", "https")
 
+    # -- "the operator is at the screen": the agent may only read meanwhile (controller op human_viewing)
+    def _tell_viewing(self, on: bool) -> None:
+        tell = getattr(self.server, "human_viewing", None)
+        if tell is None:
+            from bh.browser_service import host as bhost
+
+            def tell(v: bool) -> None:
+                bhost.call({"op": "human_viewing", "on": v}, timeout=20)
+
+        try:
+            tell(on)
+        except Exception as exc:  # noqa: BLE001 (said, the screen still works)
+            sys.stderr.write(f"ui: human_viewing {on}: {type(exc).__name__}\n")
+
+    def _viewing_start(self) -> threading.Event:
+        """Count this screen in; the first one tells the controller, and a ticker re-asserts it every
+        VIEWING_REFRESH_S while this screen stays open (the controller forgets it after its own TTL)."""
+        srv = self.server.__dict__
+        lock = srv.setdefault("viewing_lock", threading.Lock())
+        with lock:
+            srv["viewers"] = srv.get("viewers", 0) + 1
+        self._tell_viewing(True)
+        stop = threading.Event()
+
+        def tick() -> None:
+            while not stop.wait(VIEWING_REFRESH_S):
+                self._tell_viewing(True)
+
+        threading.Thread(target=tick, daemon=True).start()
+        return stop
+
+    def _viewing_stop(self, stop: threading.Event) -> None:
+        stop.set()
+        srv = self.server.__dict__
+        with srv.setdefault("viewing_lock", threading.Lock()):
+            srv["viewers"] = max(0, srv.get("viewers", 1) - 1)
+            last = srv["viewers"] == 0
+        if last:
+            self._tell_viewing(False)
+
     def _captcha_ws(self) -> None:
         from bh.ui import ws
 
@@ -322,7 +401,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.flush()
                 self.connection.settimeout(None)  # a screen may stay still for minutes
-                ws.relay(self.rfile, self.wfile, proc.stdin, proc.stdout)
+                viewing = self._viewing_start()
+                try:
+                    ws.relay(self.rfile, self.wfile, proc.stdin, proc.stdout)
+                finally:
+                    self._viewing_stop(viewing)
             finally:
                 self.close_connection = True
                 with contextlib.suppress(OSError):
@@ -618,9 +701,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str | None = None, port: int = 7340) -> None:
     host = host or default_host()
-    srv = ThreadingHTTPServer((host, port), Handler)
-    srv.token = ui_token()
-    srv.daemon_threads = True
+    ui_token()  # created now if missing, before the first login
+    srv = UIServer((host, port), Handler)
     srv.captcha_slots = threading.BoundedSemaphore(CAPTCHA_TUNNELS)
     print(f"bh ui on http://{host}:{port}/  (log in with the token in secrets/ui.token)", flush=True)
     srv.serve_forever()

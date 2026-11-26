@@ -1,6 +1,7 @@
 """Host side of the browser service: everything the host does to bh-browser goes through `podman exec -i`.
 
-- `call`: one control request (load_session, status, reset, human_done) on stdin, one JSON reply on stdout;
+- `call`: one control request (HOST_OPS) on stdin, one JSON reply on stdout; `load` and `reset` also write
+  `<state>/browser-identity.json` (the identity the gate labels bh-browser's traffic with);
 - `identity_payload`: an identity's session file (read with bh.gate.session) turned into browser cookies;
 - `novnc_files`: the noVNC client (the container's /usr/share/novnc), copied once into memory, served by the UI;
 - `open_tunnel`: a byte pipe to x11vnc on the container's loopback (the UI's /captcha/ws relays it).
@@ -121,6 +122,47 @@ def call(req: dict[str, Any], timeout: float = CALL_TIMEOUT_S) -> dict[str, Any]
         if isinstance(out, dict):
             return out
     return {"code": 503, "error": f"no reply from {stack.BROWSER_CTR} (rc {r.returncode})"}
+
+
+# ---------------------------------------------------------------- the identity bh-browser holds (read by the gate)
+IDENTITY_FILE = "browser-identity.json"
+
+
+def identity_file():
+    """<state>/browser-identity.json = {"program": str, "identity": str | null, "loaded_at": float}: written by the
+    host after every load, switch and reset, read by the gate to label bh-browser's traffic. Fixed contract."""
+    return paths.state() / IDENTITY_FILE
+
+
+def write_identity(program: str, identity: str | None, now: float | None = None) -> None:
+    """Atomic (temporary file in the same directory, then rename): the gate never reads half a record."""
+    f = identity_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"program": program, "identity": identity, "loaded_at": time.time() if now is None else now}
+    tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)  # no secret in it; the gate's user reads it
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh)
+    os.replace(tmp, f)
+
+
+def reset(program: str = "", force: bool = False, call_=None) -> dict[str, Any]:
+    """Wipe the profile; on success the gate is told bh-browser holds no identity. Without `force`, the controller
+    refuses while a human challenge is on screen (it would lose it and the message typed under it)."""
+    out = (call_ or call)({"op": "reset", **({"force": True} if force else {})})
+    if out.get("code") == 200:
+        write_identity(program, None)
+    return out
+
+
+def load(program: str, name: str, call_=None) -> dict[str, Any]:
+    """Load `name`'s session (the controller refuses it on a profile that holds another account); on success the
+    gate is told which identity bh-browser holds."""
+    req, _ = identity_payload(program, name)
+    out = (call_ or call)(req)
+    if out.get("code") == 200:
+        write_identity(program, name)
+    return out
 
 
 def done_file():
