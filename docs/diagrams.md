@@ -1,3 +1,4 @@
+Outdated since 2026-11-26: see docs/architecture.md; redrawn in wave W4.
 # Diagrammes d'architecture
 
 État du 2026-11-24, après la revue hostile (Mythos 5.2) et ses correctifs. Chaque bloc est du mermaid

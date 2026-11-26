@@ -14,8 +14,9 @@ après le correctif. Demander un SLA fait perdre l'éligibilité.
 
 ## Ce qui contraint le harnais
 
-- **Tester seulement ses propres tenants et comptes** (comptes de test et tenants d'essai encouragés, nom « MSOBB »
-  si possible). Jamais les données d'un autre client ni de Microsoft ; au-delà de la PoC, rien.
+- **Tester seulement ses propres tenants et comptes** (comptes de test et tenants d'essai encouragés ; nos comptes
+  gardent leur vrai nom, décision de Mio). Jamais les données d'un autre client ni de Microsoft ; au-delà de la PoC,
+  rien.
 - **Interdit** : « network-intensive fuzzing or automated testing that generates excessive traffic » (aucun seuil
   publié), DoS, ingénierie sociale, secrets qui ne sont pas les nôtres, post-exploitation. Fuzzing et scan seulement
   sur ses propres VM Azure.
@@ -38,8 +39,9 @@ Détail et citations : skills `msrc-ai-bug-bounty` (barre, rapport), `msrc-copil
   `scanners_allowed: false` est une décision de Mio, à écrire dans le scope (plafond par appel et par jour).
   Contourner la limite de débit : ne pas le chercher ; le signaler si vu par hasard.
 - **Exécution côté serveur (T3)** : arrêt à la première preuve ; MSRC demande d'écrire à bounty@microsoft.com
-  avant d'aller plus loin (« don't go beyond proof of concept »). Geste harnais : `bh-note blocked other`, piste
-  close, Mio décide.
+  avant d'aller plus loin (« don't go beyond proof of concept »). Geste harnais :
+  `bh-note blocked server-exec "<where, no content>"` : le runner arrête le segment et parque le programme ; Mio
+  décide.
 - **Contrats de service (T3)** : utiliser les services « in a way that does not violate our service agreements ».
   Bridage d'un compte de test : arrêt sur cette surface.
 - **Champs du rapport IA (T2)** : URL ou application exacte, réglages choisis et texte de chaque prompt, preuves
@@ -47,14 +49,16 @@ Détail et citations : skills `msrc-ai-bug-bounty` (barre, rapport), `msrc-copil
   une hallucination. Liens courts entendus (`aka.ms/secure-ai`, `aka.ms/secure-at`) : divergents, non vérifiés,
   ne pas les utiliser ; passer par le portail lié depuis bounty-ai.
 - **Donnée d'un tiers vue par accident (T1)** : la signaler tout de suite (« let us know immediately so we can
-  contact our customers »). Pendant la chasse : arrêt, aucune relecture, `bh-note blocked other` sans contenu.
-  Fait dédié, pause du programme et alerte à Mio : à construire.
+  contact our customers »). Pendant la chasse : arrêt, aucune relecture,
+  `bh-note blocked third-party-data "<where, no content>"`. Le runner parque alors le programme, arrête le segment
+  et pousse à Mio une alerte sans contenu (`src/bh/runner/run.py`, `StopWatcher`) ; `bh unpark` lève l'arrêt.
 - **Websockets** (mis à jour le 2026-11-25) : le gate a un mode websocket borné, activé par `websockets: true` dans
   le scope (refusé sinon) : cibles seulement, handshake jugé comme une requête cible, messages client limités par
   connexion (12/min, 64 Kio, 10 min, 2 connexions ; variables `BH_WS_*` du gate) et journalisés (taille, empreinte,
   extrait caviardé). `scopes/msrc/copilot.yaml` l'active, avec consigne de débit bas. `bh-browse` laisse alors passer
-  les websockets vers la cible (ligne « websockets: N opened to the target »). Que le chat Copilot passe par
-  websocket reste à mesurer au premier passage live ; s'il a un chemin HTTP, le préférer (plus de contrôles du gate).
+  les websockets vers la cible (ligne « websockets: N opened to the target »). Le chat Copilot passe par
+  websocket (constat live ci-dessous) ; un prompt ne part que par `bh-web`, jamais par un websocket direct ni un appel
+  d'API qui porte un prompt (cela sauterait le challenge).
 - **Hôtes de support** : les hôtes de connexion Microsoft (`login.live.com`…) et d'assets (`res.cdn.office.net`…)
   sont sortis de `in_scope` vers `support` : ils ne sont plus des cibles. `auth` ne sert qu'à l'enrôlement
   (`bh-login`), `assets` est en GET/HEAD sans cookies ni identité (voir `architecture.md` §2). `login.live.com` et
@@ -85,8 +89,8 @@ Détail et citations : skills `msrc-ai-bug-bounty` (barre, rapport), `msrc-copil
   (Mio) peut le résoudre lui-même dans le navigateur persistant de l'agent (brique P1). Le gate reste la seule
   frontière dure : chaque ouverture est minimale, journalisée et testée.
 - **Notes de la page MSRC reprises dans le scope** : la page déclare « copilot.microsoft.com and copilot.ai … when
-  tested using a personal account » (`copilot.ai` n'est pas encore une cible du YAML) ; « MSOBB » dans le nom du
-  compte si possible ; identifiant de conversation obtenu par `/id` dans la conversation, à joindre au rapport.
+  tested using a personal account » (`copilot.ai` n'est pas encore une cible du YAML) ; nos comptes gardent leur vrai
+  nom (décision de Mio) ; identifiant de conversation obtenu par `/id` dans la conversation, à joindre au rapport.
 - **À valider en live** : jetons obtenus (POST token 200 sous `user-a`, aucun refus `token_paths` ni pré-vol `OPTIONS`
   refusé dans `events.jsonl`), `/savedusers` en GET, websocket substrate ouvert et borné, événement `passthrough` avec
   des octets, aucune requête déchiffrée vers `challenges.cloudflare.com`, et le comportement de Turnstile dans
@@ -118,5 +122,5 @@ périmètre net, identité simple, `bh-browse` adapté, impact entre utilisateur
 juge. Les services cloud larges (Azure, Entra ID) viendront après la recette OAuth.
 
 **Réserve (2026-11-25)** : cette recommandation suppose que le chat Copilot soit joignable à travers le
-gate. S'il ne parle qu'en websocket (à mesurer), il passe par le mode websocket borné (voir « Compléments »), à
-valider en live avant la première chasse.
+gate. Il parle en websocket (constat live du 2026-11-25, ci-dessus) : il passe par le mode websocket borné (voir
+« Compléments ») et le chasseur le pilote par `bh-web` seulement, l'opérateur passant le challenge à la main.
