@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -112,6 +113,15 @@ class Support:
 
 
 @dataclass(frozen=True)
+class RecipientRule:
+    """One `recipient_guard` entry: `url`, a regex searched case-insensitively in the request URL (scheme, host,
+    path and query, raw and %-decoded); `note`, what route it is (from the host survey)."""
+
+    url: str
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class Scope:
     program: str
     platform: str
@@ -136,6 +146,12 @@ class Scope:
     # D27 (O28): data-free hosts the hunter may cite and load (GET/HEAD/OPTIONS, nothing of ours attached); never a
     # target, a subdomain of a target nor a support host. Read through `payload_hosts`.
     payload: tuple[str, ...] = ()
+    # D31: routes that name a recipient (a mail, an invitation): for a request whose URL one of these regexes matches,
+    # whoever sends it, the gate wants at least one e-mail address and every one of them our identities' own
+    # (bh.gate.recipients). None = the key is absent (bh.scope.guards wants it on an MSRC scope); () = no `send` route
+    recipient_guard: tuple[RecipientRule, ...] | None = None
+    # S8: the program's public rule pages, read on the host only (bh.rules); never what decides the scope
+    rules_url: tuple[str, ...] = ()
     forbidden_vulns: tuple[str, ...] = ()
     # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?, method?, headers?, json?}, enroll?,
     # origins?, role?, tenant?}; never a secret
@@ -203,6 +219,8 @@ _TOP_KEYS = {
     "cards",
     "protected_urls",
     "payload_hosts",
+    "recipient_guard",
+    "rules_url",
 }
 _RULE_KEYS = {"type", "value", "note"}
 _SUPPORT_KEYS = {"value", "kind", "note", "type", "token_paths", "get_paths"}
@@ -452,6 +470,8 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         cards=tuple(dict.fromkeys(cards)),
         protected_urls=_protected_urls(doc.get("protected_urls"), origin),
         payload=_payload_names(doc.get("payload_hosts"), origin),
+        recipient_guard=_recipient_guard(doc.get("recipient_guard", ...), origin),
+        rules_url=_rules_url(doc.get("rules_url"), origin),
         forbidden_vulns=tuple(doc.get("forbidden_vulns") or ()),
         identities=tuple(identities),
         source=doc.get("source"),
@@ -479,6 +499,49 @@ def _protected_urls(raw: Any, origin: str) -> tuple[str, ...]:
         except re.error as exc:
             raise ScopeError(f"{origin}: protected_urls[{i}] {r!r} is not a valid regex ({exc})") from exc
     return tuple(raw)
+
+
+def _recipient_guard(raw: Any, origin: str) -> tuple[RecipientRule, ...] | None:
+    """`recipient_guard: [{url: <regex>, note: <text>}]`. Absent: None; null or []: no route. A regex that does not
+    compile, an unknown key or an empty pattern is an error (fail closed, like protected_urls)."""
+    if raw is ...:
+        return None
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ScopeError(f"{origin}: 'recipient_guard' is a list of {{url: <regex>, note: <text>}}")
+    out = []
+    for i, entry in enumerate(raw):
+        ctx = f"{origin}: recipient_guard[{i}]"
+        if not isinstance(entry, dict) or set(entry) - {"url", "note"}:
+            raise ScopeError(f"{ctx}: a mapping {{url: <regex>, note: <text>}}")
+        pattern, note = entry.get("url"), entry.get("note", "")
+        if not isinstance(pattern, str) or not pattern.strip() or not isinstance(note, str):
+            raise ScopeError(f"{ctx}: 'url' is a non-empty regex, 'note' a text")
+        try:
+            re.compile(pattern, re.I)
+        except re.error as exc:
+            raise ScopeError(f"{ctx}: {pattern!r} is not a valid regex ({exc})") from exc
+        out.append(RecipientRule(pattern, note))
+    return tuple(out)
+
+
+def _rules_url(raw: Any, origin: str) -> tuple[str, ...]:
+    """`rules_url`: the program's public rule pages, https URLs (no credentials, no wildcard)."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(u, str) for u in raw):
+        raise ScopeError(f"{origin}: 'rules_url' is a list of https URLs")
+    for i, u in enumerate(raw):
+        try:
+            parts = urlsplit(u)
+            ok = parts.scheme == "https" and bool(parts.hostname) and parts.username is None
+            ok = ok and parts.port in (None, 443)
+        except ValueError:
+            ok = False
+        if not ok or "*" in u or any(c.isspace() for c in u):
+            raise ScopeError(f"{origin}: rules_url[{i}] {u!r} is not an https URL of a public page")
+    return tuple(dict.fromkeys(raw))
 
 
 _HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}")
