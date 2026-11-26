@@ -1493,10 +1493,11 @@ def _run_locked(
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
     prepare_workdir(board, scope, scope_file, identities)
     # targets behind a third-party challenge: bh-browser holds a live session, the operator is pushed any challenge
+    say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     watcher = None
     if browser_watch.wanted(scope):
-        browser_watch.prepare(scope, identities, None if quiet else (lambda m: print(m, flush=True)))
-        watcher = browser_watch.ChallengeWatcher()
+        browser_watch.prepare(scope, identities, say)
+        watcher = browser_watch.ChallengeWatcher(program=prog, identities=identities, say=say)
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
     pinned = classes.pinned_cards(scope)
@@ -1518,7 +1519,6 @@ def _run_locked(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     res = SegmentResult(program=prog, run_id=run_id, session_id=session)
     board.run_set(run_id, cards=",".join([*pinned, *cards]) or None)
-    say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     say(
         f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · "
         f"max {max_turns} turns / {minutes:g} min"

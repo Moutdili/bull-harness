@@ -141,6 +141,22 @@ def test_pinned_card_is_in_the_first_task(tmp_path, monkeypatch):
         classes.pinned_cards(s)
 
 
+def test_pinned_cards_from_a_real_loaded_scope(tmp_path):
+    """F1 made `scope.cards` a tuple, parsed and deduplicated by the loader: the runner injects it as is."""
+    from bh.scope import load_scope
+
+    f = tmp_path / "p.yaml"
+    f.write_text("program: p\nplatform: x\nin_scope: [app.t.test]\ncards: [prompt-injection, idor, prompt-injection]\n")
+    s = load_scope(f)
+    assert isinstance(s.cards, tuple) and s.cards == ("prompt-injection", "idor")
+    assert classes.pinned_cards(s) == ["prompt-injection", "idor"]
+    block = run.segment_cards(s, ["idor", "cors"])
+    assert block.count("## Indirect prompt injection") == 1 and "Program cards (pinned" in block
+    assert classes.card_text("cors") in block
+    f.write_text("program: p\nplatform: x\nin_scope: [app.t.test]\n")
+    assert load_scope(f).cards == () and classes.pinned_cards(load_scope(f)) == []
+
+
 def test_cards_mounted_read_only_for_the_agent():
     from pathlib import Path
 
@@ -212,29 +228,55 @@ def _ev(ts, where, identity, client="browser", **kw):
 
 def test_canary_seen_on_both_sides_is_verified_evidence():
     events = [
-        _ev(1, "request", "user-b", client="agent"),  # planted in B's data
+        _ev(1, "request-body", "user-b", client="agent"),  # planted in B's data
         _ev(2, "ws-server", "user-b"),  # B's own chat shows it
         _ev(3, "ws-server", "user-a"),  # A received it
     ]
     out = observation.decide(events, OBS)
     assert out["status"] == "verified-evidence" and "received by user-a" in out["why"]
+    out = observation.decide([_ev(1, "request-body", "user-b", client="agent"), _ev(2, "response-body", "user-a")], OBS)
+    assert out["status"] == "verified-evidence"
     # or B's browser sends it to a host only A's payload named (refused by the gate, logged)
-    out = observation.decide(
-        [_ev(1, "request", "user-b", client="agent"), _ev(5, "request", "user-b", host="evil.test")],
-        OBS,
-        offscope=lambda h: h == "evil.test",
-    )
-    assert out["status"] == "verified-evidence" and "evil.test" in out["why"]
+    for where in ("request-url", "request-body"):
+        out = observation.decide(
+            [_ev(1, "request-body", "user-b", client="agent"), _ev(5, where, "user-b", host="evil.test")],
+            OBS,
+            offscope=lambda h: h == "evil.test",
+        )
+        assert out["status"] == "verified-evidence" and "evil.test" in out["why"], where
+    # the same request from B's agent (not its browser), or to an in-scope host, proves nothing
+    for ev in (_ev(5, "request-url", "user-b", client="agent", host="evil.test"), _ev(5, "request-url", "user-b")):
+        out = observation.decide([ev], OBS, offscope=lambda h: h == "evil.test")
+        assert out["status"] == "inconclusive"
 
 
 def test_canary_typed_by_the_attacker_is_rejected():
-    events = [_ev(1, "request", "user-b"), _ev(2, "ws-client", "user-a"), _ev(3, "ws-server", "user-a")]
+    events = [_ev(1, "request-body", "user-b"), _ev(2, "ws-client", "user-a"), _ev(3, "ws-server", "user-a")]
     assert observation.decide(events, OBS)["status"] == "rejected"
-    # an anonymous sender counts as the attacker
-    events = [_ev(1, "request", None, client="agent"), _ev(3, "response", "user-a", client="agent")]
-    assert observation.decide(events, OBS)["status"] == "rejected"
-    # never seen on A's side
-    assert observation.decide([_ev(1, "request", "user-b")], OBS)["status"] == "inconclusive"
+    # an anonymous sender counts as the attacker, whatever part of the request carried it
+    for where in ("request-url", "request-body"):
+        events = [_ev(1, where, None, client="agent"), _ev(3, "response-body", "user-a", client="agent")]
+        assert observation.decide(events, OBS)["status"] == "rejected", where
+    # never seen on A's side; A's own request is not a sighting
+    assert observation.decide([_ev(1, "request-body", "user-b")], OBS)["status"] == "inconclusive"
+    assert observation.decide([_ev(1, "request-url", "user-a", client="agent")], OBS)["status"] == "inconclusive"
+    # the pre-gate names S3 assumed are not the gate's: they count for neither side
+    for old in ("request", "response"):
+        assert observation.decide([_ev(1, old, "user-a")], OBS)["status"] == "inconclusive"
+
+
+def test_observation_speaks_the_gates_canary_vocabulary():
+    """Every `where` the gate writes is classified exactly once (sent or received); every client is a plain string
+    the browser rule can match."""
+    from bh.gate import canary
+
+    assert set(canary.WHERE) == observation.SENT | observation.RECEIVED
+    assert not observation.SENT & observation.RECEIVED
+    assert set(canary.WHERE) >= observation.REQUEST and "browser" in canary.CLIENTS
+    for client in canary.CLIENTS:  # the attacker's side counts whatever client fetched it
+        assert observation.decide([_ev(1, "response-body", "user-a", client=client)], OBS)["status"] == (
+            "verified-evidence"
+        )
 
 
 def test_observation_journal_and_ingestion(tmp_path, monkeypatch):
@@ -243,7 +285,7 @@ def test_observation_journal_and_ingestion(tmp_path, monkeypatch):
     log.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         {"kind": "blocked", "url": "https://x.test/"},
-        {**_ev(1, "request", "user-b", client="agent"), "program": "p"},
+        {**_ev(1, "request-body", "user-b", client="agent"), "program": "p"},
         {**_ev(2, "ws-server", "user-a"), "program": "p"},
         {**_ev(3, "ws-server", "user-a"), "program": "other"},
     ]
@@ -387,18 +429,39 @@ def test_finding_and_board_fence_the_hunters_text(tmp_path, monkeypatch, capsys)
 
 
 def test_rotate_commands_never_print_the_secret(monkeypatch, capsys):
-    import types
-
+    """B1: `bh notify rotate` and `bh ui rotate-token` call the real rotations and print only where to read."""
     from bh import cli
+    from bh.browser_service import notify
+    from bh.ui import server
 
-    fake = types.SimpleNamespace(rotate=lambda: "NEW-TOPIC-VALUE")
-    monkeypatch.setitem(__import__("sys").modules, "bh.browser_service.notify", fake)
+    called = []
+    monkeypatch.setattr(notify, "rotate", lambda: called.append("ntfy") or "bh-NEW-TOPIC-VALUE-0123456789")
+    monkeypatch.setattr(server, "rotate_token", lambda: called.append("ui") or "NEW-UI-TOKEN-VALUE")
     assert cli.main(["notify", "rotate"]) == 0
-    out = capsys.readouterr().out
-    assert "NEW-TOPIC-VALUE" not in out and "cat secrets/ntfy.env" in out
-    monkeypatch.setitem(__import__("sys").modules, "bh.ui.server", types.SimpleNamespace())  # not written yet
-    assert cli.main(["ui", "rotate-token"]) == 2
-    assert "does not exist yet" in capsys.readouterr().err
+    assert cli.main(["ui", "rotate-token"]) == 0
+    cap = capsys.readouterr()
+    assert called == ["ntfy", "ui"]
+    for secret in ("NEW-TOPIC-VALUE", "NEW-UI-TOKEN-VALUE"):
+        assert secret not in cap.out and secret not in cap.err
+    assert f"cat {notify.env_path()}" in cap.out and f"cat {server.token_path()}" in cap.out
+
+
+def test_rotate_commands_write_a_new_secret_they_never_show(tmp_path, monkeypatch, capsys):
+    from bh import cli, paths
+    from bh.browser_service import notify
+    from bh.ui import server
+
+    monkeypatch.setattr(paths, "secrets_dir", lambda: tmp_path)
+    for argv, read in ((["notify", "rotate"], notify.topic), (["ui", "rotate-token"], server.ui_token)):
+        assert cli.main(argv) == 0
+        first = read()
+        assert cli.main(argv) == 0
+        second = read()
+        cap = capsys.readouterr()
+        assert first and second and first != second
+        assert first not in cap.out + cap.err and second not in cap.out + cap.err
+    assert (tmp_path / "ntfy.env").stat().st_mode & 0o077 == 0
+    assert (tmp_path / "ui.token").stat().st_mode & 0o077 == 0
 
 
 def test_quiet_run_prints_counts_only(monkeypatch, capsys):

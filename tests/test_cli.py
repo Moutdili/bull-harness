@@ -132,3 +132,30 @@ def test_browser_view_prints_the_captcha_page(capsys):
 
 def test_browser_reset_needs_confirmation(capsys):
     assert main(["browser", "reset"]) == 2
+
+
+def test_browser_load_goes_through_host_load(monkeypatch, capsys):
+    """`bh browser load` uses host.load, which writes browser-identity.json for the gate (I2)."""
+    from bh.browser_service import host as bhost
+
+    calls = []
+    monkeypatch.setattr(bhost, "identity_payload", lambda program, name: ({"op": "load"}, ["X-Api-Key"]))
+    monkeypatch.setattr(
+        bhost, "load", lambda program, name: calls.append((program, name)) or {"code": 200, "cookies": 3}
+    )
+    monkeypatch.setattr(bhost, "call", lambda *a, **k: pytest.fail("a raw call skips browser-identity.json"))
+    assert main(["browser", "load", DEMO, "user-a"]) == 0
+    out = capsys.readouterr().out
+    assert calls == [("demo", "user-a")] and "3 cookie(s)" in out and "X-Api-Key" in out
+
+
+def test_browser_reset_goes_through_host_reset_with_force(monkeypatch, capsys):
+    from bh.browser_service import host as bhost
+
+    calls = []
+    monkeypatch.setattr(bhost, "reset", lambda program="", force=False: calls.append((program, force)) or {"code": 200})
+    monkeypatch.setattr(bhost, "call", lambda *a, **k: pytest.fail("a raw call skips browser-identity.json"))
+    assert main(["browser", "reset", "--yes"]) == 0
+    assert main(["browser", "reset", "--yes", "--force", "--scope", DEMO]) == 0
+    assert calls == [("", False), ("demo", True)]
+    assert main(["browser", "reset", "--force"]) == 2 and len(calls) == 2  # --force never replaces --yes
