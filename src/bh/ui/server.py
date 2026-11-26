@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from bh import paths, stack
 from bh.agent.contract import SEVERITIES, tail_jsonl
 from bh.board import Board
-from bh.text import clip, escape_tree
+from bh.text import clip, escape_invisible, escape_tree
 
 STATIC = Path(__file__).parent / "static"
 COOKIE = "bh_ui"
@@ -249,6 +249,56 @@ def provenance(f: dict) -> dict:
             "status": f.get("status") or "",
             "verdict": f.get("verdict") or "",
         },
+    }
+
+
+def _table_cols(b: Board, table: str) -> set[str]:
+    return {r["name"] for r in b.rows(f"PRAGMA table_info({table})")}
+
+
+def lineage_programs(b: Board) -> list[str]:
+    """Programs with agents or credit lines (tables of W2: absent on an older board, then an empty list)."""
+    progs: set[str] = set()
+    for table in ("agents", "ledger"):
+        if "program" in _table_cols(b, table):
+            progs |= {r["program"] for r in b.rows(f"SELECT DISTINCT program FROM {table}")}
+    return sorted(progs)
+
+
+def lineage(b: Board, program: str) -> dict:
+    """The page « Lignée »: agents and their credit by signal (the ledger as the runner last computed it), the cost of
+    their run next to it, never mixed with it. Host facts and agent text are split: the pseudo is the agent's word
+    (escaped, in `declared`), every other field is the host's."""
+    from bh.lineage import score
+
+    cols = _table_cols(b, "agents")
+    agents, declared = [], []
+    if {"no", "program"} <= cols:
+        pick = [k for k in ("no", "generation", "run_id", "status") if k in cols]
+        for r in b.rows(
+            f"SELECT {', '.join(pick)}{', pseudo' if 'pseudo' in cols else ''} FROM agents WHERE program=? ORDER BY no",
+            program,
+        ):
+            a = {k: r[k] for k in pick}
+            run = (
+                b.rows("SELECT cost_usd, verify_cost FROM runs WHERE id=?", a.get("run_id")) if a.get("run_id") else []
+            )
+            a["cost_usd"] = run[0]["cost_usd"] if run else None
+            a["verify_cost"] = run[0]["verify_cost"] if run else None
+            agents.append(a)
+            if "pseudo" in cols:
+                declared.append({"no": r["no"], "pseudo": escape_invisible(str(r["pseudo"] or "")[:80])})
+    s = score.summary(b, program)
+    for a in agents:
+        a["credit"] = s["by_agent"].get(a["no"], {})
+        a["points"] = sum(a["credit"].values())
+    return {
+        "program": program,
+        "agents": agents,
+        "declared": declared,
+        "ledger": s["by_signal"],
+        "honor": score.honor_roll(b, program),
+        "weights_sha256": score.weights_sha256(),
     }
 
 
@@ -577,6 +627,10 @@ class Handler(BaseHTTPRequestHandler):
             return list(reversed(tail_jsonl(paths.events_log(), int(bounded(q.get("n"), 200, 1, 2000)))))
         if path == "/api/programs":
             return self._programs(b)
+        if path == "/api/lineage":
+            return {"programs": lineage_programs(b)}
+        if m := re.fullmatch(r"/api/lineage/([A-Za-z0-9_.-]+)", path):
+            return lineage(b, m.group(1))
         if m := re.fullmatch(r"/api/board/([A-Za-z0-9_.-]+)", path):
             prog = m.group(1)
             return {
