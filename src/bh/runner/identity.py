@@ -3,6 +3,10 @@
 `setup()` gathers every knob that shapes a segment (model, effort, judge, budget, rendered system prompt, task
 template, loaded cards, scope digest, rate, identity names and roles, Claude Code version of the image, daily caps,
 fill and prompt budgets, BH_PREFLIGHT) into a canonical JSON document (sorted keys, no whitespace) and its sha256.
+Wave W2 (D9) adds what makes an agent relaunchable as it was: the hook layer (`hooks_sha256`: the agent's
+hooks/settings.json and bh.agent.mcp_policy), the gate policy (`policy_sha256`), the doctrine opening, the naming
+rule (`pseudo_rule` = bh.lineage.names.TABLES_SHA256) and whether the pseudo is shown (BH_LINEAGE_PSEUDO), the score
+weights (lot G's `score.weights_sha256()`, empty while it does not exist) and the recall parameters.
 Two segments set up alike share a condensate; any change to one knob changes it. The document never holds a
 secret: identities are names and roles (never a session, a credential or a recipe), texts are condensates.
 
@@ -13,11 +17,13 @@ touched.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
+from pathlib import Path
 
-from bh import classes
+from bh import classes, redact
 
 # (column, type) added to `runs`; created here, never in bh.board.db.MIGRATIONS
 COLUMNS = (
@@ -84,6 +90,51 @@ def _card(name: str) -> dict:
     return {"name": name, "sha256": digest}
 
 
+_BH = Path(__file__).resolve().parents[1]  # src/bh
+HOOK_FILES = (
+    ("container/agent/hooks/settings.json", _BH.parents[1] / "container" / "agent" / "hooks" / "settings.json"),
+    ("src/bh/agent/mcp_policy.py", _BH / "agent" / "mcp_policy.py"),
+)
+POLICY_FILE = _BH / "gate" / "policy.py"
+DOCTRINE_OPENING = "a"  # default opening of the doctrine since wave W2
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def hooks_sha256() -> str:
+    """One condensate for the hook layer: {repo-relative name: sha256 of the file (None if missing)}."""
+    return sha256(canonical({name: file_sha256(p) for name, p in HOOK_FILES}))
+
+
+def policy_sha256() -> str:
+    return file_sha256(POLICY_FILE) or ""
+
+
+def score_weights_sha256() -> str:
+    """Lot G's score weights condensate; "" while that module is not there (or cannot answer)."""
+    for mod in ("bh.lineage.score", "bh.score"):
+        try:
+            module = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            return str(module.weights_sha256())
+        except Exception:  # noqa: BLE001 (an absent or broken score never stops a segment from starting)
+            return ""
+    return ""
+
+
+def pseudo_shown_setting(env=None) -> str:
+    """BH_LINEAGE_PSEUDO as the segment runs with it: "0" (pseudo hidden from the agent) or "1" (the default)."""
+    env = os.environ if env is None else env
+    return "0" if str(env.get("BH_LINEAGE_PSEUDO", "1")).strip() == "0" else "1"
+
+
 def setup(
     scope,
     *,
@@ -102,8 +153,14 @@ def setup(
     fill_day: int,
     prompt_quantum: int,
     prompt_floor: int,
+    doctrine_opening: str = DOCTRINE_OPENING,
+    recall_params: dict | None = None,
+    pseudo_shown: str | None = None,
 ) -> tuple[str, dict]:
-    """(sha256 of the canonical document, the document)."""
+    """(sha256 of the canonical document, the document). `recall_params`: what the agent is given of its elders
+    (counts, windows), numbers and names only; `pseudo_shown` defaults to BH_LINEAGE_PSEUDO."""
+    from bh.lineage import names
+
     doc = {
         "model": model,
         "effort": effort,
@@ -130,5 +187,13 @@ def setup(
         "PROMPT_QUANTUM": int(prompt_quantum),
         "PROMPT_FLOOR": int(prompt_floor),
         "BH_PREFLIGHT": preflight_setting(scope),
+        # D9 (wave W2)
+        "hooks_sha256": hooks_sha256(),
+        "policy_sha256": policy_sha256(),
+        "doctrine_opening": str(doctrine_opening),
+        "pseudo_rule": names.TABLES_SHA256,
+        "pseudo_shown": pseudo_shown_setting() if pseudo_shown is None else str(pseudo_shown),
+        "score_weights_sha256": score_weights_sha256(),
+        "recall_params": redact.data(dict(recall_params or {})),
     }
     return sha256(canonical(doc)), doc
