@@ -32,7 +32,11 @@ in_scope:
   # for Microsoft online services). Each one was seen in the app's code or traffic, our own objects only.
   - {value: "https://copilot.cloud.microsoft/", note: "where consumer share links open (/chat/share/<base64 {shareId, conversationId}>); our own shares only"}
   - {value: "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads", note: "file upload: the user's own OneDrive 'Copilot uploads' folder"}
+  - {value: "https://graph.microsoft.com/v1.0/me/people", note: "people picker of the notebook invite (our own account's people list, seen 2026-11-26)"}
   - {value: "https://substrate.office.com/recommended/api/", note: "Notebooks (Loop workspaces): recent, deltasync, findsession"}
+  - {value: "https://home.microsoftpersonalcontent.com/contentstorage/", note: "Notebook storage (SharePoint Embedded container of the account, seen 2026-11-26); our own notebooks only"}
+  - {value: "pus4-collabhubrtc.officeapps.live.com", note: "Loop/Fluid real-time collaboration of a notebook (seen 2026-11-26)"}
+  - {value: "https://home.microsoftpersonalcontent.com/_api/v2.1/drives/b!", note: "Notebook container drive API (SharePoint Embedded drives only, seen 2026-11-26); our own notebooks only"}
 # program and browser cards, pinned in every task from the first leg (audit I7; src/bh/cards/)
 cards: [msrc-copilot, bh-web-manual]
 # chat traffic only from bh-browser (audit B2): a prompt reaches Copilot through the one browser where the operator solves
@@ -103,6 +107,15 @@ identities:
         - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
         - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
         - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
+        # copilot.cloud.microsoft (where consumer share links open, 2026-11-26) keeps a session of its own: sign in there too
+        - {goto: "https://copilot.cloud.microsoft/chat"}
+        - {fill: "input[type=email]", value: "{email}", optional: true, timeout: 20}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
+        - {fill: "input[type=password]", value: "{password}", optional: true, timeout: 10}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
+        - {wait_for: {url: "copilot.cloud.microsoft"}, optional: true, timeout: 60}
       capture: {cookies: true, authorization: true}
   - name: user-b
     origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
