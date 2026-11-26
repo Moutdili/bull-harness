@@ -18,7 +18,7 @@ from bh import paths, redact
 from bh.agent import contract as c
 from bh.agent import proof
 from bh.board import Board
-from bh.board.db import FINDING_FIELDS
+from bh.board.db import FINDING_FIELDS, HONESTY_FIELDS, HONESTY_MAX
 from bh.classes import canonical
 from bh.runner import observation
 from bh.scope import Scope
@@ -101,7 +101,11 @@ def _revive(board: Board, program: str, title: str, fields: dict, doc) -> int | 
     if not rows:
         return None
     fid = int(rows[0]["id"])
-    keep = {k: v for k, v in fields.items() if k in ("severity", "summary", "poc", "evidence", "not_proven")}
+    keep = {
+        k: v
+        for k, v in fields.items()
+        if k in ("severity", "summary", "poc", "evidence", "not_proven", *HONESTY_FIELDS)
+    }
     board.finding_set(fid, proof=json.dumps(doc), replay=None, **keep)
     board.set_finding(fid, "new", "new proof received from the hunter: verified once more")
     return fid
@@ -112,24 +116,36 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
     match n.get("op"):
         case "fact":
             kind = _s(n.get("kind") or "fact", 40)
+            kind = kind if kind in c.FACT_KINDS else "fact"
+            title, summary = _hunter_title(_s(n.get("title"), 300)), _s(n.get("summary"))
+            if kind == "handoff":  # read by the next session and the operator: no credential crosses it (T7)
+                title, summary = redact.text(title), redact.text(summary)
             board.add_fact(
                 program,
-                _hunter_title(_s(n.get("title"), 300)),
-                _s(n.get("summary")),
+                title,
+                summary,
                 _s(n.get("evidence")),
                 # blocker and harness facts are the host's (add_blocker, ingestion): a note cannot forge them
-                kind=kind if kind in c.FACT_KINDS else "fact",
+                kind=kind,
                 run_id=run_id,
             )
             return 1, 0, 0
+        case "handoff":
+            board.add_fact(program, *_handoff(n), kind="handoff", run_id=run_id)
+            return 1, 0, 0
         case "intent":
-            board.add_intent(program, _s(n.get("title"), 300), run_id=run_id)
+            board.add_intent(
+                program,
+                _s(n.get("title"), 300),
+                run_id=run_id,
+                **{k: _s(n.get(k), c.CRITERION_MAX).strip() or None for k in c.REACHED},
+            )
         case "done":
             if m := INTENT_ID.fullmatch(_s(n.get("intent_id"), 20)):
-                board.close_intent(int(m.group(1)), _s(n.get("outcome")))
+                return _done(board, program, run_id, int(m.group(1)), n)
         case "finding":
             fields = {k: n.get(k) for k in FINDING_FIELDS if k not in ("vuln_class", "proof", "observation")}
-            fields = {k: _s(v, 20000) for k, v in fields.items()}
+            fields = {k: _s(v, HONESTY_MAX if k in HONESTY_FIELDS else 20000) for k, v in fields.items()}
             fields["poc"] = redact.text(fields.get("poc", ""))
             doc = n.get("proof")
             if doc is not None and proof.validate(doc):  # re-checked on the host: the sandbox check is advisory
@@ -139,6 +155,8 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
             obs = observation.valid(n.get("observation")) if doc is None and "observation" in n else None
             if doc is None and "observation" in n and obs is None:
                 fields["not_proven"] = (fields.get("not_proven", "") + " [observation refused by the host]").strip()
+            elif obs is not None and "control" not in obs:  # N6: kept, but the host's verdict stops at inconclusive
+                fields["not_proven"] = (fields.get("not_proven", "") + " [no control k/N without A's payload]").strip()
             title = _s(n.get("title"), 300)
             if _revive(board, program, title, fields, doc) is not None:
                 return 0, 1, 0
@@ -178,6 +196,51 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
                 return 1, 0, 0
             board.add_blocker(program, _hunter_reason(kind), title, _s(n.get("detail")), run_id=run_id)
             return 0, 0, 1
+    return 0, 0, 0
+
+
+def _handoff(n: dict) -> tuple[str, str]:
+    """(title, summary) of a `bh-note handoff` (T7 a): "HANDOFF: <state>" and the four rubrics, one line each, in
+    their fixed order. A rubric the note lacks is shown empty, never dropped. Both go through bh.redact."""
+    rubric = {k: " ".join(_s(n.get(k), 480).split()) for k in ("state", "dead", "next", "files")}
+    title = _hunter_title(f"HANDOFF: {rubric['state']}"[:300])
+    return redact.text(title), redact.text("\n".join(f"{k}: {v}" for k, v in rubric.items()))
+
+
+def _done(board: Board, program: str, run_id: int, iid: int, n: dict) -> tuple[int, int, int]:
+    """Close an intent (T8). `reached` is kept only for an intent with exit criteria; such an intent closed without it
+    is closed all the same, reached NULL, and a harness fact says so. `--reached abandon` also records the lead as a
+    dead end, under the intent's title, in the run of this note. Returns (facts, findings, blockers) added."""
+    rows = board.rows("SELECT title, success, abandon FROM intents WHERE id=? AND program=?", iid, program)
+    reached = _s(n.get("reached"), 20)
+    reached = reached if reached in c.REACHED else None
+    outcome = _s(n.get("outcome"))
+    if not rows:
+        board.close_intent(iid, outcome)  # as before: an unknown id updates nothing
+        return 0, 0, 0
+    intent = rows[0]
+    if not (intent["success"] or intent["abandon"]):
+        board.close_intent(iid, outcome)  # no criteria: nothing to reach (a --reached here is not stored)
+        return 0, 0, 0
+    board.close_intent(iid, outcome, reached)
+    if reached is None:
+        board.add_fact(
+            program,
+            f"I{iid} closed without --reached",
+            "the intent had exit criteria (--success / --abandon); its `done` did not say which one was met",
+            kind="harness",
+            run_id=run_id,
+        )
+        return 1, 0, 0
+    if reached == "abandon":
+        board.add_fact(
+            program,
+            _hunter_title(intent["title"]),
+            f"abandoned (criterion: {_s(intent['abandon'], 300) or 'none given'}): {outcome}",
+            kind="dead-end",
+            run_id=run_id,
+        )
+        return 1, 0, 0
     return 0, 0, 0
 
 

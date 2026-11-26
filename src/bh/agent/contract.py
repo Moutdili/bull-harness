@@ -92,6 +92,37 @@ CHALLENGE_BLOCKER_TTL_S = 30 * 60
 # Canary of an observation proof (audit I1): planted by the hunter in the victim's data only, then found by the gate in
 # what the attacker receives. The gate logs {"kind": "canary", "token", "where", "identity", "client", ...}.
 CANARY_RE = re.compile(r"BH-SECRET-[0-9a-f]{16}")
+# The control of an observation proof (audit N6): the same steps without the attacker's payload, run N times; k is how
+# many times the canary crossed all the same. Written "k/N", 1 <= N <= 1000, k <= N. Without it (or with k > 0) the
+# content of A is not shown to be the cause: the host's verdict is `inconclusive`, never `verified-evidence`.
+CONTROL_RE = re.compile(r"(\d{1,4})/(\d{1,4})")
+CONTROL_MAX = 1000
+# Exit criteria of an intent (bh-note intent --success/--abandon) and how `bh-note done --reached` names the one met
+REACHED = ("success", "abandon")
+CRITERION_MAX = 300  # stored length of one criterion (board)
+CRITERION_SHOWN = 120  # shown length in the frontier
+# The frontier writes an open intent with criteria as "- I<n> <title> · success: <...> · abandon: <...>"
+_FRONTIER_INTENT = re.compile(r"^- I(\d{1,12}) ")
+_FRONTIER_CRITERIA = re.compile(r" · (success|abandon): ")
+
+
+def parse_control(value: object) -> tuple[int, int] | None:
+    """(k, N) of a well-formed control "k/N", else None (a sandbox-written value: never trusted as typed)."""
+    m = CONTROL_RE.fullmatch(value) if isinstance(value, str) else None
+    if m is None:
+        return None
+    k, n = int(m.group(1)), int(m.group(2))
+    return (k, n) if 1 <= n <= CONTROL_MAX and k <= n else None
+
+
+def intent_has_criteria(frontier: str, intent_id: int) -> bool | None:
+    """Whether the frontier shows open intent I<intent_id> with an exit criterion; None when it is not listed."""
+    for line in frontier.splitlines():
+        m = _FRONTIER_INTENT.match(line)
+        if m and int(m.group(1)) == intent_id:
+            return bool(_FRONTIER_CRITERIA.search(line))
+    return None
+
 
 NOTES, COVERAGE, ENDPOINTS, TOUCHED, COMMANDS = (
     "notes.jsonl",
@@ -454,6 +485,7 @@ MAPPERS = (
     "bh-browse",
     "bh-zap",
     "bh-authz",
+    "bh-js",  # reads an app's JavaScript bundles for routes and actions: mapping, neither a scan nor a manual request
     "katana",
     "subfinder",
     "httpx-toolkit",
