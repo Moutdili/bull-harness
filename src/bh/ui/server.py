@@ -345,19 +345,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 (said, the screen still works)
             sys.stderr.write(f"ui: human_viewing {on}: {type(exc).__name__}\n")
 
+    def _viewing_lock(self) -> threading.Lock:
+        return self.server.__dict__.setdefault("viewing_lock", threading.Lock())  # dict.setdefault: atomic
+
     def _viewing_start(self) -> threading.Event:
-        """Count this screen in; the first one tells the controller, and a ticker re-asserts it every
-        VIEWING_REFRESH_S while this screen stays open (the controller forgets it after its own TTL)."""
+        """Count this screen in and tell the controller; a ticker re-asserts it every VIEWING_REFRESH_S while this
+        screen stays open (the controller forgets it after its own VIEWING_TTL_S). Every tell happens under the
+        lock, and a ticker checks its stop flag under it: a closed screen's late `on` never lands after the
+        last screen's `off`."""
         srv = self.server.__dict__
-        lock = srv.setdefault("viewing_lock", threading.Lock())
+        lock = self._viewing_lock()
         with lock:
             srv["viewers"] = srv.get("viewers", 0) + 1
-        self._tell_viewing(True)
+            self._tell_viewing(True)
         stop = threading.Event()
 
         def tick() -> None:
             while not stop.wait(VIEWING_REFRESH_S):
-                self._tell_viewing(True)
+                with lock:
+                    if stop.is_set():
+                        return
+                    self._tell_viewing(True)
 
         threading.Thread(target=tick, daemon=True).start()
         return stop
@@ -365,11 +373,10 @@ class Handler(BaseHTTPRequestHandler):
     def _viewing_stop(self, stop: threading.Event) -> None:
         stop.set()
         srv = self.server.__dict__
-        with srv.setdefault("viewing_lock", threading.Lock()):
+        with self._viewing_lock():
             srv["viewers"] = max(0, srv.get("viewers", 1) - 1)
-            last = srv["viewers"] == 0
-        if last:
-            self._tell_viewing(False)
+            if srv["viewers"] == 0:
+                self._tell_viewing(False)
 
     def _captcha_ws(self) -> None:
         from bh.ui import ws

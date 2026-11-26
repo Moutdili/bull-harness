@@ -7,7 +7,7 @@ profile, behind the gate) and one Playwright client attached over CDP (loopback)
   goto, fill, click, press, text, wait, state, outline, attr, net, tabs, upload, frames, switch. Never cookies,
   storage, raw CDP, script evaluation or screenshots.
 - the host's control socket (RUN_DIR, 0700): reached only by `podman exec -i ... host`, JSON on stdin:
-  load_session, status, reset, human_done, human_viewing, fill_budget_reset, switch_refused.
+  load_session, status, reset, human_done, human_viewing, fill_budget_reset, switch_refused, snapshot.
 
 The browser is the distribution's Chromium as it ships: no flag that hides automation, no user agent of ours,
 not headless. While a human challenge is on screen, click/fill/press/upload are refused: the agent never touches
@@ -270,6 +270,7 @@ SPEC: dict[str, dict[str, tuple[bool, Any]]] = {
     "human_done": {},
     "human_viewing": {"on": (True, lambda v: _bool(v, "on"))},
     "fill_budget_reset": {},
+    "snapshot": {},
     "switch_refused": {
         "identity": (True, lambda v: _name(v, "identity")),
         "reason": (True, lambda v: _str(v, "reason", 1, 200)),
@@ -683,6 +684,27 @@ class Controller:
         f["segment"] = 0
         self._write(FILLS_FILE, f)
         return {"ok": True, "fills": self._fills_left()}
+
+    def _op_snapshot(self) -> dict[str, Any]:
+        """What detect.challenge() reads of the page (url, title, visible text head and tail, child frames), with
+        its verdict: the host saves it as a test fixture (host.save_snapshot). Never the HTML: no hidden input (a
+        Turnstile answer), no script, no attribute; and scrubbed like every reply."""
+        snap = self.driver.snapshot()
+        secrets = self._all_secrets()
+        frames = [
+            {"url": scrub_url(str(f.get("url") or ""), secrets), "visible": f.get("visible")}
+            for f in snap.get("frames") or []
+            if isinstance(f, dict)
+        ]
+        text = str(snap.get("text") or "")
+        out = {
+            "url": scrub_url(str(snap.get("url") or ""), secrets),
+            "title": str(snap.get("title") or "")[:200],
+            "text": text,
+            "text_len": snap.get("text_len") if isinstance(snap.get("text_len"), int) else len(text),
+            "frames": frames,
+        }
+        return {"snapshot": out, "challenge": challenge(out), "taken_at": self.clock()}
 
     def _op_switch_refused(self, identity: str, reason: str) -> dict[str, Any]:
         if self.switch_requested == identity:

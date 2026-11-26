@@ -42,6 +42,7 @@ AGENT_OPS = frozenset(
 )
 HOST_OPS = frozenset(
     {"load_session", "status", "reset", "human_done", "human_viewing", "fill_budget_reset", "switch_refused"}
+    | {"snapshot"}
 )
 # While the operator has the screen open (/captcha/ws), the agent may only read.
 VIEWING_OPS = frozenset({"state", "text", "frames"})
