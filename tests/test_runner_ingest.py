@@ -41,7 +41,11 @@ def test_blocked_closes_its_intent_and_old_todos_become_blockers(tmp_path):
         ],
     )
     assert ingest.notes(b, "p", 1, f) == (1, 0, 4)
-    assert b.rows("SELECT status, outcome FROM intents")[0][:] == ("closed", "blocked: account")
+    assert b.rows("SELECT status, result, outcome FROM intents")[0][:] == (
+        "closed",
+        "blocked: account",
+        "open_proof_gap",
+    )
     titles = [r["title"] for r in b.rows("SELECT title FROM facts WHERE kind='blocker' ORDER BY id")]
     assert titles == ["[account] needs a 2nd account", "[other] x", "[waf] old waf todo", "[other] old quota todo"]
     assert b.rows("SELECT kind FROM facts WHERE title LIKE 'is cdn%'")[0]["kind"] == "out-of-scope"

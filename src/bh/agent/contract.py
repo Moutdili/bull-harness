@@ -62,7 +62,32 @@ RULES_MARK = "[bh-rules]"  # prefix of a denial imposed by the program's rules
 SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
 WORK_ROOT = "/work"  # the agent's work volume (var/work on the host)
 # Fact kinds the agent may write. "blocker" is not one: the host writes it from `bh-note blocked` and gate events.
-FACT_KINDS = ("fact", "recon", "handoff", "dead-end")
+# `think` (D15): a line of the agent's reasoning, never grounded. `threat-model` (T16): one active per program, the
+# latest; an older one stays with its date.
+FACT_KINDS = ("fact", "recon", "handoff", "dead-end", "think", "threat-model")
+# Why a lead is a dead end (T13): required with `-k dead-end`, shown on the frontier
+DEAD_END_WHY = ("technical", "environment", "approach", "external", "rule")
+# A fact's quote (T12): one line, at most QUOTE_MAX characters, an exact substring of the response body of a gate flow
+# of the run (the host checks it, after bh.redact). Shorter than QUOTE_MIN it anchors nothing ("{" is in every body).
+QUOTE_MAX = 400
+QUOTE_MIN = 10
+RECENT_FLOWS = 200  # a quote without --flow is looked for in the run's last RECENT_FLOWS target flows
+FLOW_ID_RE = re.compile(r"\d{1,12}-[0-9a-f]{6}-\d{1,12}")  # the gate's flow ids (gate/addon.py, _record)
+# Typed intents (T15): map needs no recall; test and prove carry one (`--recall R-<id>` or `none`). A prove is refused
+# by the host without a grounded fact on the same endpoint.
+INTENT_KINDS = ("map", "test", "prove")
+RECALL_NEEDED = ("test", "prove")
+RECALL_RE = re.compile(r"R-[A-Za-z0-9_.:-]{1,64}|none")
+# How an intent ends (T13), beside --reached: what the hunt learned. An intent a run leaves open is an open proof gap.
+INTENT_OUTCOMES = ("confirmed", "ruled_out", "open_proof_gap")
+# Coverage of one (endpoint, class) (T14). `clean` stands only on an endpoint the gate saw tested by hand in the run:
+# the host stores it as `retry` otherwise. Lack of information is never a proof of safety.
+COVER_OUTCOMES = ("clean", "suspect", "blocked", "retry")
+THREAT_MODEL_LINES = 8  # lines of a threat model (T16); a line cites its receipt as `<claim> :: <exact quote>`
+THREAT_QUOTE_SEP = " :: "
+INFERRED = " (inferred)"  # added by the host to a threat-model line without an anchored quote
+# A request to widen the scope (D40): an https URL prefix the agent saw used, judged on the host, never by the agent
+SCOPE_REQUEST_STATUS = ("pending", "approved", "refused", "revoked")
 # Why a lead is blocked. Nobody unblocks the agent during the hunt: a blocker closes the lead, it pages no one.
 BLOCKER_REASONS = (
     "auth",
@@ -313,6 +338,47 @@ def endpoint_key(url: str, method: str = "GET") -> tuple[str, str] | None:
     if o is None:
         return None
     return o, f"{method.upper()} {path_key(urlsplit(url).path)}"
+
+
+_LABEL = re.compile(r"([A-Za-z]{3,7})\s+(\S+)")
+
+
+def endpoint_label(value: object, method: str = "GET") -> str | None:
+    """`"METHOD route"` of a typed note (facts.endpoint, intents.endpoint, coverage_class.endpoint): the route as
+    endpoint_key and family make it (/basket/7 -> /basket/{id}), without the origin. Accepts a URL, `METHOD URL`,
+    `/route` or `METHOD /route`; None for anything else (a sandbox value: never trusted as typed)."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        return None
+    s = value.strip()
+    if m := _LABEL.fullmatch(s):
+        method, s = m.group(1), m.group(2)
+    method = method.upper()
+    if s.startswith(("http://", "https://")):
+        k = endpoint_key(s, method)
+        return family(k[1]) if k else None
+    if s.startswith("/") and not s.startswith("//") and not any(ch.isspace() for ch in s):
+        return family(f"{method} {path_key(s)}")
+    return None
+
+
+def scope_prefix(value: object) -> str | None:
+    """A scope request's prefix (D40), normalized: `https://host[:port]/path`, no joker, no query, no fragment, no
+    credentials, no whitespace. None when it is not one."""
+    if not isinstance(value, str) or not value or len(value) > 500 or any(ch.isspace() for ch in value):
+        return None
+    if "*" in value or "?" in value or "#" in value or "\\" in value:
+        return None
+    try:
+        p = urlsplit(value)
+        port = p.port
+    except ValueError:
+        return None
+    if p.scheme != "https" or not p.hostname or "@" in p.netloc or "%" in p.netloc:
+        return None
+    host = p.hostname.lower().rstrip(".")
+    if not re.fullmatch(r"([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?", host):
+        return None  # a name with a dot and a letter TLD: no IP address, no single label
+    return f"https://{host}{f':{port}' if port and port != 443 else ''}{p.path or '/'}"
 
 
 def query_params(url: str) -> list[str]:
