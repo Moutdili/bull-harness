@@ -40,7 +40,8 @@ def test_fill_split_and_marker_validation():
 
 def test_mapper_without_xss_scanner_with_it():
     assert b.phase_kind(b.parse_args(["http://h/"])) == "mapper"
-    assert b.phase_kind(b.parse_args(["http://h/", "--xss", "bhX1"])) == "scanner"
+    assert b.phase_kind(b.parse_args(["http://h/", "--xss", "bhX1"])) == "mapper"  # one page: an observation
+    assert b.phase_kind(b.parse_args(["http://h/", "--xss", "bhX1", "--routes"])) == "scanner"
     for cmd in ("bh-browse http://h/", "bh-agent browse http://h/ --routes"):
         assert c.runs_mapper(cmd) and not c.runs_scanner(cmd) and c.uses_arsenal(cmd), cmd
     for cmd in (
@@ -60,9 +61,13 @@ def test_xss_refused_without_scanners(monkeypatch, tmp_path, capsys):
     assert reason.startswith(c.RULES_MARK)
     assert hooks.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "bh-browse http://h/"}}) is None
     with pytest.raises(SystemExit) as exc:
-        b.main(["http://h/", "--xss", "bhX1"])
+        b.main(["http://h/", "--xss", "bhX1", "--routes"])
     assert str(exc.value).startswith(c.RULES_MARK)
     assert not (tmp_path / c.RAW).exists()  # refused before anything ran
+    # one page rendered with a marker is an observation: not refused by the program rules
+    monkeypatch.setattr(b, "run", lambda a, raw, r: None)
+    b.main(["http://h/", "--xss", "bhX1"])
+    assert c.RULES_MARK not in capsys.readouterr().out
 
 
 def test_route_filter_drops_offsite_and_noise():
@@ -335,3 +340,87 @@ def test_gate_ca_trusted_in_a_fresh_home(tmp_path, monkeypatch):
     assert browse.trust_gate_ca(tmp_path, ca) is None
     assert len(calls) == 2  # new DB, then the CA
     assert browse.trust_gate_ca(tmp_path, ca) is None and len(calls) == 2  # idempotent
+
+
+# ------------------------------------------------------------------ I19: no token of our accounts left to read
+TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJzdWJzdHJhdGUifQ.c2lnbmF0dXJl"
+REFRESH = "0.AXoA-refresh-token-value-not-a-jwt-123456"
+
+
+def _har(tmp_path):
+    entries = [
+        {  # the sso host's token endpoint
+            "request": {
+                "url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                "headers": [{"name": "Cookie", "value": "ESTSAUTH=abc123456"}],
+                "cookies": [{"name": "ESTSAUTH", "value": "abc123456"}],
+                "postData": {"text": f"grant_type=refresh_token&refresh_token={REFRESH}&client_id=x"},
+            },
+            "response": {
+                "headers": [{"name": "Set-Cookie", "value": "ESTSAUTH=new987654"}],
+                "cookies": [],
+                "content": {"text": json.dumps({"access_token": TOKEN, "refresh_token": REFRESH, "expires_in": 3600})},
+            },
+        },
+        {  # a target API call carrying the bearer MSAL attached
+            "request": {
+                "url": f"https://substrate.example.com/api/conv?access_token={REFRESH}&id=7",
+                "headers": [{"name": "Authorization", "value": f"Bearer {TOKEN}"}],
+            },
+            "response": {"headers": [], "content": {"text": json.dumps({"owner": "a@example.com", "id": 7})}},
+        },
+        {  # another host: credential headers scrubbed all the same
+            "request": {"url": "https://cdn.other.example/app.js", "headers": [{"name": "authorization", "value": "x"}]},
+            "response": {"headers": [], "content": {"text": "var a=1;"}},
+        },
+    ]
+    p = tmp_path / "har.json"
+    p.write_text(json.dumps({"log": {"entries": entries}}))
+    return p
+
+
+def test_the_har_keeps_no_token_of_our_accounts(tmp_path):
+    p = _har(tmp_path)
+    b.scrub_har(p, "copilot.example.com", sso=("login.microsoftonline.com",), targets=("substrate.example.com",))
+    text = p.read_text()
+    for secret in (TOKEN, REFRESH, "abc123456", "new987654"):
+        assert secret not in text, secret
+    har = json.loads(text)
+    assert "a@example.com" in text  # a target's data stays readable (what an IDOR shows)
+    assert "id=7" in har["log"]["entries"][1]["request"]["url"]
+    assert har["log"]["entries"][2]["response"]["content"]["text"] == "var a=1;"
+    assert har["log"]["entries"][2]["request"]["headers"][0]["value"] == "<redacted:authorization>"
+
+
+def test_the_stored_state_keeps_no_token_under_an_identity(tmp_path):
+    p = tmp_path / "browse-state-user-a.json"
+    st = {
+        "cookies": [
+            {"name": "sid", "value": "target-cookie-999999", "domain": "copilot.example.com", "path": "/"},
+            {"name": "ESTSAUTH", "value": "sso-cookie-888888", "domain": ".login.microsoftonline.com", "path": "/"},
+            {"name": "pref", "value": "dark", "domain": "cdn.other.example", "path": "/"},
+        ],
+        "origins": [
+            {
+                "origin": "https://copilot.example.com",
+                "localStorage": [
+                    {"name": "uid-tenant-login.windows.net-accesstoken-app", "value": json.dumps({"secret": TOKEN})},
+                    {"name": "uid-refreshtoken-app", "value": json.dumps({"secret": REFRESH})},
+                    {"name": "msal.account.keys", "value": json.dumps(["uid-tenant"])},
+                    {"name": "theme", "value": "dark"},
+                ],
+            }
+        ],
+    }
+    p.write_text(json.dumps(st))
+    b.scrub_state(p, "copilot.example.com", "user-a", sso=("login.microsoftonline.com",))
+    text = p.read_text()
+    for secret in (TOKEN, REFRESH, "target-cookie-999999", "sso-cookie-888888"):
+        assert secret not in text, secret
+    got = json.loads(text)
+    assert [k["name"] for k in got["cookies"]] == ["pref"]
+    assert {"name": "theme", "value": "dark"} in got["origins"][0]["localStorage"]
+    # logged out: nothing of ours in it, kept as it is
+    p.write_text(json.dumps(st))
+    b.scrub_state(p, "copilot.example.com", None, sso=("login.microsoftonline.com",))
+    assert json.loads(p.read_text()) == st

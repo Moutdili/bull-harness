@@ -10,9 +10,12 @@ Layout:
   (connect_over_cdp) behind two interfaces:
     * the agent's narrow HTTP API on the sandbox network (AGENT_OPS, bearer token);
     * the host's control socket, reached only through `podman exec -i` (HOST_OPS, JSON on stdin).
-- `detect`: pure helpers (challenge detection, redaction), shared by the controller and the tests.
-- `host`: host side (session -> cookies, `podman exec` calls, the noVNC client files, the screen tunnel).
-- `notify`: the call point for "a human is needed" (empty on purpose for now).
+- `detect`: pure helpers (challenge detection, redaction, websocket frame filter), shared with the tests.
+- `host`: host side (session -> cookies, `podman exec` calls, the noVNC client files, the screen tunnel, the
+  `browser-identity.json` the gate reads).
+- `notify`: the ntfy push "a human is needed" (topic in secrets/ntfy.env, `rotate()` replaces it).
+- `watch`: host side of a segment: `prepare()` (one identity per profile, reset when it changes), the challenge
+  watcher (bounded pushes, a reminder) and the agent's `bh-web switch` requests.
 
 Nothing in this package imports playwright at module level: the host has no playwright.
 """
@@ -25,11 +28,20 @@ VNC_PORT = 5900  # x11vnc, the container's loopback only
 DISPLAY = ":99"
 SCREEN = (1280, 900)
 PROFILE_ROOT = "/profile"  # named volume `browser-profile`: the profile survives a restart, `reset` wipes it
+MARKER_FILE = "bh-identity.json"  # in PROFILE_ROOT: {program, identity, loaded_at} of the session in the profile
+FILLS_FILE = "bh-fills.json"  # in PROFILE_ROOT: the fill budget (segment, identity and day); survives a reset
 RUN_DIR = "/tmp/bh-browser"  # 0700, the container user's own: control socket
 CTL_SOCK = RUN_DIR + "/ctl.sock"
 GATE_PROXY = "http://gate:8080"
 TOKEN_ENV = "BH_BROWSER_TOKEN"
 
 # What the agent may ask (HTTP API) and what only the host may ask (podman exec). Anything else is refused.
-AGENT_OPS = frozenset({"goto", "fill", "click", "press", "text", "wait", "state"})
-HOST_OPS = frozenset({"load_session", "status", "reset", "human_done"})
+AGENT_OPS = frozenset(
+    {"goto", "fill", "click", "press", "text", "wait", "state"}
+    | {"outline", "attr", "net", "tabs", "upload", "frames", "switch"}
+)
+HOST_OPS = frozenset(
+    {"load_session", "status", "reset", "human_done", "human_viewing", "fill_budget_reset", "switch_refused"}
+)
+# While the operator has the screen open (/captcha/ws), the agent may only read.
+VIEWING_OPS = frozenset({"state", "text", "frames"})
