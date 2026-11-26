@@ -23,7 +23,8 @@ def test_wait_human_returns_once_cleared_and_gives_up_at_the_timeout(capsys):
     t = iter(range(0, 1000, 50))
     pending = {"challenge": {"pending": True, "since": 1.0}}
     assert web.wait_human(100, call=lambda r, t_: pending, sleep=lambda s: None, clock=lambda: next(t)) == 3
-    assert "blocked captcha" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "blocked captcha" not in err and "bh-web wait-human" in err and "bh-note intent" in err  # R5
 
 
 def test_without_a_token_bh_web_says_the_browser_is_unavailable(monkeypatch):
