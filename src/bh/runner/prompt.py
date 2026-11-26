@@ -271,9 +271,15 @@ def scope_block(scope: Scope, identities: list[str] | None = None, *, verifier: 
             "This program FORBIDS automated scanners: the harness refuses every tool the Arsenal does not list. "
             "Test by hand, few requests."
         )
-    # D27: the hosts a payload may name are ours (never a placeholder domain); a canary goes in the first label
-    for host in getattr(scope, "payload_hosts", None) or ():
-        lines.append(f"Payload hosts (ours; the gate refuses and logs them): <marker>.{str(host).removeprefix('*.')}")
+    # D27 (Mio's O28): test hosts a payload may name and load; the gate lets GET/HEAD/OPTIONS through to them, without
+    # cookies or identity, and logs each request (CORS origins, redirect targets, image or link rendering)
+    hosts = [str(h).removeprefix("*.") for h in getattr(scope, "payload_hosts", None) or ()]
+    if hosts:
+        lines.append(
+            "Payload hosts (test sites, no data; GET/HEAD/OPTIONS only, without cookies, each request logged): "
+            + ", ".join(hosts)
+            + ". Name them in a payload or as an Origin; a canary may go in the path"
+        )
     if sso := _sso_line(scope):
         lines.append(sso)
     browser = bool(scope.support_hosts("passthrough"))

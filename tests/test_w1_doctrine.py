@@ -206,13 +206,13 @@ def test_bearer_expired_is_neither_an_answer_nor_a_control():
     assert "identity bearer expired" in plain and "bh-web" not in plain
 
 
-def test_payload_hosts_are_listed_one_line_each():
+def test_payload_hosts_are_listed_on_one_line():
     base = _scope()
     block = scope_block(_WithPayload(base, ["bh-canary.test", "bh-sink.test"]), [])
     lines = [ln for ln in block.splitlines() if ln.startswith("Payload hosts")]
     assert lines == [
-        "Payload hosts (ours; the gate refuses and logs them): <marker>.bh-canary.test",
-        "Payload hosts (ours; the gate refuses and logs them): <marker>.bh-sink.test",
+        "Payload hosts (test sites, no data; GET/HEAD/OPTIONS only, without cookies, each request logged): "
+        "bh-canary.test, bh-sink.test. Name them in a payload or as an Origin; a canary may go in the path",
     ]
     assert "Payload hosts" not in scope_block(_WithPayload(base, []), [])
     assert "Payload hosts" not in scope_block(base, [])
