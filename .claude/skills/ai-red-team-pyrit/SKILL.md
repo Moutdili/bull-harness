@@ -11,7 +11,7 @@ engineering lead. Quotes, positions and transcription errors: `references/talk-n
 Related skills: **`msrc-ai-bug-bounty`** owns what pays, severity and the report format (§6 there);
 `msrc-copilot-studio-research` owns the Copilot Studio / Power Platform surface.
 Rules for the harness on MSRC: `docs/research/15-msrc-premier-programme.md`.
-Canary name in all three skills: `BH-CANARY-<id>`.
+Canary in all three skills: `BH-SECRET-<16 hex>`, printed by `bh-note canary` (the gate looks for it in its traffic).
 
 **Dating.** The talk shows PyRIT around v0.5 (late 2024). PyRIT has since moved from `Azure/PyRIT`
 (archived) to **https://github.com/microsoft/PyRIT** (v1.2.1, 2026-11-18; names below checked on `main`
@@ -73,8 +73,8 @@ Steps [inferred, from the talk's method]:
 2. **Pick a cross-boundary path**: content A controls -> read by B's AI -> action in B or B's data
    visible to A. No path = no bounty; stop or change surface. Mail or file injection supposes an AI that
    reads B's mailbox or drive, probably behind a licence [inferred]: if so, blocker `paid`.
-3. **Canary first.** A plants a benign instruction asking B's AI to emit `BH-CANARY-<id>` somewhere **A
-   can read** (a reply mail to A, a shared file, a comment on A's object), or to perform a harmless action
+3. **Canary first.** A plants a benign instruction asking B's AI to emit a canary `BH-SECRET-<16 hex>` (from
+   `bh-note canary`) somewhere **A can read** (a reply mail to A, a shared file, a comment on A's object), or to perform a harmless action
    in B. Benign payloads only.
 4. **Trigger as B** with an ordinary request ("summarize my last mail").
 5. **Observe the side effect**, never the model's prose: A's inbox or object (as A), B's state (as B), the
@@ -97,10 +97,12 @@ missing, it is not a finding. Rate-limit bypass: not hunted (`msrc-ai-bug-bounty
 
 - **Server-side execution** (traditional bug or one of the AI categories): stop at the first proof.
   "reach out to bounty@microsoft.com if you want additional guidance on should you proceed uh or not" ...
-  "you don't go beyond proof of concept" [talk]. Harness gesture: `bh-note blocked other "server-side
-  execution: <where>, stopped at PoC"`, leave the lead; Mio decides whether to write to MSRC.
-- **Third-party data seen by accident**: stop, no re-read, `bh-note blocked other "third-party data seen:
-  <where, no content>"`; see `msrc-copilot-studio-research` §6.
+  "you don't go beyond proof of concept" [talk]. Harness gesture:
+  `bh-note blocked server-exec "<where, no content>"`: the runner ends the segment and parks the program;
+  Mio decides whether to write to MSRC.
+- **Third-party data seen by accident**: stop, no re-read,
+  `bh-note blocked third-party-data "<where, no content>"` (ends the segment, parks the program); see
+  `msrc-copilot-studio-research` §6. The blocker reason `other` stops nothing: never use it for these two cases.
 - **Volume.** MSRC forbids automated testing that "generates excessive traffic" and DoS [doc 15]; the talk
   admits the tool if you "abide by the rate limiting that is in place" [talk]. Small batches, program rate,
   stop on throttling.

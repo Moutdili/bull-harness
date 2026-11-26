@@ -11,7 +11,8 @@ Line-level quotes and ambiguities: `references/talk-notes.md`.
 
 This skill is the **single home** of "what pays", severity and the report format. Related skills point
 here: `msrc-copilot-studio-research` (Copilot Studio / Power Platform surface), `ai-red-team-pyrit`
-(injection workflow, payload delivery). Canary name in all three: `BH-CANARY-<id>`.
+(injection workflow, payload delivery). Canary in all three: `BH-SECRET-<16 hex>`, printed by `bh-note canary`
+(the gate looks for it in its own traffic).
 
 Tags: **[talk]** = said in this talk; **[PyRIT talk]** = the MSRC PyRIT webinar (2 Dec 2024);
 **[doc 15]** = official pages as summarised in doc 15; **[deduction]** = ours, not said.
@@ -152,8 +153,8 @@ AI-specific items the speakers asked for [talk], each a field of the harness rep
 | "if possible at all, ... proof that the issue isn't a result of a hallucination" | Optional per the talk; see below |
 
 Non-hallucination proof [deduction], in this order, because `bh-oob` does not exist (issue 31 open):
-1. **Effect visible from A's account**: B's `BH-CANARY-<id>` (planted by us in B's data) appears in a
-   response A receives, in A's mailbox, or in an object A owns.
+1. **Effect visible from A's account**: a canary `BH-SECRET-<16 hex>` (from `bh-note canary`, planted by us in
+   B's data) appears in a response A receives, in A's mailbox, or in an object A owns.
 2. **Effect inside B**: an action executed in B's account that only A's planted content asked for (mail
    sent, file written, setting changed), seen as B, with a control run without the poisoned source.
 3. **Request leaving B's browser**: `bh-browse` aborts and counts off-host requests per host in its

@@ -267,8 +267,8 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   avant le rejeu (pour l'état de la cible, plus pour l'isolation). Reste : le juge lit des réponses de la cible
   (injection de prompt possible, comme pour tout relecteur) ; il partage avec le chasseur l'image, le gate, le
   budget de relais du run et le code sandbox monté en lecture seule.
-- **Énumération** : comptée sur les ids du chemin seulement (I6), route normalisée, au plus 12 ids distincts par route
-  en 10 min (le 13e est refusé). Un id passé en query string, en corps formulaire, JSON ou GraphQL n'est pas compté :
+- **Énumération** : comptée sur les ids du chemin seulement (I6), route normalisée, au plus 6 ids distincts par route
+  en 10 min (le 7e est refusé ; `policy.ID_LIMIT`, `policy.ID_WINDOW_S`). Un id passé en query string, en corps formulaire, JSON ou GraphQL n'est pas compté :
   la doctrine (preuve sur nos propres objets) et le juge couvrent ce cas.
 - **bh-browser** : reconnu par son IP. Un autre conteneur qui reprendrait cette IP (bh-browser arrêté, IP réattribuée
   avant l'expiration du cache de 60 s) en hériterait : identité de la jarre, `browser_only`, méthodes d'identité. Le

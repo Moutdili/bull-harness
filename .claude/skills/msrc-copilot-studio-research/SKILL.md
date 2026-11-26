@@ -15,7 +15,8 @@ Official rules live on the MSRC pages; the orchestrator re-reads them before a r
 
 Related skills: **`msrc-ai-bug-bounty`** owns what pays, severity and the report format (§6 there);
 `ai-red-team-pyrit` owns the injection workflow and payload delivery. This skill owns the Copilot
-Studio / Power Platform surface. Canary name in all three: `BH-CANARY-<id>`.
+Studio / Power Platform surface. Canary in all three: `BH-SECRET-<16 hex>`, printed by `bh-note canary` (the
+gate looks for it in its traffic).
 
 Tags: **[talk]** = said by the speaker; **[doc 15]** = official pages as summarised in doc 15;
 **[PyRIT talk]** = the MSRC PyRIT webinar (see `ai-red-team-pyrit`); **[inferred]** = our deduction.
@@ -123,8 +124,8 @@ part of the job [talk]. State in the report why you chose that program.
 
 **Sections 4 to 6 are our method [inferred], built from the talk's hints and doc 15; the talk does not
 describe a lab.** The transcript names no license or SKU: check the current Copilot Studio trial /
-developer-plan docs and the "MSOBB" naming advice in the MSRC terms before buying anything. A feature
-behind a licence we do not have: blocker `paid`.
+developer-plan docs and the account rules in the MSRC terms before buying anything; our accounts keep their
+real names (Mio's decision). A feature behind a licence we do not have: blocker `paid`.
 
 1. Two tenants we own: **attacker tenant A** and **victim tenant B** (needed to prove cross-tenant impact).
    Trial tenants are encouraged by MSRC [doc 15]. Never touch a tenant we do not own.
@@ -139,7 +140,7 @@ behind a licence we do not have: blocker `paid`.
    (needs `bh-oob` or another receiver of ours: else blocker `oob-needed`), one with uploaded files, one
    with a SharePoint/Dataverse source holding a canary, one with a connector + flow, one published to a
    test channel with authentication on.
-6. Plant `BH-CANARY-<id>` strings in victim-tenant B data. A canary appearing in A's context is the
+6. Plant canaries `BH-SECRET-<16 hex>` (each from `bh-note canary`) in victim-tenant B data. A canary appearing in A's context is the
    cleanest cross-tenant proof, and needs no receiver.
 7. Harness: `scanners_allowed: false`, low request rate, own identities only [doc 15]; accounts via
    `bh accounts` (§0).
@@ -181,13 +182,13 @@ that only A asked for). k/N repetitions as in `msrc-ai-bug-bounty` §6.
 - **Server-side execution** (a custom connector, plugin or flow runs code we chose on Microsoft's side):
   stop at the first proof, do not explore the host. Source: the PyRIT webinar, not this talk: "reach out
   to bounty@microsoft.com if you want additional guidance on should you proceed uh or not" and "don't go
-  beyond proof of concept" [PyRIT talk]. Harness gesture: `bh-note blocked other "server-side execution:
-  <where>, stopped at PoC"`, then leave the lead; Mio decides whether to write to MSRC.
+  beyond proof of concept" [PyRIT talk]. Harness gesture: `bh-note blocked server-exec "<where, no content>"`:
+  the runner ends the segment and parks the program; Mio decides whether to write to MSRC.
 - **Data of a tenant or user we do not own seen by accident** [talk: "let us know immediately so we can
   contact our customers"]: stop the program at once, do not re-read, copy or summarise the data, write
-  `bh-note blocked other "third-party data seen: <url or request id, no content>"`. A dedicated fact kind,
-  an automatic program pause and an alert to Mio are **to build** on the harness side; until then this
-  blocker is the gesture. Doc 15 forbids accessing other customers' data beyond the PoC.
+  `bh-note blocked third-party-data "<where, no content>"` (url or request id). The runner then parks the
+  program, ends the segment and pushes Mio an alert without content; `bh unpark <program>` lifts it after
+  review. Doc 15 forbids accessing other customers' data beyond the PoC.
 - **Service agreements**: use the services in a way that "does not violate our service agreements"
   [PyRIT talk]. Throttling or a WAF challenge on a test account ends the call.
 - No social engineering of Microsoft employees, partners or vendors [doc 15, PyRIT talk].

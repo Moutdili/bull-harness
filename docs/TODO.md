@@ -1,3 +1,4 @@
+> Plan en vigueur : v4.2, `out/roadmap-v4.md` (chemin à confirmer par l'orchestrateur) ; ce TODO le précède.
 # bull-harness — TODO maître
 
 Décisions figées (2026-11-22, plan Ultra depuis le 2026-11-24) : CVP **Defense** (individuel) · Podman rootless · YWH + Intigriti d'abord · objectif court terme : **premiers CVE** (divulgation coordonnée) → dossier Red Team plus tard.
