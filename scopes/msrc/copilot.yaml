@@ -65,13 +65,19 @@ support:
   - {value: "uhf.microsoft.com", kind: assets, note: "Copilot page header/footer assets"}
   - {value: "wcpstatic.microsoft.com", kind: assets, note: "cookie consent assets"}
 out_of_scope: []
+# data-free hosts the hunter may cite and load (CORS, redirects, an image) without touching a real third party (O28):
+# GET/HEAD/OPTIONS only, nothing of ours attached. example.* are reserved by IANA; bh.datk.ch is ours (O16, no DNS record).
+payload_hosts: [example.org, example.com, example.net, bh.datk.ch]
 identities:
   - name: user-a
-    origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
+    # where its captured Authorization may go; substrate: the MSAL bearer bh-browser sends there is kept for that origin
+    # (R46), and the gate still refuses every substrate path outside the in_scope prefixes
+    origins: ["https://copilot.microsoft.com/", "https://copilot.com/", "https://substrate.office.com/"]
     role: member
     tenant: A
-    # measured 2026-11-26: signed in, /chat is 200 (JSON for a client without Accept: text/html); signed out, a 302
-    probe: {url: "https://copilot.com/chat", status: 200}
+    # measured 2026-11-26: the server action answers 200 and JSON for a live session, a 302 for a dead one (/chat said
+    # 200 for a dead session). x-route-id: not known yet, to add once read from the app's traffic.
+    probe: {url: "https://copilot.com/resources/app-shell-action", method: POST, status: 200, headers: {Accept: "application/json"}, json: {action: "RefreshNavPane"}}
     enroll:
       kind: browser
       steps:
@@ -105,11 +111,14 @@ identities:
         - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
       capture: {cookies: true, authorization: true}
   - name: user-b
-    origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
+    # where its captured Authorization may go; substrate: the MSAL bearer bh-browser sends there is kept for that origin
+    # (R46), and the gate still refuses every substrate path outside the in_scope prefixes
+    origins: ["https://copilot.microsoft.com/", "https://copilot.com/", "https://substrate.office.com/"]
     role: member
     tenant: B
-    # measured 2026-11-26: signed in, /chat is 200 (JSON for a client without Accept: text/html); signed out, a 302
-    probe: {url: "https://copilot.com/chat", status: 200}
+    # measured 2026-11-26: the server action answers 200 and JSON for a live session, a 302 for a dead one (/chat said
+    # 200 for a dead session). x-route-id: not known yet, to add once read from the app's traffic.
+    probe: {url: "https://copilot.com/resources/app-shell-action", method: POST, status: 200, headers: {Accept: "application/json"}, json: {action: "RefreshNavPane"}}
     enroll:
       kind: browser
       steps:

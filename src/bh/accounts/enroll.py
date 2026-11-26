@@ -87,7 +87,9 @@ def main(raw):
         headers = {"Accept": "application/json, */*", **s.get("headers", {})}
         data = None
         if "json" in s:
-            data, headers["Content-Type"] = json.dumps(s["json"]).encode(), "application/json"
+            data = json.dumps(s["json"]).encode()
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = "application/json"
         elif "form" in s:
             data = urllib.parse.urlencode(s["form"]).encode()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -226,10 +228,30 @@ def _why(rec: dict[str, Any] | None, what: str) -> str:
 
 
 # ---------------------------------------------------------------- probe
+def expect_text(ident: Identity, template: str) -> str | None:
+    """A probe's `expect` with `{email}` and `{name}` resolved on the host from the identity's credential (R43):
+    the value goes to the gate script on stdin and nowhere else (never a log, a return value nor the session file,
+    which keeps the template). None when a placeholder cannot be resolved."""
+    if "{" not in template:
+        return template
+    cred = credential(ident) if "{email}" in template else {}
+    values = _values(ident, cred or {})
+    out = template
+    for key in ("email", "name"):
+        if "{" + key + "}" in out:
+            if not values.get(key):
+                return None
+            out = out.replace("{" + key + "}", values[key])
+    return out
+
+
 def probe(ident: Identity) -> tuple[bool | None, str]:
-    """GET the probe URL under the identity (the gate injects its session). (True, detail) when the declared
-    status comes back and the body holds `expect`; (False, detail) when the session is not accepted; (None, why)
-    when nothing can be said: no probe declared, no session file. A gate refusal or a network error raises."""
+    """Send the probe request under the identity (the gate injects its session): GET by default, or the declared
+    `method` with its `headers` and `json` (R43). (True, detail) when the declared status comes back and the body
+    holds `expect`; (False, detail) when the session is not accepted (a redirect is never followed: the status is
+    the first answer's; a bearer the gate refuses as expired); (None, why) when nothing can be said: no probe
+    declared, no session file, an `expect` placeholder without its value. Another gate refusal or a network error
+    raises. The body and the resolved `expect` are never logged nor returned."""
     pr = ident.probe
     if not pr:
         return None, "no probe declared"
@@ -237,11 +259,18 @@ def probe(ident: Identity) -> tuple[bool | None, str]:
         return None, "no session"
     # X-BH-Probe: the gate lends the identity's session to this request (it comes from the gate's own loopback);
     # every other enrollment request logs in with its own credentials and never borrows a session
-    headers = {"X-BH-Identity": ident.name, "X-BH-Probe": "1"}
-    step = {"step": "probe", "method": "GET", "url": pr["url"], "headers": headers}
+    headers = {**(pr.get("headers") or {}), "X-BH-Identity": ident.name, "X-BH-Probe": "1"}
+    step = {"step": "probe", "method": pr.get("method") or "GET", "url": pr["url"], "headers": headers}
+    if "json" in pr:
+        step["json"] = pr["json"]
     if pr.get("expect"):
-        step["expect"] = pr["expect"]
+        expect = expect_text(ident, pr["expect"])
+        if expect is None:
+            return None, "the probe's expected text names a value the credential does not hold"
+        step["expect"] = expect
     rec = run_steps([step])[0]
+    if rec.get("gate") and "identity bearer expired" in rec["gate"]:
+        return False, "identity bearer expired"  # the gate withheld it: a new login renews it
     if rec.get("error") or rec.get("gate"):
         raise AccountError(_why(rec, "probe"))
     ok = rec.get("status") == pr["status"] and rec.get("match", True)
@@ -277,7 +306,13 @@ def _new_session(ident: Identity, headers: dict[str, str], now: float) -> dict[s
         "origin_headers": {},
         "cookies": {},
         "expires_at": None,
-        "probe": {"url": ident.probe["url"], "status": ident.probe["status"]} if ident.probe else None,
+        # the probe's URL, status and method; never its `expect` (a template that may name the account)
+        "probe": (
+            {"url": ident.probe["url"], "status": ident.probe["status"]}
+            | ({"method": ident.probe["method"]} if ident.probe.get("method") else {})
+            if ident.probe
+            else None
+        ),
         "updated": round(now, 3),
     }
 
@@ -366,9 +401,13 @@ def _host_ok(ident: Identity, host: str) -> bool:
 
 
 def _is_target(scope: Scope, url: str) -> bool:
-    from bh.scope.enforce import check
+    """R1: an origin (scheme://host:port) is a target when the scope covers it, or when an in-scope URL rule of the
+    same scheme and port covers its host (`https://substrate.office.com/m365Copilot/` and the origin
+    `https://substrate.office.com:443`): the bearer seen there is kept for that origin only, and the gate still
+    judges every request on its full URL."""
+    from bh.scope.model import origin_covered
 
-    return bool(check(scope, url))
+    return origin_covered(scope, url)
 
 
 def browser_jar(ident: Identity, cookies: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:

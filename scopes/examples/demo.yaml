@@ -15,6 +15,8 @@ in_scope:
   - "https://api.example.org/v2/"
   - 192.0.2.0/24
   - {type: repo, value: "github.com/example/project"}
+# data-free host the hunter may cite and load (D27): GET/HEAD/OPTIONS only, nothing of ours attached
+payload_hosts: [example.org]
 out_of_scope:
   - admin.example.com
   - "*.corp.example.com"

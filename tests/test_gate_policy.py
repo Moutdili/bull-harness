@@ -171,7 +171,7 @@ def test_token_bucket_rate():
 def test_id_enumeration_is_refused(tmp_path):
     p = _policy(tmp_path)
     url = "https://a.example.com/api/baskets/{}"
-    assert pol.ID_LIMIT == 12
+    assert pol.ID_LIMIT == 6  # D26: six distinct ids per route and window, the seventh refused
     for i in range(1, pol.ID_LIMIT + 1):
         assert req(p, url.format(i), "a.example.com", authenticated=True).allowed, i
     v = req(p, url.format(pol.ID_LIMIT + 1), "a.example.com", authenticated=True)

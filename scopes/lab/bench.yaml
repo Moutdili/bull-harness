@@ -10,6 +10,8 @@ max_rps: 20
 required_headers: {X-Bug-Bounty: bull-harness-lab}
 in_scope:
   - {value: "10.231.0.20/32", note: "Larkspur Rooms, http://10.231.0.20:8000"}
+# data-free host the hunter may cite and load (D27): GET/HEAD/OPTIONS only, nothing of ours attached
+payload_hosts: [example.org]
 out_of_scope: []
 forbidden_vulns: [dos]
 # The app keeps its data in memory: after a restart, `bh accounts refresh` signs the same accounts up again.
