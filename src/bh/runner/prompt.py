@@ -6,7 +6,8 @@ refuse. Everything about the persistent browser and its human challenge lives in
 a `passthrough` host: the general doctrine offers no human channel.
 
 The opening (D17) sits between the three first lines and the hard rules: `a` (default), `b`, `c` or `legacy` (none),
-from `BH_DOCTRINE_OPENING`. It names no agent: number, pseudo and legacy live in the task (`build_task(lineage=...)`),
+from `BH_DOCTRINE_OPENING`. A or B asked by name needs `bh.agent.recall`; the default, without it, is C (warned).
+It names no agent: number, pseudo and legacy live in the task (`build_task(lineage=...)`),
 so the system prompt stays the same from one agent to the next and stays cached."""
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import warnings
 
 from bh.gate import policy  # mitmproxy-free: the id enumeration bound the gate enforces (R11)
 from bh.scope import Scope
@@ -116,6 +118,7 @@ The hard rules below come first.
 OPENINGS = {"legacy": "", "a": _OPENING_A, "b": _OPENING_B, "c": _OPENING_C}
 OPENING_ENV = "BH_DOCTRINE_OPENING"
 OPENING_DEFAULT = "a"  # Mio: version A from the Sonnet phase on, after a pass on the lab
+OPENING_NO_RECALL = "c"  # the default's stand-in while bh.agent.recall is not shipped (it names no bh-recall)
 _NEEDS_RECALL = frozenset({"a", "b"})  # the openings that name `bh-recall`
 
 _ARSENAL_SCANNERS = """\
@@ -250,6 +253,14 @@ def opening_name(opening: str | None = None) -> str:
     return name
 
 
+def _recall_shipped() -> bool:
+    try:
+        importlib.import_module("bh.agent.recall")
+    except ImportError:
+        return False
+    return True
+
+
 def _check_recall(name: str) -> None:
     """A doctrine promises nothing the harness does not hold: A and B send the agent to `bh-recall`."""
     try:
@@ -265,9 +276,20 @@ def doctrine(scanners: bool = True, opening: str | None = None) -> str:
     """The doctrine for a program that allows automated scanners or not (audit I8). The id enumeration bound is the
     gate's own (R11), read at each call: the prompt never announces a number the gate does not enforce. `opening`:
     see opening_name; the same for both arsenals, and agent-free (the system prompt stays cached)."""
+    asked = opening is not None or os.environ.get(OPENING_ENV, "").strip() != ""
     name = opening_name(opening)
     if name in _NEEDS_RECALL:
-        _check_recall(name)
+        if asked:
+            _check_recall(name)  # a version named for a lab comparison runs as named, or not at all
+        elif not _recall_shipped():
+            # The default promises nothing the harness does not hold: until bh.agent.recall ships, it is C.
+            warnings.warn(
+                f"bh.agent.recall is not importable: default doctrine opening {name!r} replaced by "
+                f"{OPENING_NO_RECALL!r} (set {OPENING_ENV} to choose)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            name = OPENING_NO_RECALL
     head = (
         _HEAD.replace("{opening}", OPENINGS[name])
         .replace("{id_limit}", str(policy.ID_LIMIT))

@@ -189,6 +189,15 @@ def test_relay_openings_need_bh_recall(monkeypatch, opening):
     assert build_verifier_prompt(_scope(), {"id": 1, "title": "t", "proof": "{}"}, {}, "e")
 
 
+def test_default_without_bh_recall_is_c_and_warns(monkeypatch):
+    """Nothing asked and bh.agent.recall missing: the default promises no bh-recall (C), and says so; with it, A."""
+    assert doctrine(True) == doctrine(True, "a")
+    monkeypatch.setitem(sys.modules, "bh.agent.recall", None)
+    with pytest.warns(RuntimeWarning, match="default doctrine opening 'a' replaced by 'c'"):
+        doc = doctrine(True)
+    assert doc == doctrine(True, "c") and "bh-recall" not in doc.split("## Network (hard rules)")[0]
+
+
 @pytest.mark.parametrize("opening", ["c", "legacy"])
 def test_other_openings_build_without_bh_recall(monkeypatch, opening):
     monkeypatch.setitem(sys.modules, "bh.agent.recall", None)
