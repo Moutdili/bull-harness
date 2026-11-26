@@ -1,0 +1,52 @@
+# Microsoft MSRC, OneDrive personal (Microsoft 365 bounty) with our two personal test accounts, no M365 subscription.
+# Hosts: only what the host survey of 2026-11-26 saw live (docs/research/21-releve-hotes-outlook-onedrive.md, ML23),
+# each with that date in its note. Rules: docs/research/15-msrc-premier-programme.md (own accounts only, no excessive
+# automated traffic, no DoS, stop at the proof, human review of every report). "In scope by default" speaks of the
+# bounty, never of this file: a host the survey has not seen is not here.
+# Not here, on purpose:
+# - the Copilot Notebooks (Loop) hosts of the survey (home.microsoftpersonalcontent.com, the collabhubrtc websocket,
+#   the people picker): another service, its own file when Mio opens it;
+# - login and asset hosts: the survey lists none for OneDrive; the orchestrator adds them (support) once it has seen
+#   the sign-in of onedrive.live.com through the gate, with its enrollment recipe.
+schema: 1
+program: msrc-onedrive
+platform: msrc
+automation_allowed: true
+scanners_allowed: false
+self_signup: false
+max_rps: 2
+forbidden_vulns: [dos]
+in_scope:
+  - {value: "https://onedrive.live.com/", note: "OneDrive web interface (/?cid=…&id=…, shared view), seen 2026-11-26; our own files only"}
+  - {value: "api.onedrive.com", note: "OneDrive API behind onedrive.live.com (/v2.1/drive, /v2.1/drives/<CID>, consumerSiteAppConfigs, inappmessaging, unifiedStorageQuota), seen 2026-11-26; our own drives only (another account's drive answered 404)"}
+  - {value: "https://d.docs.live.net/", note: "WebDAV access to a file (/<CID>/<path>, 302 to a sign-in), seen 2026-11-26; our own files only"}
+  - {value: "https://my.microsoftpersonalcontent.com/personal/", note: "personal storage API: upload session bytes (PUT …/drive/items/<id>/uploadSession), seen 2026-11-26; our own drives only"}
+  - {value: "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads", note: "the account's 'Copilot uploads' special folder (GET), seen 2026-11-26"}
+  - {value: "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads:", note: "upload session (POST :/<file>:/createUploadSession, a `link` route: no recipient), seen 2026-11-26"}
+# program and browser cards, pinned in every task (onedrive.live.com is driven through bh-browser)
+cards: [msrc-onedrive, bh-web-manual]
+# D31: the survey saw no `send` route on OneDrive (an invitation naming a recipient) and says to survey one before
+# opening sharing. Until then, any path that invites or grants is held to our two addresses: the gate refuses it
+# without an address, or with one that is not user-a's or user-b's ("recipient not ours"). Creating a sharing link
+# names nobody (`link`): not guarded, the link carries only our canary file.
+recipient_guard:
+  - {url: "^https://[^/?#]+/[^?#]*invite", note: "share invitation (not surveyed yet: any invite path, every host)"}
+  - {url: "^https://[^/?#]+/[^?#]*/grant(?:[/?#]|$)", note: "permission grant to a recipient (not surveyed yet)"}
+# S8: the program's rule pages, read on the host by `bh rules check`. The survey gives no URL of the Microsoft 365
+# bounty page: the MSRC program list (its "in scope by default" entry), terms and rules of engagement, read on
+# 2026-11-25 (docs/research/15-msrc-premier-programme.md); the orchestrator adds the M365 page once it is surveyed.
+rules_url:
+  - "https://www.microsoft.com/en-us/msrc/bounty-programs"
+  - "https://www.microsoft.com/en-us/msrc/bounty-terms"
+  - "https://www.microsoft.com/en-us/msrc/pentest-rules-of-engagement"
+support: []
+out_of_scope: []
+# data-free hosts the hunter may cite and load (CORS, redirects, an image) without touching a real third party (O28):
+# GET/HEAD/OPTIONS only, nothing of ours attached. example.* are reserved by IANA; bh.datk.ch is ours (O16, no DNS record).
+payload_hosts: [example.org, example.com, example.net, bh.datk.ch]
+# the same two personal accounts as Copilot. No enrollment recipe: the survey does not say the Copilot session serves
+# onedrive.live.com, so the orchestrator enrolls both identities on this program (secrets/identities/msrc-onedrive/).
+identities:
+  - {name: user-a, role: member, tenant: A}
+  - {name: user-b, role: member, tenant: B}
+notes: "MSRC Microsoft 365 bounty, OneDrive personal (onedrive.live.com), tested with our two personal accounts only (user-a, user-b); no M365 subscription. Cross-account impact is what pays (program card): one account reads or changes the other's file, sharing link or permission. Our own files only; another account's drive answers 404. Invitations only to the other account of ours (the gate refuses any other recipient). The program page is read again before every report."

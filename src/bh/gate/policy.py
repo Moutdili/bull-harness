@@ -22,6 +22,10 @@ Classes of destination:
             an image) without touching a real third party. GET/HEAD/OPTIONS without body from any sandbox client, on
             80/443, public IPs only, no cookie, no identity, no program header, the program's own rate; every request
             journaled (flows class `payload`); any other method refused ("payload host: GET/HEAD/OPTIONS only").
+Recipients (D31): a request whose URL a `recipient_guard` regex of the scope matches, whatever the client, needs at
+least one e-mail address and every address one of the program's identities (bh.gate.recipients); else "recipient not
+ours". Approved prefixes (D40): `<state>/scope-extra/<program>.yaml` joins the scope's targets at every reload
+(bh.scope.extra); a revoked one leaves at the next.
 Protected paths (T5): a path matching PROTECTED_DEFAULT or the scope's `protected_urls` is refused to every client,
 bh-browser included, whatever the method ("protected url"): sign-out, password and account changes, payment.
 Websockets (scope `websockets: true`, refused otherwise): the handshake is a target request like any other
@@ -37,6 +41,7 @@ absolute request URL), never on the Host header alone.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -44,6 +49,7 @@ import os
 import re
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
@@ -57,7 +63,9 @@ from bh.agent.contract import (
     path_key,
 )
 from bh import redact
+from bh.gate import recipients
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
+from bh.scope import extra as scope_extra
 from bh.scope.enforce import browser_only, check_support_resolved, support_entry
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
@@ -97,6 +105,7 @@ PROTECTED_DEFAULT = (
     r"(^|/)(checkout|payment|billing|purchase|subscribe)(/|$)",
 )
 PROTECTED_REASON = "protected url"
+RECIPIENT_REASON = recipients.REASON  # "recipient not ours"
 PAYLOAD_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 PAYLOAD_REASON = "payload host: GET/HEAD/OPTIONS only"
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
@@ -165,6 +174,7 @@ class Verdict:
     reason: str
     rule: str | None = None
     support: str | None = None  # kind of a `support` verdict: "auth" | "assets" | "sso" | "passthrough"
+    recipients: bool = False  # D31: a recipient_guard route that passed (the journal hides its addresses)
 
 
 def deny(reason: str, rule: str | None = None) -> Verdict:
@@ -215,26 +225,56 @@ class Policy:
     passthrough: PassthroughGuard = field(
         default_factory=lambda: PassthroughGuard.from_env()
     )  # a lambda: defined below
+    base_scope: Scope | None = None  # the scope file as loaded, before the approved prefixes (D40)
+    extra_sig: object = None  # signature of the scope-extra file merged into `scope`
+    on_event: Callable[[dict], None] | None = None  # journal hook (the addon's events log); None: not journaled
+
+    @property
+    def state_dir(self) -> Path:
+        """The gate's state dir: where the active scope, the allowlist and the approved prefixes live."""
+        return self.scope_path.parent
 
     def reload(self) -> None:
-        """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
+        """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed). The approved prefixes
+        (D40) are merged again whenever their file changes; a broken one is ignored and journaled."""
         try:
             mtime = self.scope_path.stat().st_mtime
         except OSError:
             self.scope, self.scope_error, self.scope_mtime = None, "no active scope", -1.0
+            self.base_scope, self.extra_sig = None, None
             return
-        if mtime == self.scope_mtime:
+        if mtime != self.scope_mtime:
+            self.scope_mtime = mtime
+            try:
+                self.base_scope, self.scope_error = load_scope(self.scope_path), None
+            except Exception as exc:  # noqa: BLE001 - whatever the parser raises, fail closed
+                self.base_scope, self.scope_error = None, f"invalid active scope: {exc}"
+            self.scope, self.extra_sig = self.base_scope, object()  # a new base: merge its prefixes again
+            self.buckets.pop("target", None)
+            self.backoff_until = 0.0
+            self.ids_seen.clear()
+            self.misses.clear()
+            # WAF pauses survive a scope reload: a new run on the same program must not hit the challenge again.
+        if self.base_scope is None:
             return
-        self.scope_mtime = mtime
+        sig = scope_extra.signature(self.base_scope.program, self.state_dir)
+        if sig == self.extra_sig:
+            return
+        self.extra_sig = sig
         try:
-            self.scope, self.scope_error = load_scope(self.scope_path), None
-        except Exception as exc:  # noqa: BLE001 - whatever the parser raises, fail closed
-            self.scope, self.scope_error = None, f"invalid active scope: {exc}"
-        self.buckets.pop("target", None)
-        self.backoff_until = 0.0
-        self.ids_seen.clear()
-        self.misses.clear()
-        # WAF pauses survive a scope reload: a new run on the same program must not hit the challenge again.
+            rules, errors = scope_extra.load(self.base_scope, self.state_dir)
+        except Exception as exc:  # noqa: BLE001 - a broken file of prefixes never costs the scope itself
+            rules, errors = (), [f"scope-extra: {exc!r}"[:300]]
+        self.scope = scope_extra.merged(self.base_scope, rules)
+        for err in errors:
+            self._event({"kind": "scope-extra-error", "error": err[:300]})
+        if rules:
+            self._event({"kind": "scope-extra", "prefixes": [r.value for r in rules]})
+
+    def _event(self, rec: dict) -> None:
+        if self.on_event is not None:
+            with contextlib.suppress(Exception):  # logging never decides anything
+                self.on_event(rec)
 
     @property
     def program(self) -> str:
@@ -296,6 +336,33 @@ class Policy:
             return Verdict(True, "payload", f"payload host {host}")
         return deny(self.scope_error or "not in scope")
 
+    def recipient_check(
+        self,
+        url: str,
+        body: bytes | None,
+        *,
+        body_len: int,
+        content_type: str | None = None,
+        content_encoding: str | None = None,
+    ) -> tuple[bool, Verdict | None]:
+        """D31: (the URL is a recipient_guard route, its refusal or None). No option loosens it."""
+        rules = self.scope.recipient_guard if self.scope is not None else None
+        if not rules or (rule := recipients.matching(url, rules)) is None:
+            return False, None
+        program, state = self.scope.program, self.state_dir
+        why = recipients.judge(
+            url,
+            body,
+            body_len=body_len,
+            content_type=content_type,
+            content_encoding=content_encoding,
+            ok=lambda a: recipients.allowed(program, a, state=state),
+            has_list=recipients.has_list(program, state=state),
+        )
+        if why is None:
+            return True, None
+        return True, deny(RECIPIENT_REASON, f"recipient_guard {rule.note[:60] or rule.url[:60]}: {why}")
+
     def classify_request(
         self,
         url: str,
@@ -310,10 +377,13 @@ class Policy:
         enroll: bool = False,
         websocket: bool = False,
         browser: bool = False,
+        content_type: str | None = None,
+        content_encoding: str | None = None,
     ) -> Verdict:
         """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent.
         `enroll`: the client is an enrollment source (the gate itself, bh-login). `websocket`: an upgrade handshake.
-        `browser`: the client is bh-browser (B2: websockets and `browser_only` paths are its own)."""
+        `browser`: the client is bh-browser (B2: websockets and `browser_only` paths are its own). `body`,
+        `content_type`, `content_encoding`: read by the recipient guard (D31) only."""
         method = method.upper()
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
@@ -322,6 +392,43 @@ class Policy:
         v = self._target(url)
         if protected := self.protected(url):  # after _target: the scope (and its protected_urls) is loaded
             return protected
+        guarded, refused = self.recipient_check(
+            url, body, body_len=body_len, content_type=content_type, content_encoding=content_encoding
+        )
+        if refused is not None:  # every client, every class of host: an address that is not ours never leaves
+            return refused
+        out = self._classify(
+            url,
+            host,
+            method,
+            v,
+            host_header=host_header,
+            identity=identity,
+            body_len=body_len,
+            authenticated=authenticated,
+            enroll=enroll,
+            websocket=websocket,
+            browser=browser,
+        )
+        if guarded and out.allowed:
+            out.recipients = True
+        return out
+
+    def _classify(
+        self,
+        url: str,
+        host: str,
+        method: str,
+        v: Verdict | None,
+        *,
+        host_header: str | None,
+        identity: str | None,
+        body_len: int,
+        authenticated: bool,
+        enroll: bool,
+        websocket: bool,
+        browser: bool,
+    ) -> Verdict:
         if websocket:  # the scope opts in; then targets only, and the handshake goes through the target rules below
             if self.scope is None or not self.scope.websockets_on:
                 return deny("websockets are not allowed: this program's scope does not enable them (websockets: true)")

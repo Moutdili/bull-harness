@@ -77,6 +77,16 @@ out_of_scope: []
 # data-free hosts the hunter may cite and load (CORS, redirects, an image) without touching a real third party (O28):
 # GET/HEAD/OPTIONS only, nothing of ours attached. example.* are reserved by IANA; bh.datk.ch is ours (O16, no DNS record).
 payload_hosts: [example.org, example.com, example.net, bh.datk.ch]
+# S8: the program's rule pages, read on the host by `bh rules check` (dated, compared, never interpreted): the Copilot
+# bounty page named in `notes`, and the MSRC terms and rules of engagement read on 2026-11-25
+# (docs/research/15-msrc-premier-programme.md)
+rules_url:
+  - "https://www.microsoft.com/en-us/msrc/bounty-ai"
+  - "https://www.microsoft.com/en-us/msrc/bounty-terms"
+  - "https://www.microsoft.com/en-us/msrc/pentest-rules-of-engagement"
+# D31 (bh.scope.guards wants the key on an MSRC scope): no `send` route of Copilot in the host survey (the share link
+# names nobody, the notebook invite is not a target here)
+recipient_guard: []
 identities:
   - name: user-a
     # where its captured Authorization may go; substrate: the MSAL bearer bh-browser sends there is kept for that origin

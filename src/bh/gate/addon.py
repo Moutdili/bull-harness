@@ -121,7 +121,7 @@ from mitmproxy.proxy import mode_specs, server_hooks
 from bh import paths, redact
 from bh.accounts.expiry import jwt_exp
 from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER, origin
-from bh.gate import canary, session
+from bh.gate import canary, recipients, session
 from bh.gate.policy import (
     SYSTEM_HOSTS,
     Policy,
@@ -497,6 +497,7 @@ class Gate:
         self.state = Path(ctx.options.bh_state)
         (self.state / paths.FLOWS_DIR).mkdir(parents=True, exist_ok=True)
         self.policy = Policy(self.state / paths.ACTIVE_SCOPE, local_ips=local_addresses())
+        self.policy.on_event = lambda rec: self._log(paths.EVENTS, rec)  # D40: a broken scope-extra file, journaled
         self.policy.reload()
         if ctx.options.rawtcp:
             ctx.options.update(rawtcp=False)  # non-HTTP bytes are not relayed (tcp hooks below kill the rest)
@@ -617,7 +618,7 @@ class Gate:
         rec = {
             "kind": "blocked",
             "where": where,
-            "url": redact.url(url),
+            "url": recipients.scrub(redact.url(url)),  # D31: never an address, its truncated digest at most
             "method": flow.request.method,
             "reason": v.reason,
             "rule": v.rule,
@@ -938,8 +939,11 @@ class Gate:
             enroll=_from_gate(flow),
             websocket=websocket,
             browser=browser,
+            content_type=req.headers.get("content-type"),
+            content_encoding=req.headers.get("content-encoding"),
         )
         flow.metadata["bh_class"] = v.klass
+        flow.metadata["bh_recipients"] = v.recipients  # D31: its flow lines keep no address
         flow.metadata["bh_support"] = v.support
         if not v.allowed:
             self._deny(flow, v, "request")
@@ -1206,11 +1210,12 @@ class Gate:
             # account enrollment (bh.accounts runs in the gate through this proxy): its bodies carry passwords and
             # session tokens, so the exchange is not kept, and it is not the agent's testing (assets, counts)
             klass = "enroll"
+        hide = recipients.scrub if flow.metadata.get("bh_recipients") else (lambda t: t)  # D31: our addresses too
         rec = {
             "id": fid,
             "class": klass,
             "method": req.method,
-            "url": redact.url(url),  # tokens in query strings stay out of the log
+            "url": hide(redact.url(url)),  # tokens in query strings stay out of the log
             "status": status,
             "len": len(body),
             "ctype": resp.headers.get("content-type", "") if resp else "",
@@ -1237,7 +1242,7 @@ class Gate:
                     "headers": [
                         (k, injected.get(k.lower()) or redact.header(k, v)) for k, v in req.headers.items(multi=True)
                     ],
-                    "body": _redacted_body(_decoded(req.raw_content, req.headers.get("content-encoding"))),
+                    "body": hide(_redacted_body(_decoded(req.raw_content, req.headers.get("content-encoding")))),
                 },
                 "response": {
                     "headers": [(k, redact.header(k, v)) for k, v in resp.headers.items(multi=True)] if resp else [],
