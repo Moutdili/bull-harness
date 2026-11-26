@@ -1038,6 +1038,7 @@ class Controller:
         program: str,
         identity: str,
         cookies: list[dict[str, Any]],
+        *,
         secrets: list[str] | None = None,
         passthrough: bool | None = None,
         targets: list[str] | None = None,
