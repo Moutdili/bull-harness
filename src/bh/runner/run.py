@@ -60,8 +60,8 @@ MAX_LEGS, EARLY_STOP, MIN_LEFT_TURNS, MIN_LEFT_S = 3, 0.5, 5, 180
 MIN_LEG_TOOL_CALLS = 2  # a leg that barely used tools has run out of leads: nudging it again only costs tokens
 CONTINUE_PROMPT = (
     "Continue in this session: about {turns} turns and {minutes} minutes remain. Run `bh-note frontier`, "
-    "take the next untested endpoint or open intent, test it, record the outcome, and keep going. "
-    "Stop only when every lead on the board is a recorded dead end; then write the HANDOFF fact."
+    "take the next untested endpoint or open intent, or the next unchecked surface of the program card, test it, "
+    "record the outcome, and keep going. Keep the HANDOFF fact current."
 )
 # Context rotation (issue 10, TODO 4.2b). A turn's context = input + cache read + cache write tokens. Measured
 # (plan v3 §1): 8.4-10.3k at the base of a session, a 19.4k peak over 22 turns (run 12). 30k is 3x the base and
@@ -70,13 +70,34 @@ CONTINUE_PROMPT = (
 # turn). At CONTEXT_HARD_FACTOR x the threshold the leg is stopped after the turn in progress, then rotated.
 CONTEXT_ROTATE_TOKENS = int(os.environ.get("BH_CONTEXT_ROTATE_TOKENS", "30000"))
 CONTEXT_HARD_FACTOR = 2
+# A hunt in the persistent browser (scope with a `passthrough` host) piles up selectors and page state: 30k is reached
+# in 20-45 turns and every fresh session forgets the page (audit I9). There: 60k and 5 legs. BH_CONTEXT_ROTATE_TOKENS
+# and BH_MAX_LEGS, when set, win for every scope.
+BROWSER_ROTATE_TOKENS, BROWSER_MAX_LEGS = 60000, 5
+
+
+def _env_int(env, name: str) -> int | None:
+    try:
+        v = int(str(env.get(name, "")).strip())
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def segment_limits(scope: Scope, env=None) -> tuple[int, int]:
+    """(context rotation threshold in tokens, legs at most) for this scope's segments."""
+    env = os.environ if env is None else env
+    browser = bool(scope.support_hosts("passthrough"))
+    rotate = _env_int(env, "BH_CONTEXT_ROTATE_TOKENS") or (BROWSER_ROTATE_TOKENS if browser else CONTEXT_ROTATE_TOKENS)
+    legs = _env_int(env, "BH_MAX_LEGS") or (BROWSER_MAX_LEGS if browser else MAX_LEGS)
+    return rotate, legs
 
 
 @dataclass
 class SegmentResult:
     program: str
     run_id: int
-    status: str = "error"  # ok | max_turns | timeout | quota | error | refusal | stopped
+    status: str = "error"  # ok | max_turns | timeout | quota | error | refusal | stopped | parked
     session_id: str | None = None
     legs: int = 0
     turns: int = 0
@@ -172,8 +193,40 @@ class ProgramNotReady(SystemExit):
         self.program, self.fields = program, fields
 
 
+def parked_file(program: str) -> Path:
+    """Marker of a program stopped on third-party data or server-side execution (audit I11). Only the operator lifts
+    it (`bh unpark <program>`), after reading the board and reporting to the program if needed."""
+    return paths.var() / "parked" / f"{program}.json"
+
+
+def park(program: str, reason: str, run_id: int | None) -> None:
+    p = parked_file(program)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"program": program, "reason": reason, "run_id": run_id, "ts": time.time()}))
+
+
+def parked(program: str) -> dict | None:
+    p = parked_file(program)
+    if not p.exists():
+        return None
+    try:
+        rec = json.loads(p.read_text())
+    except (OSError, ValueError):
+        rec = None
+    return rec if isinstance(rec, dict) else {"reason": "unreadable marker"}
+
+
 def check_automation(scope: Scope) -> None:
-    """Unknown program rules = onboarding not done; automation forbidden = never run. Nobody is asked mid-hunt."""
+    """Unknown program rules = onboarding not done; automation forbidden = never run; parked = never run until the
+    operator lifts it. Nobody is asked mid-hunt."""
+    if (rec := parked(scope.program)) is not None:
+        raise ProgramNotReady(
+            scope.program,
+            ["parked"],
+            f"{scope.program}: parked since run {rec.get('run_id')} ({rec.get('reason')}: third-party data or "
+            f"server-side execution). Read the board, report it to the program if needed, then `bh unpark "
+            f"{scope.program}`",
+        )
     if scope.automation_allowed is False:
         raise ProgramNotReady(
             scope.program,
@@ -457,6 +510,105 @@ class SessionKeeper:
             self._thread = None
 
 
+# ------------------------------------------------------------------ stop on third-party data (during a segment)
+STOP_TICK_S = 2.0
+STOP_TITLE = "bull-harness: STOP"
+
+
+class StopWatcher:
+    """A host thread alive during one segment (audit I11, MSRC rule of docs/research/15): it follows the sandbox's
+    notes.jsonl and, on `bh-note blocked third-party-data|server-exec`, parks the program (marker first: it holds even
+    if the push fails), pushes a ntfy WITHOUT content (program name only) and kills the agent. The runner then starts
+    no other leg and judges nothing. The note itself is ingested as usual at the end of the segment."""
+
+    def __init__(
+        self,
+        program: str,
+        run_id: int,
+        *,
+        path: Path | None = None,
+        notify=None,
+        kill=None,
+        say=None,
+        tick: float = STOP_TICK_S,
+    ) -> None:
+        self.program, self.run_id, self.say, self.tick_s = program, run_id, say, tick
+        self.path = path or paths.work_bh(program) / c.NOTES
+        self._notify, self._kill = notify, kill
+        self.offset, self.inode = 0, None
+        self.triggered: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def _send(self, title: str, message: str) -> bool:
+        if self._notify is not None:
+            return bool(self._notify(title, message))
+        from bh.browser_service import notify
+
+        return notify.send(title, message)
+
+    def poll(self) -> str | None:
+        """Read the new complete lines; fire on the first stop reason. Returns the reason, if any."""
+        with self._lock:
+            try:
+                st = self.path.stat()
+                if st.st_ino != self.inode or st.st_size < self.offset:  # rotated mid-segment: a new file
+                    self.inode, self.offset = st.st_ino, 0
+                with open(self.path, "rb") as fh:
+                    fh.seek(self.offset)
+                    chunk = fh.read()
+            except OSError:
+                return self.triggered
+            end = chunk.rfind(b"\n") + 1
+            self.offset += end
+            for line in chunk[:end].splitlines():
+                try:
+                    n = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(n, dict) and n.get("op") == "blocked" and n.get("reason") in c.STOP_REASONS:
+                    self._fire(str(n["reason"]))
+                    break
+            return self.triggered
+
+    def _fire(self, reason: str) -> None:
+        if self.triggered:
+            return
+        self.triggered = reason
+        park(self.program, reason, self.run_id)
+        # content-free: neither the note's title nor its detail (they may describe someone else's data)
+        sent = self._send(STOP_TITLE, f"{self.program}: arret, donnee tierce ou execution serveur. Voir le board.")
+        if self.say:
+            self.say(f"  ■ STOP {reason}: program parked, agent stopped" + ("" if sent else " (ntfy push failed)"))
+        try:
+            (self._kill or (lambda: stack.kill_agent(self.program)))()
+        except Exception as exc:  # noqa: BLE001 (the runner checks `triggered` after the leg anyway)
+            if self.say:
+                self.say(f"  ⚠ stop: cannot kill the agent: {exc!r}"[:200])
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.tick_s):
+            try:
+                if self.poll():
+                    return
+            except Exception as exc:  # noqa: BLE001 (never take the segment down)
+                if self.say:
+                    self.say(f"  ⚠ stop watcher: {type(exc).__name__}: {one_line(str(exc), 160)}")
+
+    def start(self) -> StopWatcher:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._loop, name="bh-stop-watcher", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(10.0, self.tick_s * 2))
+            self._thread = None
+
+
 def identity_roles(scope: Scope, names: list[str]) -> str:
     """BH_IDENTITY_ROLES (contract with bh.agent): `name=role@tenant` per name, comma-separated, in the order of
     `names` (BH_IDENTITIES). An undeclared role or tenant is empty: `user-x=@`, `admin-a=admin@`."""
@@ -643,7 +795,12 @@ def frontier(board: Board, program: str, scope: Scope | None = None) -> str:
     if scope is None:
         return board.frontier(program)
     surface = Graph(board, scope).render(phases_for(scope))
-    return board.frontier(program) + (f"\n{surface}" if surface else "")
+    return board.frontier(program, passthrough=has_browser(scope)) + (f"\n{surface}" if surface else "")
+
+
+def has_browser(scope: Scope | None) -> bool:
+    """The scope has a host behind a human challenge: the hunt drives bh-browser (docs/research/18)."""
+    return bool(scope is not None and scope.support_hosts("passthrough"))
 
 
 def coverage_counts(board: Board, scope: Scope) -> tuple[int, int]:
@@ -668,7 +825,17 @@ def pick_cards(board: Board, scope: Scope) -> list[str]:
         for cid in (r["cards"] or "").split(",")
         if cid
     ]
-    return classes.select_cards(endpoints, exclude=scope.forbidden_vulns, recently_used=recent)
+    pinned = classes.pinned_cards(scope)
+    return [
+        cid
+        for cid in classes.select_cards(endpoints, exclude=scope.forbidden_vulns, recently_used=recent)
+        if cid not in pinned
+    ]
+
+
+def segment_cards(scope: Scope, picked: list[str]) -> str:
+    """The cards block of a task: the scope's pinned cards, always, then the picked ones."""
+    return classes.cards_block(picked, classes.pinned_cards(scope))
 
 
 def prepare_workdir(board: Board, scope: Scope, scope_file: Path, identities: list[str] | None = None) -> None:
@@ -682,7 +849,7 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path, identities: li
     board.export_facts(prog, stage / c.FACTS)
     cbh = c.sandbox_dir(prog)
     # bh-note frontier = this board view + the surface recomputed live in the sandbox
-    stack.push_file(f"{cbh}/{c.FRONTIER}", board.frontier(prog))
+    stack.push_file(f"{cbh}/{c.FRONTIER}", board.frontier(prog, passthrough=has_browser(scope)))
     tested = board.rows(
         "SELECT a.key FROM assets a WHERE a.program=? AND a.kind='endpoint' "
         "AND EXISTS (SELECT 1 FROM tests t WHERE t.asset_id=a.id)",
@@ -1130,11 +1297,58 @@ def last_fact_id(board: Board) -> int:
     return board.rows("SELECT COALESCE(MAX(id), 0) AS n FROM facts")[0]["n"]
 
 
+def browser_status(call=None) -> dict | None:
+    """bh-browser's state as the host sees it (op `status`), None when it cannot be read: never raises."""
+    try:
+        if call is None:
+            from bh.browser_service import host
+
+            call = host.call
+        st = call({"op": "status"})
+    except Exception:  # noqa: BLE001 (a handoff never fails on the browser)
+        return None
+    return st if isinstance(st, dict) and "error" not in st else None
+
+
+def browser_line(st: dict | None) -> str:
+    """One bounded line for the HANDOFF: page (scheme, host and path: no query, no title, both written by the target),
+    identity, challenge."""
+    if not st:
+        return ""
+    try:
+        u = urlsplit(str(st.get("url") or ""))
+        page = f"{u.scheme}://{u.hostname}{u.path}" if u.hostname else "-"
+    except ValueError:
+        page = "-"
+    ch = st.get("challenge") if isinstance(st.get("challenge"), dict) else {}
+    return one_line(
+        f"bh-web: page {page[:120]} · identity {st.get('identity') or '-'} · "
+        "challenge " + ("PENDING (`bh-web state` first, then resume the last intent)" if ch.get("pending") else "none"),
+        260,
+    )
+
+
+def challenge_pending(st: dict | None) -> bool:
+    ch = st.get("challenge") if isinstance(st, dict) else None
+    return isinstance(ch, dict) and ch.get("pending") is True
+
+
+def challenge_resume(board: Board, program: str) -> str:
+    """First line of the next leg's task when a human challenge was still pending as the leg ended: the hunt goes on
+    with the task it was on, never with another surface (Mio, 2026-11-26)."""
+    rows = board.rows(
+        "SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id DESC LIMIT 1", program
+    )
+    what = f"I{rows[0]['id']} {one_line(rows[0]['title'], 120)}" if rows else "what you were doing"
+    return f"A human challenge was pending: `bh-web state` first, then resume {what}."
+
+
 def auto_handoff(
-    board: Board, program: str, run_id: int, *, since: int, context: int, last_cmd: str
+    board: Board, program: str, run_id: int, *, since: int, context: int, last_cmd: str, browser: str = ""
 ) -> tuple[str, str]:
     """(title, summary) of the HANDOFF the runner writes when a session rotates without one. Built from the board
-    (the agent's own notes, each title cut to one bounded line) and the last command, never from target output."""
+    (the agent's own notes, each title cut to one bounded line), the last command and `browser` (browser_line),
+    never from target output."""
     intents = board.rows(
         "SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id DESC LIMIT 5", program
     )
@@ -1157,6 +1371,8 @@ def auto_handoff(
         lines.append("Recorded: " + "; ".join(one_line(r["title"], 80) for r in done))
     if last_cmd:
         lines.append("Last command: " + one_line(last_cmd, 150))
+    if browser:
+        lines.append(browser)
     return f"HANDOFF (runner): context rotation at {context} tokens", "\n".join(lines)
 
 
@@ -1169,10 +1385,13 @@ def prepare_rotation(
     since: int,
     context: int,
     identities: list[str] | None = None,
+    stopper: StopWatcher | None = None,
 ) -> bool:
     """Before a fresh session takes over mid-segment: ingest the notes so far, write the HANDOFF if none was
     ingested since fact id `since`, push the updated frontier to the sandbox. True when the runner wrote it."""
     prog = scope.program
+    if stopper is not None:  # the last lines of the file about to move: a stop note in them still fires
+        stopper.poll()
     facts, findings, blockers = ingest.notes(board, prog, res.run_id, rotate_notes(prog, res.run_id, res.legs), scope)
     res.new_facts += facts
     res.new_findings += findings
@@ -1182,7 +1401,10 @@ def prepare_rotation(
     )
     if wrote:
         last = next((t["cmd"] for t in reversed(res.tool_log) if t.get("cmd")), "")
-        title, summary = auto_handoff(board, prog, res.run_id, since=since, context=context, last_cmd=last)
+        browser = browser_line(browser_status()) if has_browser(scope) else ""
+        title, summary = auto_handoff(
+            board, prog, res.run_id, since=since, context=context, last_cmd=last, browser=browser
+        )
         board.add_fact(prog, title, summary, kind="handoff", run_id=res.run_id)
     Graph(board, scope).sync(res.run_id)
     prepare_workdir(board, scope, scope_file, identities)
@@ -1190,9 +1412,11 @@ def prepare_rotation(
 
 
 def pending_findings(board: Board, program: str) -> int:
-    """Findings with a proof still waiting for the judge ('verifying' = a verification that died mid-way)."""
+    """Findings with a proof or an observation still waiting for the judge ('verifying' = a verification that died
+    mid-way)."""
     return board.rows(
-        "SELECT COUNT(*) AS n FROM findings WHERE program=? AND status IN ('new', 'verifying') AND proof IS NOT NULL",
+        "SELECT COUNT(*) AS n FROM findings WHERE program=? AND status IN ('new', 'verifying') "
+        "AND (proof IS NOT NULL OR observation IS NOT NULL)",
         program,
     )[0]["n"]
 
@@ -1216,6 +1440,10 @@ def run_segment(
     for name in (stack.GATE, stack.AGENT):
         if not stack.container_running(name):
             raise SystemExit(f"container {name} is not running — start the stack with `bh up`")
+    try:
+        classes.pinned_cards(scope)  # an operator error, said before anything starts
+    except ValueError as exc:
+        raise SystemExit(f"{scope.program}: {exc}") from None
     with run_lock():
         return _run_locked(
             scope,
@@ -1271,40 +1499,45 @@ def _run_locked(
         watcher = browser_watch.ChallengeWatcher()
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
+    pinned = classes.pinned_cards(scope)
     refused = last_refusal(board, prog, run_id)
     operator = f"\n\nOperator instruction for this segment: {extra_task}" if extra_task else ""
+    shape = {"scanners": scope.scanners_on, "browser": has_browser(scope)}
     task = (
         build_task(
             frontier(board, prog, scope),
             first=first,
             max_turns=max_turns,
-            cards=classes.cards_block(cards),
+            cards=segment_cards(scope, cards),
             refused=refused,
+            **shape,
         )
         + operator
     )
     log_path = paths.run_log(run_id, prog)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     res = SegmentResult(program=prog, run_id=run_id, session_id=session)
-    board.run_set(run_id, cards=",".join(cards) or None)
+    board.run_set(run_id, cards=",".join([*pinned, *cards]) or None)
     say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     say(
         f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · "
         f"max {max_turns} turns / {minutes:g} min"
         + (f" · resume {session[:8]}" if session else "")
-        + (f" · cards {', '.join(cards)}" if cards else "")
+        + (f" · cards {', '.join([*pinned, *cards])}" if pinned or cards else "")
     )
 
     deadline = time.monotonic() + minutes * 60
     prompt, timed_out, next_session = task, False, session
-    limit = CONTEXT_ROTATE_TOKENS
+    limit, max_legs = segment_limits(scope)
     events_at = events_size()  # the relay's journal of this segment starts here
     set_active_run(run_id, prog, relay_budget(max_turns))
     # the agent's sessions are kept alive while it hunts (renewal before expiry and on session-dead)
     keeper = SessionKeeper(scope, board.path, run_id, identities, say, events_offset=events_at).start()
+    # third-party data or server-side execution: push, stop, park (audit I11)
+    stopper = StopWatcher(prog, run_id, say=say).start()
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
-            while res.legs < MAX_LEGS:
+            while res.legs < max_legs and not stopper.triggered:
                 res.legs += 1
                 if res.legs > 1:  # whatever the previous leg planted goes before the next one loads it
                     clean_leg(prog, sandbox_home(run_id))
@@ -1362,9 +1595,10 @@ def _run_locked(
                 say(f"  ◆ leg {res.legs}: {len(leg_turns)} turns, context max {max_ctx} / last {last_ctx} tokens")
                 left_turns, left_s = max_turns - res.turns, deadline - time.monotonic()
                 if (
-                    timed_out
+                    stopper.poll()
+                    or timed_out
                     or res.status != "ok"
-                    or res.legs >= MAX_LEGS
+                    or res.legs >= max_legs
                     or left_turns < MIN_LEFT_TURNS
                     or left_s < MIN_LEFT_S
                     # the agent ended the leg itself (not cut by the runner) after most of the budget, or
@@ -1375,17 +1609,27 @@ def _run_locked(
                     )
                 ):
                     break
+                waiting = has_browser(scope) and challenge_pending(browser_status())
                 if not cards and (cards := pick_cards(board, scope)):  # the surface exists once mapping is done
                     board.run_set(run_id, cards=",".join(cards))
                     say(f"  ↻ cards {', '.join(cards)}")
-                    new_cards = classes.cards_block(cards)
+                    new_cards = classes.cards_block(cards)  # the pinned ones are already in this session
                 else:
                     new_cards = ""
                 if rotate:
                     res.rotations += 1
                     wrote = prepare_rotation(
-                        board, scope, scope_file, res, since=facts_before, context=last_ctx, identities=identities
+                        board,
+                        scope,
+                        scope_file,
+                        res,
+                        since=facts_before,
+                        context=last_ctx,
+                        identities=identities,
+                        stopper=stopper,
                     )
+                    if stopper.triggered:
+                        break
                     say(
                         f"  ⟳ context {last_ctx} tokens > {limit}: fresh session from the board"
                         + (" (HANDOFF written by the runner)" if wrote else "")
@@ -1395,9 +1639,10 @@ def _run_locked(
                             frontier(board, prog, scope),
                             first=False,
                             max_turns=left_turns,
-                            cards=classes.cards_block(cards),
+                            cards=segment_cards(scope, cards),
                             refused=refused,
                             rotated=True,
+                            **shape,
                         )
                         + operator
                     )
@@ -1407,9 +1652,12 @@ def _run_locked(
                     prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
                     prompt += f"\n\n{new_cards}" if new_cards else ""
                     next_session = res.session_id
+                if waiting:  # the next leg starts where this one waited, not on another surface
+                    prompt = challenge_resume(board, prog) + "\n\n" + prompt
     except BaseException as exc:  # Ctrl-C / SIGTERM, or a harness error: record what the agent already wrote
         with signals_ignored():
             keeper.stop()
+            stopper.stop()
             stopped = isinstance(exc, KeyboardInterrupt)
             res.status = "stopped" if stopped else "error"
             note = "stopped by operator" if stopped else f"harness error: {exc!r}"
@@ -1421,6 +1669,8 @@ def _run_locked(
         raise
     with signals_ignored():
         keeper.stop()
+        stopper.stop()
+        stopper.poll()  # a stop note written as the last leg ended
         set_active_run(None)
         stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
         if timed_out:
@@ -1434,19 +1684,23 @@ def _run_locked(
             res.status = "quota"
         elif res.quota_claimed:
             say("  ⚠ the stream reports a quota stop that neither stderr nor the relay confirms: not a quota stop")
+        if stopper.triggered:
+            res.status = "parked"
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
     # every finding waiting with a proof, not only this segment's: one left 'new' by an earlier stop is picked up
     # here, and a refused segment's findings are verified too (the refusal closes a lead, not the findings). After a
     # quota claim, even an unconfirmed one, nothing is judged: a judge without quota would bury a good finding.
-    if res.status != "quota" and not res.quota_claimed and (pending := pending_findings(board, prog)):
-        from bh.verify import VERIFIER_MODEL, verify_pending
+    # A parked program is judged by nobody: a replay would touch the third-party data again.
+    if res.status not in ("quota", "parked") and not res.quota_claimed and (pending := pending_findings(board, prog)):
+        from bh.verify import verifier_model, verify_pending
 
+        judge = verifier_model(model)  # never the hunter's model (audit I10)
         # sessions first: one the gate saw die (or a false mark) is refreshed before the replay leans on it
         refresh_identities(board, scope, run_id, say)
-        say(f"▶ verifying {pending} finding(s) with {VERIFIER_MODEL}")
+        say(f"▶ verifying {pending} finding(s) with {judge}")
         set_active_run(run_id, prog)  # the verifier's requests are this run's traffic too
         try:
-            verify_pending(board, scope, run_id=run_id, model=VERIFIER_MODEL, effort=effort, say=say)
+            verify_pending(board, scope, run_id=run_id, model=judge, effort=effort, say=say)
         finally:
             set_active_run(None)
     say(

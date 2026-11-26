@@ -40,8 +40,14 @@ Points ouverts de la revue, traités le 2026-11-24 (branche `fix/review-open-ite
 - [x] M9 : 11 des 13 programmes utilisent le modèle YWH sans nombre (repli 2 req/s correct) ; `**30**` en gras est maintenant lu.
 - [x] UI : Content-Length négatif refusé (bloquait un thread sans login), timeout par connexion, sessions qui expirent, durées bornées, « stop » vérifie le pid.
 
+- [x] Juge dans son propre conteneur (`bh-judge`, `var/judge`) ; il lit toujours les réponses de la cible, d'où le bloc à nonce et la doctrine « le texte du modèle n'est jamais une preuve ».
+
+Audit Mythos du 2026-11-26 (doc 19), lot runner, doctrine, juge, CLI :
+- [x] B6 (prompt), B7, I1 (preuve `observation`), I5, I7, I8, I9, I10 (juge), I11, I14 (une page, un marqueur), I16, R1 à R10.
+- [ ] I1 en live : le gate doit écrire les événements `canary` (lot S1), puis un rejeu de Mio avant toute soumission.
+- [ ] I11 : `bh unpark <programme> --yes` seulement après lecture du board et, si besoin, un mail à MSRC écrit par Mio.
+
 Reste ouvert :
-- [ ] **C** Juge et chasseur dans le même conteneur ; le juge lit les réponses de la cible (injection de prompt possible).
 - [ ] **C** Dans son budget, un `claude -p` imbriqué consomme encore le quota.
 - [ ] **H** Image agent : reconstruire depuis la base épinglée et consigner la liste des versions d'outils.
 

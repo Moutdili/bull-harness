@@ -138,6 +138,10 @@ def hunt(
             print(f"{p.program}: parked until the end of the hunt (segment failed: {exc!r})"[:500])
             continue
         p.resumes = p.resumes + 1 if resume else 0
+        if res.status == "parked":  # third-party data or server-side execution: only the operator lifts it
+            p.parked = True
+            print(f"{p.program}: parked (stop note: third-party data or server-side execution), see `bh unpark`")
+            continue
         if res.status == "quota":
             wake = quota_wake(res, time.time())
             if wake >= deadline:

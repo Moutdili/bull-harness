@@ -45,10 +45,47 @@ from bh.scope import Scope
 from bh.text import one_line
 
 VERIFIER_TURNS, VERIFIER_MINUTES = 8, 5
-# the judge is not the hunter's model (correlated errors); BH_VERIFIER_MODEL overrides
-VERIFIER_MODEL = os.environ.get("BH_VERIFIER_MODEL", "opus")
+# The judge is never the hunter's model (correlated errors, audit I10). BH_VERIFIER_MODEL names it; empty, it is Opus,
+# or Mythos when the hunter is Opus. A BH_VERIFIER_MODEL of the hunter's family is replaced the same way.
+JUDGE_DEFAULT, JUDGE_FOR_OPUS = "opus", "claude-mythos-5-2"
+VERIFIER_MODEL = os.environ.get("BH_VERIFIER_MODEL", "").strip() or JUDGE_DEFAULT  # shown as the CLI default
 # second judge for what the first one leaves inconclusive (decision of 2026-11-25), once per finding
 ESCALATION_MODEL = os.environ.get("BH_ESCALATION_MODEL", "claude-mythos-5-2")
+
+
+def model_family(model: str | None) -> str:
+    """`opus`, `claude-opus-5-5`, `us.anthropic.claude-opus...` -> opus; same for sonnet, haiku, mythos, fable."""
+    m = (model or "").lower()
+    return next((f for f in ("opus", "sonnet", "haiku", "mythos", "fable") if f in m), m)
+
+
+def verifier_model(hunter: str | None, requested: str | None = None, env=None) -> str:
+    """The judge's model for a finding the model `hunter` found: `requested` (the CLI's --model), else
+    BH_VERIFIER_MODEL, else Opus; whichever it is, never the hunter's family (then Opus, or Mythos for an Opus
+    hunter)."""
+    env = os.environ if env is None else env
+    choice = (requested or "").strip() or (env.get("BH_VERIFIER_MODEL") or "").strip() or JUDGE_DEFAULT
+    if hunter and model_family(choice) == model_family(hunter):
+        choice = JUDGE_FOR_OPUS if model_family(hunter) == "opus" else JUDGE_DEFAULT
+    return choice
+
+
+def escalation_model(hunter: str | None, judge: str) -> str | None:
+    """The second judge: ESCALATION_MODEL unless it is the hunter's or the first judge's family (then Opus, if that
+    is neither); None when no model is left."""
+    taken = {model_family(hunter), model_family(judge)}
+    for m in (ESCALATION_MODEL, JUDGE_DEFAULT, JUDGE_FOR_OPUS):
+        if model_family(m) not in taken:
+            return m
+    return None
+
+
+def hunter_model(board: Board, finding: dict) -> str | None:
+    """The model of the run that recorded the finding (runs.model), None if unknown."""
+    rows = board.rows("SELECT model FROM runs WHERE id=?", finding.get("run_id"))
+    return rows[0]["model"] if rows and rows[0]["model"] else None
+
+
 ESCALATION_EFFORT = "high"
 MAX_VERIFY_ERRORS = 2  # an error is a breakdown, not a doubt: retried on a later pass, never escalated
 REPLAY_TIMEOUT_S = 420
@@ -124,10 +161,17 @@ def stage_b(
         prompts.build_verifier_prompt(scope, finding, replay, classes.evidence(finding["vuln_class"])),
     )
     nonce = secrets.token_hex(16)  # only this claude process gets it: a verdict without it was not written by it
-    task = (
-        f"Verify finding F{fid}. The proof is at {vdir}/proof.json. Re-test it, then record exactly one "
-        f"`bh-note verdict F{fid} ...`."
-    )
+    if finding.get("observation"):  # no proof.json: the host's table of canary events is in the system prompt
+        task = (
+            f"Judge finding F{fid} from the host's observation table in your instructions. Re-test what single "
+            f"requests can show (the canary owner's data, the route the canary left by), then record exactly one "
+            f"`bh-note verdict F{fid} ...`."
+        )
+    else:
+        task = (
+            f"Verify finding F{fid}. The proof is at {vdir}/proof.json. Re-test it, then record exactly one "
+            f"`bh-note verdict F{fid} ...`."
+        )
     cmd = runner.agent_command(
         scope,
         task,
@@ -303,11 +347,14 @@ def _identity_headers(program: str, name: str) -> list[str]:
 def verify_finding(
     board: Board, scope: Scope, fid: int, *, run_id: int, model: str, effort: str | None, say=print
 ) -> str:
-    """`model` is the verifier's (VERIFIER_MODEL by default in callers), not the hunter's."""
+    """`model` is the judge asked for (VERIFIER_MODEL by default in callers); never the hunter's (verifier_model)."""
     rows = board.rows("SELECT * FROM findings WHERE id=? AND program=?", fid, scope.program)
     if not rows:
         raise SystemExit(f"F{fid} is not a finding of {scope.program}")
     finding = dict(rows[0])
+    model = verifier_model(hunter_model(board, finding), model)
+    if not finding.get("proof") and finding.get("observation"):
+        return _verify_observation_safe(board, scope, finding, run_id=run_id, model=model, effort=effort, say=say)
     if not finding.get("proof"):
         board.set_finding(fid, "inconclusive", "no structured proof (finding recorded before the verifier existed)")
         return "inconclusive"
@@ -363,10 +410,20 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
         status, why = decide(replay, verdict, reason)
         why = f"[judge {model}] {why}"
         key = f"escalated:F{fid}:{scope.program}"
-        if status == "inconclusive" and not board.meta_get(key):
-            board.meta_set(key, ESCALATION_MODEL)  # before the call: a crash in it does not escalate again
+        second = escalation_model(hunter_model(board, finding), model)
+        if status == "inconclusive" and second and not board.meta_get(key):
+            board.meta_set(key, second)  # before the call: a crash in it does not escalate again
             status, why = _escalate(
-                board, scope, finding, proof=proof, replay=replay, home=home, first=why, run_id=run_id, say=say
+                board,
+                scope,
+                finding,
+                proof=proof,
+                replay=replay,
+                home=home,
+                first=why,
+                run_id=run_id,
+                say=say,
+                model=second,
             )
     board.set_finding(fid, status, why)
     if status == "verified":
@@ -382,32 +439,115 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
 
 
 def _escalate(
-    board: Board, scope: Scope, finding: dict, *, proof: dict, replay: dict, home: str, first: str, run_id: int, say
+    board: Board,
+    scope: Scope,
+    finding: dict,
+    *,
+    proof: dict,
+    replay: dict,
+    home: str,
+    first: str,
+    run_id: int,
+    say,
+    model: str = ESCALATION_MODEL,
 ) -> tuple[str, str]:
     """Stage B again with the second judge, recombined with the same stage A. Returns (status, verdict text)."""
     fid, vdir = finding["id"], verify_dir(scope.program, finding["id"])
-    say(f"  ↳ F{fid} inconclusive for the first judge, second judge {ESCALATION_MODEL}")
+    say(f"  ↳ F{fid} inconclusive for the first judge, second judge {model}")
     # fresh context: the first judge's processes, HOME and work dir (its notes, its verdict) are gone
     stack.prepare_judge(home, vdir)
     _push(f"{vdir}/proof.json", json.dumps(proof))
     verdict, reason = stage_b(
-        board, scope, finding, replay, run_id=run_id, model=ESCALATION_MODEL, effort=ESCALATION_EFFORT, say=say
+        board, scope, finding, replay, run_id=run_id, model=model, effort=ESCALATION_EFFORT, say=say
     )
     status, why = decide(replay, verdict, reason)
     if status == "inconclusive":
-        return status, f"neither judge decided. {first} | [judge {ESCALATION_MODEL}] {why}"
-    return status, f"[judge {ESCALATION_MODEL}] {why} | first judge: {first}"
+        return status, f"neither judge decided. {first} | [judge {model}] {why}"
+    return status, f"[judge {model}] {why} | first judge: {first}"
+
+
+# ------------------------------------------------------------------ observation proofs (audit I1)
+def decide_observation(host: dict, verdict: str, reason: str) -> tuple[str, str]:
+    """The host's verdict from the gate's journal, lowered (never raised) by the judge."""
+    hs, hwhy = host.get("status"), str(host.get("why") or "")
+    if hs != "verified-evidence":
+        return ("rejected" if hs == "rejected" else "inconclusive"), f"host: {hwhy}"
+    if verdict == "rejected":
+        return "rejected", f"host: {hwhy}; judge rejected it: {reason}"
+    if verdict == "confirmed":
+        return "verified-evidence", f"host: {hwhy}; judge: {reason}"
+    return "inconclusive", f"host: {hwhy}; judge {verdict}: {reason}"
+
+
+def _verify_observation_safe(
+    board: Board, scope: Scope, finding: dict, *, run_id: int, model: str, effort: str | None, say
+) -> str:
+    fid = finding["id"]
+    try:
+        return _verify_observation(board, scope, finding, run_id=run_id, model=model, effort=effort, say=say)
+    except Exception as exc:  # noqa: BLE001 - never leave a finding stuck in 'verifying'
+        board.set_finding(fid, "inconclusive", f"observation check error: {exc!r}"[:500])
+        say(f"  ↳ F{fid} inconclusive: observation check error {exc!r}"[:200])
+        return "inconclusive"
+
+
+def _verify_observation(
+    board: Board, scope: Scope, finding: dict, *, run_id: int, model: str, effort: str | None, say
+) -> str:
+    """The host reads the canary events again (the gate may have logged more since the ingestion). Rejected or never
+    seen: decided without a judge. Seen on the attacker's side: one judge session reads the table and may lower it."""
+    from bh.runner import observation
+
+    fid = finding["id"]
+    try:
+        obs = observation.valid(json.loads(finding["observation"]))
+    except (TypeError, ValueError):
+        obs = None
+    if obs is None:
+        board.set_finding(fid, "inconclusive", "observation unreadable")
+        return "inconclusive"
+    board.set_finding(fid, "verifying")
+    host = observation.check(obs, scope)
+    board.finding_set(fid, replay=json.dumps({"observation": host})[:200_000])
+    say(f"  ↳ F{fid} observation: host says {host['status']} ({one_line(host['why'], 160)})")
+    if host["status"] == "verified-evidence" and not stack.container_running(stack.JUDGE_CTR):
+        board.set_finding(fid, "new", "observation seen by the host; judge container down, left for a later pass")
+        say(f"  ↳ F{fid} not judged: container {stack.JUDGE_CTR} is not running (`bh up`)")
+        return "skipped"
+    if host["status"] == "verified-evidence":
+        home = runner.sandbox_home(f"{run_id}-F{fid}")
+        runner.clean_sandbox(scope.program, home)
+        stack.prepare_judge(home, verify_dir(scope.program, fid))
+        verdict, reason = stage_b(
+            board, scope, finding, {"observation": host}, run_id=run_id, model=model, effort=effort, say=say
+        )
+        status, why = decide_observation(host, verdict, reason)
+        why = f"[judge {model}] {why}"
+    else:
+        status, why = decide_observation(host, "", "")
+    board.set_finding(fid, status, why[:2000])
+    if status == "verified-evidence":
+        board.add_todo(
+            "submit",
+            f"F{fid} verified by observation: {finding['title']}",
+            "replay it once yourself in bh-web (same prompts, a new canary) before submitting",
+            program=scope.program,
+            dedup=f"{scope.program}:submit:F{fid}",
+        )
+    say(f"  ↳ F{fid} {status}: {one_line(why, 200)}")
+    return status
 
 
 def verify_pending(
     board: Board, scope: Scope, *, run_id: int, model: str, effort: str | None, say=print, limit: int = 10
 ) -> dict[str, int]:
-    """Verify the unverified findings that carry a proof, newest first (bounded: each one costs a claude session)."""
+    """Verify the unverified findings that carry a proof or an observation, newest first (bounded: each one costs a
+    claude session)."""
     out: dict[str, int] = {}
     for r in board.rows(
         # 'verifying' = a verification that died with the process: picked up again
-        "SELECT id FROM findings WHERE program=? AND status IN ('new', 'verifying') AND proof IS NOT NULL "
-        "ORDER BY id DESC LIMIT ?",
+        "SELECT id FROM findings WHERE program=? AND status IN ('new', 'verifying') "
+        "AND (proof IS NOT NULL OR observation IS NOT NULL) ORDER BY id DESC LIMIT ?",
         scope.program,
         limit,
     ):

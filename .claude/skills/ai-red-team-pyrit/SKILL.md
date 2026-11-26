@@ -64,7 +64,7 @@ Preconditions (hard):
 - Use the services "in a way that does not violate our service agreements" [talk]; a throttled or
   challenged test account ends the run on that surface.
 - Stop rules of §5 known (server-side execution, third-party data).
-- Target UI transport measured (websocket or HTTP, §6). Websocket-only: blocker, stop.
+- Chat driven through `bh-web` only (§6); never another path to send prompts.
 
 Steps [inferred, from the talk's method]:
 1. **Inventory the surface** as B: every channel the AI reads (mail, files, web pages, calendar, chat
@@ -119,17 +119,18 @@ missing, it is not a finding. Rate-limit bypass: not hunted (`msrc-ai-bug-bounty
 
 ## 6. Integrating with bull-harness (proposal, not built)
 
-**Blocking point: the transport.** The gate refuses every websocket upgrade (`src/bh/gate/addon.py`:
-"websockets are not allowed: the gate cannot judge their frames"), and `bh-browse` refuses them locally.
-Copilot chat UIs probably use websockets [inferred, to measure: `WebSocketCopilotTarget` defaults to
-`wss://substrate.svc.cloud.microsoft/m365Copilot/Chathub`]. So:
-- Measure first: one `bh-browse` of the chat page as B; its summary prints "websockets: N refused".
-- Websocket-only chat: **unreachable today**. `bh-note blocked other "websocket-only chat: <url>"`.
-  A bounded websocket mode in the gate (frames judged or capped) is to be designed; decision for Mio.
-- HTTP alternative when it exists: an HTTP API of the same assistant, a channel that answers over plain
-  HTTP, or the injection side only (A writes mail/files over HTTP) with B's trigger through an HTTP surface.
-- `bh-browse` starts one Chromium per command: no persistent page to hand to `PlaywrightTarget` /
-  `PlaywrightCopilotTarget`. Not usable as is. Same for doc 15's "start with Copilot" recommendation.
+**Transport (updated 2026-11-26, audit doc 19).** The Copilot chat runs over a websocket
+(`wss://substrate.svc.cloud.microsoft/m365Copilot/Chathub`, measured) behind a Cloudflare Turnstile challenge.
+A scope with `websockets: true` lets the gate relay it, frames bounded and journaled, and the hunter drives the
+chat in the persistent headful browser `bh-browser` with `bh-web` (docs/research/18); the operator passes each
+challenge by hand. So:
+- Prompts go through `bh-web fill` / `press` only. **Never** another path to the assistant: no direct
+  websocket client, no `WebSocketCopilotTarget`, no HTTP API carrying a prompt. That would skip the challenge,
+  which the harness never does (account and program ban).
+- A challenge on screen: `bh-web wait-human`, then resume exactly the task in progress (scope_block).
+- Proof of a cross-user effect: the observation proof (`bh-note canary`, then `bh-note finding ...
+  --observation <canary> --victim user-b --attacker user-a`), decided by the host from the gate's journal.
+- `PlaywrightTarget` / `PlaywrightCopilotTarget` drive their own browser: not usable here.
 
 **v1 without PyRIT: native converters.** In the default mode (no LLM), PyRIT would only bring
 deterministic converters, at the cost of a large third-party dependency in the agent image with an API

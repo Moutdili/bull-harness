@@ -219,3 +219,32 @@ def test_rotation_metrics_are_stored(tmp_path, monkeypatch):
     board.run_set(rid, rotations=2, max_context=31000)
     row = board.rows("SELECT rotations, max_context FROM runs WHERE id=?", rid)[0]
     assert (row["rotations"], row["max_context"]) == (2, 31000)
+
+
+# ------------------------------------------------------------------ audit I11 and Mio's resume rule, in the loop
+def test_stop_note_ends_the_segment_and_parks_the_program(seg, tmp_path, monkeypatch):
+    board, go = seg
+    pushed: list = []
+    real = run.StopWatcher
+    monkeypatch.setattr(
+        run,
+        "StopWatcher",
+        lambda prog, rid, **kw: real(
+            prog, rid, path=tmp_path / "notes" / "notes.jsonl", notify=lambda t, m: pushed.append(m), **kw
+        ),
+    )
+    stop = {"op": "blocked", "reason": "server-exec", "title": "id ran on the server"}
+    res, st = go([{"ctx": [500, 600], "notes": [stop]}, {"ctx": [500]}])
+    assert len(st["cmds"]) == 1 and res.status == "parked"  # no second leg, nothing judged
+    assert run.parked("p")["reason"] == "server-exec" and len(pushed) == 1 and "id ran" not in pushed[0]
+    titles = [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='blocker'")]
+    assert "[server-exec] id ran on the server" in titles
+
+
+def test_pending_challenge_opens_the_next_leg(seg, monkeypatch):
+    _board, go = seg
+    monkeypatch.setattr(run, "has_browser", lambda scope: True)
+    monkeypatch.setattr(run, "browser_status", lambda call=None: {"challenge": {"pending": True}})
+    _res, st = go([{"ctx": [500, 600], "notes": [{"op": "intent", "title": "send prompt 3"}]}, {"ctx": [500]}])
+    task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
+    assert task.startswith("A human challenge was pending: `bh-web state` first, then resume")

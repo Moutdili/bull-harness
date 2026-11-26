@@ -101,6 +101,8 @@ services:
       # sandbox code only (bh.agent): the rest of the harness stays out of the agent's reach
       - ../src/bh/__init__.py:/opt/bh/lib/bh/__init__.py:ro,z
       - ../src/bh/agent:/opt/bh/lib/bh/agent:ro,z
+      # method and program cards, read on demand with the Read tool (audit I7); the task names the pinned ones
+      - ../src/bh/cards:/opt/bh/cards:ro,z
       # pinned nuclei templates, fetched on the host: the gate blocks GitHub
       - ../var/tools/nuclei-templates:/opt/bh/nuclei-templates:ro,z
     networks: [sandbox]
