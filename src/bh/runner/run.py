@@ -35,7 +35,7 @@ from bh import classes, paths, retention, stack
 from bh.assets import Graph
 from bh.agent import contract as c
 from bh.board import Board
-from bh.runner import ingest
+from bh.runner import identity, ingest
 from bh.runner.prompt import build_system_prompt, build_task
 from bh.scope import Scope, load_scope
 from bh.text import one_line
@@ -122,6 +122,8 @@ class SegmentResult:
     refusal_cause: dict = field(default_factory=dict)  # cmd, url, host, key: what the refusal most likely followed
     refusal_repeat: bool = False  # a refusal on a cause already refused within 7 days: not escalated again
     quota_claimed: bool = False  # the stream said `rejected`, confirmed or not: no verification after it
+    early_stops: int = 0  # legs that closed themselves on an announced action they never ran (T11)
+    preflight: dict | None = None  # the gate self-test this segment started after (T4)
     _pending: dict = field(default_factory=dict, repr=False)  # tool_use id -> index in tool_log
     _last_urls: list[str] = field(default_factory=list, repr=False)  # URLs of the last tool result
 
@@ -1333,9 +1335,15 @@ def challenge_pending(st: dict | None) -> bool:
     return isinstance(ch, dict) and ch.get("pending") is True
 
 
-def challenge_resume(board: Board, program: str) -> str:
+def challenge_resume(board: Board, program: str, *, replay: bool = True) -> str:
     """First line of the next leg's task when a human challenge was still pending as the leg ended: the hunt goes on
-    with the task it was on, never with another surface (Mio, 2026-11-26)."""
+    with the task it was on, never with another surface (Mio, 2026-11-26). `replay` False (T9: this leg's requests
+    with effects already left the sandbox): the intent is named, never handed back to be sent again."""
+    if not replay:
+        return (
+            "A human challenge was pending: `bh-web state` first. [bh] This leg already sent requests with effects: "
+            "check on the page what the last one did before sending anything again."
+        )
     rows = board.rows(
         "SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id DESC LIMIT 1", program
     )
@@ -1421,6 +1429,269 @@ def pending_findings(board: Board, program: str) -> int:
     )[0]["n"]
 
 
+# ------------------------------------------------------------------ harness lines, journal checks (W1)
+# Lines the runner adds to a task it builds, signed `[bh]`: facts the harness observed, never how to end a segment.
+EARLY_STOP_LINE = (
+    "[bh] The previous leg closed itself on an announced action it never ran (early stop recorded by the harness)."
+)
+NO_PROMPT_LINE = "[bh] no prompt this run: HTTP surfaces only"
+# T11: the last message of a leg that closes itself announces an action it never ran.
+_ANNOUNCED = re.compile(
+    r"\bnext,?\s+i(?:'ll|\u2019ll| will)\b|\bi(?:'ll|\u2019ll| will) now\b|\bnow,?\s+i(?:'ll|\u2019ll| will)\b"
+    r"|\bproceeding to\b|\blet me now\b|(?:\.\.\.|\u2026)\s*$",
+    re.I,
+)
+ANNOUNCE_TAIL = 400  # chars of the last message searched: the announcement is its end, not a plan quoted earlier
+
+
+def announced_action(text: str) -> bool:
+    """The text ends on an action announced and not run: "Next, I will...", "I'll now...", "Proceeding to...",
+    a final ellipsis."""
+    tail = (text or "").strip()[-ANNOUNCE_TAIL:]
+    return bool(tail) and bool(_ANNOUNCED.search(tail))
+
+
+def early_stop(res: SegmentResult, result: dict | None, *, timed_out: bool, max_turns: int) -> bool:
+    """The leg closed itself (a success result, not cut by the runner or the clock) before its turn budget, on an
+    announced action."""
+    return (
+        result is not None
+        and res.status == "ok"
+        and not res.overflow
+        and not timed_out
+        and res.turns < max_turns
+        and announced_action(res.text)
+    )
+
+
+def early_stop_key(program: str) -> str:
+    return f"early-stop:{program}"
+
+
+WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+FILL_KINDS = frozenset({"fill", "bh-web-fill"})
+
+
+def _since(rec: dict, since: float) -> bool:
+    ts = rec.get("ts")
+    return isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts >= since
+
+
+def left_the_sandbox(run_id: int, since: float) -> bool:
+    """T9: something of this run left the sandbox with an effect since `since`, per the gate's journal (out of the
+    sandbox's reach): a POST/PUT/PATCH/DELETE request, a client websocket message, a bh-web `fill`. The host's own
+    logins (class `enroll`) are not the run's actions."""
+    for f in c.read_jsonl(paths.flows_log()):
+        if (
+            isinstance(f, dict)
+            and f.get("run") == run_id
+            and _since(f, since)
+            and str(f.get("method", "")).upper() in WRITE_METHODS
+            and f.get("class") != "enroll"
+        ):
+            return True
+    for e in c.read_jsonl(paths.events_log()):
+        if not isinstance(e, dict) or e.get("run") != run_id or not _since(e, since):
+            continue
+        kind = e.get("kind")
+        if kind == "ws-message" and e.get("from") == "client":
+            return True
+        if kind in FILL_KINDS or (kind == "bh-web" and e.get("op") == "fill"):
+            return True
+    return False
+
+
+def resumable(board: Board, program: str) -> str | None:
+    """The session an automatic resume would reopen, None when that run left the sandbox (T9): the resume then
+    starts a fresh session from the board instead of replaying the intent in progress."""
+    rows = board.rows(
+        "SELECT id, started, session_id FROM runs WHERE program=? AND session_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+        program,
+    )
+    if not rows:
+        return None
+    return None if left_the_sandbox(rows[0]["id"], rows[0]["started"]) else rows[0]["session_id"]
+
+
+BUDGET = "budget.json"  # /work/<program>/.bh/budget.json, read by the agent's hook (T7)
+
+
+def push_budget(program: str, max_turns: int, used: int) -> None:
+    stack.push_file(
+        f"{c.sandbox_dir(program)}/{BUDGET}",
+        json.dumps({"max_turns": int(max_turns), "used": int(used), "ts": time.time()}),
+        user="root",  # the hunter reads it, never rewrites it in place
+    )
+
+
+# ------------------------------------------------------------------ bh-browser budget and friction (R44, D35)
+def browser_prompts(scope: Scope, st: dict | None, runs_left: int, say) -> dict[str, int] | None:
+    """Prompts per identity for this run, None when the controller gives no quotas (its own limits apply) or the
+    program is local."""
+    if scope.platform == "local":
+        return None
+    quotas = st.get("quotas") if isinstance(st, dict) else None
+    if not isinstance(quotas, dict) or not quotas:
+        say("  bh-browser: status " + ("has no quotas" if st else "unreadable") + ": no prompt allotment this run")
+        return None
+    from bh.runner.supervisor import prompt_allotment
+
+    return prompt_allotment(quotas, runs_left)
+
+
+def prepare_browser(scope: Scope, identities: list[str], say, prompts: dict[str, int] | None) -> str | None:
+    """watch.prepare with the run's prompt allotment, when the controller takes one."""
+    import inspect
+
+    try:
+        takes = "prompts" in inspect.signature(browser_watch.prepare).parameters
+    except (TypeError, ValueError):
+        takes = False
+    if takes:
+        return browser_watch.prepare(scope, identities, say, prompts=prompts)
+    if prompts is not None:
+        say("  bh-browser: this controller takes no prompt allotment; its own fill limits apply")
+    return browser_watch.prepare(scope, identities, say)
+
+
+def _counters(st: dict | None) -> dict[str, int] | None:
+    cnt = st.get("counters") if isinstance(st, dict) else None
+    if not isinstance(cnt, dict):
+        return None
+    out = {k: v for k in ("challenges", "sessions") if isinstance(v := cnt.get(k), int) and not isinstance(v, bool)}
+    return out if len(out) == 2 else None
+
+
+def browser_pushback(run_id: int, offset: int = 0) -> int:
+    """429 / 503 answers the `browser` client got for this run, per the gate's flows journal (from `offset`)."""
+    try:
+        if paths.flows_log().stat().st_size < offset:
+            offset = 0
+    except OSError:
+        return 0
+    return sum(
+        1
+        for f in c.read_jsonl(paths.flows_log(), offset)
+        if isinstance(f, dict)
+        and f.get("run") == run_id
+        and f.get("status") in (429, 503)
+        and (f.get("client") == "browser" or f.get("browser") is True)
+    )
+
+
+def friction(start: dict | None, end: dict | None, run_id: int, flows_at: int) -> dict | None:
+    """D35: {"challenges_extra", "browser_429"} of a bh-browser segment, None when the end status is unreadable.
+    One challenge per new session is the normal regime: only the challenges beyond the sessions are friction."""
+    e = _counters(end)
+    if e is None:
+        return None
+    s = _counters(start) or {"challenges": 0, "sessions": 0}
+    if e["challenges"] < s["challenges"] or e["sessions"] < s["sessions"]:  # the counters restarted meanwhile
+        s = {"challenges": 0, "sessions": 0}
+    extra = max(0, (e["challenges"] - s["challenges"]) - (e["sessions"] - s["sessions"]))
+    return {"challenges_extra": extra, "browser_429": browser_pushback(run_id, flows_at)}
+
+
+def quota_record(st: dict | None, ident: str | None, prompts: dict[str, int] | None) -> dict | None:
+    """R44: {"identity", "allot", "sent", "remaining_pct", "spent"} (+ clock_mismatch) of the identity this run
+    used, read in the controller's status at the close; None when unreadable."""
+    quotas = st.get("quotas") if isinstance(st, dict) else None
+    if not ident or not isinstance(quotas, dict) or not isinstance(q := quotas.get(ident), dict):
+        return None
+    rec = {
+        "identity": ident,
+        "allot": (prompts or {}).get(ident) if prompts is not None else None,
+        "sent": q.get("sent"),
+        "remaining_pct": q.get("remaining_pct"),
+        "spent": q.get("spent"),
+    }
+    if "clock_mismatch" in q:
+        rec["clock_mismatch"] = q["clock_mismatch"]
+    elif "clock_mismatch" in st:
+        rec["clock_mismatch"] = st["clock_mismatch"]
+    return rec
+
+
+def close_browser(
+    board: Board,
+    run_id: int,
+    counters_at: dict | None,
+    loaded: str | None,
+    prompts: dict[str, int] | None,
+    flows_at: int,
+    status=None,
+) -> None:
+    """At the close of a bh-browser segment: runs.friction and runs.quota from the controller's status (NULL when
+    it cannot be read). Never raises: the segment's own record comes first."""
+    try:
+        st = (status or browser_status)()
+        fr = friction(counters_at, st, run_id, flows_at)
+        qu = quota_record(st, loaded, prompts)
+        board.run_set(
+            run_id,
+            friction=json.dumps(fr, sort_keys=True) if fr is not None else None,
+            quota=json.dumps(qu, sort_keys=True) if qu is not None else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠ bh-browser friction/quota not recorded: {type(exc).__name__}: {one_line(str(exc), 160)}")
+
+
+def flows_size() -> int:
+    try:
+        return paths.flows_log().stat().st_size
+    except OSError:
+        return 0
+
+
+# ------------------------------------------------------------------ setup identity (T10)
+TASK_TEMPLATE_BOARD = "{board}"  # the task's template is rendered on this placeholder: the board is not the setup
+
+
+def record_setup(
+    board: Board,
+    run_id: int,
+    scope: Scope,
+    *,
+    model: str,
+    effort: str | None,
+    max_turns: int,
+    minutes: float,
+    system_prompt: str,
+    task: str,
+    cards: list[str],
+    shape: dict,
+) -> str:
+    """runs.setup_sha256 / setup_json, and the segment's system prompt and task under var/runs/."""
+    from bh.browser_service import controller
+    from bh.runner import supervisor as sv
+    from bh.verify import verifier_model
+
+    template = build_task(TASK_TEMPLATE_BOARD, first=False, max_turns=max_turns, **shape)
+    digest, doc = identity.setup(
+        scope,
+        model=model,
+        effort=effort,
+        verifier_model=verifier_model(model),
+        max_turns=max_turns,
+        minutes=minutes,
+        system_prompt=system_prompt,
+        task_template=template,
+        cards=cards,
+        max_runs_per_day=sv.MAX_RUNS_PER_DAY,
+        runs_per_session=sv.RUNS_PER_SESSION,
+        sessions_per_day=sv.SESSIONS_PER_DAY,
+        fill_segment=controller.FILL_SEGMENT,
+        fill_day=controller.FILL_DAY,
+        prompt_quantum=sv.PROMPT_QUANTUM,
+        prompt_floor=sv.PROMPT_FLOOR,
+    )
+    board.run_set(run_id, setup_sha256=digest, setup_json=identity.canonical(doc))
+    paths.runs_dir().mkdir(parents=True, exist_ok=True)
+    paths.run_text(run_id, "system").write_text(system_prompt)
+    paths.run_text(run_id, "task").write_text(task)
+    return digest
+
+
 # ------------------------------------------------------------------ segment
 def run_segment(
     scope_file: Path,
@@ -1433,9 +1704,20 @@ def run_segment(
     quiet: bool = False,
     extra_task: str = "",
     effort: str | None = None,
+    phase: str | None = None,
+    session: str | None = None,
+    runs_left: int = 1,
+    preflight: bool | dict = True,
 ) -> SegmentResult:
+    """One segment. `phase` / `session`: the caps this run counts in (supervisor.admit: refused with the reason,
+    before anything starts). `preflight`: True runs the gate's self-test first (bh.runner.preflight), a dict is the
+    result of one already passed in this hunt. `runs_left`: runs this program may still get today (R44)."""
+    from bh.runner import preflight as gate_check
+    from bh.runner import supervisor as sv
+
     scope = load_scope(scope_file)
     board = board or Board()
+    identity.ensure(board)
     check_automation(scope)
     for name in (stack.GATE, stack.AGENT):
         if not stack.container_running(name):
@@ -1444,7 +1726,16 @@ def run_segment(
         classes.pinned_cards(scope)  # an operator error, said before anything starts
     except ValueError as exc:
         raise SystemExit(f"{scope.program}: {exc}") from None
+    say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     with run_lock():
+        phase, session = sv.admit(board, scope, phase=phase, session=session, now=time.time())
+        if isinstance(preflight, dict):
+            checked = preflight
+        elif preflight and gate_check.enabled(scope, say=say):
+            checked = gate_check.require(scope, scope_file=Path(scope_file), say=say)
+        else:
+            checked = {"ok": None, "skipped": "BH_PREFLIGHT=0 (local program)", "ts": time.time()}
+            say(f"preflight: skipped for {scope.platform}/{scope.program} (BH_PREFLIGHT=0)")
         return _run_locked(
             scope,
             scope_file,
@@ -1456,6 +1747,10 @@ def run_segment(
             quiet=quiet,
             extra_task=extra_task,
             effort=effort,
+            phase=phase,
+            session=session,
+            runs_left=runs_left,
+            preflight=checked,
         )
 
 
@@ -1471,16 +1766,34 @@ def _run_locked(
     quiet: bool,
     extra_task: str,
     effort: str | None,
+    phase: str | None = None,
+    session: str | None = None,
+    runs_left: int = 1,
+    preflight: dict | None = None,
 ) -> SegmentResult:
     prog = scope.program
+    identity.ensure(board)
+    say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     try:  # under the lock, before the gate sees this segment: every log consumer is up to date
         retention.prune()
     except OSError as exc:
         print(f"retention: {exc}", file=sys.stderr)
     activate_scope(scope_file)
-    session = board.last_session(prog) if resume else None
+    hunt_session = session
+    session = None
+    if resume:  # T9: a run that left the sandbox is never resumed: a fresh session from the board instead
+        session = resumable(board, prog)
+        if session is None and board.last_session(prog):
+            say(f"  ↺ {prog}: the last run sent requests with effects: fresh session from the board, no resume")
     first = session is None and not board.rows("SELECT 1 FROM facts WHERE program=? LIMIT 1", prog)
     run_id = board.run_start(prog, model)  # closes a run orphaned by a crash (we hold the lock)
+    board.run_set(
+        run_id,
+        phase=phase,
+        session=hunt_session,
+        preflight=json.dumps(preflight, sort_keys=True) if preflight is not None else None,
+        early_stop=0,
+    )
     clean_sandbox(prog, sandbox_home(run_id))
     # before the prompt is written: a recipe identity without a live session is left out of it
     no_session = refresh_identities(board, scope, run_id, None if quiet else (lambda m: print(m, flush=True)))
@@ -1493,16 +1806,31 @@ def _run_locked(
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
     prepare_workdir(board, scope, scope_file, identities)
     # targets behind a third-party challenge: bh-browser holds a live session, the operator is pushed any challenge
-    say = (lambda _m: None) if quiet else (lambda m: print(m, flush=True))
     watcher = None
+    prompts: dict[str, int] | None = None
+    loaded: str | None = None
+    counters_at: dict | None = None
+    flows_at = flows_size()
+    bh_lines: list[str] = []  # `[bh]` lines of every task the runner builds in this segment
+    first_lines: list[str] = []  # `[bh]` lines of the segment's first task only
     if browser_watch.wanted(scope):
-        browser_watch.prepare(scope, identities, say)
+        prompts = browser_prompts(scope, browser_status(), runs_left, say)
+        if prompts is not None:
+            say("  bh-browser: prompts this run " + ", ".join(f"{k} {v}" for k, v in sorted(prompts.items())))
+            if not any(prompts.values()):
+                bh_lines.append(NO_PROMPT_LINE)
+        loaded = prepare_browser(scope, identities, say, prompts)
+        counters_at = browser_status()
         watcher = browser_watch.ChallengeWatcher(program=prog, identities=identities, say=say)
+    if board.meta_get(early_stop_key(prog)):  # the previous segment closed itself on an announced action
+        first_lines.append(EARLY_STOP_LINE)
+        board.meta_set(early_stop_key(prog), "")
     before = coverage_counts(board, scope)
     cards = pick_cards(board, scope)
     pinned = classes.pinned_cards(scope)
     refused = last_refusal(board, prog, run_id)
     operator = f"\n\nOperator instruction for this segment: {extra_task}" if extra_task else ""
+    harness = "".join(f"\n\n{line}" for line in bh_lines)
     shape = {"scanners": scope.scanners_on, "browser": has_browser(scope)}
     task = (
         build_task(
@@ -1513,11 +1841,26 @@ def _run_locked(
             refused=refused,
             **shape,
         )
+        + harness
+        + "".join(f"\n\n{line}" for line in first_lines)
         + operator
+    )
+    record_setup(
+        board,
+        run_id,
+        scope,
+        model=model,
+        effort=effort,
+        max_turns=max_turns,
+        minutes=minutes,
+        system_prompt=build_system_prompt(scope, identities),
+        task=task,
+        cards=[*pinned, *cards],
+        shape=shape,
     )
     log_path = paths.run_log(run_id, prog)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    res = SegmentResult(program=prog, run_id=run_id, session_id=session)
+    res = SegmentResult(program=prog, run_id=run_id, session_id=session, preflight=preflight)
     board.run_set(run_id, cards=",".join([*pinned, *cards]) or None)
     say(
         f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · "
@@ -1542,6 +1885,8 @@ def _run_locked(
                 if res.legs > 1:  # whatever the previous leg planted goes before the next one loads it
                     clean_leg(prog, sandbox_home(run_id))
                 calls_before, turns_before, facts_before = res.tool_calls, len(res.turn_log), last_fact_id(board)
+                leg_started = time.time()
+                push_budget(prog, max_turns, res.turns)  # T7: the hook reads what this segment has left
                 cmd = agent_command(
                     scope,
                     prompt,
@@ -1574,6 +1919,11 @@ def _run_locked(
                     res.turns += len(leg_turns)
                     if res.status != "refusal":
                         res.status = "ok"
+                stopped_early = early_stop(res, result, timed_out=timed_out, max_turns=max_turns)
+                if stopped_early:
+                    res.early_stops += 1
+                    board.run_set(run_id, early_stop=res.early_stops)
+                    say("  ⏸ the leg closed itself on an announced action it never ran (early stop)")
                 last_ctx, max_ctx = leg_context(leg_turns)
                 res.leg_context.append(max_ctx)
                 rotate = res.overflow or last_ctx > limit
@@ -1608,6 +1958,8 @@ def _run_locked(
                         and (res.turns >= max_turns * EARLY_STOP or res.tool_calls - calls_before < MIN_LEG_TOOL_CALLS)
                     )
                 ):
+                    if stopped_early:  # the next segment of this program is told
+                        board.meta_set(early_stop_key(prog), str(run_id))
                     break
                 waiting = has_browser(scope) and challenge_pending(browser_status())
                 if not cards and (cards := pick_cards(board, scope)):  # the surface exists once mapping is done
@@ -1644,6 +1996,7 @@ def _run_locked(
                             rotated=True,
                             **shape,
                         )
+                        + harness
                         + operator
                     )
                     next_session = None
@@ -1652,8 +2005,12 @@ def _run_locked(
                     prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
                     prompt += f"\n\n{new_cards}" if new_cards else ""
                     next_session = res.session_id
+                if stopped_early:
+                    prompt = EARLY_STOP_LINE + "\n\n" + prompt
                 if waiting:  # the next leg starts where this one waited, not on another surface
-                    prompt = challenge_resume(board, prog) + "\n\n" + prompt
+                    # T9: an intent whose request already left is not resumed by the harness
+                    replay = not left_the_sandbox(run_id, leg_started)
+                    prompt = challenge_resume(board, prog, replay=replay) + "\n\n" + prompt
     except BaseException as exc:  # Ctrl-C / SIGTERM, or a harness error: record what the agent already wrote
         with signals_ignored():
             keeper.stop()
@@ -1664,6 +2021,8 @@ def _run_locked(
             board.run_end(run_id, status=res.status, note=one_line(note, 500))
             set_active_run(None)
             stack.kill_agent(prog)
+            if watcher is not None:
+                close_browser(board, run_id, counters_at, loaded, prompts, flows_at)
             finish(board, res, scope, before, effort=effort, note=note)
             say(f"■ run {run_id} {res.status}: {one_line(note, 200)}")
         raise
@@ -1686,6 +2045,8 @@ def _run_locked(
             say("  ⚠ the stream reports a quota stop that neither stderr nor the relay confirms: not a quota stop")
         if stopper.triggered:
             res.status = "parked"
+        if watcher is not None:
+            close_browser(board, run_id, counters_at, loaded, prompts, flows_at)
         finish(board, res, scope, before, effort=effort, note=res.text or stderr)
     # every finding waiting with a proof, not only this segment's: one left 'new' by an earlier stop is picked up
     # here, and a refused segment's findings are verified too (the refusal closes a lead, not the findings). After a

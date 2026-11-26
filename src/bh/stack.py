@@ -23,6 +23,9 @@ LOGIN_USER = "hunter"
 BROWSER_CTR = "bh-browser"
 BROWSER_USER = "hunter"
 BROWSER_SERVICE = "browser"
+# The practice lab (compose service `juiceshop`, profile `lab`): the gate's preflight runs its positive checks against
+# it before every hunt, a real one included (bh.runner.preflight).
+LAB_CTR = "bh-lab-juiceshop"
 VERIFY_SUBDIR = ".verify"  # /work/<program>/.verify/F<id>: a verifier's work dir, only in the judge container
 COMPOSE_FILE = "container/compose.yaml"
 
