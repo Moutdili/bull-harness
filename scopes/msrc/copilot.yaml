@@ -32,6 +32,11 @@ in_scope:
   # for Microsoft online services). Each one was seen in the app's code or traffic, our own objects only.
   - {value: "https://copilot.cloud.microsoft/", note: "where consumer share links open (/chat/share/<base64 {shareId, conversationId}>); our own shares only"}
   - {value: "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads", note: "file upload: the user's own OneDrive 'Copilot uploads' folder"}
+  - {value: "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads:", note: "upload session in Graph's path syntax (copilotuploads:/<file>:/createUploadSession)"}
+  - {value: "https://my.microsoftpersonalcontent.com/personal/", note: "OneDrive personal storage API: the Copilot upload session (uploadUrl), our own accounts only"}
+  - {value: "https://d.docs.live.net/", note: "OneDrive WebDAV path of a file referenced in a shared chat (seen 2026-11-26); our own files only"}
+  - {value: "api.onedrive.com", note: "OneDrive API behind onedrive.live.com (seen 2026-11-26); our own files only"}
+  - {value: "https://onedrive.live.com/", note: "OneDrive link of a file referenced in a shared chat (seen 2026-11-26); our own files only"}
   - {value: "https://graph.microsoft.com/v1.0/me/people", note: "people picker of the notebook invite (our own account's people list, seen 2026-11-26)"}
   - {value: "https://substrate.office.com/recommended/api/", note: "Notebooks (Loop workspaces): recent, deltasync, findsession"}
   - {value: "https://home.microsoftpersonalcontent.com/contentstorage/", note: "Notebook storage (SharePoint Embedded container of the account, seen 2026-11-26); our own notebooks only"}
