@@ -111,6 +111,19 @@ def _scope_for(program: str):
     return None
 
 
+def _scope_file_for(program: str) -> str | None:
+    """The scope file whose `program` is `program` (None if there is none)."""
+    from bh.scope import ScopeError, load_scope
+
+    for f in sorted(paths.scopes_dir().rglob("*.yaml")):
+        try:
+            if load_scope(f).program == program:
+                return str(f)
+        except ScopeError:
+            continue
+    return None
+
+
 def _researcher() -> dict[str, str]:
     """secrets/researcher.env: KEY=value lines (YWH alias e-mail, username). Never sent anywhere."""
     p = paths.secrets_dir() / "researcher.env"
@@ -211,7 +224,20 @@ def cmd_status(args) -> int:
 # ---------------------------------------------------------------- runs
 def cmd_run(args) -> int:
     from bh.runner.run import run_segment
+    from bh.runner.supervisor import rules_fresh
 
+    from bh.scope import ScopeError, load_scope
+
+    try:
+        scope = load_scope(args.scope)
+    except (OSError, ScopeError):
+        scope = None  # run_segment loads it again and says why it cannot
+    fresh, why = rules_fresh(scope) if scope is not None else (True, "")
+    if not fresh:  # bh.rules (lot H): the rules are the authorisation to test
+        print(
+            f"run refused: program rules {why or 'not fresh'} (`bh rules check`, then `bh rules ack`)", file=sys.stderr
+        )
+        return 2
     res = run_segment(
         Path(args.scope),
         model=args.model,
@@ -425,7 +451,7 @@ def cmd_board(args) -> int:
         print(fence.legend())
         print(fence("\n" + frontier(b, args.program, scope) + "\n"))  # titles, endpoints: the hunter's words
     elif args.what == "reset":
-        return board_reset(b, args.program, args.yes)
+        return board_reset(b, args.program, args.yes, with_lineage=args.with_lineage)
     else:
         print(fence.legend())
         for r in b.rows(
@@ -440,17 +466,25 @@ def cmd_board(args) -> int:
     return 0
 
 
-def board_reset(b, program: str, yes: bool) -> int:
-    """Training labs: back up the board, forget the program, wipe its sandbox work dir."""
+def board_reset(b, program: str, yes: bool, *, with_lineage: bool = False) -> int:
+    """Training labs: back up the board, forget the program, wipe its sandbox work dir. The lineage's tables (agents,
+    memory, scores) stay unless `with_lineage` (bh.lineage.store.purge)."""
     if not yes:
         print(
-            f"this deletes every fact, finding, todo and run of '{program}' and its /work dir; add --yes",
+            f"this deletes every fact, finding, todo and run of '{program}' and its /work dir"
+            + (" and its lineage memory" if with_lineage else "")
+            + "; add --yes",
             file=sys.stderr,
         )
+        return 2
+    store = _lineage("store", "bh board reset --with-lineage") if with_lineage else None
+    if with_lineage and store is None:
         return 2
     backup = paths.var() / f"board-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
     b.db.execute("VACUUM INTO ?", (str(backup),))
     deleted = b.reset_program(program)
+    if store is not None:
+        deleted["lineage"] = store.purge(b, program)
     stack.wipe_program(program)
     shutil.rmtree(paths.stage(program), ignore_errors=True)
     print(f"backup {backup}; deleted {deleted}")
@@ -490,6 +524,240 @@ def cmd_tokens(args) -> int:
     print(f"{runs} runs mined; {len(chosen)} prefixes worth an alias (net saving per {args.turns}-turn segment):")
     for c in chosen:
         print(f"  {c.net:8.0f} eq.  {c.uses:5.1f} uses/segment  {c.tokens:2d} tok  {c.prefix}")
+    return 0
+
+
+# ---------------------------------------------------------------- lineage (wave W2)
+def _need(module: str, what: str):
+    """The module a sub-command needs, or None after one clear line (it may not be installed yet)."""
+    import importlib
+
+    try:
+        return importlib.import_module(module)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{what}: {module} is not available ({type(exc).__name__}: {exc}); nothing done", file=sys.stderr)
+        return None
+
+
+def _lineage(name: str, what: str):
+    return _need(f"bh.lineage.{name}", what)
+
+
+AGENT_COLUMNS = ("no", "pseudo", "program", "run_id", "parent_no", "status", "setup_sha256", "born", "closed")
+
+
+def _agent_rows(b, program: str | None = None, no: int | None = None) -> list[dict]:
+    """Rows of the lineage's `agents` table (bh.lineage.identity), [] while it does not exist."""
+    if not b.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'"):
+        return []
+    cols = {r["name"] for r in b.db.execute("PRAGMA table_info(agents)")}
+    sql, params = "SELECT * FROM agents WHERE 1=1", []
+    if program and "program" in cols:
+        sql, params = sql + " AND program=?", [*params, program]
+    if no is not None and "no" in cols:
+        sql, params = sql + " AND no=?", [*params, no]
+    return [dict(r) for r in b.rows(sql + (" ORDER BY no" if "no" in cols else ""), *params)]
+
+
+def _agent_line(r: dict) -> str:
+    def cell(k):
+        v = r.get(k)
+        if k == "setup_sha256" and isinstance(v, str):
+            return v[:12]
+        if k in ("born", "closed") and isinstance(v, (int, float)):
+            return time.strftime("%m-%d %H:%M", time.localtime(v))
+        return "-" if v is None else str(v)
+
+    return "  ".join(f"{k}={cell(k)}" for k in AGENT_COLUMNS if k in r)
+
+
+def cmd_agent(args) -> int:
+    what = f"bh agent {args.acmd}"
+    ident = _lineage("identity", what)
+    if ident is None:
+        return 2
+    b = _board()
+    if args.acmd == "ls":
+        rows = _agent_rows(b, args.program)
+        for r in rows:
+            print(_agent_line(r))
+        if not rows:
+            print("no agent" + (f" for {args.program}" if args.program else ""))
+        return 0
+    if args.acmd == "show":
+        rows = _agent_rows(b, no=args.n)
+        if not rows:
+            print(f"unknown agent {args.n}", file=sys.stderr)
+            return 1
+        r = rows[0]
+        for k, v in r.items():
+            print(f"{k:14}: {escape_invisible(str(v))}")
+        archive = _need("bh.lineage.archive", what)
+        if archive is not None and r.get("program"):
+            try:
+                print(f"{'archive':14}: {archive.agent_dir(r['program'], args.n, r.get('pseudo'))}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"{'archive':14}: ? ({type(exc).__name__})")
+        return 0
+    if args.acmd == "diff":
+        import json
+
+        print(json.dumps(ident.diff(b, args.a, args.b), indent=2, sort_keys=True, default=str, ensure_ascii=False))
+        return 0
+    return agent_relaunch(args, b, ident)
+
+
+def agent_relaunch(args, b, ident) -> int:
+    """A new segment whose agent's parent is agent n: refused, with the fields that moved, when the setup drifted."""
+    from bh.runner import run
+
+    scope_file = Path(args.scope) if args.scope else paths.lab_scope()
+    scope = _load_scope_or_exit(str(scope_file))
+    rows = _agent_rows(b, no=args.n)
+    if not rows:
+        print(f"unknown agent {args.n}", file=sys.stderr)
+        return 1
+    if rows[0].get("program") not in (None, scope.program):
+        print(f"agent {args.n} hunted {rows[0]['program']}, not {scope.program}: --scope", file=sys.stderr)
+        return 2
+    _, doc = run.preview_setup(
+        b, scope, model=args.model, effort=args.effort, max_turns=args.max_turns, minutes=args.minutes
+    )
+    drift = list(ident.relaunch_check(b, args.n, doc) or [])
+    if drift and not args.allow_drift:
+        print(
+            f"relaunch of agent {args.n} refused: the setup moved ({', '.join(map(str, drift))}); "
+            "--allow-drift to relaunch anyway",
+            file=sys.stderr,
+        )
+        return 2
+    if drift:
+        print(f"setup drift accepted: {', '.join(map(str, drift))}")
+    mode = "same-birth" if args.same_birth else "fresh-legacy" if args.fresh_legacy else None
+    res = run.run_segment(
+        scope_file,
+        model=args.model,
+        max_turns=args.max_turns,
+        minutes=args.minutes,
+        effort=args.effort,
+        quiet=True,
+        phase=args.phase,
+        lineage_parent=args.n,
+        lineage_mode=mode,
+    )
+    print(f"run {res.run_id} {res.status} · {res.legs} leg(s) · {res.turns} turns · +{res.new_findings} findings")
+    return 0 if res.status in ("ok", "max_turns", "timeout") else 1
+
+
+def cmd_memory(args) -> int:
+    if args.mcmd == "export":
+        export = _lineage("export", "bh memory export")
+        if export is None:
+            return 2
+        out = Path(args.out) if args.out else paths.lineage_dir() / "export" / args.program
+        out.mkdir(parents=True, exist_ok=True)
+        print(f"wrote {export.markdown(_board(), args.program, out)}")
+        return 0
+    store = _lineage("store", "bh memory import")
+    if store is None:
+        return 2
+    if not Path(args.file).is_file():
+        print(f"no such file: {args.file}", file=sys.stderr)
+        return 1
+    imported, skipped = store.import_items(_board(), args.program, Path(args.file))
+    print(f"{args.program}: imported {imported}, skipped {skipped}")
+    return 0
+
+
+def cmd_lineage_verify(args) -> int:
+    chain = _lineage("chain", "bh lineage verify")
+    if chain is None:
+        return 2
+    ok, index = chain.verify_blocks(_board(), args.program)
+    if ok:
+        print(f"{args.program}: lineage chain ok")
+        return 0
+    print(f"{args.program}: lineage chain BROKEN at block {index}")
+    return 1
+
+
+def cmd_rules(args) -> int:
+    rules = _need("bh.rules", f"bh rules {args.rcmd}")
+    if rules is None:
+        return 2
+    if args.rcmd == "check":
+        scope = _load_scope_or_exit(args.target)
+        out = rules.check(scope)
+        for k, v in (out or {}).items():
+            print(f"{k:14}: {escape_invisible(str(v))}")
+        return 0 if (out or {}).get("ok", True) else 1
+    if args.rcmd == "ack":
+        rules.ack(args.target)
+        print(f"{args.target}: program rules acknowledged")
+        return 0
+    print(escape_invisible(rules.diff(args.target) or f"{args.target}: no change"))
+    return 0
+
+
+def cmd_stats(args) -> int:
+    from bh import stats
+
+    summary = stats.summary(_board(), program=args.program, phase=args.phase, setup=args.setup)
+    if args.json:
+        import json
+
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(stats.table(summary))
+    return 0
+
+
+def cmd_scope_requests(args) -> int:
+    """Endpoint requests of the hunter (D40): listed; `--review` sends the pending ones to the judge."""
+    from bh.runner import run
+
+    b = _board()
+    if args.review:
+        scope_file = args.scope or _scope_file_for(args.program or "")
+        if not scope_file:
+            print("--review needs the program's scope: --scope FILE", file=sys.stderr)
+            return 2
+        scope = _load_scope_or_exit(scope_file)
+        if not stack.container_running(stack.JUDGE_CTR):
+            print(f"container {stack.JUDGE_CTR} is not running — `bh up`", file=sys.stderr)
+            return 2
+        with run.run_lock():
+            run_id = b.run_start(scope.program, args.model)
+            run.activate_scope(Path(scope_file))
+            run.set_active_run(run_id, scope.program)  # the gate relays the judge's calls during a run only
+            try:
+                run.review_requests(b, scope, run_id=run_id, model=args.model, effort=None, say=print)
+            finally:
+                run.set_active_run(None)
+                b.run_end(run_id, status="ok", note="scope requests")
+    fence = Fence()
+    rows = run.scope_requests(b, args.program)
+    if rows:
+        print(fence.legend())
+    for r in rows:
+        t = time.strftime("%m-%d %H:%M", time.localtime(r.get("ts") or 0))
+        print(f"R{r['id']:<4} {t} {r['program']:16} run {r.get('run_id')} {r['status']:8} {fence(r.get('prefix'))}")
+        print(f"      seen: {fence(r.get('why'))}")
+        if r.get("reason"):
+            print(f"      {r.get('decided_by') or '?'}: {fence(r['reason'])}")
+    if not rows:
+        print("no scope request")
+    return 0
+
+
+def cmd_scope_revoke(args) -> int:
+    from bh.runner import run
+
+    rec = run.revoke_request(_board(), int(str(args.id).lstrip("R")))
+    if rec is None:
+        print(f"unknown request {args.id}", file=sys.stderr)
+        return 1
+    print(f"R{rec['id']} revoked: {paths.scope_extra(rec['program'])} rewritten (the gate drops it at its next reload)")
     return 0
 
 
@@ -851,6 +1119,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     im.add_argument("--force", action="store_true", help="overwrite an existing scope file")
     im.set_defaults(func=cmd_scope_import)
+    rq = scope.add_parser("requests", help="endpoint requests of the hunter (D40); --review sends them to the judge")
+    rq.add_argument("program", nargs="?")
+    rq.add_argument("--review", action="store_true", help="judge the pending requests now")
+    rq.add_argument("--scope", help="scope YAML of the program (default: found under scopes/)")
+    from bh.runner.run import DEFAULT_MODEL as _hunter
+
+    rq.add_argument("--model", default=os.environ.get("BH_MODEL", _hunter), help="hunter model (the judge's follows)")
+    rq.set_defaults(func=cmd_scope_requests)
+    rv = scope.add_parser("revoke", help="revoke an approved endpoint request (the gate drops it at its reload)")
+    rv.add_argument("id")
+    rv.set_defaults(func=cmd_scope_revoke)
 
     u = sub.add_parser("up", help="start gate + agent containers (+ web UI)")
     u.add_argument("--build", action="store_true")
@@ -951,7 +1230,60 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("program")
     b.add_argument("-v", "--verbose", action="store_true")
     b.add_argument("--yes", action="store_true", help="confirm `reset`")
+    b.add_argument("--with-lineage", action="store_true", help="`reset` also purges the lineage memory")
     b.set_defaults(func=cmd_board)
+
+    ag = sub.add_parser("agent", help="lineage agents: ls, show, relaunch, diff")
+    ags = ag.add_subparsers(dest="acmd", required=True)
+    al = ags.add_parser("ls", help="agents of a program (all programs without one)")
+    al.add_argument("program", nargs="?")
+    ash = ags.add_parser("show", help="one agent: identity, parent, setup, archive")
+    ash.add_argument("n", type=int)
+    arl = ags.add_parser("relaunch", help="a new segment whose agent descends from agent n (refused on setup drift)")
+    arl.add_argument("n", type=int)
+    arl.add_argument("--allow-drift", action="store_true", help="relaunch although the setup moved")
+    birth = arl.add_mutually_exclusive_group()
+    birth.add_argument("--same-birth", action="store_true", help="the agent starts from agent n's birth")
+    birth.add_argument("--fresh-legacy", action="store_true", help="the agent starts from the legacy as it is now")
+    arl.add_argument("--scope", help="scope YAML (default: the training lab, scopes/lab/juiceshop.yaml)")
+    arl.add_argument("--phase", help="phase this run counts in (a real program needs one)")
+    run_opts(arl)
+    adf = ags.add_parser("diff", help="what differs between two agents")
+    adf.add_argument("a", type=int)
+    adf.add_argument("b", type=int)
+    ag.set_defaults(func=cmd_agent)
+
+    mem = sub.add_parser("memory", help="lineage memory: export (markdown), import (jsonl)")
+    mems = mem.add_subparsers(dest="mcmd", required=True)
+    mex = mems.add_parser("export", help="the program's memory as markdown")
+    mex.add_argument("program")
+    mex.add_argument("--out", help="output dir (default var/lineage/export/<program>)")
+    mim = mems.add_parser("import", help="memory items from a jsonl file (bh.lineage.store.import_items)")
+    mim.add_argument("program")
+    mim.add_argument("file")
+    mem.set_defaults(func=cmd_memory)
+
+    lin = sub.add_parser("lineage", help="lineage chain")
+    lins = lin.add_subparsers(dest="lcmd", required=True)
+    lv = lins.add_parser("verify", help="check the program's chain of agent blocks (rc 1 and the index if broken)")
+    lv.add_argument("program")
+    lin.set_defaults(func=cmd_lineage_verify)
+
+    ru = sub.add_parser("rules", help="program rules: check (fetch and compare), ack, diff")
+    rus = ru.add_subparsers(dest="rcmd", required=True)
+    rus.add_parser("check", help="read the program rules of a scope").add_argument("target", metavar="scope")
+    rus.add_parser("ack", help="acknowledge the rules as read").add_argument("target", metavar="program")
+    rus.add_parser("diff", help="what changed in the rules since the last ack").add_argument(
+        "target", metavar="program"
+    )
+    ru.set_defaults(func=cmd_rules)
+
+    sta = sub.add_parser("stats", help="runs, cost, findings by phase and setup (what the analysis reads)")
+    sta.add_argument("--program")
+    sta.add_argument("--phase")
+    sta.add_argument("--setup", help="setup_sha256 (a prefix is enough)")
+    sta.add_argument("--json", action="store_true")
+    sta.set_defaults(func=cmd_stats)
 
     ac = sub.add_parser("accounts", help="the harness's own test accounts: enroll, refresh, ls (no secret shown)")
     acs = ac.add_subparsers(dest="acmd", required=True)

@@ -3,6 +3,8 @@
 #   egress  : normal network. gate only.
 #   lab     : internal network for local practice targets (profile "lab"). gate only.
 # The gate is therefore the only path from the agent (and the judge, and the login browser) to anything.
+# The lineage's memory and archives (var/lineage) and the lab's sources (lab/) stay on the host: no container
+# mounts them (tests/test_w2_runner.py reads this file).
 name: bh
 
 # What the agent and the judge share: same image, same gate (proxy + Claude API relay), same environment.

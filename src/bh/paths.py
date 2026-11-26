@@ -100,3 +100,27 @@ def secrets_dir() -> Path:
 
 def tools_dir() -> Path:
     return var() / "tools"
+
+
+def lineage_dir() -> Path:
+    """var/lineage: the agents' archives (bh.lineage.archive). Host only: never mounted in a container."""
+    return var() / "lineage"
+
+
+def scope_extra_dir() -> Path:
+    """Approved endpoint requests (D40), one YAML per program, merged by the gate at its policy reload."""
+    return state() / "scope-extra"
+
+
+def scope_extra(program: str) -> Path:
+    return scope_extra_dir() / f"{program}.yaml"
+
+
+def program_page(program: str) -> Path:
+    """The program's page as the orchestrator stored it (read by the judge of endpoint requests, D40)."""
+    return var() / "programs" / f"{program}.md"
+
+
+def lab_scope() -> Path:
+    """The training lab's scope (default of `bh agent relaunch`)."""
+    return scopes_dir() / "lab" / "juiceshop.yaml"

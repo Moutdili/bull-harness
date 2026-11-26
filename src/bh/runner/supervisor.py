@@ -24,6 +24,7 @@ from bh.runner.run import (
     ProgramNotReady,
     SegmentResult,
     check_automation,
+    note_decision,
     recent_refusals,
     run_segment,
 )
@@ -220,8 +221,26 @@ def _fmt(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def rules_fresh(scope) -> tuple[bool, str]:
+    """bh.rules.fresh(program) (lot H): rules never read, read more than 7 days ago, or changed without `bh rules
+    ack` -> (False, the reason). Without the module nothing changes (True). The rules are the authorisation to
+    test: a check that raises refuses (fails closed). Local labs have no rules page: exempt."""
+    if scope.platform == "local":
+        return True, ""
+    try:
+        from bh import rules
+    except ImportError:
+        return True, ""
+    try:
+        ok, why = rules.fresh(scope.program)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"program rules check failed: {type(exc).__name__}: {exc}"
+    return bool(ok), str(why or "")
+
+
 def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
-    """The programs this hunt may run: onboarding done and fewer than REFUSAL_LIMIT refusals in 7 days."""
+    """The programs this hunt may run: onboarding done, program rules fresh (bh.rules) and fewer than
+    REFUSAL_LIMIT refusals in 7 days."""
     ready = []
     for f in scope_files:
         scope = load_scope(f)
@@ -230,6 +249,10 @@ def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
         except ProgramNotReady as exc:
             print(f"{scope.program}: excluded ({exc})")
             continue
+        fresh, why = rules_fresh(scope)
+        if not fresh:
+            print(f"{scope.program}: excluded (program rules: {why or 'not fresh'}; `bh rules check`, `bh rules ack`)")
+            continue
         if (n := len(recent_refusals(board, scope.program, time.time()))) >= REFUSAL_LIMIT:
             print(f"{scope.program}: excluded ({n} model refusals in 7 days: review its [refusal] blockers)")
             continue
@@ -237,10 +260,12 @@ def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
     return ready
 
 
-def _after_refusal(p: ProgState) -> None:
+def _after_refusal(p: ProgState, board: Board | None = None, res: SegmentResult | None = None) -> None:
     p.refusals += 1
     if p.refusals >= REFUSALS_TO_PARK:
         p.parked = True
+        if board is not None and res is not None:  # T20: the park is journaled in the run that caused it
+            note_decision(board, res, "park")
         print(f"{p.program}: parked until the end of the hunt ({p.refusals} refusals)")
     else:
         p.cooldown_until = time.time() + REFUSAL_COOLDOWN_S
@@ -358,7 +383,7 @@ def hunt(
                 p.cooldown_until = time.time() + COOLDOWN_S
                 print(f"{p.program}: cooldown until {_fmt(p.cooldown_until)} (refusal on a cause already refused)")
             else:
-                _after_refusal(p)
+                _after_refusal(p, board, res)
             continue
         if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1

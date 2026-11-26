@@ -164,7 +164,9 @@ def test_no_rotation_under_the_threshold(seg):
     assert st["limits"] == [2 * LIMIT, 2 * LIMIT]
     # M5: the sandbox is scrubbed before the 2nd leg (after the 1st exited), in the segment's HOME
     assert st["cleaned"] == [(1, run.sandbox_home(res.run_id))]
-    assert not board.rows("SELECT 1 FROM facts WHERE kind='handoff'")
+    # no rotation HANDOFF; the segment closed without one of the agent's: the runner's closing one (T22)
+    titles = [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")]
+    assert titles == ["HANDOFF (runner): segment closed (ok)"]
 
 
 def test_rotation_above_the_threshold_starts_a_fresh_session(seg):
@@ -176,8 +178,12 @@ def test_rotation_above_the_threshold_starts_a_fresh_session(seg):
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
     assert "rotated on a context threshold" in task
     assert "HANDOFF: api mapped" in task  # the frontier was rebuilt from the notes ingested at rotation
-    # the agent wrote its HANDOFF: the runner did not add one
-    assert [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")] == ["HANDOFF: api mapped"]
+    # the agent wrote its HANDOFF: the runner did not add one at the rotation (only at the close, T22: the last leg
+    # wrote none)
+    assert [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")] == [
+        "HANDOFF: api mapped",
+        "HANDOFF (runner): segment closed (ok)",
+    ]
     assert res.new_facts == 1  # counted once, though ingested mid-segment
     log = [json.loads(x) for x in run.paths.run_log(res.run_id, "p").read_text().splitlines()]
     legs = [x for x in log if x.get("type") == "bh_leg"]
@@ -192,7 +198,9 @@ def test_runner_writes_the_handoff_when_missing(seg):
     ]
     res, st = go([{"ctx": [900, 1100], "notes": notes}, {"ctx": [750]}])
     assert res.rotations == 1
-    rows = board.rows("SELECT title, summary, run_id FROM facts WHERE kind='handoff'")
+    rows = board.rows(
+        "SELECT title, summary, run_id FROM facts WHERE kind='handoff' AND title LIKE '%context rotation%'"
+    )
     assert len(rows) == 1
     assert rows[0]["title"] == "HANDOFF (runner): context rotation at 1100 tokens"
     assert rows[0]["run_id"] == res.run_id
