@@ -21,9 +21,19 @@ CARDS_DIR = Path(__file__).parent / "cards"
 # first pass of the access-control classes (idor, broken-access-control): the builtin and the proof it leaves
 AUTHZ_TOOL = (
     "`bh-authz` (after mapping, 2+ identities): every known endpoint as each identity and anonymous; it flags owner "
-    "data seen by another identity (horizontal) or a role's answer given to a lower role (vertical), and with "
-    "`--write-own` a cross-identity PATCH on your own object. It leaves raw/authz-*/proof.json for the best candidate: "
-    "read it, then `bh-note finding ... --class idor|broken-access-control --proof <that path>`."
+    "data seen by another identity (horizontal) or a role's answer given to a lower role (vertical). It leaves "
+    "raw/authz-*/proof.json for the best candidate: read it, then `bh-note finding ... --class "
+    "idor|broken-access-control --proof <that path>`."
+)
+# its write mode is a scanner (contract._AUTHZ_WRITE): shown only to a program that allows scanners
+AUTHZ_WRITE = "With `--write-own` it also sends a cross-identity PATCH on your own objects."
+# An observation proof (a canary the gate sees on the attacker's side) is only as good as the place it was planted
+# (audit T2): shared by every class such a proof may support.
+CANARY_PRIVATE = (
+    " An observation proof (the canary seen by the gate on the attacker's side) proves nothing unless the place where "
+    "the canary was planted is private to the victim by construction (the victim's own conversation, memory entry or "
+    "file, never shared, public or readable by the attacker): a canary the attacker could read anyway crosses no "
+    "boundary."
 )
 MAX_CARDS = 3  # per segment: cards are resent every turn
 
@@ -38,6 +48,9 @@ class VulnClass:
     card: bool = False  # has a method card
     weight: float = 1.0  # < 1 for signals that match broadly (every /api/ route, every login page)
     tool: str = ""  # the builtin that does the first pass for this class (shown with the card, not to the verifier)
+    # what a program that allows scanners adds (a scanner of contract.SCANNERS or a scanner mode); never in the card
+    # file itself, which the agent may read on any program (audit I8)
+    scan: str = ""
 
     def __post_init__(self) -> None:  # `(r"x")` is a str, not a tuple: accept both
         for name in ("aliases", "path_signals", "param_signals"):
@@ -60,9 +73,10 @@ CLASSES: tuple[VulnClass, ...] = (
         (r"(user|account|order|invoice|basket|cart|doc(ument)?|file|org|team|project)?_?id", r"uuid"),
         "Data that belongs to identity B is returned to identity A, or A changes B's object. Control: the same "
         "request for A's own object works and an unauthenticated request is refused. An empty 200, an OPTIONS "
-        "or preflight answer, or public data is not access.",
+        "or preflight answer, or public data is not access." + CANARY_PRIVATE,
         True,
         tool=AUTHZ_TOOL,
+        scan=AUTHZ_WRITE,
     ),
     VulnClass(
         "broken-access-control",
@@ -79,9 +93,10 @@ CLASSES: tuple[VulnClass, ...] = (
         evidence="A lower-privileged identity (or no session) reads or performs what only a higher role, or only the "
         "object's owner or tenant, may: the answer holds that role's or owner's data, or the action takes effect. "
         "Control: the same request as an identity without the right, or without a session, is refused. The same "
-        "public answer for everyone, or an answer without the protected data, is not a bypass.",
+        "public answer for everyone, or an answer without the protected data, is not a bypass." + CANARY_PRIVATE,
         card=True,
         tool=AUTHZ_TOOL,
+        scan=AUTHZ_WRITE,
     ),
     VulnClass(
         "auth",
@@ -113,6 +128,9 @@ CLASSES: tuple[VulnClass, ...] = (
         "otherwise read), or a boolean pair: a true and a false payload give consistently different answers on "
         "two runs. A database error tied to the payload is a lead, not a finding. Never time-based.",
         True,
+        scan="`bh-sqli '<url with the parameter>'` (`--data` for a body, `--as user-a` for an authenticated one) "
+        "runs Boolean/Error/Union only, never time-based; a point it finds is confirmed by hand with ONE read-only "
+        "extraction.",
     ),
     VulnClass(
         "nosqli",
@@ -133,15 +151,17 @@ CLASSES: tuple[VulnClass, ...] = (
         "only `xss CONFIRMED (marker ...)` is proof. Client-side routes (`/#/...`) and DOM sinks are tested the "
         'same way; in proof.json such a step carries `"browse": {"xss": "<marker>"}`.',
         True,
+        scan="`bh-xss '<url?param=x>'` for the reflected cases, before the method by hand.",
     ),
     VulnClass(
         "ssrf",
         ("server-side-request-forgery", "ssrf"),
         (r"/(proxy|fetch|preview|import|webhook|callback|render|pdf|image)",),
         (r"url|uri|link|src|source|dest|redirect_uri|callback|webhook|image(_?url)?|feed|proxy|fetch|host"),
-        "The target's server fetched a URL we chose and returned or acted on internal content (cloud metadata, an "
-        "internal-only host). The sandbox has no out-of-band listener: a blind SSRF cannot be proven here; record "
-        '`bh-note blocked oob-needed "<url and parameter>"`.',
+        "The target's server fetched a URL we chose, shown one of two ways: a request received on a host of ours "
+        "(a listener the scope declares), or the content of an in-scope page the server read and returned or "
+        "rendered. An internal address is never the proof and never requested (the program forbids it). No "
+        'listener declared by the scope: `bh-note blocked oob-needed "<url and parameter>"`.',
         True,
     ),
     VulnClass(
@@ -190,6 +210,7 @@ CLASSES: tuple[VulnClass, ...] = (
         "An actual secret value (credential, API key, token, private key) or other users' personal data. Field "
         "names, public specs, version banners and by-design data are not disclosure.",
         True,
+        scan="Candidates also come from the hits of `bh-content` and `bh-scan`.",
     ),
     VulnClass(
         "path-traversal",
@@ -229,7 +250,7 @@ CLASSES: tuple[VulnClass, ...] = (
         "of N runs (N >= 3). Control: the same content without the "
         "instruction, or the same request by B without the poisoned source, shows neither. The model saying it "
         "leaked data, a jailbreak or harmful text, self-impact (attacker = victim) and system prompt extraction "
-        "are not findings.",
+        "are not findings." + CANARY_PRIVATE,
         True,
     ),
     # exclusion-only classes (no card): names programs use in their non-qualifying lists
@@ -358,28 +379,54 @@ def pinned_cards(scope) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _card(c: str) -> str:
+def _scanner_words():
+    from bh.agent.contract import SCANNERS
+
+    alt = "|".join(re.escape(n) for n in sorted(SCANNERS, key=len, reverse=True))
+    # a scanner's name as a word, and the scanner modes of the mappers (contract: _BROWSE_XSS aside, which one page
+    # with one marker keeps legal)
+    return re.compile(rf"(?<![\w.-])({alt})(?![\w.-])|--write-own\b|--active\b", re.I)
+
+
+SCANNER_WORDS = _scanner_words()
+
+
+def no_scanner(text: str) -> str:
+    """The lines of `text` that name no scanner (audit I8, R18): a guard behind the cards, which are written without
+    one; a line dropped here is a card to fix (tests/test_w1_verify.py)."""
+    return "\n".join(line for line in text.splitlines() if not SCANNER_WORDS.search(line))
+
+
+def _card(c: str, scanners: bool = False) -> str:
     cls = BY_ID.get(c)
-    if cls is None or not cls.card:  # a program card: its text only
-        return card_text(c)
-    return (
-        f"{card_text(c)}\n"
-        + (f"Tool: {cls.tool}\n" if cls.tool else "")
-        + f"Proof standard (the verifier applies exactly this): {cls.evidence}"
-    )
+    text = card_text(c)
+    if cls is not None and cls.card:
+        text += (
+            "\n"
+            + (f"Tool: {cls.tool}\n" if cls.tool else "")
+            + (f"Scanner (this program allows them): {cls.scan}\n" if scanners and cls.scan else "")
+            + f"Proof standard (the verifier applies exactly this): {cls.evidence}"
+        )
+    return text if scanners else no_scanner(text)
 
 
-def cards_block(class_ids: list[str], pinned: list[str] | tuple[str, ...] = ()) -> str:
+def cards_block(class_ids: list[str], pinned: list[str] | tuple[str, ...] = (), *, scanners: bool = False) -> str:
     """Cards for one task: the scope's pinned ones first, then those picked from the attack surface (a pinned card is
-    never repeated). Every card is also readable on demand under SANDBOX_CARDS_DIR."""
+    never repeated). Every card is also readable on demand under SANDBOX_CARDS_DIR.
+
+    `scanners`: the program allows automated scanners (scope.scanners_on). False by default, so a caller that does
+    not say gets the cards a scanner-free program reads: no tool of contract.SCANNERS, no scanner mode."""
     picked = [c for c in class_ids if c not in pinned]
     if not picked and not pinned:
         return ""
     out = []
     if pinned:
-        out += ["# Program cards (pinned by the operator for this program)", *(_card(c) for c in pinned)]
+        out += ["# Program cards (pinned by the operator for this program)", *(_card(c, scanners) for c in pinned)]
     if picked:
-        out += ["# Method cards for this segment (picked from the attack surface)", *(_card(c) for c in picked)]
+        out += [
+            "# Method cards for this segment (picked from the attack surface)",
+            *(_card(c, scanners) for c in picked),
+        ]
     out.append(f"Other cards: `Read {SANDBOX_CARDS_DIR}/<name>.md` ({', '.join(all_cards())}).")
     return "\n\n".join(out)
 

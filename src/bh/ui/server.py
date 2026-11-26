@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from bh import paths, stack
 from bh.agent.contract import SEVERITIES, tail_jsonl
 from bh.board import Board
-from bh.text import clip
+from bh.text import clip, escape_tree
 
 STATIC = Path(__file__).parent / "static"
 COOKIE = "bh_ui"
@@ -226,6 +226,32 @@ def run_events(run_id: int, after: int = 0) -> dict:
     return {"events": events, "next": (events[-1]["i"] + 1) if events else after}
 
 
+def provenance(f: dict) -> dict:
+    """A finding split by who said it (audit T3): the hunter's claims, and what the harness replayed and decided.
+    `counter`, `severity_if` and `severity_why` may not exist yet: read with an empty default."""
+    replay = None
+    try:
+        replay = json.loads(f["replay"]) if f.get("replay") else None
+    except (TypeError, ValueError):
+        replay = None
+    return {
+        "declared": {
+            "title": f.get("title") or "",
+            "severity": f.get("severity") or "",
+            "severity_if": f.get("severity_if") or "",
+            "severity_why": f.get("severity_why") or "",
+            "summary": f.get("summary") or "",
+            "not_proven": f.get("not_proven") or "",
+            "counter": f.get("counter") or "",
+        },
+        "observed": {
+            "replay": replay,
+            "status": f.get("status") or "",
+            "verdict": f.get("verdict") or "",
+        },
+    }
+
+
 # ------------------------------------------------------------------ handler
 class Handler(BaseHTTPRequestHandler):
     server_version = "bh-ui"
@@ -251,7 +277,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, obj, code: int = 200) -> None:
-        self._send(code, json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json")
+        # every string escaped before it leaves (audit T3): hunter and target text hides no invisible character
+        self._send(code, json.dumps(escape_tree(obj), ensure_ascii=False, default=str).encode(), "application/json")
 
     def _authed(self) -> bool:
         cookies = dict(c.strip().split("=", 1) for c in self.headers.get("Cookie", "").split(";") if "=" in c)
@@ -263,7 +290,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._send(400, b"bad request", "text/plain")
         form = {k: v[-1] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
-        if not hmac.compare_digest(form.get("token", ""), self.server.token):
+        # a pasted token often carries a space or a line break around it (R38); inside it, nothing is forgiven
+        if not hmac.compare_digest(form.get("token", "").strip().encode(), self.server.token.encode()):
             return self._send(403, b"bad token", "text/plain")
         cookie = f"{COOKIE}={new_session(self.server.token)}; {COOKIE_ATTRS}"
         return self._send(303, b"", "text/plain", {"Set-Cookie": cookie, "Location": "/"})
@@ -497,6 +525,7 @@ class Handler(BaseHTTPRequestHandler):
                 x for x in tail_jsonl(paths.flows_log(), 3000) if host and urlparse(x.get("url", "")).netloc == host
             ][-40:]
             f["flows"] = flows
+            f["provenance"] = provenance(f)
             return f
         if path == "/api/todos":
             # Submissions only: todos of the retired kinds are history (status obsolete), not work.
