@@ -63,9 +63,12 @@ def test_prompt_injection_card_loads_with_its_cross_user_standard():
     assert cls.card and classes.canonical("Indirect Prompt Injection") == "prompt-injection"
     text = classes.card_text("prompt-injection")
     assert text.startswith("## ") and len(text.splitlines()) <= 40
-    for part in ("When:", "Do:", "Watch:", "Never:", "BH-CANARY-<id>", "oob-needed"):
+    for part in ("When:", "Do:", "Watch:", "Never:", "BH-SECRET-<16 hex>", "--observation", "oob-needed"):
         assert part in text, part
-    assert "BH-CANARY-<id>" in cls.evidence and "Control:" in cls.evidence
+    assert "BH-SECRET-<16 hex>" in cls.evidence and "Control:" in cls.evidence
+    # audit B7/R7: the chat goes through bh-web only, never another path to the assistant
+    assert "HTTP path" not in text and "websockets: N refused" not in text
+    assert "bh-web" in text and "Never look for another path to send prompts" in text
     block = classes.cards_block(["prompt-injection"])
     assert text in block and cls.evidence in block
     assert classes.select_cards([("POST /api/chat", ["prompt"])])[0] == "prompt-injection"

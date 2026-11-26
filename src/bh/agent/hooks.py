@@ -38,7 +38,9 @@ def rules_decision(cmd: str) -> str | None:
                 "no other tools."
             )
         return None
-    if not c.scanners_allowed() and c.runs_scanner(c.without_commands(cmd, ("bh-note",))):
+    tools = c.without_commands(cmd, ("bh-note",))
+    # one rendered page with one marker is an observation, not a scan (audit I14, Mio's decision)
+    if not c.scanners_allowed() and c.runs_scanner(tools) and not c.single_page_xss(tools):
         return (
             f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
             "hand-made requests at a low rate; do not try another scanner."

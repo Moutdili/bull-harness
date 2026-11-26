@@ -523,6 +523,9 @@ def crawl(job: Job) -> None:
             "-fx",
             "-fs",
             "fqdn",
+            # never follow a sign-out link: it kills the identity's session under the agent (audit §4)
+            "-cos",
+            r"(?i)(log-?out|sign-?out|logoff)",
             "-iqp",
             "-ef",
             "png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot,css,mp4,webm",

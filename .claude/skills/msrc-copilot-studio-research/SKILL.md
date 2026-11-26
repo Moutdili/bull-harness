@@ -25,14 +25,11 @@ suggest 2024 [inferred]. Features and UI may have moved. Check current docs for 
 
 ## 0. Harness limits that decide what is testable today
 
-- **Websockets.** The gate refuses every websocket upgrade (`src/bh/gate/addon.py`, "websockets are not
-  allowed"); `bh-browse` refuses them locally too. Copilot chat UIs probably talk over websockets
-  [inferred, to be measured: PyRIT's `WebSocketCopilotTarget` defaults to a `wss://` URL]. Until the gate
-  has a bounded websocket mode (to be designed, decision for Mio), a chat that only works over websockets
-  is **not reachable**: record `bh-note blocked other "websocket-only chat: <url>"`. Use the HTTP
-  alternative when there is one: maker-portal and PPAC REST calls, Dataverse Web API, flow and connector
-  HTTP endpoints, a channel that answers over plain HTTP (Direct Line REST, if in scope; check docs).
-  `bh-browse` reports refused websockets in its summary: that line is the measurement.
+- **Websockets (updated 2026-11-26, audit doc 19).** A scope with `websockets: true` lets the gate relay them,
+  frames bounded and journaled. A chat behind an anti-bot challenge is driven in the persistent browser with
+  `bh-web` only, the operator passing the challenge by hand; never another path to send prompts (no direct
+  websocket client, no API call carrying a prompt). Maker-portal and PPAC REST calls, Dataverse Web API, flow
+  and connector endpoints stay ordinary HTTP surfaces, tested as such, not as a way around the chat's challenge.
 - **No out-of-band receiver.** `bh-oob` does not exist (issue 31 open). Prefer a proof visible without a
   receiver (§5). Otherwise `bh-note blocked oob-needed "<what and where>"`.
 - **Logins.** Test accounts and their sessions go through `bh accounts` (recipes `browser`, `oauth_refresh`,

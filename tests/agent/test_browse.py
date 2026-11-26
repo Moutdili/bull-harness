@@ -55,7 +55,8 @@ def test_mapper_without_xss_scanner_with_it():
 def test_xss_refused_without_scanners(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("BH_DIR", str(tmp_path))
     monkeypatch.setenv("BH_SCANNERS", "0")
-    ev = {"tool_name": "Bash", "tool_input": {"command": "bh-browse http://h/ --xss bhX1"}}
+    # one page with one marker is an observation (audit I14); following links with payloads is a scan
+    ev = {"tool_name": "Bash", "tool_input": {"command": "bh-browse http://h/ --routes --xss bhX1"}}
     reason = hooks.pre_tool_use(ev)["hookSpecificOutput"]["permissionDecisionReason"]
     assert reason.startswith(c.RULES_MARK)
     assert hooks.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "bh-browse http://h/"}}) is None

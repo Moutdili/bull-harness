@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from bh import paths
-from bh.agent.contract import BLOCKER_REASONS, BLOCKER_TTL_S
+from bh.agent.contract import BLOCKER_REASONS, BLOCKER_TTL_S, CHALLENGE_BLOCKER_TTL_S, CHALLENGE_REASONS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -75,6 +75,9 @@ MIGRATIONS = (
     ("runs", "blockers", "INTEGER"),  # blocker facts the segment recorded
     ("runs", "rotations", "INTEGER"),  # fresh sessions started on the context threshold (runner, 4.2b)
     ("runs", "max_context", "INTEGER"),  # largest per-turn context of the segment, tokens
+    # observation proof (audit I1): {"token": "BH-SECRET-<16 hex>", "victim": ..., "attacker": ...}; the verdict
+    # comes from the gate's journal, read by the host (bh.runner.observation), never from the hunter
+    ("findings", "observation", "TEXT"),
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
@@ -88,13 +91,25 @@ FINDING_STATUS = {
     "new",
     "verifying",
     "verified",
+    # observation proof: the gate saw the victim's canary on the attacker's side, the hunter never sent it (I1)
+    "verified-evidence",
     "inconclusive",
     "needs-proof",
     "rejected",
     "submitted",
     "duplicate",
 }
-FINDING_FIELDS = ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven", "proof")
+FINDING_FIELDS = (
+    "severity",
+    "vuln_class",
+    "url",
+    "summary",
+    "poc",
+    "evidence",
+    "not_proven",
+    "proof",
+    "observation",
+)
 
 
 class Board:
@@ -350,8 +365,10 @@ class Board:
     def rows(self, sql: str, *args: Any) -> list[sqlite3.Row]:
         return list(self.db.execute(sql, args))
 
-    def frontier(self, program: str, max_facts: int = 25) -> str:
-        """Compact context for the agent: titles only, newest first. Target <= ~40 lines."""
+    def frontier(self, program: str, max_facts: int = 25, *, passthrough: bool = False) -> str:
+        """Compact context for the agent: titles only, newest first. Target <= ~40 lines.
+        `passthrough`: the scope has a host behind a human challenge that the operator passes in bh-web. A captcha or
+        challenge blocker is then a wait, not a wall: shown CHALLENGE_BLOCKER_TTL_S only, under "retry"."""
         # Bookkeeping facts repeat every segment (one HANDOFF, one "gate denied" per run): only the latest
         # of each kind is worth resending; every other fact stays, newest first. Blockers have their own section.
         facts = self.rows(
@@ -364,11 +381,20 @@ class Board:
             max_facts,
         )
         # Past the TTL a blocker is dropped from view: the wall may be gone, the lead is worth a new look.
+        now = time.time()
         blockers = self.rows(
-            "SELECT id, title FROM facts WHERE program=? AND kind='blocker' AND created>=? ORDER BY id DESC LIMIT 10",
+            "SELECT id, title, created FROM facts WHERE program=? AND kind='blocker' AND created>=? "
+            "ORDER BY id DESC LIMIT 10",
             program,
-            time.time() - BLOCKER_TTL_S,
+            now - BLOCKER_TTL_S,
         )
+        retry = []
+        if passthrough:
+            waits = tuple(f"[{r}]" for r in CHALLENGE_REASONS)
+            retry = [r for r in blockers if r["title"].startswith(waits)]
+            waiting = {r["id"] for r in retry}
+            blockers = [r for r in blockers if r["id"] not in waiting]
+            retry = [r for r in retry if r["created"] >= now - CHALLENGE_BLOCKER_TTL_S]
         intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)
         out: list[str] = []
@@ -384,6 +410,9 @@ class Board:
         if blockers:
             out.append("## blocked (do not retry)")
             out += [f"- {r['id']} {r['title']}" for r in reversed(blockers)]
+        if retry:
+            out.append("## blocked, retry: `bh-web state` (a human challenge the operator may have passed)")
+            out += [f"- {r['id']} {r['title']}" for r in reversed(retry)]
         return "\n".join(out) if out else "(board empty: first session on this program)"
 
     def export_facts(self, program: str, path: Path) -> None:

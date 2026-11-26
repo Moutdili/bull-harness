@@ -20,6 +20,7 @@ from bh.agent import proof
 from bh.board import Board
 from bh.board.db import FINDING_FIELDS
 from bh.classes import canonical
+from bh.runner import observation
 from bh.scope import Scope
 from bh.text import one_line
 
@@ -127,13 +128,17 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
             if m := INTENT_ID.fullmatch(_s(n.get("intent_id"), 20)):
                 board.close_intent(int(m.group(1)), _s(n.get("outcome")))
         case "finding":
-            fields = {k: n.get(k) for k in FINDING_FIELDS if k not in ("vuln_class", "proof")}
+            fields = {k: n.get(k) for k in FINDING_FIELDS if k not in ("vuln_class", "proof", "observation")}
             fields = {k: _s(v, 20000) for k, v in fields.items()}
             fields["poc"] = redact.text(fields.get("poc", ""))
             doc = n.get("proof")
             if doc is not None and proof.validate(doc):  # re-checked on the host: the sandbox check is advisory
                 fields["not_proven"] = (fields.get("not_proven", "") + " [proof refused by the host]").strip()
                 doc = None
+            # an observation proof (I1) only without a replayable one; its verdict is the host's, never the note's
+            obs = observation.valid(n.get("observation")) if doc is None and "observation" in n else None
+            if doc is None and "observation" in n and obs is None:
+                fields["not_proven"] = (fields.get("not_proven", "") + " [observation refused by the host]").strip()
             title = _s(n.get("title"), 300)
             if _revive(board, program, title, fields, doc) is not None:
                 return 0, 1, 0
@@ -142,9 +147,12 @@ def _note(board: Board, program: str, run_id: int, n: dict, scope: Scope | None)
                 title or "(untitled)",
                 run_id=run_id,
                 proof=doc,
+                observation=obs,
                 **fields,
                 vuln_class=canonical(_s(n.get("vuln_class"), 80) or "unknown"),
             )
+            if obs is not None:  # the gate's table as of now, for the board; the verification reads it again
+                board.finding_set(fid, replay=json.dumps({"observation": observation.check(obs, scope)})[:200_000])
             if scope is not None and (excluded := scope.excludes(_s(n.get("vuln_class"), 80))):
                 # the program does not pay for this class: rejected by the harness, not by the model's judgment
                 board.set_finding(fid, "rejected", f"excluded by program policy (forbidden_vulns: {excluded})")

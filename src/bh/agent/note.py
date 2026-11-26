@@ -5,6 +5,10 @@
   bh-note done I12 "outcome"
   bh-note finding "title" --severity high --class idor --url URL --proof proof.json \\
           --summary "..." --not-proven "..." [--poc-file poc.sh]
+  bh-note finding "title" --severity high --class prompt-injection --url URL \\
+          --observation BH-SECRET-<16 hex> --victim user-b --attacker user-a --summary "..." [-e transcript]
+          # a result only the browser shows: the host looks for that canary in the gate's journal (audit I1)
+  bh-note canary           # prints a fresh BH-SECRET-<16 hex> to plant in the victim's data
   bh-note verdict F12 confirmed|rejected|inconclusive "reason"     # verifier only
   bh-note blocked auth|account|waf|captcha|...|other "what is blocked" [-d detail] [--intent I3] [--host H]
   bh-note show 42          # full summary/evidence of fact 42
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -45,7 +50,16 @@ def parser() -> argparse.ArgumentParser:
     fi.add_argument("--severity", required=True, choices=c.SEVERITIES)
     fi.add_argument("--class", dest="vuln_class", required=True)
     fi.add_argument("--url", required=True)
-    fi.add_argument("--proof", required=True, help="proof.json: attack + control steps (see the doctrine)")
+    how = fi.add_mutually_exclusive_group(required=True)
+    how.add_argument("--proof", help="proof.json: attack + control steps (see the doctrine)")
+    how.add_argument(
+        "--observation",
+        metavar="CANARY",
+        help="BH-SECRET-<16 hex> planted in the victim's data only; the host looks for it on the attacker's side",
+    )
+    fi.add_argument("--victim", help="with --observation: the identity whose data holds the canary")
+    fi.add_argument("--attacker", help="with --observation: the identity that must never have sent it")
+    fi.add_argument("-e", "--evidence", default="", help="with --observation: the exact prompts and outputs (a file)")
     fi.add_argument("--poc-file", help="optional script; the harness generates the triager PoC from the proof")
     fi.add_argument("--summary", required=True)
     fi.add_argument("--not-proven", default="")
@@ -60,8 +74,35 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--intent", help="the intent (I<n>) this blocker closes")
     b.add_argument("--host")
     sub.add_parser("show").add_argument("fact_id")
+    sub.add_parser("canary", help="print a fresh canary for an observation proof")
     sub.add_parser("frontier")
     return p
+
+
+def _observation_finding(a: argparse.Namespace) -> None:
+    """A finding only the browser shows (audit I1). No proof.json: the host reads the gate's journal for the canary.
+    The hunter's account of what happened is the summary; the verdict is the host's, never written here."""
+    if not c.CANARY_RE.fullmatch(a.observation):
+        sys.exit("the canary is BH-SECRET- and 16 lowercase hex characters (`bh-note canary` prints one)")
+    if not a.victim or not a.attacker or a.victim == a.attacker:
+        sys.exit("--observation needs --victim and --attacker, two different identities (A attacking A pays nothing)")
+    ev = Path(a.evidence) if a.evidence else None
+    if ev is not None and not ev.is_file():
+        sys.exit(f"evidence file not found: {ev}")
+    _emit(
+        {
+            "op": "finding",
+            "title": a.title,
+            "severity": a.severity,
+            "vuln_class": a.vuln_class,
+            "url": a.url,
+            "poc": "",
+            "evidence": str(ev.resolve()) if ev else "",
+            "observation": {"token": a.observation, "victim": a.victim, "attacker": a.attacker},
+            "summary": a.summary,
+            "not_proven": a.not_proven,
+        }
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -80,10 +121,16 @@ def main(argv: list[str] | None = None) -> None:
         manual = {tuple(x) for x in c.read_json(d / c.MANUAL_TESTED, [])}
         print(board + ("\n" + s if (s := c.surface(d, also_tested=manual)) else ""))
         return
+    if a.op == "canary":  # nothing recorded: the gate sees it wherever it crosses
+        print(f"BH-SECRET-{secrets.token_hex(8)}")
+        return
     if a.op == "verdict" and not c.is_verifier():
         sys.exit("bh-note verdict is reserved to the independent verifier")
     if a.op != "verdict" and c.is_verifier():
         sys.exit("the verifier only records verdicts")
+    if a.op == "finding" and a.observation is not None:
+        _observation_finding(a)
+        return
     if a.op == "finding":
         try:
             proof_doc = json.loads(Path(a.proof).read_text())

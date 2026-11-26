@@ -186,8 +186,9 @@ Report hygiene:
 
 1. Orchestrator, before the run: re-read bounty-ai, bounty-terms, ZDQ page, AI bug bar; note date and version.
 2. Two owned identities (A, B), in separate tenants for cross-tenant claims.
-3. Measure the transport of the target UI: a websocket-only chat is unreachable through the gate today
-   (`ai-red-team-pyrit` §6); find the HTTP path or record the blocker.
+3. The chat is driven in the persistent browser only (`bh-web`, scope with `websockets: true` and the challenge
+   host as `passthrough`); the operator passes the Turnstile challenge by hand. Never look for another path to
+   send prompts (no direct websocket, no API call carrying a prompt): that would skip the challenge.
 4. Enumerate context channels that reach the model for B (pages, mail, files, connectors, tools).
 5. For each candidate: bar category, impact, interaction, affected party. Drop content-only or self-only.
 6. Capture: surface + version, settings, verbatim prompts, conversation IDs, k/N, proof from the list in §6.

@@ -77,9 +77,21 @@ BLOCKER_REASONS = (
     "write-needed",
     "oob-needed",
     "refusal",
+    # MSRC rule (docs/research/15): another customer's data seen, or code run on the server. Not a closed lead but a
+    # stop: the runner pushes a content-free alert, ends the segment and parks the program until the operator lifts it.
+    "third-party-data",
+    "server-exec",
     "other",
 )
+STOP_REASONS = frozenset({"third-party-data", "server-exec"})
 BLOCKER_TTL_S = 7 * 86400  # older blockers leave the frontier: the obstacle may have gone
+# A human challenge (captcha, challenge) on a scope with a `passthrough` host is passed by the operator in bh-web: such
+# a blocker is a "retry later", shown for 30 minutes only, never a lead closed for the week (audit B7).
+CHALLENGE_REASONS = ("captcha", "challenge")
+CHALLENGE_BLOCKER_TTL_S = 30 * 60
+# Canary of an observation proof (audit I1): planted by the hunter in the victim's data only, then found by the gate in
+# what the attacker receives. The gate logs {"kind": "canary", "token", "where", "identity", "client", ...}.
+CANARY_RE = re.compile(r"BH-SECRET-[0-9a-f]{16}")
 
 NOTES, COVERAGE, ENDPOINTS, TOUCHED, COMMANDS = (
     "notes.jsonl",
@@ -499,7 +511,8 @@ _MAPPER_WORDS = _words(MAPPERS)
 _SCANNER_EXTRA = re.compile(
     rf"bh-agent\s+({_BUILTIN_SCANS})\b|katana\b[^;&|]*\s-d\s*[4-9]|httpx(-toolkit)?\b[^;&|]*\s-paths?\b"
 )
-# bh-browse --xss runs payloads: a scanner. Fail closed: --xss anywhere after bh-browse counts.
+# bh-browse --xss runs payloads: a scanner for the metrics. Fail closed: --xss anywhere after bh-browse counts. One
+# page with one marker is an observation all the same, allowed without scanners (single_page_xss, hooks).
 _BROWSE_XSS = re.compile(r"(?<![\w.-])(bh-browse|bh-agent\s+browse)(?![\w.-])[\s\S]*\s--xss\b")
 # bh-zap --active runs ZAP's active scan: a scanner. Same fail-closed reading.
 _ZAP_ACTIVE = re.compile(r"(?<![\w.-])(bh-zap|bh-agent\s+zap)(?![\w.-])[\s\S]*\s--active\b")
@@ -564,6 +577,25 @@ def runs_scanner(cmd: str) -> bool:
     )
 
 
+_BROWSE_CALL = re.compile(r"(?<![\w.-])(bh-browse|bh-agent\s+browse)(?![\w.-])")
+# a payload loop or a generated list of pages: never one page
+_LOOPING = re.compile(r"(?<![\w.-])(for|while|until|xargs|parallel|seq|watch)(?![\w.-])")
+
+
+def single_page_xss(cmd: str) -> bool:
+    """`bh-browse <url> --xss <marker>` that renders ONE page with one marker: an observation, not a scan (decision
+    of Mio on audit I14), allowed on a program without scanners. Fail closed: exactly one bh-browse call, written
+    `bh-browse` (no entry point form), no `--routes` (it follows links), no loop, no shell variable (a payload list),
+    and nothing else in the command that is a scanner."""
+    bare = cmd.replace("'", " ").replace('"', " ").replace("\\", "")
+    if len(_BROWSE_CALL.findall(bare)) != 1 or not _BROWSE_XSS.search(bare):
+        return False
+    if _LOOPING.search(bare) or "$" in cmd or "`" in cmd or re.search(r"\s--routes\b", bare):
+        return False
+    rest = without_commands(cmd, ("bh-browse", "/opt/bh/bin/bh-browse"))
+    return not _BROWSE_CALL.search(rest) and not runs_scanner(rest)
+
+
 def runs_mapper(cmd: str) -> bool:
     bare = cmd.replace("'", " ").replace('"', " ")
     return bool(_MAPPER_WORDS.search(bare) or re.search(r"bh-agent\s+(recon|crawl|browse|zap|authz)\b", bare))
@@ -575,9 +607,45 @@ _Q_CLIENT = re.compile(r"^qq?$")  # bh.agent.q: `/path` arguments use the origin
 _BARE_TARGET = re.compile(r"^([a-z0-9-]+(\.[a-z0-9-]+)+|\[[0-9a-f:]+\])(:\d+)?(/\S*)?$", re.I)
 
 
+_WEB_CALL = re.compile(r"(?<![\w.-])(bh-web|bh-agent\s+web)(?![\w.-])")
+
+
+def web_destinations(cmd: str) -> str:
+    """`cmd` with every bh-web call reduced to its destination: `bh-web goto <url>` keeps its URL, any other op
+    (`fill <css> <text>`, `click <css>`, `wait <css>`...) keeps nothing: a URL in a prompt or a selector is text
+    typed into the page, not a request of ours (audit I5). A command substitution inside a bh-web call still runs
+    in bash: its body is kept. Unparsable: returned whole (never less strict)."""
+    if not _WEB_CALL.search(cmd):
+        return cmd
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
+    lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return cmd
+    commands: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok and set(tok) <= _SIMPLE_SEP:
+            commands.append([])
+        else:
+            commands[-1].append(tok)
+    out = []
+    for words in (w for w in commands if w):
+        args = words[1:] if words[0] == "bh-web" else words[2:] if words[:2] == ["bh-agent", "web"] else None
+        if args is None:
+            out.append(shlex.join(words))
+        elif len(args) >= 2 and args[0] == "goto":
+            out.append(shlex.join(["bh-web", "goto", args[1]]))
+        else:
+            out.append("bh-web")
+    return " ; ".join(out + _substitutions(cmd))
+
+
 def urls_in(cmd: str) -> list[str]:
     """URLs a command talks to: literal http(s) URLs, scheme-less `host[:port]/path` arguments of curl/wget
-    (curl defaults them to http), and `/path` arguments of q/qq on their saved origin."""
+    (curl defaults them to http), and `/path` arguments of q/qq on their saved origin. Of a bh-web call, only the
+    destination of `goto` (web_destinations)."""
+    cmd = web_destinations(cmd)
     urls = URL_RE.findall(cmd)
     in_client = in_q = False
     q_base = None
