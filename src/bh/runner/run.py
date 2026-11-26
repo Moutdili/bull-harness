@@ -837,7 +837,7 @@ def pick_cards(board: Board, scope: Scope) -> list[str]:
 
 def segment_cards(scope: Scope, picked: list[str]) -> str:
     """The cards block of a task: the scope's pinned cards, always, then the picked ones."""
-    return classes.cards_block(picked, classes.pinned_cards(scope))
+    return classes.cards_block(picked, classes.pinned_cards(scope), scanners=scope.scanners_on)
 
 
 def prepare_workdir(board: Board, scope: Scope, scope_file: Path, identities: list[str] | None = None) -> None:
@@ -1168,7 +1168,11 @@ def gate_counts(board: Board, run_id: int) -> dict[str, int]:
         if f.get("run") == run_id and f.get("class") in (None, "target")
     ]
     events = board.new_lines(paths.events_log(), "gate-counts:events")
-    denied = sum(1 for e in events if e.get("run") == run_id and e.get("kind") == "blocked")
+    denied = sum(
+        1
+        for e in events
+        if e.get("run") == run_id and e.get("kind") == "blocked" and e.get("client", "agent") in ("agent", "judge")
+    )
     return {
         "gate_requests": len(flows),
         "gate_denied": denied,
@@ -1965,7 +1969,9 @@ def _run_locked(
                 if not cards and (cards := pick_cards(board, scope)):  # the surface exists once mapping is done
                     board.run_set(run_id, cards=",".join(cards))
                     say(f"  ↻ cards {', '.join(cards)}")
-                    new_cards = classes.cards_block(cards)  # the pinned ones are already in this session
+                    new_cards = classes.cards_block(
+                        cards, scanners=scope.scanners_on
+                    )  # the pinned ones are already in this session
                 else:
                     new_cards = ""
                 if rotate:

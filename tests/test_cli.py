@@ -141,7 +141,7 @@ def test_browser_load_goes_through_host_load(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(bhost, "identity_payload", lambda program, name: ({"op": "load"}, ["X-Api-Key"]))
     monkeypatch.setattr(
-        bhost, "load", lambda program, name: calls.append((program, name)) or {"code": 200, "cookies": 3}
+        bhost, "load", lambda program, name, scope=None: calls.append((program, name)) or {"code": 200, "cookies": 3}
     )
     monkeypatch.setattr(bhost, "call", lambda *a, **k: pytest.fail("a raw call skips browser-identity.json"))
     assert main(["browser", "load", DEMO, "user-a"]) == 0

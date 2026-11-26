@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from bh import __version__, paths, stack
+from bh.text import escape_invisible
 
 UI_PORT = 7340
 NUCLEI_TEMPLATES_REPO = "https://github.com/projectdiscovery/nuclei-templates.git"
@@ -381,8 +382,8 @@ def cmd_finding(args) -> int:
         "evidence",
         "observation",
     ):
-        print(f"{k:11}: {r.get(k) if k in host_fields else fence(r.get(k))}")
-    print("poc:\n" + fence(r.get("poc") or ""))
+        print(f"{k:11}: {r.get(k) if k in host_fields else fence(escape_invisible(str(r.get(k) or '')))}")
+    print("poc:\n" + fence(escape_invisible(str(r.get("poc") or ""))))
     return 0
 
 
@@ -801,7 +802,7 @@ def cmd_browser_load(args) -> int:
 
     scope = _load_scope_or_exit(args.scope)
     _, headers = bhost.identity_payload(scope.program, args.identity)
-    out = bhost.load(scope.program, args.identity)  # on success, writes browser-identity.json for the gate
+    out = bhost.load(scope.program, args.identity, scope=scope)  # on success, writes browser-identity.json for the gate
     if rc := _browser_reply(out):
         return rc
     print(f"{scope.program}/{args.identity}: {out.get('cookies')} cookie(s) loaded in {stack.BROWSER_CTR}")

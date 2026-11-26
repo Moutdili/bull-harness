@@ -211,7 +211,7 @@ def test_judge_model_is_never_the_hunters():
 
 
 # ------------------------------------------------------------------ I1: observation proofs
-OBS = {"token": "BH-SECRET-0123456789abcdef", "victim": "user-b", "attacker": "user-a"}
+OBS = {"token": "BH-SECRET-0123456789abcdef", "victim": "user-b", "attacker": "user-a", "control": "0/3"}
 
 
 def _ev(ts, where, identity, client="browser", **kw):
@@ -350,13 +350,15 @@ def test_note_observation_form(tmp_path, monkeypatch, capsys):
     canary = capsys.readouterr().out.strip()
     assert c.CANARY_RE.fullmatch(canary)
     base = ["finding", "t", "--severity", "high", "--class", "prompt-injection", "--url", "https://a.test/"]
+    base += ["--control", "0/3", "--counter", "c", "--severity-if", "i", "--severity-why", "w"]
     with pytest.raises(SystemExit):
         note.main([*base, "--observation", canary, "--victim", "user-a", "--attacker", "user-a", "--summary", "s"])
     with pytest.raises(SystemExit):
         note.main([*base, "--observation", "BH-SECRET-xyz", "--victim", "b", "--attacker", "a", "--summary", "s"])
     note.main([*base, "--observation", canary, "--victim", "user-b", "--attacker", "user-a", "--summary", "s"])
     rec = json.loads((tmp_path / c.NOTES).read_text().splitlines()[-1])
-    assert rec["observation"] == {"token": canary, "victim": "user-b", "attacker": "user-a"} and "proof" not in rec
+    assert rec["observation"] == {"token": canary, "victim": "user-b", "attacker": "user-a", "control": "0/3"}
+    assert "proof" not in rec
 
 
 # ------------------------------------------------------------------ I11: stop on third-party data

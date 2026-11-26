@@ -47,3 +47,4 @@ gitleaks
 sslscan
 testssl.sh
 nmap
+xclip
