@@ -19,7 +19,7 @@ def main() -> None:
     if name == "bh-agent":
         if not args:
             tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz", "js"))
-            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|<tool> ...  (tools: {tools})")
+            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|recall|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
     if cmd in ("hook-pre", "hook-post"):
@@ -34,6 +34,10 @@ def main() -> None:
         from bh.agent import note
 
         note.main(args)
+    elif cmd == "recall":  # stdlib only: a request file the host answers (bh.lineage.serve)
+        from bh.agent import recall
+
+        recall.main(args)
     elif cmd in ("q", "qq"):
         from bh.agent import q
 
