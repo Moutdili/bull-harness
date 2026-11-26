@@ -18,7 +18,7 @@ def main() -> None:
     args = sys.argv[1:]
     if name == "bh-agent":
         if not args:
-            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz"))
+            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz", "js"))
             sys.exit(f"usage: bh-agent hook-pre|hook-post|note|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
@@ -50,6 +50,10 @@ def main() -> None:
         from bh.agent import authz
 
         authz.main(args)
+    elif cmd == "js":  # stdlib only: reads bundles through the gate, lists what they name
+        from bh.agent import js
+
+        js.main(args)
     elif cmd == "zap":  # starts a ZAP daemon (Java) only inside run(): bh-agent starts without ZAP
         from bh.agent import zap
 

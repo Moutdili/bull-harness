@@ -21,12 +21,19 @@ is disproved when a control's answer satisfies its attack's expectation (no diff
 
 A step that only a rendered page proves (DOM XSS, a client-side route) adds `"browse": {"xss": "<marker>"}`
 (GET only): replay runs `bh-browse <url> --xss <marker>` in a throwaway work dir, reads the `summary.json` it
-leaves there (status, dialogs, window.__bhxss) and decides itself: confirmed when a dialog's whole message, or
-the sentinel string, is the marker. The step's body is then one canonical line written by the replay, never by
-the page: `xss CONFIRMED (marker <marker>)` or `xss none (marker <marker>)`. So the attack expects
-`{"contains": ["xss CONFIRMED (marker <marker>)"]}` and its twin control (same route, benign value) expects
-`{"absent": ["xss CONFIRMED"]}`; the URL, the title and the console never reach the body. A `"browse": {}` step
-(no marker) has the rendered DOM as its body, like any answer.
+leaves there (status, dialogs, window.__bhxss, each with the origin of the frame it came from) and decides itself:
+confirmed when a dialog's whole message, or the sentinel string, is the marker AND it came from a document of the
+origin of the step's URL (a script run on another origin never confirms). The step's body is then one canonical
+line written by the replay, never by the page: `xss CONFIRMED (marker <marker>) origin=<origin>` or
+`xss none (marker <marker>)`. So the attack expects `{"contains": ["xss CONFIRMED (marker <marker>)"]}` and its
+twin control (same route, benign value) expects `{"absent": ["xss CONFIRMED"]}`; the URL, the title and the
+console never reach the body. A `"browse": {}` step (no marker) has the rendered DOM as its body, like any answer.
+
+Fresh marker: when the marker sits as is in the step's URL (or body), the replay swaps it for a marker of its own,
+drawn at random, and runs bh-browse with that one; the line still names the proof's marker, and the step's result
+says `"marker": "fresh"`. A page that merely shows a marker planted beforehand (stored, cached) then shows the old
+one, which confirms nothing. A marker absent from the URL cannot be swapped: the result says
+`"marker": "hunter-chosen"` (a stored XSS, for instance: the judge weighs it).
 
 Hostile input: the hunter writes the proof. Headers that carry an identity, a session or another method or host
 (X-BH-Identity, Cookie, Authorization, Host, X-HTTP-Method-Override...) are refused: the identity is `as` only.
@@ -40,6 +47,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -258,16 +266,36 @@ def _expect_holds(exp: dict, status: int, body: str) -> tuple[bool, list[str]]:
     return not misses, misses
 
 
+def marker_kind(step: dict) -> str | None:
+    """`fresh` when the replay can swap the step's xss marker (it sits as is in the URL or the body),
+    `hunter-chosen` otherwise; None for a step without a marker."""
+    marker = (step.get("browse") or {}).get("xss") if isinstance(step.get("browse"), dict) else None
+    if not marker:
+        return None
+    body = step.get("body")
+    text = str(step.get("url", "")) + "\n" + (json.dumps(body) if isinstance(body, (dict, list)) else str(body or ""))
+    return "fresh" if str(marker) in text else "hunter-chosen"
+
+
+def fresh_marker() -> str:
+    return "bh" + secrets.token_hex(8)  # 18 characters of [a-z0-9]: a valid bh-browse marker
+
+
 def _browse(step: dict) -> tuple[int, str, bool]:
     """A rendered page (bh-browse, through the gate like every builtin): (status, canonical body, refused).
     The text bh-browse prints is never read: it carries the URL, the title and the console."""
     exe = shutil.which("bh-browse") or "/opt/bh/bin/bh-browse"
-    cmd = [exe, str(step["url"]), "--timeout", str(BROWSE_TIMEOUT_S - 10)]
+    url = str(step["url"])
+    marker = (step.get("browse") or {}).get("xss")
+    ran = str(marker) if marker else None
+    if marker and marker_kind(step) == "fresh":
+        ran = fresh_marker()
+        url = url.replace(str(marker), ran)  # a browse step is a GET: the URL is all that is sent
+    cmd = [exe, url, "--timeout", str(BROWSE_TIMEOUT_S - 10)]
     if step.get("as"):
         cmd += ["--as", str(step["as"])]
-    marker = (step.get("browse") or {}).get("xss")
-    if marker:
-        cmd += ["--xss", str(marker)]
+    if ran:
+        cmd += ["--xss", ran]
     # the replay runs as the judge, whose HOME and default work dir may not exist or be writable: bh-browse
     # gets a throwaway work dir (raw files) and HOME (Chromium profile, gate CA) of its own
     with tempfile.TemporaryDirectory(prefix="bh-replay-") as tmp:
@@ -279,7 +307,7 @@ def _browse(step: dict) -> tuple[int, str, bool]:
         raw = _browse_raw(Path(env["BH_DIR"]) / c.RAW)
         summary = _read_summary(raw / "summary.json")
         dom = "" if marker else _read_text(raw / "dom.html")
-    status, body = browse_body(summary, str(marker) if marker else None, dom)
+    status, body = browse_body(summary, str(marker) if marker else None, dom, c.origin(str(step["url"])), ran)
     return status, body, False
 
 
@@ -308,15 +336,30 @@ def _read_summary(path: Path) -> dict:
     return doc
 
 
-def browse_body(summary: dict, marker: str | None, dom: str = "") -> tuple[int, str]:
+_ORIGIN = re.compile(r"https?://(\[[0-9a-f:.]+\]|[a-z0-9._-]+):\d{1,5}")
+
+
+def browse_body(
+    summary: dict, marker: str | None, dom: str = "", origin: str | None = None, ran: str | None = None
+) -> tuple[int, str]:
     """(status, body) of a browse step, decided here from bh-browse's structured summary: with a marker, one
-    canonical line (`xss CONFIRMED (marker m)` / `xss none (marker m)`); without, the rendered DOM."""
+    canonical line (`xss CONFIRMED (marker m) origin=o` / `xss none (marker m)`); without, the rendered DOM.
+    `origin`: contract.origin of the step's URL, the only origin the marker may show on (None: never confirmed).
+    `ran`: the marker bh-browse was given (a fresh one, see marker_kind); the line names the proof's `marker`."""
     st = summary.get("status")
     status = st if isinstance(st, int) and not isinstance(st, bool) and 100 <= st <= 599 else 0
     if not marker:
         return status, dom
-    confirmed = xss_confirmed(marker, summary.get("dialogs"), summary.get("sentinel"))
-    return status, f"xss {'CONFIRMED' if confirmed else 'none'} (marker {marker})"
+    confirmed = (
+        isinstance(origin, str)
+        and _ORIGIN.fullmatch(origin) is not None
+        and xss_confirmed(
+            ran or marker, summary.get("dialogs"), summary.get("sentinel"), origin, summary.get("sentinel_origin")
+        )
+    )
+    if confirmed:
+        return status, f"xss CONFIRMED (marker {marker}) origin={origin}"
+    return status, f"xss none (marker {marker})"
 
 
 def _send(step: dict) -> tuple[int, str, bool]:
@@ -364,18 +407,19 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
                 status, body, denied = _browse(st) if "browse" in st else _send(st)
                 answers.append((st, status, body))
                 ok, misses = _expect_holds(st["expect"], status, body)
-                round_.append(
-                    {
-                        "name": st.get("name", ""),
-                        "role": st["role"],
-                        "status": status,
-                        "ok": ok and not denied,
-                        "misses": misses + (["refused by the gate"] if denied else []),
-                        "len": len(body),
-                        "sha1": hashlib.sha1(body.encode()).hexdigest()[:12],
-                        "snippet": body[:SNIPPET],
-                    }
-                )
+                res = {
+                    "name": st.get("name", ""),
+                    "role": st["role"],
+                    "status": status,
+                    "ok": ok and not denied,
+                    "misses": misses + (["refused by the gate"] if denied else []),
+                    "len": len(body),
+                    "sha1": hashlib.sha1(body.encode()).hexdigest()[:12],
+                    "snippet": body[:SNIPPET],
+                }
+                if "browse" in st and (kind := marker_kind(st)):
+                    res["marker"] = kind
+                round_.append(res)
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 round_.append(
                     {
