@@ -504,6 +504,9 @@ class Gate:
             else:
                 host = flow.request.host if flow.request.method == "CONNECT" else self._named(flow)[1]
             client = client_kind(flow)
+            identity = flow.metadata.get("bh_identity")
+            if identity is None and client == "browser":  # at CONNECT the request hook has not tagged it yet
+                identity = self._browser_identity()
             for tok in tokens:
                 self._log(
                     paths.EVENTS,
@@ -513,7 +516,7 @@ class Gate:
                         "where": where,
                         "host": host,
                         "url": redact.url(url),
-                        "identity": flow.metadata.get("bh_identity"),
+                        "identity": identity,
                         "client": client,
                     },
                 )

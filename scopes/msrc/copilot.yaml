@@ -28,6 +28,11 @@ in_scope:
   - {value: "https://substrate.office.com/search/api/v1/prompts", note: "prompt gallery and its activity"}
   - {value: "https://substrate.office.com/search/api/v1/suggestions", note: "composer suggestions"}
   - {value: "https://substrate.svc.cloud.microsoft/m365Copilot/", note: "alternate chat hub host (in the app's code, not seen live)"}
+# chat traffic only from bh-browser (audit B2): a prompt reaches Copilot through the one browser where the operator solves
+# the Turnstile challenge, never by a direct websocket or API call from the agent's container
+browser_only:
+  - "https://substrate.office.com/m365Copilot/Chathub/"
+  - "https://substrate.svc.cloud.microsoft/m365Copilot/Chathub/"
 support:
   # sso: the app signs in silently while in use (iframe GET .../oauth2/v2.0/authorize, /savedusers, then the PKCE
   # code exchange POST .../oauth2/v2.0/token); seen live 2026-11-25 on login.microsoftonline.com, tenant
