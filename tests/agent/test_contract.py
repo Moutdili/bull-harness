@@ -46,7 +46,7 @@ def test_phases_and_surface(tmp_path):
 
 
 def test_blocker_contract():
-    assert c.FACT_KINDS == ("fact", "recon", "handoff", "dead-end")
+    assert c.FACT_KINDS == ("fact", "recon", "handoff", "dead-end", "think", "threat-model")
     assert "blocker" not in c.FACT_KINDS  # host-written only
     assert {"auth", "waf", "captcha", "write-needed", "oob-needed", "refusal", "other"} <= set(c.BLOCKER_REASONS)
     assert len(set(c.BLOCKER_REASONS)) == len(c.BLOCKER_REASONS) and c.BLOCKER_REASONS[-1] == "other"
@@ -55,3 +55,30 @@ def test_blocker_contract():
 
 def test_bh_js_maps_and_never_scans():
     assert c.runs_mapper("bh-js https://t.test/") and not c.runs_scanner("bh-js https://t.test/")
+
+
+def test_endpoint_label_is_the_method_and_the_route_family():
+    assert c.endpoint_label("https://t.test/api/orders/7?x=1") == "GET /api/orders/{id}"
+    assert c.endpoint_label("post https://t.test:8443/api/orders") == "POST /api/orders"
+    assert c.endpoint_label("DELETE /api/orders/7") == "DELETE /api/orders/{id}"
+    assert c.endpoint_label("/rest/basket/") == "GET /rest/basket/{id}"
+    for bad in ("", "orders", "GET orders", "//evil.test/x", "ftp://t.test/x", None, 7, "GET /a b"):
+        assert c.endpoint_label(bad) is None
+
+
+def test_scope_prefix_is_an_https_prefix_without_joker():
+    assert c.scope_prefix("https://API.t.test/v2/") == "https://api.t.test/v2/"
+    assert c.scope_prefix("https://t.test") == "https://t.test/"
+    assert c.scope_prefix("https://t.test:8443/a") == "https://t.test:8443/a"
+    for bad in (
+        "http://t.test/",
+        "https://*.t.test/",
+        "https://t.test/a?b=1",
+        "https://t.test/#x",
+        "https://u:p@t.test/",
+        "https://10.0.0.1/",
+        "https://localhost/",
+        "https://t.test/a b",
+        None,
+    ):
+        assert c.scope_prefix(bad) is None

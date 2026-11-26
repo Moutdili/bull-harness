@@ -1,10 +1,20 @@
 """bh-note — the agent's only way to write to the board (an inbox the runner ingests).
 
   bh-note fact "title" [-s summary] [-e evidence_path] [-k fact|recon|handoff|dead-end]
+          [--quote "<exact substring of a response body>" [--flow <flow id>]]      # T12: anchored by the host
+          [--url URL --class C --technique T --as user-a,user-b] [--why "<reason>"]
+          # -k dead-end needs --why technical|environment|approach|external|rule
+  bh-note think "<idea>" --why "<reason>"                 # D15: a line of your reasoning, never anchored
+  bh-note threat-model "<title>" -l "<claim> :: <exact quote>" [-l ...] [--flow <id>]   # T16: at most 8 lines
   bh-note handoff --state "..." --dead "...|none" --next "..." --files "..."   # fact HANDOFF: <state>, 4 rubrics
-  bh-note intent "what I will try next" [--success "<signal>"] [--abandon "<signal or n tries>"]
-  bh-note done I12 "outcome"                              # an intent without criteria
-  bh-note done I12 --reached success|abandon "outcome"    # an intent with --success / --abandon
+  bh-note intent "what I will try next" --kind map|test|prove [--success "<signal>"] [--abandon "<signal>"]
+          [--basis F<n>] [--after I<n>] [--url URL --class C] [--recall R-<id>|none]
+          # test and prove need --recall (run `bh-recall "<idea>" --url U --class C` first); map does not
+  bh-note reorder I4 I2 I7                                # the order of your open intents, first = next
+  bh-note done I12 "outcome" [--outcome confirmed|ruled_out|open_proof_gap]  # an intent without criteria
+  bh-note done I12 --reached success|abandon "outcome" [--outcome ...]       # an intent with --success / --abandon
+  bh-note cover "GET /api/orders/{id}" idor clean|suspect|blocked|retry -e <file>   # T14: one (endpoint, class)
+  bh-note scope-request "https://<prefix>" "<where it was seen: page, JS bundle, response>"   # D40: judged later
   bh-note finding "title" --severity high --class idor --url URL --proof proof.json \\
           --summary "..." --not-proven "..." [--poc-file poc.sh] HONESTY
   bh-note finding "title" --severity high --class prompt-injection --url URL \\
@@ -16,7 +26,8 @@
             --severity-why "<why this severity>"   (all three required, never empty)
   bh-note canary           # prints a fresh BH-SECRET-<16 hex> to plant in the victim's data
   bh-note verdict F12 confirmed|rejected|inconclusive "reason"     # verifier only
-  bh-note blocked auth|account|waf|captcha|...|other "what is blocked" [-d detail] [--intent I3] [--host H]
+  bh-note blocked auth|account|waf|captcha|...|other "what is blocked" --tried "<what you tried>" \\
+          --would-prove "<what would prove it>" [-d detail] [--intent I3] [--host H]
   bh-note show 42          # full summary/evidence of fact 42
   bh-note frontier         # current board view (+ attack surface)
 """
@@ -66,6 +77,23 @@ def parser() -> argparse.ArgumentParser:
     f.add_argument("-s", "--summary", default="")
     f.add_argument("-e", "--evidence", default="")
     f.add_argument("-k", "--kind", default="fact", choices=c.FACT_KINDS)
+    f.add_argument(
+        "--quote", help=f"an exact substring of a response body: one line, {c.QUOTE_MIN}-{c.QUOTE_MAX} chars"
+    )
+    f.add_argument("--flow", help="the gate's flow id the quote is from (else the run's latest flows are searched)")
+    f.add_argument("--why", help="why (required with -k dead-end: " + "|".join(c.DEAD_END_WHY) + ")")
+    _typed(f)
+    f.add_argument("--technique", help="the technique the fact is about")
+    f.add_argument("--as", dest="identities", help="the identities involved, comma-separated (user-a,user-b)")
+    t = sub.add_parser("think", help="a line of your reasoning: never anchored")
+    t.add_argument("title")
+    t.add_argument("--why", help="required: the reason")
+    tm = sub.add_parser("threat-model", help="the program's threat model: replaces the previous one")
+    tm.add_argument("title")
+    tm.add_argument(
+        "-l", "--line", action="append", default=[], help='"<claim> :: <exact quote>"; without a quote: (inferred)'
+    )
+    tm.add_argument("--flow", help="the gate's flow id the quotes are from")
     h = sub.add_parser("handoff", help="the state for the next session: four rubrics, all required")
     h.add_argument("--state", help="where the hunt stands")
     h.add_argument("--dead", help="leads abandoned, and why (`none` if none)")
@@ -75,10 +103,27 @@ def parser() -> argparse.ArgumentParser:
     i.add_argument("title")
     i.add_argument("--success", help="the signal that the test worked, written before it runs")
     i.add_argument("--abandon", help="the signal (or number of tries) that ends it")
+    i.add_argument("--kind", choices=c.INTENT_KINDS, help="map (no recall needed), test or prove")
+    i.add_argument("--basis", help="F<n>: the finding this intent builds on")
+    i.add_argument("--after", help="I<n>: the intent this one waits for")
+    _typed(i)
+    i.add_argument("--recall", help="R-<id> printed by bh-recall, or none (required with --kind test|prove)")
+    r = sub.add_parser("reorder", help="the order of your open intents, first = next")
+    r.add_argument("intent_ids", nargs="+")
     d = sub.add_parser("done")
     d.add_argument("intent_id")
     d.add_argument("outcome")
     d.add_argument("--reached", choices=c.REACHED, help="required when the intent has --success or --abandon")
+    d.add_argument("--outcome", dest="closure", choices=c.INTENT_OUTCOMES, help="what the test established")
+    d.add_argument("--why", choices=c.DEAD_END_WHY, help="with --reached abandon: why the lead is a dead end")
+    cv = sub.add_parser("cover", help="coverage of one (endpoint, class)")
+    cv.add_argument("endpoint", help='"METHOD /route" (or a URL)')
+    cv.add_argument("vuln_class")
+    cv.add_argument("outcome", choices=c.COVER_OUTCOMES)
+    cv.add_argument("-e", "--evidence", help="required: the file that shows it")
+    sr = sub.add_parser("scope-request", help="ask the host's judge for an https prefix the target uses")
+    sr.add_argument("prefix")
+    sr.add_argument("why", help="where it was seen: page, JS bundle, response")
     fi = sub.add_parser("finding")
     fi.add_argument("title")
     fi.add_argument("--severity", required=True, choices=c.SEVERITIES)
@@ -112,12 +157,183 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("reason", choices=c.BLOCKER_REASONS)
     b.add_argument("title")
     b.add_argument("-d", "--detail", default="")
+    b.add_argument("--tried", help="required: what you tried")
+    b.add_argument("--would-prove", help="required: what would prove it, if the wall were not there")
     b.add_argument("--intent", help="the intent (I<n>) this blocker closes")
     b.add_argument("--host")
     sub.add_parser("show").add_argument("fact_id")
     sub.add_parser("canary", help="print a fresh canary for an observation proof")
     sub.add_parser("frontier")
     return p
+
+
+def _typed(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--url", help='the endpoint: a URL, or "METHOD URL"')
+    sp.add_argument("--class", dest="vuln_class", help="the vulnerability class")
+
+
+def _refuse(what: str, bad: list[str]) -> None:
+    if bad:
+        sys.exit(f"{what} refused:\n  - " + "\n  - ".join(bad))
+
+
+def _quote_errors(quote: str | None, flow: str | None) -> list[str]:
+    bad = []
+    if quote is not None:
+        if "\n" in quote or "\r" in quote:
+            bad.append("--quote is one line: quote one line of the body")
+        if not c.QUOTE_MIN <= len(quote) <= c.QUOTE_MAX:
+            bad.append(f"--quote is {c.QUOTE_MIN} to {c.QUOTE_MAX} characters, copied exactly from a response body")
+    if flow is not None and not c.FLOW_ID_RE.fullmatch(flow):
+        bad.append("--flow is a gate flow id (<seconds>-<6 hex>-<n>, as in the flow log)")
+    return bad
+
+
+def _typed_fields(a: argparse.Namespace) -> tuple[dict, list[str]]:
+    """--url / --class of a fact or an intent: the endpoint must read as one."""
+    out, bad = {}, []
+    if a.url is not None:
+        if c.endpoint_label(a.url) is None:
+            bad.append('--url is a URL, or "METHOD URL" (GET https://t.test/api/orders/7)')
+        out["url"] = a.url
+    if a.vuln_class is not None:
+        if _blank(a.vuln_class):
+            bad.append("--class is empty")
+        out["vuln_class"] = a.vuln_class.strip()
+    return out, bad
+
+
+def _fact(a: argparse.Namespace) -> None:
+    if a.kind == "threat-model":
+        sys.exit('a threat model: bh-note threat-model "<title>" -l "<claim> :: <exact quote>" [-l ...]')
+    bad = _quote_errors(a.quote, a.flow)
+    if a.flow is not None and a.quote is None:
+        bad.append("--flow goes with --quote")
+    if a.kind == "dead-end" and a.why not in c.DEAD_END_WHY:
+        bad.append("-k dead-end needs --why " + "|".join(c.DEAD_END_WHY))
+    if a.kind == "think" and _blank(a.why):
+        bad.append('-k think needs --why (or: bh-note think "<idea>" --why "<reason>")')
+    typed, more = _typed_fields(a)
+    _refuse("fact", bad + more)
+    rec = {"op": "fact", "title": a.title, "summary": a.summary, "evidence": a.evidence, "kind": a.kind, **typed}
+    for k in ("quote", "flow", "why", "technique", "identities"):
+        if getattr(a, k) is not None:
+            rec[k] = getattr(a, k)
+    _emit(rec)
+
+
+def _think(a: argparse.Namespace) -> None:
+    _refuse("think", ["the idea is empty"] * _blank(a.title) + ["--why is required and not empty"] * _blank(a.why))
+    _emit({"op": "think", "title": _one_line(a.title), "why": _one_line(a.why)})
+
+
+def _threat_model(a: argparse.Namespace) -> None:
+    bad = []
+    lines = [ln.strip() for ln in a.line]
+    if not lines or len(lines) > c.THREAT_MODEL_LINES or any(not ln for ln in lines):
+        bad.append(f"1 to {c.THREAT_MODEL_LINES} non-empty -l lines")
+    for ln in lines:
+        claim, sep, quote = ln.partition(c.THREAT_QUOTE_SEP)
+        bad += _quote_errors(quote if sep else None, None)
+        if sep and not claim.strip():
+            bad.append(f"a line has a quote and no claim: {ln[:60]!r}")
+    bad += _quote_errors(None, a.flow)
+    _refuse("threat model", list(dict.fromkeys(bad)))
+    _emit({"op": "threat-model", "title": a.title, "lines": lines, **({"flow": a.flow} if a.flow else {})})
+
+
+def _recall_command(a: argparse.Namespace) -> str:
+    return f'bh-recall "{a.title}" --url {a.url or "<URL>"} --class {a.vuln_class or "<class>"}'
+
+
+def _intent_typed(a: argparse.Namespace) -> tuple[dict, list[str]]:
+    rec, bad = _typed_fields(a)
+    if a.kind is not None:
+        rec["kind"] = a.kind
+    if a.kind in c.RECALL_NEEDED and a.recall is None:
+        bad.append(
+            f"--kind {a.kind} needs --recall: run `{_recall_command(a)}` first, then add --recall R-<id> "
+            "(or --recall none when it found nothing)"
+        )
+    if a.recall is not None and not c.RECALL_RE.fullmatch(a.recall):
+        bad.append("--recall is R-<id> as bh-recall printed it, or none")
+    if a.kind == "prove" and a.url is None:
+        bad.append("--kind prove needs --url: the endpoint of your anchored fact (bh-note fact ... --quote --url)")
+    if a.basis is not None and not re.fullmatch(r"F\d{1,12}", a.basis.strip()):
+        bad.append("--basis is a finding id, F<n>")
+    if a.after is not None and not re.fullmatch(r"I\d{1,12}", a.after.strip()):
+        bad.append("--after is an intent id, I<n>")
+    for k in ("basis", "after", "recall"):
+        if getattr(a, k) is not None:
+            rec[k] = getattr(a, k).strip()
+    return rec, bad
+
+
+def _reorder(a: argparse.Namespace) -> None:
+    ids = [m.group(1) for x in a.intent_ids if (m := re.fullmatch(r"I?(\d{1,12})", x.strip()))]
+    if len(ids) != len(a.intent_ids):
+        sys.exit("bh-note reorder I<a> I<b> ...: intent ids only")
+    _emit({"op": "reorder", "intents": [f"I{n}" for n in dict.fromkeys(ids)]})
+
+
+def _cover(a: argparse.Namespace) -> None:
+    bad = []
+    if c.endpoint_label(a.endpoint) is None:
+        bad.append('the endpoint is "METHOD /route" (GET /api/orders/{id}) or a URL')
+    if _blank(a.vuln_class):
+        bad.append("the class is empty")
+    if _blank(a.evidence):
+        bad.append("-e <file> is required: the file that shows it")
+    elif not Path(a.evidence).is_file():
+        bad.append(f"evidence file not found: {a.evidence}")
+    _refuse("cover", bad)
+    _emit(
+        {
+            "op": "cover",
+            "endpoint": a.endpoint,
+            "vuln_class": a.vuln_class.strip(),
+            "outcome": a.outcome,
+            "evidence": str(Path(a.evidence).resolve()),
+        }
+    )
+
+
+def _scope_request(a: argparse.Namespace) -> None:
+    bad = []
+    if c.scope_prefix(a.prefix) is None:
+        bad.append("the prefix is an https URL (https://host/path), no joker (*), no query (?), no fragment")
+    if _blank(a.why):
+        bad.append("say where it was seen: the page, the JS bundle or the response")
+    _refuse("scope request", bad)
+    rec = {"op": "scope-request", "kind": "scope-request", "prefix": a.prefix, "why": _one_line(a.why)}
+    c.append_jsonl(c.bh_dir() / c.NOTES, {**rec, "run": None, "program": os.environ.get("BH_PROGRAM", "")})
+    print("asked, pending: the host's judge decides after this segment; until then the gate refuses it")
+
+
+def _blocked(a: argparse.Namespace) -> None:
+    """A closed lead says what was tried and what would have proved it (T13). A stop (third-party data, server
+    execution) is written at once: nothing is asked of it."""
+    if a.reason not in c.STOP_REASONS:
+        _refuse(
+            "blocked",
+            [
+                f"{flag} is required and not empty"
+                for flag, v in (("--tried", a.tried), ("--would-prove", a.would_prove))
+                if _blank(v)
+            ],
+        )
+    rec = {
+        "op": "blocked",
+        "reason": a.reason,
+        "title": a.title,
+        "detail": a.detail,
+        "intent": a.intent or "",
+        "host": a.host or "",
+    }
+    for k in ("tried", "would_prove"):
+        if not _blank(getattr(a, k)):
+            rec[k] = _one_line(getattr(a, k))
+    _emit(rec)
 
 
 def _observation_finding(a: argparse.Namespace) -> None:
@@ -177,13 +393,23 @@ def _handoff(a: argparse.Namespace) -> None:
 
 
 def _intent(a: argparse.Namespace) -> None:
-    if bad := [
+    """Several intents may be open at once. --kind test|prove asks what the lineage already knows first (--recall);
+    --kind map does not."""
+    bad = [
         f"--{k} is empty: give the signal or leave the option out"
         for k in c.REACHED
         if getattr(a, k) is not None and _blank(getattr(a, k))
-    ]:
-        sys.exit("intent refused:\n  - " + "\n  - ".join(bad))
-    _emit({"op": "intent", "title": a.title, **{k: getattr(a, k) for k in c.REACHED if getattr(a, k) is not None}})
+    ]
+    typed, more = _intent_typed(a)
+    _refuse("intent", bad + more)
+    _emit(
+        {
+            "op": "intent",
+            "title": a.title,
+            **{k: getattr(a, k) for k in c.REACHED if getattr(a, k) is not None},
+            **typed,
+        }
+    )
 
 
 def _done(a: argparse.Namespace, d: Path) -> None:
@@ -203,8 +429,17 @@ def _done(a: argparse.Namespace, d: Path) -> None:
         )
     if has is False and a.reached is not None:
         sys.exit(f'I{n} has no exit criteria: bh-note done I{n} "<outcome>" (no --reached)')
+    if a.why is not None and a.reached != "abandon":
+        sys.exit("--why goes with --reached abandon (why the lead is a dead end)")
     _emit(
-        {"op": "done", "intent_id": a.intent_id, "outcome": a.outcome, **({"reached": a.reached} if a.reached else {})}
+        {
+            "op": "done",
+            "intent_id": a.intent_id,
+            "outcome": a.outcome,
+            **({"reached": a.reached} if a.reached else {}),
+            **({"closure": a.closure} if a.closure else {}),
+            **({"why": a.why} if a.why else {}),
+        }
     )
 
 
@@ -236,11 +471,19 @@ def main(argv: list[str] | None = None) -> None:
     if a.op == "finding" and a.observation is not None:
         _observation_finding(a)
         return
-    if a.op == "handoff":
-        _handoff(a)
-        return
-    if a.op == "intent":
-        _intent(a)
+    handlers = {
+        "handoff": _handoff,
+        "fact": _fact,
+        "think": _think,
+        "threat-model": _threat_model,
+        "intent": _intent,
+        "reorder": _reorder,
+        "cover": _cover,
+        "scope-request": _scope_request,
+        "blocked": _blocked,
+    }
+    if a.op in handlers:
+        handlers[a.op](a)
         return
     if a.op == "done":
         _done(a, d)
@@ -268,18 +511,6 @@ def main(argv: list[str] | None = None) -> None:
                 "summary": a.summary,
                 "not_proven": a.not_proven,
                 **_honesty(a),
-            }
-        )
-        return
-    if a.op == "blocked":
-        _emit(
-            {
-                "op": "blocked",
-                "reason": a.reason,
-                "title": a.title,
-                "detail": a.detail,
-                "intent": a.intent or "",
-                "host": a.host or "",
             }
         )
         return

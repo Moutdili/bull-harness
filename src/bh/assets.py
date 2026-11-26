@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS asset_links (
   asset_id INTEGER NOT NULL, ref_kind TEXT NOT NULL, ref_id INTEGER NOT NULL, UNIQUE(asset_id, ref_kind, ref_id)
 );
 CREATE INDEX IF NOT EXISTS assets_prog ON assets(program, kind);
+-- T14: coverage of one (endpoint, class), one row per `bh-note cover`, the latest wins. endpoint is "METHOD route"
+-- (contract.endpoint_label), vuln_class classes.canonical. gate_seen = 1 only when `tests` holds a `gate` proof for
+-- that endpoint in that run; without it a `clean` is stored as `retry`.
+CREATE TABLE IF NOT EXISTS coverage_class (
+  program TEXT NOT NULL, endpoint TEXT NOT NULL, vuln_class TEXT NOT NULL, outcome TEXT NOT NULL, evidence TEXT,
+  run_id INTEGER, ts REAL NOT NULL, gate_seen INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS coverage_class_key ON coverage_class(program, endpoint, vuln_class);
 """
 # User-Agents of hand-made requests (curl, PoC scripts). Builtins (katana, ffuf, nuclei, sqlmap...) differ.
 MANUAL_UA = re.compile(r"^(curl|wget|python-requests|python-urllib|httpie|xh|node-fetch|axios|undici)/", re.I)
@@ -95,6 +103,54 @@ def _coverage_row(phase, entry) -> tuple[str, str | None, float | None, str | No
 
 def ensure(board: Board) -> None:
     board.db.executescript(SCHEMA)
+
+
+def gate_flow(f: dict) -> tuple[str, str] | None:
+    """(origin, "METHOD route") of a flows.jsonl line that is a proof of rank `gate`: a hand-made request (MANUAL_UA)
+    to a target. The one rule Graph.sync and gate_tested share."""
+    if not isinstance(f, dict) or f.get("class") not in (None, "target") or not MANUAL_UA.match(str(f.get("ua") or "")):
+        return None
+    url = f.get("url") if isinstance(f.get("url"), str) else ""
+    k = c.endpoint_key(url, str(f.get("method", "GET")))
+    return (k[0], c.family(k[1])) if k else None
+
+
+def gate_endpoints(run_id: int | None, window: int = 8_000_000) -> set[str]:
+    """ "METHOD route" of the hand-made target requests the gate logged for the run, from the tail of flows.jsonl:
+    what `tests` will hold as `gate` once Graph.sync has read the log (the runner syncs after the notes)."""
+    out = set()
+    for f in c.tail_jsonl(paths.flows_log(), 10**6, window):
+        # a run id belongs to one program (runs table): the run is the filter, as in Graph.sync
+        if run_id is not None and f.get("run") == run_id and (k := gate_flow(f)):
+            out.add(k[1])
+    return out
+
+
+def gate_tested(board: Board, program: str, endpoint: str, run_id: int | None, logged: set[str] | None = None) -> bool:
+    """`tests` holds a proof of rank `gate` (a hand-made request the gate forwarded) for the endpoint "METHOD route"
+    of the program, on any of its origins, in run `run_id`; or the gate's flow log of that run does, not yet synced
+    (`logged`: gate_endpoints, computed once by the caller). Never the sandbox's files."""
+    ensure(board)
+    if logged is not None and endpoint in logged:
+        return True
+    return bool(
+        board.rows(
+            "SELECT 1 FROM tests t JOIN assets a ON a.id=t.asset_id WHERE a.program=? AND a.kind='endpoint' "
+            "AND t.evidence='gate' AND t.run_id=? AND substr(a.key, instr(a.key, ' ') + 1)=? LIMIT 1",
+            program,
+            run_id,
+            endpoint,
+        )
+    )
+
+
+def class_coverage(board: Board, program: str) -> dict[tuple[str, str], dict]:
+    """(endpoint, class) -> the latest `bh-note cover` row for it."""
+    ensure(board)
+    out: dict[tuple[str, str], dict] = {}
+    for r in board.rows("SELECT * FROM coverage_class WHERE program=? ORDER BY ts, rowid", program):
+        out[(r["endpoint"], r["vuln_class"])] = dict(r)
+    return out
 
 
 class Graph:
