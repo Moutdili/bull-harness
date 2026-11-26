@@ -17,6 +17,10 @@ Decision (pure, `decide`):
   An unknown `where` counts for neither side (shown in the table only).
 Both -> `verified-evidence`. Sent by someone else first -> `rejected` (the attacker typed it). Otherwise -> no
 sighting, `inconclusive`. The judge reads the table and can only lower this verdict.
+
+The control (audit N6): the hunter also ran the same steps without A's payload, N times, and the canary crossed k of
+them (`control: "k/N"`). A sighting proves the leak, not that A's content caused it (B's own prompt, a share B made):
+without a well-formed control, or with k > 0, a sighting stays `inconclusive`. Never `verified-evidence` without it.
 """
 
 from __future__ import annotations
@@ -37,7 +41,9 @@ TABLE_MAX = 20  # events shown to the judge and kept with the finding
 
 
 def valid(obs: object) -> dict | None:
-    """The sandbox-written observation, checked: {token, victim, attacker} or None."""
+    """The sandbox-written observation, checked: {token, victim, attacker[, control]} or None. A missing or malformed
+    control does not refuse the observation (the gate's table is still worth keeping): it is left out, and `decide`
+    then stops at `inconclusive`."""
     if not isinstance(obs, dict):
         return None
     token, victim, attacker = obs.get("token"), obs.get("victim"), obs.get("attacker")
@@ -45,7 +51,10 @@ def valid(obs: object) -> dict | None:
         return None
     if not all(isinstance(x, str) and 0 < len(x) <= 80 for x in (victim, attacker)) or victim == attacker:
         return None
-    return {"token": token, "victim": victim, "attacker": attacker}
+    out = {"token": token, "victim": victim, "attacker": attacker}
+    if c.parse_control(obs.get("control")) is not None:
+        out["control"] = obs["control"]
+    return out
 
 
 def _ts(e: dict) -> float:
@@ -92,7 +101,25 @@ def decide(events: Iterable[dict], obs: dict, offscope: Callable[[str], bool] = 
             "the attacker supplied it",
             "events": table,
         }
-    return {"status": "verified-evidence", "why": f"{token} {why}; never sent by anyone but {victim}", "events": table}
+    why = f"{token} {why}; never sent by anyone but {victim}"
+    control = c.parse_control(obs.get("control"))
+    if control is None:
+        return {
+            "status": "inconclusive",
+            "why": f"{why}; but no control without A's payload (k/N): A's content is not shown to be the cause",
+            "events": table,
+        }
+    if control[0]:
+        return {
+            "status": "inconclusive",
+            "why": f"{why}; but it also crossed in {control[0]}/{control[1]} control runs without A's payload",
+            "events": table,
+        }
+    return {
+        "status": "verified-evidence",
+        "why": f"{why}; control without A's payload {control[0]}/{control[1]}",
+        "events": table,
+    }
 
 
 def _lines(path: Path, needle: bytes) -> Iterator[dict]:

@@ -1,13 +1,19 @@
 """bh-note — the agent's only way to write to the board (an inbox the runner ingests).
 
   bh-note fact "title" [-s summary] [-e evidence_path] [-k fact|recon|handoff|dead-end]
-  bh-note intent "what I will try next"
-  bh-note done I12 "outcome"
+  bh-note handoff --state "..." --dead "...|none" --next "..." --files "..."   # fact HANDOFF: <state>, 4 rubrics
+  bh-note intent "what I will try next" [--success "<signal>"] [--abandon "<signal or n tries>"]
+  bh-note done I12 "outcome"                              # an intent without criteria
+  bh-note done I12 --reached success|abandon "outcome"    # an intent with --success / --abandon
   bh-note finding "title" --severity high --class idor --url URL --proof proof.json \\
-          --summary "..." --not-proven "..." [--poc-file poc.sh]
+          --summary "..." --not-proven "..." [--poc-file poc.sh] HONESTY
   bh-note finding "title" --severity high --class prompt-injection --url URL \\
-          --observation BH-SECRET-<16 hex> --victim user-b --attacker user-a --summary "..." [-e transcript]
-          # a result only the browser shows: the host looks for that canary in the gate's journal (audit I1)
+          --observation BH-SECRET-<16 hex> --victim user-b --attacker user-a --control 0/3 --summary "..." \\
+          [-e transcript] HONESTY
+          # a result only the browser shows: the host looks for that canary in the gate's journal (audit I1);
+          # --control k/N: the same steps without A's payload, N runs, k canary crossings (N6)
+  HONESTY = --counter "<best case against it>" --severity-if "<proof that would change the severity>"
+            --severity-why "<why this severity>"   (all three required, never empty)
   bh-note canary           # prints a fresh BH-SECRET-<16 hex> to plant in the victim's data
   bh-note verdict F12 confirmed|rejected|inconclusive "reason"     # verifier only
   bh-note blocked auth|account|waf|captcha|...|other "what is blocked" [-d detail] [--intent I3] [--host H]
@@ -20,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -33,6 +40,24 @@ def _emit(rec: dict) -> None:
     print(f"ok {rec['op']}")
 
 
+# The honesty pass of a finding (T1): required with --proof as with --observation, one error line per missing field
+HONESTY = (
+    ("counter", "--counter", "the best case against this finding"),
+    ("severity_if", "--severity-if", "the proof that would change its severity"),
+    ("severity_why", "--severity-why", "why this severity"),
+)
+# The handoff's rubrics, in this order, all required (`--dead none` when nothing was abandoned). No credentials rubric.
+HANDOFF = ("state", "dead", "next", "files")
+
+
+def _blank(v: str | None) -> bool:
+    return v is None or not v.strip()
+
+
+def _one_line(v: str) -> str:
+    return " ".join(v.split())
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bh-note")
     sub = p.add_subparsers(dest="op", required=True)
@@ -41,10 +66,19 @@ def parser() -> argparse.ArgumentParser:
     f.add_argument("-s", "--summary", default="")
     f.add_argument("-e", "--evidence", default="")
     f.add_argument("-k", "--kind", default="fact", choices=c.FACT_KINDS)
-    sub.add_parser("intent").add_argument("title")
+    h = sub.add_parser("handoff", help="the state for the next session: four rubrics, all required")
+    h.add_argument("--state", help="where the hunt stands")
+    h.add_argument("--dead", help="leads abandoned, and why (`none` if none)")
+    h.add_argument("--next", help="what to try next")
+    h.add_argument("--files", help="the files that hold the work (paths)")
+    i = sub.add_parser("intent")
+    i.add_argument("title")
+    i.add_argument("--success", help="the signal that the test worked, written before it runs")
+    i.add_argument("--abandon", help="the signal (or number of tries) that ends it")
     d = sub.add_parser("done")
     d.add_argument("intent_id")
     d.add_argument("outcome")
+    d.add_argument("--reached", choices=c.REACHED, help="required when the intent has --success or --abandon")
     fi = sub.add_parser("finding")
     fi.add_argument("title")
     fi.add_argument("--severity", required=True, choices=c.SEVERITIES)
@@ -59,10 +93,17 @@ def parser() -> argparse.ArgumentParser:
     )
     fi.add_argument("--victim", help="with --observation: the identity whose data holds the canary")
     fi.add_argument("--attacker", help="with --observation: the identity that must never have sent it")
+    fi.add_argument(
+        "--control",
+        metavar="k/N",
+        help="with --observation: the same steps without A's payload, N runs; k = runs where the canary crossed",
+    )
     fi.add_argument("-e", "--evidence", default="", help="with --observation: the exact prompts and outputs (a file)")
     fi.add_argument("--poc-file", help="optional script; the harness generates the triager PoC from the proof")
     fi.add_argument("--summary", required=True)
     fi.add_argument("--not-proven", default="")
+    for _key, flag, what in HONESTY:
+        fi.add_argument(flag, help=f"required: {what}")
     v = sub.add_parser("verdict")
     v.add_argument("finding_id")
     v.add_argument("verdict", choices=["confirmed", "rejected", "inconclusive"])
@@ -86,6 +127,11 @@ def _observation_finding(a: argparse.Namespace) -> None:
         sys.exit("the canary is BH-SECRET- and 16 lowercase hex characters (`bh-note canary` prints one)")
     if not a.victim or not a.attacker or a.victim == a.attacker:
         sys.exit("--observation needs --victim and --attacker, two different identities (A attacking A pays nothing)")
+    if c.parse_control(a.control) is None:
+        sys.exit(
+            "--observation needs --control k/N: the same steps without A's payload, run N times (1-1000), the canary "
+            "crossing k of them (0/3 when it never did)"
+        )
     ev = Path(a.evidence) if a.evidence else None
     if ev is not None and not ev.is_file():
         sys.exit(f"evidence file not found: {ev}")
@@ -98,10 +144,67 @@ def _observation_finding(a: argparse.Namespace) -> None:
             "url": a.url,
             "poc": "",
             "evidence": str(ev.resolve()) if ev else "",
-            "observation": {"token": a.observation, "victim": a.victim, "attacker": a.attacker},
+            "observation": {"token": a.observation, "victim": a.victim, "attacker": a.attacker, "control": a.control},
             "summary": a.summary,
             "not_proven": a.not_proven,
+            **_honesty(a),
         }
+    )
+
+
+def _honesty(a: argparse.Namespace) -> dict:
+    return {key: getattr(a, key) for key, _flag, _what in HONESTY}
+
+
+def _check_honesty(a: argparse.Namespace) -> None:
+    """Every finding argues against itself first (T1): one line per missing or empty field."""
+    if missing := [
+        f"{flag} is required and not empty: {what}" for key, flag, what in HONESTY if _blank(getattr(a, key))
+    ]:
+        sys.exit("finding refused:\n  - " + "\n  - ".join(missing))
+
+
+def _handoff(a: argparse.Namespace) -> None:
+    """The handoff fact (T7 a): four fixed rubrics, all required. An abandoned lead is written down (`--dead`), never
+    dropped in silence: `--dead none` says there was none."""
+    if bad := [
+        f"--{k} is required and not empty" + (" (`--dead none` if nothing was abandoned)" if k == "dead" else "")
+        for k in HANDOFF
+        if _blank(getattr(a, k))
+    ]:
+        sys.exit("handoff refused:\n  - " + "\n  - ".join(bad))
+    _emit({"op": "handoff", **{k: _one_line(getattr(a, k)) for k in HANDOFF}})
+
+
+def _intent(a: argparse.Namespace) -> None:
+    if bad := [
+        f"--{k} is empty: give the signal or leave the option out"
+        for k in c.REACHED
+        if getattr(a, k) is not None and _blank(getattr(a, k))
+    ]:
+        sys.exit("intent refused:\n  - " + "\n  - ".join(bad))
+    _emit({"op": "intent", "title": a.title, **{k: getattr(a, k) for k in c.REACHED if getattr(a, k) is not None}})
+
+
+def _done(a: argparse.Namespace, d: Path) -> None:
+    """`--reached` exactly when the intent has exit criteria. Intent ids are the board's, and notes.jsonl never holds
+    them: the frontier snapshot does, with the criteria of each open intent on its line. An intent it does not list
+    (closed, or written after the snapshot) is left to the host, which records a `done` without `--reached` on an
+    intent with criteria as reached NULL, with a harness fact."""
+    m = re.fullmatch(r"I?(\d{1,12})", a.intent_id.strip())
+    if m is None:
+        sys.exit(f'bh-note done I<n> "<outcome>": {a.intent_id!r} is not an intent id')
+    n = int(m.group(1))
+    frontier = (d / c.FRONTIER).read_text(errors="replace") if (d / c.FRONTIER).is_file() else ""
+    has = c.intent_has_criteria(frontier, n)
+    if has and a.reached is None:
+        sys.exit(
+            f'I{n} has exit criteria (--success / --abandon): bh-note done I{n} --reached success|abandon "<outcome>"'
+        )
+    if has is False and a.reached is not None:
+        sys.exit(f'I{n} has no exit criteria: bh-note done I{n} "<outcome>" (no --reached)')
+    _emit(
+        {"op": "done", "intent_id": a.intent_id, "outcome": a.outcome, **({"reached": a.reached} if a.reached else {})}
     )
 
 
@@ -128,8 +231,19 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit("bh-note verdict is reserved to the independent verifier")
     if a.op != "verdict" and c.is_verifier():
         sys.exit("the verifier only records verdicts")
+    if a.op == "finding":
+        _check_honesty(a)
     if a.op == "finding" and a.observation is not None:
         _observation_finding(a)
+        return
+    if a.op == "handoff":
+        _handoff(a)
+        return
+    if a.op == "intent":
+        _intent(a)
+        return
+    if a.op == "done":
+        _done(a, d)
         return
     if a.op == "finding":
         try:
@@ -153,6 +267,7 @@ def main(argv: list[str] | None = None) -> None:
                 "proof": proof_doc,
                 "summary": a.summary,
                 "not_proven": a.not_proven,
+                **_honesty(a),
             }
         )
         return

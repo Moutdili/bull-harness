@@ -51,3 +51,7 @@ def test_blocker_contract():
     assert {"auth", "waf", "captcha", "write-needed", "oob-needed", "refusal", "other"} <= set(c.BLOCKER_REASONS)
     assert len(set(c.BLOCKER_REASONS)) == len(c.BLOCKER_REASONS) and c.BLOCKER_REASONS[-1] == "other"
     assert c.BLOCKER_TTL_S == 7 * 86400
+
+
+def test_bh_js_maps_and_never_scans():
+    assert c.runs_mapper("bh-js https://t.test/") and not c.runs_scanner("bh-js https://t.test/")

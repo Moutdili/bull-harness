@@ -17,7 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from bh import paths
-from bh.agent.contract import BLOCKER_REASONS, BLOCKER_TTL_S, CHALLENGE_BLOCKER_TTL_S, CHALLENGE_REASONS
+from bh.agent.contract import (
+    BLOCKER_REASONS,
+    BLOCKER_TTL_S,
+    CHALLENGE_BLOCKER_TTL_S,
+    CHALLENGE_REASONS,
+    CRITERION_MAX,
+    CRITERION_SHOWN,
+    REACHED,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -78,6 +86,15 @@ MIGRATIONS = (
     # observation proof (audit I1): {"token": "BH-SECRET-<16 hex>", "victim": ..., "attacker": ...}; the verdict
     # comes from the gate's journal, read by the host (bh.runner.observation), never from the hunter
     ("findings", "observation", "TEXT"),
+    # honesty pass of the hunter (T1): the best case against the finding, the proof that would change its severity,
+    # why this severity. Sandbox text, bounded at ingestion (HONESTY_MAX)
+    ("findings", "counter", "TEXT"),
+    ("findings", "severity_if", "TEXT"),
+    ("findings", "severity_why", "TEXT"),
+    # exit criteria written before the test (T8), and which one `bh-note done --reached` says was met
+    ("intents", "success", "TEXT"),
+    ("intents", "abandon", "TEXT"),
+    ("intents", "reached", "TEXT"),  # success | abandon | NULL (no criteria, or a done without --reached)
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
@@ -109,7 +126,26 @@ FINDING_FIELDS = (
     "not_proven",
     "proof",
     "observation",
+    "counter",
+    "severity_if",
+    "severity_why",
 )
+HONESTY_FIELDS = ("counter", "severity_if", "severity_why")
+HONESTY_MAX = 1000  # stored length of each honesty field
+
+
+def _flat(text: str | None, n: int) -> str:
+    """Hunter text on one frontier line: whitespace runs (newlines too) become one space, the separator `·` of the
+    intent line becomes `-` (a title never fakes a criterion), cut at n characters."""
+    s = " ".join((text or "").replace("·", "-").split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _intent_line(r: sqlite3.Row) -> str:
+    """`- I<n> <title> · success: <...> · abandon: <...>`: the criteria of an open intent on its own line, bounded.
+    bh-note done reads this shape (bh.agent.contract.intent_has_criteria) to ask for --reached."""
+    crit = "".join(f" · {k}: {_flat(r[k], CRITERION_SHOWN)}" for k in REACHED if r[k])
+    return f"- I{r['id']} {_flat(r['title'], 300)}{crit}"
 
 
 class Board:
@@ -296,18 +332,34 @@ class Board:
             run_id=run_id,
         )
 
-    def add_intent(self, program: str, title: str, run_id: int | None = None) -> int:
+    def add_intent(
+        self,
+        program: str,
+        title: str,
+        run_id: int | None = None,
+        *,
+        success: str | None = None,
+        abandon: str | None = None,
+    ) -> int:
+        """An intent, with the exit criteria the hunter wrote before the test (T8), if any: empty means none."""
         cur = self.db.execute(
-            "INSERT INTO intents(program, run_id, title, created) VALUES (?,?,?,?)",
-            (program, run_id, title[:300], time.time()),
+            "INSERT INTO intents(program, run_id, title, created, success, abandon) VALUES (?,?,?,?,?,?)",
+            (
+                program,
+                run_id,
+                title[:300],
+                time.time(),
+                (success or "")[:CRITERION_MAX] or None,
+                (abandon or "")[:CRITERION_MAX] or None,
+            ),
         )
         self.db.commit()
         return int(cur.lastrowid)
 
-    def close_intent(self, intent_id: int, outcome: str) -> None:
+    def close_intent(self, intent_id: int, outcome: str, reached: str | None = None) -> None:
         self.db.execute(
-            "UPDATE intents SET status='closed', closed=?, outcome=? WHERE id=?",
-            (time.time(), outcome[:500], intent_id),
+            "UPDATE intents SET status='closed', closed=?, outcome=?, reached=? WHERE id=?",
+            (time.time(), outcome[:500], reached if reached in REACHED else None, intent_id),
         )
         self.db.commit()
 
@@ -395,7 +447,9 @@ class Board:
             waiting = {r["id"] for r in retry}
             blockers = [r for r in blockers if r["id"] not in waiting]
             retry = [r for r in retry if r["created"] >= now - CHALLENGE_BLOCKER_TTL_S]
-        intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
+        intents = self.rows(
+            "SELECT id, title, success, abandon FROM intents WHERE program=? AND status='open' ORDER BY id", program
+        )
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)
         out: list[str] = []
         if findings:
@@ -403,7 +457,7 @@ class Board:
             out += [f"- F{r['id']} [{r['status']}/{r['severity'] or '?'}] {r['title']}" for r in findings]
         if intents:
             out.append("## open intents")
-            out += [f"- I{r['id']} {r['title']}" for r in intents]
+            out += [_intent_line(r) for r in intents]
         if facts:
             out.append(f"## facts (latest {len(facts)}; details: bh-note show <id>)")
             out += [f"- {r['id']} ({r['kind']}) {r['title']}" for r in reversed(facts)]
