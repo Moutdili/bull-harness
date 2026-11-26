@@ -21,6 +21,10 @@ notification). While the operator has the screen open, only state, text and fram
     bh-web switch <identity>           ask the host for another live identity (profile wiped: a new challenge)
     bh-web wait <css|ms>               wait for a selector, or a number of milliseconds
     bh-web wait-human [--timeout S]    poll state() until no challenge is pending (default 300 s); rc 3 if still there
+    bh-web ws-rewrite <find> <replace> [--url-contains S] [--ttl SEC]
+                                       arm ONE rewrite of the next frame the page sends on a websocket opened from now
+                                       on (default URL part /Chathub/, 180 s): first occurrence only, then disarmed;
+                                       never a challenge frame; `frames` shows it (dir "rewrite"). @file reads a value
 
 Stdlib only; the API is reached directly on the sandbox network (BH_BROWSER_URL, BH_BROWSER_TOKEN).
 """
@@ -115,6 +119,32 @@ def _upload(css: str, path: str) -> dict | None:
     return {"op": "upload", "css": css, "name": name, "content_b64": base64.b64encode(data).decode()}
 
 
+def _value(v: str) -> str | None:
+    """A literal, or the content of a file given as @path (a long value: a token, a JSON fragment)."""
+    if not v.startswith("@"):
+        return v
+    try:
+        with open(v[1:], encoding="utf-8") as fh:
+            return fh.read().rstrip("\n")
+    except OSError:
+        return None
+
+
+def _ws_rewrite(rest: list[str]) -> dict | None:
+    find, replace = _value(rest[0]), _value(rest[1])
+    if find is None or replace is None:
+        return None
+    req: dict = {"op": "ws_rewrite", "find": find, "replace": replace}
+    f = _flags(rest[2:], {"--url-contains": "str", "--ttl": "int"})
+    if f is None:
+        return None
+    if "url-contains" in f:
+        req["url_contains"] = f["url-contains"]
+    if "ttl" in f:
+        req["ttl"] = f["ttl"]
+    return req
+
+
 def request_for(argv: list[str]) -> dict | None:
     """The API request for a command line, None when it does not parse (pure, except upload reading its file)."""
     if not argv:
@@ -133,6 +163,8 @@ def request_for(argv: list[str]) -> dict | None:
         return {"op": "attr", "css": rest[0], "name": rest[1]}
     if op == "upload" and len(rest) == 2:
         return _upload(rest[0], rest[1])
+    if op == "ws-rewrite" and len(rest) >= 2:
+        return _ws_rewrite(rest)
     opts = {
         "text": {"--css": "str", "--tail": "int"},
         "outline": {"--css": "str"},

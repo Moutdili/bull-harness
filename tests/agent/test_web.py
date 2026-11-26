@@ -89,7 +89,7 @@ def test_every_agent_op_has_a_command_and_no_host_op_does():
     from bh.browser_service import AGENT_OPS, HOST_OPS
 
     for op in AGENT_OPS:
-        assert f"bh-web {op}" in web.__doc__, op
+        assert f"bh-web {op.replace('_', '-')}" in web.__doc__, op  # ws_rewrite is `bh-web ws-rewrite`
     for op in HOST_OPS:
         assert web.request_for([op]) is None and web.request_for([op, "x"]) is None, op
 
@@ -176,3 +176,18 @@ def test_wait_human_waits_for_the_screen_to_be_handed_back(capsys):
     t = iter([0, 200])
     viewing = {"challenge": {"pending": False}, "human_viewing": True}
     assert web.wait_human(100, call=lambda r, t_: viewing, sleep=lambda s: None, clock=lambda: next(t)) == 3
+
+
+def test_ws_rewrite_command_line(tmp_path):
+    tok = tmp_path / "tok.txt"
+    tok.write_text("eyJCCCCCC\n")
+    assert web.request_for(["ws-rewrite", "eyJBBBBBB", f"@{tok}", "--url-contains", "/Chathub/", "--ttl", "120"]) == {
+        "op": "ws_rewrite",
+        "find": "eyJBBBBBB",
+        "replace": "eyJCCCCCC",
+        "url_contains": "/Chathub/",
+        "ttl": 120,
+    }
+    assert web.request_for(["ws-rewrite", "only-one"]) is None
+    assert web.request_for(["ws-rewrite", "a", "b", "--bogus", "1"]) is None
+    assert web.request_for(["ws-rewrite", "@/nonexistent/file", "b"]) is None

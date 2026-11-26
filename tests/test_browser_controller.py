@@ -449,3 +449,47 @@ def test_snapshot_is_what_detect_reads_scrubbed_and_feeds_challenge_back(tmp_pat
     saved = json.loads(f.read_text())
     assert challenge(saved["snapshot"]) == saved["challenge"]  # the file is a fixture detect can be tested on
     assert host.save_snapshot(f, call_=lambda req: {"code": 503, "error": "down"})["code"] == 503
+
+
+# ---------------------------------------------------------------- bh-web ws-rewrite (Mio, 2026-11-26)
+def test_rewrite_changes_one_occurrence_of_a_client_text_frame():
+    from bh.browser_service.detect import rewrite_client_frame
+
+    frame = '{"arguments":[{"conversationTransferToken":"eyJBBBB","x":"eyJBBBB"}]}\x1e'
+    out, done = rewrite_client_frame(frame, "eyJBBBB", "eyJCCCC")
+    assert done and out == '{"arguments":[{"conversationTransferToken":"eyJCCCC","x":"eyJBBBB"}]}\x1e'
+    assert rewrite_client_frame(frame, "absent-string", "x") == (frame, False)
+
+
+def test_rewrite_never_touches_a_challenge_frame_nor_a_binary_one():
+    from bh.browser_service.detect import rewrite_client_frame
+
+    proof = '{"arguments":[{"type":"ChallengeProof","method":"CloudflareTurnstile","token":"abcdefgh"}]}'
+    assert rewrite_client_frame(proof, "abcdefgh", "zzzzzzzz") == (proof, False)
+    blob = b"abcdefgh-binary"
+    assert rewrite_client_frame(blob, "abcdefgh", "zzzzzzzz") == (blob, False)
+
+
+def test_ws_rewrite_is_an_agent_op_validated_and_handed_to_the_driver():
+    d = FakeDriver()
+    armed = []
+    d.ws_rewrite = lambda find, replace, url_contains, ttl: armed.append((find, replace, url_contains, ttl)) or {
+        "armed": True
+    }
+    ctl = Controller(d)
+    code, out = ctl.handle(AGENT_OPS, {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "eyJCCCCCC"})
+    assert code == 200 and out["ok"] and armed == [("eyJBBBBBB", "eyJCCCCCC", "/Chathub/", 180)]
+    for bad in (
+        {"op": "ws_rewrite", "find": "short", "replace": "x"},  # under 8 characters: too vague to aim
+        {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "x", "ttl": 3600},
+        {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "x", "extra": 1},
+    ):
+        assert ctl.handle(AGENT_OPS, bad)[0] == 400, bad
+    assert len(armed) == 1
+
+
+def test_ws_rewrite_waits_like_any_action_while_the_operator_has_the_screen():
+    ctl = Controller(FakeDriver(), clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    code, out = ctl.handle(AGENT_OPS, {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "eyJCCCCCC"})
+    assert code == 409 and out["error"] == "human-viewing"

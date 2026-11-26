@@ -59,7 +59,16 @@ from bh.browser_service import (
     VIEWING_OPS,
     VNC_PORT,
 )
-from bh.browser_service.detect import challenge, frame_text, scrub, scrub_obj, scrub_url
+from bh.browser_service.detect import (
+    REWRITE_FIND,
+    REWRITE_REPLACE_MAX,
+    challenge,
+    frame_text,
+    rewrite_client_frame,
+    scrub,
+    scrub_obj,
+    scrub_url,
+)
 
 CHROMIUM = "/usr/bin/chromium"
 TEXT_MAX = 8000  # head of the page text, the default of `text`
@@ -80,6 +89,7 @@ CTL_MAX = 1_000_000  # host request (a session's cookies)
 MAX_COOKIES = 300
 NET_KEEP, NET_LAST = 500, 200  # requests kept, at most returned by one `net`
 FRAMES_KEEP, FRAMES_LAST = 300, 200  # websocket frames kept, at most returned by one `frames`
+REWRITE_TTL_DEFAULT, REWRITE_TTL_MAX = 180, 600  # seconds a ws-rewrite rule stays armed
 # Prompts are bounded in number, not only in size (MSRC: never a flood of prompts). Per segment (the host resets it
 # at prepare) and per identity and UTC day (persisted in the profile volume, a reset does not clear it).
 FILL_SEGMENT = 80
@@ -259,6 +269,12 @@ SPEC: dict[str, dict[str, tuple[bool, Any]]] = {
     "upload": {"css": (True, _css), "name": (True, _file_name), "content_b64": (True, _content)},
     "frames": {"last": (False, lambda v: _int(v, "last", 1, FRAMES_LAST))},
     "switch": {"identity": (True, lambda v: _name(v, "identity"))},
+    "ws_rewrite": {
+        "find": (True, lambda v: _str(v, "find", *REWRITE_FIND)),
+        "replace": (True, lambda v: _str(v, "replace", 0, REWRITE_REPLACE_MAX)),
+        "url_contains": (False, lambda v: _str(v, "url_contains", 1, 120)),
+        "ttl": (False, lambda v: _int(v, "ttl", 10, REWRITE_TTL_MAX)),
+    },
     "load_session": {
         "program": (True, lambda v: _name(v, "program")),
         "identity": (True, lambda v: _name(v, "identity")),
@@ -324,6 +340,7 @@ class Driver(Protocol):
     def select_tab(self, index: int) -> None: ...
     def net(self) -> list[dict[str, Any]]: ...
     def frames(self) -> list[dict[str, Any]]: ...
+    def ws_rewrite(self, find: str, replace: str, url_contains: str, ttl: int) -> dict[str, Any]: ...
     def cookie_values(self) -> list[str]: ...
     def snapshot(self) -> dict[str, Any]: ...
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None: ...
@@ -629,6 +646,20 @@ class Controller:
             )
         return {"frames": out, "count": len(out)}
 
+    def _op_ws_rewrite(
+        self, find: str, replace: str, url_contains: str = "/Chathub/", ttl: int = REWRITE_TTL_DEFAULT
+    ) -> dict[str, Any]:
+        """Arm ONE rewrite of the next client frame (sent by the page) that contains `find`, on a websocket opened
+        after this call whose URL contains `url_contains`. One occurrence, then disarmed; a frame carrying a challenge
+        answer is never touched (detect.rewrite_client_frame). Logged in `frames` (dir "rewrite") and on stderr."""
+        print(
+            f"bh-browser: ws-rewrite armed ({len(find)} -> {len(replace)} chars, "
+            f"url contains {url_contains!r}, {ttl} s)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"ok": True, **self.driver.ws_rewrite(find, replace, url_contains, ttl)}
+
     def _op_switch(self, identity: str) -> dict[str, Any]:
         m = self.marker()
         if m and m["identity"] == identity:
@@ -886,6 +917,8 @@ class PlaywrightDriver:
         self.frame_log: collections.deque = collections.deque(maxlen=FRAMES_KEEP)
         self.frames_dropped = 0
         self._seen_pages: set[int] = set()
+        self._rule: dict[str, Any] | None = None  # bh-web ws-rewrite: one armed rewrite at most
+        self._ws_routed = False
 
     # -- connection and listeners
     def _context(self) -> Any:
@@ -903,6 +936,7 @@ class PlaywrightDriver:
             ctx.on("requestfailed", self._on_failed)
             for p in ctx.pages:
                 self._attach(p)
+            self._ws_routed = False
         return self.browser.contexts[0]
 
     def _attach(self, page: Any) -> None:
@@ -924,6 +958,59 @@ class PlaywrightDriver:
         with contextlib.suppress(Exception):
             failure = str(req.failure or "failed")[:120]
             self.net_log.append({"t": time.time(), "method": req.method, "url": req.url, "failure": failure})
+
+    # -- bh-web ws-rewrite: only websockets opened while a rule is armed are routed through here
+    def _rule_live(self) -> dict[str, Any] | None:
+        r = self._rule
+        return r if r and not r["used"] and time.time() < r["until"] else None
+
+    def _ws_match(self, url: str) -> bool:
+        r = self._rule_live()
+        return bool(r) and r["url_contains"] in url
+
+    def _route_ws(self, route: Any) -> None:
+        server = route.connect_to_server()
+        url = route.url
+
+        def from_page(message: Any) -> None:
+            out, done = message, False
+            r = self._rule_live()
+            if r:
+                out, done = rewrite_client_frame(message, r["find"], r["replace"])
+            if done and r:
+                r["used"] = True
+                sizes = f"{len(r['find'])} -> {len(r['replace'])} chars"
+                note = f"rewrote 1 occurrence ({sizes}) in a {len(message)}-char frame"
+                self.frame_log.append({"t": time.time(), "dir": "rewrite", "url": redact.url(url), "text": note})
+                print(f"bh-browser: ws-rewrite applied on {redact.url(url)[:80]}: {note}", file=sys.stderr, flush=True)
+            self._frame("sent", url, out)  # what really left the browser (routed frames may not raise framesent)
+            server.send(out)
+
+        def from_server(message: Any) -> None:
+            self._frame("recv", url, message)
+            route.send(message)
+
+        route.on_message(from_page)
+        server.on_message(from_server)
+
+    def ws_rewrite(self, find: str, replace: str, url_contains: str, ttl: int) -> dict[str, Any]:
+        ctx = self._context()
+        if not self._ws_routed:
+            ctx.route_web_socket(self._ws_match, self._route_ws)
+            self._ws_routed = True
+        self._rule = {
+            "find": find,
+            "replace": replace,
+            "url_contains": url_contains,
+            "until": time.time() + ttl,
+            "used": False,
+        }
+        return {
+            "armed": True,
+            "url_contains": url_contains,
+            "expires_in": ttl,
+            "applies_to": "websockets opened from now on",
+        }
 
     def _on_ws(self, ws: Any) -> None:
         url = ws.url

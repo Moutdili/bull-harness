@@ -130,3 +130,17 @@ def frame_text(payload: Any, secrets: set[str] | frozenset[str]) -> str | None:
         out.append(json.dumps(redact.data(_drop_tokens(obj)), ensure_ascii=False))
     text = scrub("\x1e".join(out), secrets)
     return text[:FRAME_MAX] + ("…" if len(text) > FRAME_MAX else "")
+
+
+# ---------------------------------------------------------------- bh-web ws-rewrite (one client frame)
+REWRITE_FIND = (8, 4096)  # characters of the string searched in one client frame
+REWRITE_REPLACE_MAX = 4096
+
+
+def rewrite_client_frame(message: Any, find: str, replace: str) -> tuple[Any, bool]:
+    """(message to forward, rewritten?) for one frame the page sends. Only a text frame that contains `find` is
+    changed, once (first occurrence). Never a binary frame, never a frame that carries a challenge answer
+    (ChallengeProof, Turnstile, Cloudflare clearance): those go out exactly as the page wrote them."""
+    if not isinstance(message, str) or not find or CHALLENGE_FRAME.search(message) or find not in message:
+        return message, False
+    return message.replace(find, replace, 1), True

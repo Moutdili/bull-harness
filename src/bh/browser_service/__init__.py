@@ -38,7 +38,7 @@ TOKEN_ENV = "BH_BROWSER_TOKEN"
 # What the agent may ask (HTTP API) and what only the host may ask (podman exec). Anything else is refused.
 AGENT_OPS = frozenset(
     {"goto", "fill", "click", "press", "text", "wait", "state"}
-    | {"outline", "attr", "net", "tabs", "upload", "frames", "switch"}
+    | {"outline", "attr", "net", "tabs", "upload", "frames", "switch", "ws_rewrite"}
 )
 HOST_OPS = frozenset(
     {"load_session", "status", "reset", "human_done", "human_viewing", "fill_budget_reset", "switch_refused"}
