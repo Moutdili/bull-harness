@@ -311,6 +311,21 @@ def test_canary_in_a_response_body(addon, tmp_path):
     }
 
 
+def test_a_compressed_target_answer_is_kept_readable_in_the_flow_file(addon, tmp_path):
+    """A gzip body read as text was noise: a share link returned by the app could not be read back (2026-11-26)."""
+    g = _gate(addon, tmp_path)
+    (tmp_path / paths.FLOWS_DIR).mkdir(exist_ok=True)
+    f = run(g, _http("https://api.example.com/v1/share", "POST", [(IDENTITY_HEADER, "user-a")], b"{}", peer=JUDGE_IP))
+    _answer(f, status=201, body=gzip.compress(b'{"shareUrl": "https://app.example.com/s/abc123"}'))
+    f.response.headers["Content-Encoding"] = "gzip"
+    g.response(f)
+    files = list((tmp_path / paths.FLOWS_DIR).glob("*.json"))
+    assert len(files) == 1
+    kept = json.loads(files[0].read_text())
+    assert "https://app.example.com/s/abc123" in kept["response"]["body"]
+    assert _flows(tmp_path)[-1]["len"] == len(f.response.raw_content)  # the wire size stays the logged length
+
+
 def test_canary_in_the_websocket_frames_both_ways(addon, tmp_path):
     g = _gate(addon, tmp_path)
     f = _ws(g, tmp_path)

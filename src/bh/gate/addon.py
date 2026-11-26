@@ -304,6 +304,14 @@ def starts_like_tls_hello(data: bytes) -> bool:
     return len(data) > 5 and data[0] == 0x16 and data[1] == 0x03 and data[2] <= 0x04 and data[5] == 0x01
 
 
+def _decoded(raw: bytes | None, encoding: str | None) -> bytes:
+    """The body as the application sees it: Content-Encoding (gzip, br, deflate, zstd) removed, bounded to MAX_BODY
+    bytes of output. A gzip body read as text is noise, and the flow file is where a share link or an id is read."""
+    if not raw or not encoding:
+        return raw or b""
+    return canary.decode(raw, encoding, limit=MAX_BODY)
+
+
 def _redacted_body(raw: bytes | None) -> str:
     """A body as the flow file keeps it: MAX_BODY bytes, credentials and JWTs replaced (bh.redact)."""
     out = redact.body((raw or b"")[:MAX_BODY].decode("utf-8", "replace"))
@@ -1070,11 +1078,11 @@ class Gate:
                     "headers": [
                         (k, injected.get(k.lower()) or redact.header(k, v)) for k, v in req.headers.items(multi=True)
                     ],
-                    "body": _redacted_body(req.raw_content),
+                    "body": _redacted_body(_decoded(req.raw_content, req.headers.get("content-encoding"))),
                 },
                 "response": {
                     "headers": [(k, redact.header(k, v)) for k, v in resp.headers.items(multi=True)] if resp else [],
-                    "body": _redacted_body(body),
+                    "body": _redacted_body(_decoded(body, resp.headers.get("content-encoding") if resp else None)),
                 },
             }
             try:
