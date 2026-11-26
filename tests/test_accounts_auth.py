@@ -3,6 +3,7 @@
 import base64
 import json
 import time
+import types
 
 import pytest
 
@@ -248,11 +249,15 @@ def test_browser_login_writes_the_session_and_answers_totp_on_the_host(env, monk
         seen["code"] = ask({"need": "totp", "step": 5})
         return _browser_result(token)
 
+    p = totp.params(SEED)
+    # the TOTP clock is frozen mid-window: fresh_code never waits for the next code (it slept up to 5.2 s for real
+    # near a window's end, which pushed expires_at out of its 5 s tolerance) and the expected code is exact
+    frozen = (time.time() // p.period) * p.period + p.period / 2
+    monkeypatch.setattr(totp, "time", types.SimpleNamespace(time=lambda: frozen, sleep=time.sleep))
     monkeypatch.setattr(browser, "execute", fake_execute)
     monkeypatch.setattr(stack, "gate_python", FakeGate())
     assert en.enroll(scope, "user-a", board=env) == "logged in, no probe declared"
-    p = totp.params(SEED)
-    assert seen["code"] in {totp.totp(p, time.time() + d) for d in (-30, 0, 30)}
+    assert seen["code"] == totp.totp(p, frozen)
     sess = _session()
     assert sess["headers"] == {"Authorization": f"Bearer {token}"}
     assert sess["cookies"] == {

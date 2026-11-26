@@ -55,7 +55,8 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 - Autre TCP : SOCKS5 avec allowlist ; l'agent passe par `proxychains`. **v1 : pas de scan SYN brut**, seulement des scans connect. C'est cohérent avec les règles YWH/Intigriti qui limitent le scan.
 - Allowlist système séparée : `api.anthropic.com` et ses dépendances (pour `claude`), dépôts de paquets au moment du build seulement.
 - Allowlist **passive** séparée (web.archive.org, CommonCrawl, OTX, urlscan, crt.sh, sources subfinder) : GET seulement, ni cookies ni en-têtes de programme, débit propre. Un hôte passif n'est jamais une cible (voir `research/07-repos-mio.md`).
-- **Hôtes de support** (`support[]` du scope, `{value, kind: auth|assets|sso|passthrough, note, token_paths?}`,
+- **Hôtes de support** (`support[]` du scope, `{value, kind: auth|assets|sso|passthrough, note, token_paths?,
+  get_paths?}`,
   domaine ou joker, domaine exact pour `sso` et `passthrough` ; une valeur qui recouvre un `in_scope` ou un support
   d'un autre kind est refusée au chargement). `enforce.check` rend une troisième réponse (`allowed: false`,
   `support: <kind>`, sans règle d'exclusion), que le gate classe `support` :
@@ -69,16 +70,20 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
     `bh-browse` les bloque aussi localement. Les URL d'un login (`login_url`, `goto` d'une recette) peuvent y pointer ;
     la sonde et les `origins` d'une identité, jamais.
   - `sso` (la connexion silencieuse que l'appli fait en cours d'usage, ex. l'iframe `GET …/oauth2/v2.0/authorize` et
-    l'échange PKCE `POST …/oauth2/v2.0/token` de `login.microsoftonline.com`) : depuis tout client du sandbox, GET et
-    HEAD sans corps, POST seulement sur les `token_paths` du scope (chemins absolus, `*` = un segment entier ; un
-    segment encodé, pointé ou vide ne correspond jamais) ; les sources d'enrôlement gardent les méthodes du login.
+    l'échange PKCE `POST …/oauth2/v2.0/token` de `login.microsoftonline.com`) : GET et HEAD sans corps, POST seulement
+    sur les `token_paths` du scope (chemins absolus, `*` = un segment entier ; un segment encodé, pointé ou vide ne
+    correspond jamais) ; les sources d'enrôlement gardent les méthodes du login. Le GET du chasseur et du juge est
+    borné aux `get_paths` (I13 : mêmes formes, comparées en préfixe sur des segments entiers, `/*/oauth2/v2.0/authorize`
+    couvre `/t/oauth2/v2.0/authorize/x` mais ni `/a/b/oauth2/…` ni `…/authorizeX` ; aucun `get_paths` déclaré : aucun
+    GET), refus « GET only under its declared get_paths » ; bh-browser (l'appli elle-même) lit l'hôte partout.
     Ni en-têtes de programme, ni User-Agent du programme, ni en-têtes d'identité (pas d'`Authorization`) : sous
     `X-BH-Identity`, seulement les cookies de la jarre de cette identité pour cet hôte (`_apply_identity(cookies_only)`),
     et ses `Set-Cookie` retournent dans la jarre, masqués pour le client comme sur une cible. L'enrôlement garde les
     cookies des hôtes `sso` et de leurs domaines parents (`enroll._host_ok`). Une URL de login peut pointer sur un
     hôte `sso` ; la sonde et les `origins` d'une identité, jamais.
   - `passthrough` (un challenge anti-bot tiers, ex. `challenges.cloudflare.com` de Turnstile) : CONNECT sur 443
-    seulement, décidé sur le nom, IP vérifiée publique comme ailleurs, puis **TLS jamais intercepté**. Mécanisme,
+    seulement, depuis bh-browser seulement (B2 : l'agent, le juge et l'enrôlement sont refusés, « browser only »),
+    décidé sur le nom, IP vérifiée publique comme ailleurs, puis **TLS jamais intercepté**. Mécanisme,
     mitmproxy 12.3.1 : les hôtes passthrough du scope actif vont dans les options officielles `ignore_hosts`
     (`^hôte:443$`, comparé au SNI du ClientHello ; https://docs.mitmproxy.org/stable/howto/ignore-domains/) et
     `show_ignored_hosts`, pour que le tunnel ignoré lève encore les événements TCP (`tcp_start`, `tcp_message` ;
@@ -87,7 +92,9 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
     donc rien à compter ni à borner. Le TCP brut reste refusé pour tout tunnel que le CONNECT n'a pas enregistré
     comme passthrough, et pour un tunnel dont les premiers octets ne sont pas un ClientHello TLS. Un SNI qui n'est pas
     l'hôte du CONNECT n'est pas ignoré, donc intercepté, et toute requête déchiffrée vers un hôte passthrough est
-    refusée. Bornes (`PassthroughGuard`) : 20 tunnels neufs par minute, 6 ouverts, 16 Mio et 600 s par tunnel.
+    refusée. Bornes (`PassthroughGuard.from_env`) : 20 tunnels neufs par minute, 6 ouverts, 16 Mio et 600 s par
+    tunnel (`BH_PASSTHROUGH_PER_MIN`, `_OPEN`, `_MAX_BYTES`, `_MAX_SECONDS` ; une valeur nulle, négative ou illisible
+    garde le défaut). Un tunnel qui franchit une borne ou sa durée est fermé (voir « Fermeture » plus bas).
     Journal : événement `passthrough` {hôte, octets montants et descendants, durée}, rien d'autre ; les octets ne sont
     pas gardés en mémoire. Aucune identité ni en-tête interne n'y entre : `bh-browse` pose `X-BH-Identity` requête par
     requête (plus d'`extra_http_headers`), vers les cibles et les hôtes `sso` seulement ; et comme Playwright reporte
@@ -103,13 +110,48 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
     compte les requêtes `sso` et `passthrough` dans son résumé.
 - **Websockets** : refusés par défaut. Avec `websockets: true` dans le scope : vers les **cibles** seulement (support,
   passif et hors scope refusés), handshake GET jugé comme une requête cible (scope, Host, identité, en-têtes de
-  programme, débit), au plus `BH_WS_MAX_OPEN` (2) connexions ouvertes. Hooks officiels mitmproxy
+  programme, débit), au plus `BH_WS_MAX_OPEN` (2) connexions ouvertes. Sur un programme qui a un hôte passthrough, le
+  handshake est réservé à bh-browser (B2, « browser only »). Hooks officiels mitmproxy
   (`websocket_start` / `websocket_message` / `websocket_end`) : par connexion, au plus `BH_WS_MSGS_PER_MIN` (12)
   messages client par minute glissante, `BH_WS_MAX_BYTES` (64 Kio) par message client (16 fois plus pour un message
-  serveur), `BH_WS_MAX_SECONDS` (600 s) de vie. Trames binaires comptées comme les autres. Au premier dépassement : la
-  trame est abandonnée (`drop()`), le flux tué, et toute trame suivante de la connexion abandonnée aussi (fail-closed
-  même si la connexion survit au kill). Chaque message client est journalisé (`events.jsonl`, `ws-message` : taille,
-  sha256, 200 premiers caractères caviardés par `redact.text`, rien pour une trame binaire).
+  serveur), `BH_WS_MAX_SECONDS` de vie : 600 s, 3600 s pour bh-browser (`WsLimits.from_env(browser=True)`, la page de
+  chat reste ouverte ; `BH_WS_MAX_SECONDS`, s'il est posé, vaut pour les deux). Trames binaires comptées comme les
+  autres. Au premier dépassement : la trame est abandonnée (`drop()`), la connexion fermée (voir « Fermeture »), et
+  toute trame suivante de la connexion abandonnée aussi (fail-closed si elle survit), avec **un seul** événement
+  `blocked` par connexion (`closed: true|false`), pas un par trame. Chaque message, dans les deux sens, est journalisé
+  (`events.jsonl`, `ws-message` : taille, sha256, 200 premiers caractères caviardés par `redact.text`, rien pour une
+  trame binaire).
+- **`browser_only`** (clé du scope : préfixes d'URL `https://hôte/chemin` d'une cible, hôte exact, sans joker ni query ;
+  un hôte qui n'est pas une cible est refusé au chargement) : quelle que soit la méthode, seul bh-browser y accède ; le
+  chasseur, le juge et l'enrôlement reçoivent « browser only: … is driven through bh-browser (bh-web) ». Comparé large,
+  comme une exclusion (schéma et port quelconques, casse ignorée, `/Chathub/` couvre `/chathub;x` et `/chathub%..`).
+- **bh-browser** (navigateur persistant, service compose `browser`, `BH_BROWSER_HOST`) : reconnu par son adresse,
+  résolue comme celle de bh-login (cache 60 s, une relecture au plus toutes les 5 s pour une IP inconnue). Son trafic
+  porte l'identité que l'hôte y a chargée, lue dans `<state>/browser-identity.json` (`{program, identity, loaded_at}`,
+  relu sur mtime ; ignoré pour un autre programme, un nom inconnu ou malformé, `null`) ; jamais un `X-BH-Identity` de
+  la page. Effets : flux et événements journalisés sous cette identité, méthodes réservées aux identités (PUT, PATCH,
+  DELETE) permises, `Set-Cookie` versés dans la jarre de l'identité mais **non masqués** (ce sont ses cookies) ; rien
+  n'est injecté (il a ses propres cookies et en-têtes). Jamais mis en pause par la garde WAF, jamais compté par la garde
+  404 (un humain y passe les challenges, I6) ; ses 401 ne déclarent pas la session de la jarre morte.
+- **Canaris** (I1, `gate/canary.py`) : `BH-SECRET-<16 hex>` est cherché dans l'URL et le corps de chaque requête, le
+  corps de chaque réponse et chaque trame websocket (deux sens), sur tout le contenu décodé (gzip, deflate, br, zstd,
+  sortie bornée à 2 Mio : une bombe de décompression coûte 2 Mio) avant toute troncature. Chaque occurrence donne un
+  événement `{kind: "canary", token, where: request-url|request-body|response-body|ws-client|ws-server, host, url
+  (caviardée), identity, client: browser|agent|judge|login|other, run, ts, program}` ; rien autour du jeton n'est
+  gardé. Observation seule : la recherche ne décide jamais du flux. Le relais (trafic de l'API Claude) n'est pas fouillé.
+- **Sonde de session** (`bh.accounts.enroll.probe`) : l'enrôlement (`_from_gate` : la boucle locale du gate, bh-login)
+  n'emprunte jamais une session, sauf la sonde de l'hôte : `X-BH-Probe: 1` **depuis la boucle locale du gate**
+  garde son `X-BH-Identity`. Depuis bh-login, l'agent ou bh-browser le marqueur ne vaut rien. Il est retiré de toute
+  requête avant l'amont, quel que soit l'émetteur.
+- **En-têtes par origine** (I19, `origin_headers` de la session : `{origine: {Authorization: valeur}}`, capturés à
+  l'enrôlement) : injectés vers cette origine exacte seulement (schéma, hôte et port ; ils priment sur l'en-tête par
+  défaut), même hors des `origins` de l'identité ; jamais dans un journal ni un fichier de flux (`<identity:nom>`).
+- **Fermeture** (I18) : `flow.kill()` ne ferme ni un websocket ni un tunnel TCP en mitmproxy 12.3.1 (`Flow.kill` :
+  « we cannot kill flows in transit », seul le calque HTTP le vérifie). `close_connection` annule la tâche de lecture
+  de la connexion client, comme le chien de garde d'inactivité de mitmproxy (`proxy/server.py`,
+  `ConnectionHandler.on_timeout`) ; le gestionnaire est trouvé via l'addon `proxyserver` (`Proxyserver.connections`
+  par id client), puis `handle_client` ferme tous les transports de ce client. Ce sont des internes de la 12.3.1, pas
+  une API : s'ils manquent, le trou noir reste (chaque message suivant abandonné) et l'événement dit `closed: false`.
 
 ### 3. `agent/` — conteneur Kali
 - `kalilinux/kali-rolling` + `kali-linux-headless` + outils Go ProjectDiscovery + ffuf, etc. La liste des outils est déclarée dans des manifests de plugins, pas en dur dans le Containerfile.
@@ -225,8 +267,23 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   avant le rejeu (pour l'état de la cible, plus pour l'isolation). Reste : le juge lit des réponses de la cible
   (injection de prompt possible, comme pour tout relecteur) ; il partage avec le chasseur l'image, le gate, le
   budget de relais du run et le code sandbox monté en lecture seule.
-- **Énumération** : comptée sur le chemin, la query string, les corps formulaire et JSON et GraphQL (nom de
-  paramètre qui désigne un id, valeur qui en a la forme). Un id sous un nom quelconque (`?q=123`) n'est pas compté.
+- **Énumération** : comptée sur les ids du chemin seulement (I6), route normalisée, au plus 12 ids distincts par route
+  en 10 min (le 13e est refusé). Un id passé en query string, en corps formulaire, JSON ou GraphQL n'est pas compté :
+  la doctrine (preuve sur nos propres objets) et le juge couvrent ce cas.
+- **bh-browser** : reconnu par son IP. Un autre conteneur qui reprendrait cette IP (bh-browser arrêté, IP réattribuée
+  avant l'expiration du cache de 60 s) en hériterait : identité de la jarre, `browser_only`, méthodes d'identité. Le
+  réseau `sandbox` est le nôtre et ses conteneurs sont fixes, mais rien ne le prouve au gate. Le fichier
+  `browser-identity.json` est écrit par l'hôte (`browser_service/host.py`, dans `var/state`, que le sandbox ne monte
+  pas) ; l'identité qu'il nomme dit
+  *quelle jarre* reçoit les `Set-Cookie`, pas ce que le navigateur envoie vraiment : si l'opérateur change de compte
+  dans le navigateur sans recharger, les flux sont mal étiquetés jusqu'au prochain chargement. Les cookies de
+  bh-browser ne sont pas masqués : le chasseur peut les lire par bh-web s'il demande la page qui les affiche (c'est le
+  navigateur de notre compte de test).
+- **Canaris** : la recherche s'arrête à 2 Mio décodés par contenu et à 16 jetons distincts ; un jeton coupé entre deux
+  trames websocket, encodé autrement (base64, %xx, échappement JSON `\u00..`) ou dans un tunnel passthrough n'est pas
+  vu. Le juge de la fuite reste l'humain qui lit l'événement.
+- **Sonde** : le marqueur n'est honoré que depuis la boucle locale du gate ; tout process du conteneur du gate peut
+  donc emprunter une session, ce qui est déjà le cas de l'enrôlement (il y tourne avec les secrets).
 - **Stockage** : fichiers de flux supprimés après 14 jours, journaux du gate tournés en gzip au-delà de 64 Mo
   (`bh prune`, et au début de chaque segment). Images épinglées par digest ; les paquets apt de Kali suivent le dépôt.
 - **Coût du verrou sur une vraie cible** : crawl + content + scan par origine (~10 min chacun à 2 req/s).
@@ -241,20 +298,21 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   Le jeton d'API obtenu par l'échange arrive en clair au navigateur de l'agent (c'est le fonctionnement de l'appli) :
   il est celui de notre compte de test et ne sort que vers les cibles et les hôtes `sso` (le gate). Un `OPTIONS` de
   pré-vol CORS vers le chemin de jeton serait refusé : à vérifier en live (MSAL l'évite en principe).
-- **passthrough** : le gate ne voit pas l'intérieur du tunnel. Il contrôle le nom du CONNECT, le SNI (via
-  `ignore_hosts`), l'IP, le débit, les octets et la durée ; pas l'en-tête `Host` chiffré. Un client du sandbox (pas
-  seulement le navigateur) peut donc ouvrir un tunnel vers l'IP du challenge avec ce SNI et un autre `Host` : du
-  domain fronting, que Cloudflare refuse en principe entre zones (non vérifié ici). Borné par la garde de tunnels et
-  journalisé. Pas d'ECH : derrière un proxy HTTP, Chromium ne résout pas le DNS et n'envoie pas d'ECH. `flow.kill()`
-  ne ferme pas une connexion TCP en mitmproxy 12 (seul le calque HTTP le vérifie) : un tunnel refusé est mis en trou
-  noir (chaque message vidé). Un handshake websocket ne peut pas porter `X-BH-Identity` en injection par requête
+- **passthrough** : le gate ne voit pas l'intérieur du tunnel. Il contrôle l'émetteur (bh-browser seul), le nom du
+  CONNECT, le SNI (via `ignore_hosts`), l'IP, le débit, les octets et la durée ; pas l'en-tête `Host` chiffré.
+  bh-browser pourrait donc ouvrir un tunnel vers l'IP du challenge avec ce SNI et un autre `Host` : du domain
+  fronting, que Cloudflare refuse en principe entre zones (non vérifié ici) ; le chasseur ne pilote bh-browser que par
+  bh-web. Borné par la garde de tunnels et journalisé. Pas d'ECH : derrière un proxy HTTP, Chromium ne résout pas le
+  DNS et n'envoie pas d'ECH. Un tunnel refusé est fermé par `close_connection` (internes de mitmproxy 12.3.1, à
+  mesurer en live) et, à défaut, mis en trou noir (chaque message vidé). Un handshake websocket ne peut pas porter `X-BH-Identity` en injection par requête
   (Playwright ne route pas les en-têtes des websockets) : il part sans identité. Le challenge décide seul ; nous ne
   le résolvons, ne le contournons ni ne le testons jamais (`runner/prompt.py`, « Anti-bot challenges ») ; un humain
   peut le résoudre dans le navigateur persistant de l'agent.
 - **Websockets** : le contenu des trames n'est pas jugé (pas de scope dans une trame, pas de garde d'énumération) ;
-  seuls le volume, la taille et la durée sont bornés, et tout est journalisé. Fermeture d'une connexion muette à sa
-  limite de durée : `flow.kill()` depuis un minuteur, effet à mesurer en live ; à défaut, la prochaine trame, dans un
-  sens ou l'autre, est abandonnée et la connexion tuée. Websocket sur HTTP/2 (CONNECT étendu) : méthode CONNECT
+  seuls le volume, la taille et la durée sont bornés, et tout est journalisé (les canaris y sont cherchés). Fermeture
+  d'une connexion muette à sa limite de durée : `close_connection` depuis un minuteur ; effet réel (le client et
+  l'amont voient la connexion tomber) à mesurer en live sur la 12.3.1 ; à défaut, la prochaine trame, dans un sens
+  ou l'autre, est abandonnée. Websocket sur HTTP/2 (CONNECT étendu) : méthode CONNECT
   refusée par la politique, donc refusé.
 - **Rechargement du gate** : mitmdump recharge `addon.py` mais pas `policy.py` ; après une modification de la
   politique, `podman restart bh-gate` (en attendant, le gate refuse : fail-closed).

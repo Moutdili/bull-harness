@@ -202,3 +202,58 @@ def test_login_urls_may_be_sso_support():
         scope(support=sup, identities=[{"name": "a", "login_url": "https://c.example.net/"}])
     with pytest.raises(ScopeError, match="origins"):  # an identity's headers never go to an sso host
         scope(support=sup, identities=[{"name": "a", "origins": ["https://login.example.org/"]}])
+
+
+# ------------------------------------------------------------------ get_paths, browser_only, cards
+def test_get_paths_star_is_one_whole_segment():
+    s = scope(support=[{"value": "login.example.org", "kind": "sso", "get_paths": ["/*/oauth2/v2.0/authorize", "/x/"]}])
+    (sso,) = s.support
+    assert sso.get_paths == ("/*/oauth2/v2.0/authorize", "/x/")
+    assert sso.get_path("/common/oauth2/v2.0/authorize") and sso.get_path("/t/oauth2/v2.0/authorize/sub/")
+    assert sso.get_path("/x") and sso.get_path("/x/y")
+    for bad in (
+        "/a/b/oauth2/v2.0/authorize",  # `*` never spans two segments
+        "//oauth2/v2.0/authorize",  # nor an empty one
+        "/../oauth2/v2.0/authorize",
+        "/t%2Fu/oauth2/v2.0/authorize",
+        "/t/oauth2/v2.0/authorizeX",  # a prefix on whole segments only
+        "/t/oauth2/v2.0/authorize/../token",
+        "/t/oauth2/v2.0/authorize//x",
+        "/",
+    ):
+        assert not sso.get_path(bad), bad
+    assert not scope(support=[{"value": "l.example.org", "kind": "sso"}]).support[0].get_path("/x")
+
+
+@pytest.mark.parametrize("paths", ["/x", [], ["x"], ["/a/../b"], ["/a*/b"], [3]])
+def test_bad_get_paths(paths):
+    with pytest.raises(ScopeError, match="get_paths"):
+        scope(support=[{"value": "l.example.org", "kind": "sso", "get_paths": paths}])
+    with pytest.raises(ScopeError, match="sso"):
+        scope(support=[{"value": "c.example.net", "kind": "passthrough", "get_paths": ["/x"]}])
+
+
+def test_browser_only_must_name_a_target():
+    s = scope(browser_only=["https://app.example.com/chathub/"])
+    assert [r.value for r in s.browser_only] == ["https://app.example.com/chathub/"]
+    sup = [{"value": "login.example.org", "kind": "sso"}]
+    for value, match in (
+        ("https://other.example.net/chat", "not an in-scope target"),
+        ("https://login.example.org/chat", "not an in-scope target"),  # a support host is never a target
+        ("https://*.api.example.com/chat", "exact host"),
+        ("https://app.example.com/chat?x=1", "exact host"),
+        ("app.example.com/chat", "exact host"),
+    ):
+        with pytest.raises(ScopeError, match=match):
+            scope(support=sup, browser_only=[value])
+    with pytest.raises(ScopeError, match="browser_only"):
+        scope(browser_only="https://app.example.com/chat")
+
+
+def test_cards_are_a_tuple_of_card_names():
+    s = scope(cards=["idor-basics", "ssrf2", "idor-basics"])
+    assert s.cards == ("idor-basics", "ssrf2") and isinstance(s.cards, tuple)
+    assert scope().cards == ()
+    for bad in (["IDOR"], ["a_b"], ["a b"], [""], "idor", [1]):
+        with pytest.raises(ScopeError, match="cards"):
+            scope(cards=bad)
