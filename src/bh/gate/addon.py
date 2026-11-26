@@ -111,6 +111,7 @@ import socket
 import struct
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from mitmproxy import ctx, http, tcp, udp
@@ -399,6 +400,12 @@ def fail_closed(hook):
 
     def on_error(hook_name: str, arg, exc: Exception) -> None:
         ctx.log.error(f"bh-gate: {hook_name} failed, denying: {exc!r}")
+        with contextlib.suppress(Exception):  # the journal says why (ctx.log is silent at flow_detail=0)
+            tb = traceback.extract_tb(exc.__traceback__)
+            where = [f"{Path(f.filename).name}:{f.lineno} {f.name}" for f in tb[-3:]]
+            addons[0]._log(
+                paths.EVENTS, {"kind": "gate-error", "hook": hook_name, "error": repr(exc)[:300], "where": where}
+            )
         if isinstance(arg, http.HTTPFlow) and arg.websocket is not None and hook_name.startswith("websocket"):
             with contextlib.suppress(Exception):  # the frame in hand is not forwarded, the connection is closed
                 if arg.websocket.messages:
