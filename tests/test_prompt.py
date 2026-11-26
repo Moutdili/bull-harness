@@ -21,7 +21,7 @@ def test_identities_line_says_sessions_are_checked():
     from bh.runner.prompt import scope_block
     from bh.scope import scope_from_dict
 
-    probe = {"url": "https://a.test/me", "status": 200}
+    probe = {"url": "https://a.test/me", "status": 200, "expect": "user"}  # R26: checked = the account's own content
     s = scope_from_dict(
         {
             "program": "p",
@@ -55,7 +55,7 @@ def test_identities_without_a_probe_are_said_unchecked():
             "platform": "x",
             "in_scope": ["a.test"],
             "identities": [
-                {"name": "user-a", "probe": {"url": "https://a.test/me", "status": 200}},
+                {"name": "user-a", "probe": {"url": "https://a.test/me", "status": 200, "expect": "a"}},
                 {"name": "user-b"},
             ],
         }
@@ -101,7 +101,7 @@ def test_verifier_prompt_fences_the_hunters_fields():
     tags = re.findall(r"<(hunter-data-[0-9a-f]{16})>", p)
     assert len(tags) == 1 and p.count(f"</{tags[0]}>") == 1
     inside = p.split(f"<{tags[0]}>")[1].split(f"</{tags[0]}>")[0].strip("\n").split("\n")
-    assert len(inside) == 7 and all(len(ln) <= 8100 for ln in inside)  # one line per field, bounded
+    assert len(inside) == 10 and all(len(ln) <= 8100 for ln in inside)  # one line per field, bounded
     assert inside[4].startswith("summary: ") and len(inside[4]) <= len("summary: ") + 2000
     # a fresh tag each time: a hunter cannot close a block it cannot predict
     assert re.findall(r"<(hunter-data-[0-9a-f]{16})>", build_verifier_prompt(scope, finding, replay, "e")) != tags
