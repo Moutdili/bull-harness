@@ -90,6 +90,7 @@ MAX_COOKIES = 300
 NET_KEEP, NET_LAST = 500, 200  # requests kept, at most returned by one `net`
 FRAMES_KEEP, FRAMES_LAST = 300, 200  # websocket frames kept, at most returned by one `frames`
 REWRITE_TTL_DEFAULT, REWRITE_TTL_MAX = 180, 600  # seconds a ws-rewrite rule stays armed
+PUMP_S = 0.02  # while a websocket is routed, how often the idle worker lets Playwright forward its frames
 # Prompts are bounded in number, not only in size (MSRC: never a flood of prompts). Per segment (the host resets it
 # at prepare) and per identity and UTC day (persisted in the profile volume, a reset does not clear it).
 FILL_SEGMENT = 80
@@ -919,6 +920,7 @@ class PlaywrightDriver:
         self._seen_pages: set[int] = set()
         self._rule: dict[str, Any] | None = None  # bh-web ws-rewrite: one armed rewrite at most
         self._ws_routed = False
+        self._routed_live = 0  # routed websockets still open (their frames need pumping)
 
     # -- connection and listeners
     def _context(self) -> Any:
@@ -968,9 +970,32 @@ class PlaywrightDriver:
         r = self._rule_live()
         return bool(r) and r["url_contains"] in url
 
+    def needs_pump(self) -> bool:
+        return self._ws_routed and (self._routed_live > 0 or self._rule_live() is not None)
+
+    def pump(self) -> None:
+        self._page().wait_for_timeout(1)
+
     def _route_ws(self, route: Any) -> None:
         server = route.connect_to_server()
         url = route.url
+        self._routed_live += 1
+        closed = [False]
+
+        def gone() -> None:
+            if not closed[0]:
+                closed[0] = True
+                self._routed_live = max(0, self._routed_live - 1)
+
+        def page_closed(code: Any = None, reason: Any = None) -> None:  # a close handler disables auto-forwarding
+            gone()
+            with contextlib.suppress(Exception):
+                server.close(code=code, reason=reason or "")
+
+        def server_closed(code: Any = None, reason: Any = None) -> None:
+            gone()
+            with contextlib.suppress(Exception):
+                route.close(code=code, reason=reason or "")
 
         def from_page(message: Any) -> None:
             out, done = message, False
@@ -992,6 +1017,8 @@ class PlaywrightDriver:
 
         route.on_message(from_page)
         server.on_message(from_server)
+        route.on_close(page_closed)
+        server.on_close(server_closed)
 
     def ws_rewrite(self, find: str, replace: str, url_contains: str, ttl: int) -> dict[str, Any]:
         ctx = self._context()
@@ -1163,7 +1190,16 @@ class Worker(threading.Thread):
     def run(self) -> None:
         ctl = self.make()
         while True:
-            ops, req, box, done = self.jobs.get()
+            # Playwright's sync API only dispatches events inside one of its calls: while a websocket is routed
+            # (bh-web ws-rewrite), its frames would wait for the agent's next command, so the idle loop pumps it.
+            driver = getattr(ctl, "driver", None)
+            needs = getattr(driver, "needs_pump", None)
+            try:
+                ops, req, box, done = self.jobs.get(timeout=PUMP_S if needs and needs() else None)
+            except queue.Empty:
+                with contextlib.suppress(Exception):
+                    driver.pump()
+                continue
             try:
                 box.append(ctl.handle(ops, req))
             except BaseException as exc:  # noqa: BLE001

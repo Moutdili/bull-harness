@@ -4,6 +4,7 @@ a real-shaped DOM (B4), switch (I2), reading and driving ops (I3), websocket fra
 
 import base64
 import json
+import types
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import ClassVar
@@ -493,3 +494,19 @@ def test_ws_rewrite_waits_like_any_action_while_the_operator_has_the_screen():
     ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
     code, out = ctl.handle(AGENT_OPS, {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "eyJCCCCCC"})
     assert code == 409 and out["error"] == "human-viewing"
+
+
+def test_the_idle_worker_pumps_the_driver_while_a_websocket_is_routed():
+    """Playwright's sync API forwards routed frames only inside one of its calls: an idle worker must pump."""
+    import time as _time
+
+    from bh.browser_service.controller import Worker
+
+    pumped = []
+    drv = types.SimpleNamespace(needs_pump=lambda: True, pump=lambda: pumped.append(1))
+    ctl = types.SimpleNamespace(driver=drv, handle=lambda ops, req: (200, {"ok": True}))
+    w = Worker(lambda: ctl)
+    w.start()
+    _time.sleep(0.2)
+    assert len(pumped) >= 3
+    assert w.call(AGENT_OPS, {"op": "state"}, timeout=5) == (200, {"ok": True})
