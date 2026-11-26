@@ -28,6 +28,8 @@ in_scope:
   - {value: "https://substrate.office.com/search/api/v1/prompts", note: "prompt gallery and its activity"}
   - {value: "https://substrate.office.com/search/api/v1/suggestions", note: "composer suggestions"}
   - {value: "https://substrate.svc.cloud.microsoft/m365Copilot/", note: "alternate chat hub host (in the app's code, not seen live)"}
+# program and browser cards, pinned in every task from the first leg (audit I7; src/bh/cards/)
+cards: [msrc-copilot, bh-web-manual]
 # chat traffic only from bh-browser (audit B2): a prompt reaches Copilot through the one browser where the operator solves
 # the Turnstile challenge, never by a direct websocket or API call from the agent's container
 browser_only:
@@ -37,8 +39,10 @@ support:
   # sso: the app signs in silently while in use (iframe GET .../oauth2/v2.0/authorize, /savedusers, then the PKCE
   # code exchange POST .../oauth2/v2.0/token); seen live 2026-11-25 on login.microsoftonline.com, tenant
   # 9188040d-6c67-4c5b-b112-36a304b66dad (Microsoft accounts). The login.live.com token path is the MSA one, to confirm.
-  - {value: "login.microsoftonline.com", kind: sso, token_paths: ["/*/oauth2/v2.0/token"], note: "Entra ID silent sign-in and token exchange"}
-  - {value: "login.live.com", kind: sso, token_paths: ["/oauth20_token.srf"], note: "Microsoft account login (enrollment) and silent sign-in"}
+  # get_paths (audit pass 2, I13): the silent sign-in GETs seen live, so `bh-browse --as` loads the app signed in;
+  # nothing else of the login hosts is readable from the agent's container (bh-browser keeps every path)
+  - {value: "login.microsoftonline.com", kind: sso, token_paths: ["/*/oauth2/v2.0/token"], get_paths: ["/*/oauth2/v2.0/authorize", "/savedusers"], note: "Entra ID silent sign-in and token exchange"}
+  - {value: "login.live.com", kind: sso, token_paths: ["/oauth20_token.srf"], get_paths: ["/oauth20_authorize.srf", "/Me.htm", "/Me.srf"], note: "Microsoft account login (enrollment) and silent sign-in"}
   - {value: "challenges.cloudflare.com", kind: passthrough, note: "Cloudflare Turnstile (free accounts' message sending): tunnelled, never intercepted nor touched"}
   - {value: "brunhild.challenges.cloudflare.com", kind: passthrough, note: "Turnstile's challenge backend (seen live 2026-11-25): tunnelled, never intercepted nor touched"}
   - {value: "login.microsoft.com", kind: auth, note: "Microsoft login"}
@@ -133,4 +137,4 @@ identities:
         - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
         - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
       capture: {cookies: true, authorization: true}
-notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). The MSRC page declares in scope 'copilot.microsoft.com and copilot.ai ... when tested using a personal account': test only our own two personal accounts, with 'MSOBB' in the account name where possible. Cross-user impact is what pays (see .claude/skills/msrc-ai-bug-bounty). Every report gives the conversation identifier, obtained by typing /id in the conversation. Login and asset hosts are support hosts, never targets. substrate.* hosts are the chat hub: our own conversations only. Websockets on: low message rate, one conversation at a time, never a flood of prompts. Cloudflare Turnstile guards message sending for free accounts: never solved, evaded or worked around by the agent; a human may solve it in the agent's browser, else bh-note blocked captcha."
+notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). The MSRC page declares in scope 'copilot.microsoft.com and copilot.ai ... when tested using a personal account': we test our own two personal accounts only (user-a, user-b). Cross-user impact is what pays (program card). Every report gives the conversation identifier, obtained by typing /id in the conversation. Login and asset hosts are support hosts, never targets. substrate.* hosts: our own conversations only. One conversation at a time, never a flood of prompts. Cloudflare Turnstile guards message sending: never solved, evaded or worked around by the agent; the operator passes it in the agent's browser (bh-web wait-human, program card)."
