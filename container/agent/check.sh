@@ -44,5 +44,7 @@ zap_check || miss=$((miss+1))
 for b in chromium chromedriver; do
   if command -v "$b" >/dev/null 2>&1; then printf 'ok   %s (bh-zap --ajax)\n' "$b"; else printf 'MISS %s\n' "$b"; miss=$((miss+1)); fi
 done
+# bh-web text --clipboard: xclip reads the page's clipboard on the browser's virtual display.
+if command -v xclip >/dev/null 2>&1; then echo "ok   xclip (bh-web text --clipboard)"; else echo "MISS xclip"; miss=$((miss+1)); fi
 if [ -s /opt/bh/missing-packages.txt ]; then echo "apt packages absent from Kali repo:"; sed 's/^/  - /' /opt/bh/missing-packages.txt; fi
 exit $miss

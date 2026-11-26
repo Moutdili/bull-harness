@@ -22,7 +22,15 @@ Identity (--as): X-BH-Identity is added request by request in the route handler 
 the targets and the `sso` hosts, never globally: a passthrough host never receives anything of ours. A websocket
 handshake cannot be given a header this way (Playwright routes it apart), so it carries no identity.
 
-Classification: a mapper; with --xss a scanner (refused when the program forbids scanners).
+XSS (--xss MARKER): confirmed only by a dialog whose whole message is the marker, or window.__bhxss set to it, raised
+in a document of the page's own origin (the origin is taken when the dialog opens, from the frame that raised it, so
+a script run on another origin, then a navigation or a history rewrite back to the target, never confirms). A click,
+a submit or a key press on a javascript: URL is not made: the hunter's own script proves nothing. The line is
+`xss CONFIRMED (marker <M>) origin=<origin>`.
+
+Classification: a mapper. `--xss` on a single page is an observation, not a scan (Mio's decision, audit I14): it
+runs on a program that forbids scanners. `--xss` with `--routes` carries the marker across the pages it walks: a
+scanner, refused when the program forbids scanners.
 This is the only sandbox module that imports playwright, inside run(): bh-agent starts without it.
 """
 
@@ -65,6 +73,24 @@ MARGIN_S = 8  # seconds kept at the end of the budget to write the artifacts
 SELECTOR_ENGINE = re.compile(r"^(css|xpath|text|role|id|data-test(?:-?id)?|alt|placeholder|label|title)=")
 A11Y_ROLES = ("heading", "textbox", "searchbox", "combobox", "button", "link", "checkbox")
 A11Y_LINE = re.compile(rf'^\s*- ({"|".join(A11Y_ROLES)}) "([^"]*)"(?:[^:]*: (.*))?')
+
+# Whether a click, submit or key press would follow a javascript: URL (a link, an image map area, a form action, a
+# button's formaction), as the browser resolves it (`java\tscript:` is javascript:). Such a step is not made.
+JS_URL_TARGET = """(el) => {
+  if (!el) return false;
+  const proto = (u) => { try { return new URL(String(u), document.baseURI).protocol; } catch (e) { return ''; } };
+  const hrefOf = (a) => (typeof a.href === 'string' ? a.href
+    : (a.getAttribute('href') || a.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || ''));
+  const urls = [];
+  const a = el.closest && el.closest('a, area');
+  if (a) urls.push(hrefOf(a));
+  const b = el.closest && el.closest('button, input');
+  if (b && b.hasAttribute('formaction')) urls.push(b.getAttribute('formaction'));
+  const f = el.form || (el.closest && el.closest('form'));
+  if (f && f.hasAttribute('action')) urls.push(f.getAttribute('action'));
+  return urls.some((u) => u && proto(u) === 'javascript:');
+}"""
+_JS_SCHEME = re.compile(r"^[\x00-\x20]*" + r"[\t\n\r]*".join("javascript") + r"[\t\n\r]*:", re.I)
 
 # Records URLs set by pushState/replaceState and hash changes (SPA routes), read back by --routes.
 ROUTE_HOOK = """(() => {
@@ -163,6 +189,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     a.timeout = max(15, a.timeout)
     if "://" not in a.url:
         a.url = "https://" + a.url
+    if urlsplit(a.url).scheme.lower() not in ("http", "https"):
+        parser().error("bh-browse loads http(s) pages only")
     return a
 
 
@@ -296,16 +324,74 @@ def add_endpoints(d: Path, origin_: str, items: Items) -> list[str]:
     return [r["key"] for r in recs]
 
 
-def xss_confirmed(marker: str | None, dialogs: object, sentinel: object) -> bool:
-    """A dialog whose whole message is the marker (alert('<marker>')), or window.__bhxss set to the marker string.
-    A message that merely contains it does not count: a page that shows its own URL in a dialog is not an XSS.
-    Also the replay's own verdict (bh.agent.proof), computed from summary.json: hostile input, checked by type."""
+def js_url(url: str) -> bool:
+    """A javascript: URL as a browser reads it (leading controls and spaces, tabs and newlines inside the scheme)."""
+    return bool(_JS_SCHEME.match(url or ""))
+
+
+def _evidence(marker: str | None, dialogs: object, sentinel: object, sentinel_origin: object) -> list[object]:
+    """Origins of the documents where the marker showed: a dialog whose whole message is the marker
+    (alert('<marker>')), or window.__bhxss set to the marker string. A message that merely contains it does not
+    count: a page that shows its own URL in a dialog is not an XSS. Hostile input (summary.json), checked by type."""
     if not marker or not MARKER.match(str(marker)):
+        return []
+    out = [
+        d.get("origin")
+        for d in (dialogs if isinstance(dialogs, list) else [])
+        if isinstance(d, dict) and isinstance(d.get("message"), str) and d["message"].strip() == marker
+    ]
+    if isinstance(sentinel, str) and sentinel == marker:
+        out.append(sentinel_origin)
+    return out
+
+
+def marker_seen(marker: str | None, dialogs: object, sentinel: object, sentinel_origin: object = None) -> bool:
+    """The marker showed, whatever the origin (to say why it does not confirm)."""
+    return bool(_evidence(marker, dialogs, sentinel, sentinel_origin))
+
+
+def xss_confirmed(
+    marker: str | None, dialogs: object, sentinel: object, origin: object, sentinel_origin: object = None
+) -> bool:
+    """The marker showed (_evidence) in a document of `origin`, the page's own (contract.origin form): a script run on
+    another origin, or on none known (a data: frame, a dialog whose frame is unknown), never confirms. Also the
+    replay's own verdict (bh.agent.proof), computed from summary.json against the origin of the step's URL."""
+    if not isinstance(origin, str) or not origin:
         return False
-    shown = [d.get("message") for d in (dialogs if isinstance(dialogs, list) else []) if isinstance(d, dict)]
-    return any(isinstance(m, str) and m.strip() == marker for m in shown) or (
-        isinstance(sentinel, str) and sentinel == marker
-    )
+    return origin in [o for o in _evidence(marker, dialogs, sentinel, sentinel_origin) if isinstance(o, str)]
+
+
+def dialog_origins(dialogs: list[dict], events: list[dict]) -> list[dict]:
+    """Each dialog gets the origin of the frame that raised it: from Chromium's Page.javascriptDialogOpening event
+    (`url` is that frame's URL), matched in order on type and message. Without the event, the page's origin at the
+    moment the dialog opened when the page had one frame only (the dialog can only be the main frame's), else None:
+    a cross-origin iframe never lends its dialog to the page."""
+    pool = [
+        (str(e.get("type", "")), str(e.get("message", "")), c.origin(str(e.get("url", ""))))
+        for e in events
+        if isinstance(e, dict)
+    ]
+    out = []
+    for d in dialogs:
+        kind, message = str(d.get("type", "")), str(d.get("message", ""))
+        hit = next((i for i, (t, m, _) in enumerate(pool) if t == kind and m == message), None)
+        origin = d.get("page_origin") if d.get("frames") == 1 else None  # a one-frame page: only its main frame
+        if hit is not None:
+            origin = pool.pop(hit)[2]
+        out.append({"type": kind, "message": message, "origin": origin})
+    return out
+
+
+def pick_sentinel(
+    found: list[tuple[str, str | None]], marker: str | None, origin: str
+) -> tuple[str | None, str | None]:
+    """(value, origin of its frame) among the frames that hold a window.__bhxss string: the marker on the page's
+    origin first, then the marker anywhere (said, not confirmed), then any value."""
+    for want in ((marker, origin), (marker, None), (None, None)):
+        for value, o in found:
+            if (want[0] is None or value == want[0]) and (want[1] is None or o == want[1]):
+                return value, o
+    return None, None
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -358,6 +444,8 @@ class Result:
     dialogs: list[dict] = field(default_factory=list)
     marker: str | None = None
     sentinel: str | None = None
+    sentinel_origin: str | None = None  # origin of the frame that held the sentinel
+    origin: str = ""  # the page's own origin (contract.origin of the URL asked): the only one an XSS confirms on
     console_errors: list[str] = field(default_factory=list)
     forms: list[dict] = field(default_factory=list)
     routes: list[str] = field(default_factory=list)
@@ -365,6 +453,9 @@ class Result:
     a11y: list[str] = field(default_factory=list)
     shot: tuple[str, int, int] | None = None
     raw: str = ""
+
+    def __post_init__(self) -> None:
+        self.origin = self.origin or c.origin(self.url) or ""
 
 
 def _short(url: str) -> str:
@@ -393,24 +484,33 @@ def render(r: Result) -> list[str]:
     if r.support["sso"] or r.support["passthrough"]:
         body.append(
             f"support: sso {r.support['sso']} (the app's own sign-in), passthrough {r.support['passthrough']} "
-            "(anti-bot challenge, not intercepted; never solve nor work around it: blocked = bh-note blocked captcha)"
+            "(anti-bot challenge, not intercepted; never solve nor work around it: a human passes it, run "
+            "`bh-web wait-human`)"
         )
     if r.websockets:
-        body.append(f"websockets: {r.websockets} refused (the gate forbids them; socket.io may fall back to polling)")
+        body.append(f"websockets: {r.websockets} refused locally (not enabled by the scope for this host)")
     if r.websockets_open:
-        body.append(f"websockets: {r.websockets_open} opened to the target (frames bounded and journaled by the gate)")
+        body.append(
+            f"websockets: {r.websockets_open} opened to the target, handshake accepted (frames bounded and journaled "
+            "by the gate)"
+        )
     if r.xhr:
         shown = " · ".join(f"{m} {_short(u)} {s}" for m, u, s in r.xhr[:6])
         body.append(f"xhr: {shown}" + (f" (+{len(r.xhr) - 6} in raw har.json)" if len(r.xhr) > 6 else ""))
     body += [f"step: {s}" for s in r.steps[:4]]
-    confirmed = xss_confirmed(r.marker, r.dialogs, r.sentinel)
-    verdict = f"xss CONFIRMED (marker {r.marker})" if confirmed else ""
+    confirmed = xss_confirmed(r.marker, r.dialogs, r.sentinel, r.origin, r.sentinel_origin)
+    verdict = f"xss CONFIRMED (marker {r.marker}) origin={r.origin}" if confirmed else ""
     if r.dialogs:
         shown = " · ".join(f'{d.get("type")}("{str(d.get("message", ""))[:40]}")' for d in r.dialogs[:3])
         body.append(f"dialogs: {len(r.dialogs)} — {shown}" + (f" ← {verdict}" if verdict else ""))
     if verdict and not r.dialogs:
         body.append(f"{verdict} via window.{SENTINEL}")
-    if r.marker and not confirmed:
+    if r.marker and not confirmed and marker_seen(r.marker, r.dialogs, r.sentinel, r.sentinel_origin):
+        body.append(
+            f"xss: marker {r.marker} showed in a document of another origin than the page's {r.origin}, or of an "
+            "unknown one: not confirmed"
+        )
+    elif r.marker and not confirmed:
         body.append(f"xss: marker {r.marker} not seen (no dialog, no window.{SENTINEL}): not confirmed")
     if r.console_errors:
         body.append(f"console: {len(r.console_errors)} errors ({r.console_errors[0][:120]})")
@@ -440,16 +540,25 @@ def render(r: Result) -> list[str]:
 
 
 def summary(r: Result) -> dict:
-    """summary.json: the structured result. The replay of a proof reads `status`, `dialogs` and `sentinel` and
-    decides itself; `xss_confirmed` is for a human reading the raw dir. Never the URL, the title or the console."""
+    """summary.json: the structured result. The replay of a proof reads `status`, `dialogs` (with the origin of the
+    frame that raised each), `sentinel` and `sentinel_origin`, and decides itself against the origin of its own step
+    URL; `xss_confirmed` is for a human reading the raw dir. Never the URL, the title or the console."""
     return {
         "status": r.status,
         "state": r.state,
         "new": r.new_keys,
-        "dialogs": [{"type": str(d.get("type", "")), "message": str(d.get("message", ""))} for d in r.dialogs],
+        "dialogs": [
+            {
+                "type": str(d.get("type", "")),
+                "message": str(d.get("message", "")),
+                "origin": d.get("origin") if isinstance(d.get("origin"), str) else None,
+            }
+            for d in r.dialogs
+        ],
         "sentinel": r.sentinel,
+        "sentinel_origin": r.sentinel_origin,
         "marker": r.marker,
-        "xss_confirmed": xss_confirmed(r.marker, r.dialogs, r.sentinel),
+        "xss_confirmed": xss_confirmed(r.marker, r.dialogs, r.sentinel, r.origin, r.sentinel_origin),
     }
 
 
@@ -694,12 +803,24 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
         console.append(f"pageerror: {exc}")
         r.console_errors.append(f"pageerror: {str(exc).splitlines()[0] if str(exc) else exc}")
 
+    dialog_events: list[dict] = []  # Page.javascriptDialogOpening (CDP): the URL of the frame that raised each
+
     def on_dialog(dialog) -> None:
-        rec = {"type": dialog.type, "message": dialog.message}
+        # at this moment, not at the end: a navigation or a history rewrite afterwards does not move the dialog
+        rec = {
+            "type": dialog.type,
+            "message": dialog.message,
+            "page_origin": c.origin(page.url),
+            "frames": len(page.frames),
+        }
         r.dialogs.append(rec)
         c.append_jsonl(raw / "dialogs.jsonl", rec)
         with contextlib.suppress(PwError):
             dialog.dismiss()
+
+    def on_websocket(ws) -> None:
+        if ws_through(ws.url, host, extra.websockets, extra.targets):  # mocked ones are counted by on_ws
+            count_when_open(ws, r)
 
     def settle(cap: float | None) -> None:
         refuse_sockets()
@@ -732,13 +853,9 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             page.on("console", on_console)
             page.on("pageerror", on_pageerror)
             page.on("dialog", on_dialog)
-            page.on(  # mocked ones may show here too: count only those let through
-                "websocket",
-                lambda ws: (
-                    ws_through(ws.url, host, extra.websockets, extra.targets)
-                    and setattr(r, "websockets_open", r.websockets_open + 1)
-                ),
-            )
+            page.on("websocket", on_websocket)  # mocked ones may show here too: count only those let through
+            if a.xss:
+                watch_dialogs(ctx, page, dialog_events, PwError)
 
             resp = page.goto(a.url, wait_until="domcontentloaded", timeout=left_ms())
             r.status = resp.status if resp else None
@@ -753,6 +870,13 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 try:
                     if kind == "fill":
                         page.fill(value[0], value[1], timeout=left_ms(20))
+                    elif follows_js_url(page, kind, value, left_ms(20)):
+                        r.steps.append(
+                            f"{i} --{kind} {value}: a javascript: URL, not followed (the hunter's own script proves "
+                            "nothing)"
+                        )
+                        r.state = f"error step {i}"
+                        break
                     elif kind == "press":
                         page.keyboard.press(value)  # a chat box sends on Enter, with no button to click
                         settle(15)
@@ -767,14 +891,14 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
 
             if a.xss:
                 page.wait_for_timeout(min(1500, left_ms()))
-                r.sentinel = _sentinel(page, PwError)
+                r.sentinel, r.sentinel_origin = pick_sentinel(_sentinels(page, PwError), a.xss, r.origin)
 
             links = _links(page, PwError)
             seen_urls.append(("GET", page.url, r.status))
             if a.routes:
                 seen_urls += _explore(page, links, host=host, deadline=deadline, err=PwError, settle=settle)
-                if a.xss and r.sentinel != a.xss:
-                    r.sentinel = _sentinel(page, PwError)
+                if a.xss and not xss_confirmed(a.xss, [], r.sentinel, r.origin, r.sentinel_origin):
+                    r.sentinel, r.sentinel_origin = pick_sentinel(_sentinels(page, PwError), a.xss, r.origin)
             seen_urls += [("GET", u, None) for u in links if same_site(u, host)]
 
             r.final_url = page.url
@@ -804,6 +928,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             r.state, r.error = "error rc=1", str(exc).splitlines()[0][:200]
         finally:
             r.seconds = time.monotonic() - t0
+            r.dialogs = dialog_origins(r.dialogs, dialog_events)
             for closing in (ctx, browser):  # closing the context writes the HAR
                 if closing is not None:
                     with contextlib.suppress(PwError):
@@ -825,15 +950,51 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
     r.new_keys = add_endpoints(c.bh_dir(), origin_, items)
 
 
-def _sentinel(page, err) -> str | None:
+def count_when_open(ws, r: Result) -> None:
+    """r.websockets_open counts `ws` once a frame crossed it: only an accepted handshake carries frames. The page's
+    `websocket` event comes when the socket is created, before the handshake, and for a refused one too."""
+    seen = False
+
+    def frame(_payload=None) -> None:
+        nonlocal seen
+        if not seen:
+            seen = True
+            r.websockets_open += 1
+
+    ws.on("framesent", frame)
+    ws.on("framereceived", frame)
+
+
+def _sentinels(page, err) -> list[tuple[str, str | None]]:
+    """(window.__bhxss, origin of the frame) for every frame that holds a string there."""
+    found = []
     for frame in page.frames:
         try:
             v = frame.evaluate("n => (typeof window[n] === 'string' ? window[n] : null)", SENTINEL)
         except err:
             continue
-        if v:
-            return v
-    return None
+        if isinstance(v, str) and v:
+            found.append((v, c.origin(frame.url)))
+    return found
+
+
+def watch_dialogs(ctx, page, events: list[dict], err) -> None:
+    """Chromium tells which frame raised a dialog (Page.javascriptDialogOpening, `url`): a CDP session of our own
+    listens. Without it (an error), dialog_origins falls back on a one-frame page only."""
+    try:
+        cdp = ctx.new_cdp_session(page)
+        cdp.on("Page.javascriptDialogOpening", events.append)
+        cdp.send("Page.enable")
+    except err:
+        return
+
+
+def follows_js_url(page, kind: str, value, timeout: float) -> bool:
+    """A click, submit or key press that would follow a javascript: URL (JS_URL_TARGET): the element the selector
+    names, or the focused one for a key press. Raises the page's error when the element is missing, like the step."""
+    if kind == "press":
+        return bool(page.evaluate(f"() => ({JS_URL_TARGET})(document.activeElement)"))
+    return bool(page.locator(value).first.evaluate(JS_URL_TARGET, timeout=timeout))
 
 
 def _links(page, err) -> list[str]:
@@ -852,7 +1013,7 @@ def _explore(page, links: list[str], *, host: str, deadline: float, err, settle)
     visits = 0
     while queue and visits < MAX_ROUTE_VISITS and time.monotonic() < deadline - 5:
         u = queue.pop(0)
-        if u in visited or RISKY_LINK.search(u) or not spa_route(u) or not _same_document(u, page.url):
+        if u in visited or js_url(u) or RISKY_LINK.search(u) or not spa_route(u) or not _same_document(u, page.url):
             continue
         visited.add(u)
         visits += 1

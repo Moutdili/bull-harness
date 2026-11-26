@@ -194,31 +194,70 @@ def test_spa_routes_become_endpoints(tmp_path):
     assert {r["source"] for r in recs} == {"browse"} and recs[0]["params"] == ["q"]
 
 
+ORIG = "http://t:80"
+
+
 def test_xss_verdict_needs_the_marker():
-    alert = [{"type": "alert", "message": "bhX1"}]
-    assert b.xss_confirmed("bhX1", alert, None)
-    assert b.xss_confirmed("bhX1", [], "bhX1")
-    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "1"}], None)
-    assert not b.xss_confirmed(None, alert, None)
+    alert = [{"type": "alert", "message": "bhX1", "origin": ORIG}]
+    assert b.xss_confirmed("bhX1", alert, None, ORIG)
+    assert b.xss_confirmed("bhX1", [], "bhX1", ORIG, ORIG)
+    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "1", "origin": ORIG}], None, ORIG)
+    assert not b.xss_confirmed(None, alert, None, ORIG)
     # a dialog that merely shows the URL (which holds the marker) is the page talking, not the payload
-    assert not b.xss_confirmed("bhX1", [{"type": "confirm", "message": "Leave http://t/?q=bhX1 ?"}], None)
-    assert not b.xss_confirmed("bhX1", "bhX1", ["bhX1"])  # hostile shapes
-    assert not b.xss_confirmed("bhX1", [], {"bhX1": 1})
+    msg = [{"type": "confirm", "message": "Leave http://t/?q=bhX1 ?", "origin": ORIG}]
+    assert not b.xss_confirmed("bhX1", msg, None, ORIG)
+    assert not b.xss_confirmed("bhX1", "bhX1", ["bhX1"], ORIG)  # hostile shapes
+    assert not b.xss_confirmed("bhX1", [], {"bhX1": 1}, ORIG)
+    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "bhX1", "origin": ["http://t:80"]}], None, ORIG)
+
+
+def test_xss_verdict_needs_the_page_origin():
+    """The marker must show in a document of the page's own origin: not another one, not an unknown one."""
+    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "bhX1", "origin": "http://u:80"}], None, ORIG)
+    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "bhX1", "origin": None}], None, ORIG)
+    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "bhX1"}], None, ORIG)
+    assert not b.xss_confirmed("bhX1", [], "bhX1", ORIG, "http://u:80")
+    assert not b.xss_confirmed("bhX1", [], "bhX1", ORIG, None)
+    assert not b.xss_confirmed("bhX1", [{"type": "alert", "message": "bhX1", "origin": ORIG}], None, None)
+    assert b.marker_seen("bhX1", [], "bhX1", "http://u:80")
+
+
+def test_dialog_origin_is_the_raising_frame_s():
+    d = [{"type": "alert", "message": "m", "page_origin": ORIG, "frames": 3}]
+    events = [{"type": "alert", "message": "m", "url": "https://other.test/x"}]
+    assert b.dialog_origins(d, events)[0]["origin"] == "https://other.test:443"
+    assert b.dialog_origins(d, [])[0]["origin"] is None  # several frames, no event: unknown
+    one = [{"type": "alert", "message": "m", "page_origin": ORIG, "frames": 1}]
+    assert b.dialog_origins(one, [])[0]["origin"] == ORIG
+    assert b.dialog_origins(one, [{"type": "alert", "message": "m", "url": "data:text/html,x"}])[0]["origin"] is None
+    # events are matched in order, each once
+    two = [{"type": "alert", "message": "m", "frames": 2}] * 2
+    ev = [{"type": "alert", "message": "m", "url": "http://t/"}, {"type": "alert", "message": "m", "url": "http://u/"}]
+    assert [x["origin"] for x in b.dialog_origins(two, ev)] == [ORIG, "http://u:80"]
+
+
+def test_sentinel_prefers_the_page_origin():
+    found = [("bhX1", "http://u:80"), ("other", ORIG), ("bhX1", ORIG)]
+    assert b.pick_sentinel(found, "bhX1", ORIG) == ("bhX1", ORIG)
+    assert b.pick_sentinel(found[:2], "bhX1", ORIG) == ("bhX1", "http://u:80")
+    assert b.pick_sentinel([], "bhX1", ORIG) == (None, None)
 
 
 def test_summary_json_is_structured_and_holds_no_url_or_title():
-    r = _fake(sentinel="bhX1")
+    r = _fake(sentinel="bhX1", sentinel_origin="http://h:3000", url="http://h:3000/search?q=bhX1")
     doc = b.summary(r)
     assert doc["xss_confirmed"] and doc["marker"] == "bhX1" and doc["sentinel"] == "bhX1"
-    assert doc["dialogs"] == [{"type": "alert", "message": "bhX1"}] and doc["status"] == 200
-    assert "http://h:3000" not in json.dumps(doc) and "Juice" not in json.dumps(doc)
+    assert doc["sentinel_origin"] == "http://h:3000"
+    assert doc["dialogs"] == [{"type": "alert", "message": "bhX1", "origin": "http://h:3000"}] and doc["status"] == 200
+    # origins only, compared by the replay: never the URL or the title
+    assert "search" not in json.dumps(doc) and "Juice" not in json.dumps(doc)
 
 
 def _fake(**kw) -> b.Result:
     r = b.Result(url="http://h:3000/", identity="alice", status=200, title="OWASP Juice Shop", seconds=2.8)
     r.requests, r.blocked, r.websockets = 41, Counter({"cdnjs.cloudflare.com": 6, "image": 2}), 1
     r.xhr = [("GET", f"http://h:3000/api/x{i}?a=1", 200) for i in range(30)]
-    r.dialogs, r.marker = [{"type": "alert", "message": "bhX1"}], "bhX1"
+    r.dialogs, r.marker = [{"type": "alert", "message": "bhX1", "origin": "http://h:3000"}], "bhX1"
     r.console_errors = ["TypeError: x"] * 5
     form = {"method": "POST", "action": "http://h:3000/rest/x", "fields": ["a", "b"]}
     r.forms = [{**form, "id": f"f{i}"} for i in range(9)]
@@ -236,7 +275,7 @@ def test_summary_is_bounded_and_says_what_matters():
     text = "\n".join(lines)
     assert len(lines) <= b.SUMMARY_LINES and all(len(x) <= b.LINE_CHARS for x in lines)
     assert lines[0].startswith('bh-browse http://h:3000/ as=alice: 200, title "OWASP Juice Shop"')
-    assert "xss CONFIRMED (marker bhX1)" in text and "cdnjs.cloudflare.com ×6" in text
+    assert "xss CONFIRMED (marker bhX1) origin=http://h:3000" in text and "cdnjs.cloudflare.com ×6" in text
     assert lines[-1] == "raw: /work/.bh/raw/browse-x/"
     small = "\n".join(b.render(_fake(dialogs=[], steps=[], forms=[], xhr=[])))
     assert "not confirmed" in small and "CONFIRMED" not in small.replace("not confirmed", "")
@@ -316,13 +355,14 @@ def test_browse_proof_replay_uses_the_summary(monkeypatch):
 
     def fake_browse(step):
         hit = "<iframe>" in step["url"]
-        summary = {"status": 200, "dialogs": [{"type": "alert", "message": "bhX1"}] if hit else []}
-        return (*proof.browse_body(summary, "bhX1"), False)
+        o = "http://h:3000"
+        summary = {"status": 200, "dialogs": [{"type": "alert", "message": "bhX1", "origin": o}] if hit else []}
+        return (*proof.browse_body(summary, "bhX1", origin=o), False)
 
     monkeypatch.setattr(proof, "_browse", fake_browse)
     r = proof.replay(_xss_proof())
     assert r["reproduced"] and not r["control_disproves"]
-    assert r["rounds"][0][0]["snippet"] == "xss CONFIRMED (marker bhX1)"
+    assert r["rounds"][0][0]["snippet"] == "xss CONFIRMED (marker bhX1) origin=http://h:3000"
     assert r["rounds"][0][1]["snippet"] == "xss none (marker bhX1)"
 
     monkeypatch.setattr(proof, "_browse", lambda st: (200, "xss CONFIRMED (marker bhX1)", False))
@@ -428,3 +468,83 @@ def test_the_stored_state_keeps_no_token_under_an_identity(tmp_path):
     p.write_text(json.dumps(st))
     b.scrub_state(p, "copilot.example.com", None, sso=("login.microsoftonline.com",))
     assert json.loads(p.read_text()) == st
+
+
+def test_a_websocket_counts_once_its_handshake_was_accepted():
+    """R17: the page's `websocket` event comes before the handshake: only a frame proves the socket opened."""
+
+    class Ws:
+        def __init__(self):
+            self.handlers = {}
+
+        def on(self, event, cb):
+            self.handlers.setdefault(event, []).append(cb)
+
+        def emit(self, event):
+            for cb in self.handlers.get(event, []):
+                cb("payload")
+
+    r = b.Result(url="http://h/")
+    refused, opened = Ws(), Ws()
+    b.count_when_open(refused, r)
+    b.count_when_open(opened, r)
+    refused.emit("socketerror")
+    refused.emit("close")
+    assert r.websockets_open == 0
+    opened.emit("framesent")
+    opened.emit("framereceived")
+    opened.emit("framesent")
+    assert r.websockets_open == 1
+
+
+def test_websocket_lines_no_longer_promise_polling():
+    text = "\n".join(b.render(_fake(websockets=2, websockets_open=1)))
+    assert "polling" not in text and "2 refused locally" in text and "handshake accepted" in text
+
+
+def test_a_challenge_points_to_wait_human_not_to_a_blocker():
+    """R5: a passthrough challenge is passed by a human (bh-web wait-human), not closed as a captcha blocker."""
+    r = _fake()
+    r.support["passthrough"] = 3
+    text = "\n".join(b.render(r))
+    assert "bh-web wait-human" in text and "blocked captcha" not in text
+
+
+def test_docstring_says_single_page_xss_is_an_observation():
+    """R34 (audit I14): one page with --xss is an observation, not a scan."""
+    doc = " ".join(b.__doc__.split())
+    assert "`--xss` on a single page is an observation, not a scan" in doc
+    assert "with --xss a scanner (refused" not in doc
+
+
+def test_a_javascript_url_is_never_followed():
+    assert b.js_url("javascript:alert(1)") and b.js_url("\x00 JAVA\tscript\n:x") and not b.js_url("/javascript:x")
+    with pytest.raises(SystemExit):
+        b.parse_args(["javascript://x/%0aalert(1)"])
+
+
+def test_follows_js_url_asks_the_element_or_the_focused_one():
+    calls = []
+
+    class Loc:
+        first = None
+
+        def evaluate(self, expr, timeout=None):
+            calls.append(("locator", expr, timeout))
+            return True
+
+    Loc.first = Loc()
+
+    class Page:
+        def locator(self, sel):
+            calls.append(("sel", sel))
+            return Loc()
+
+        def evaluate(self, expr):
+            calls.append(("page", expr))
+            return False
+
+    assert b.follows_js_url(Page(), "click", "a#x", 5)
+    assert not b.follows_js_url(Page(), "press", "Enter", 5)
+    assert ("sel", "a#x") in calls and ("locator", b.JS_URL_TARGET, 5) in calls
+    assert any(k == "page" and "document.activeElement" in e for k, e, *_ in calls)
