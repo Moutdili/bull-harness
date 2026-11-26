@@ -180,9 +180,17 @@ def test_copilot_scope_targets_and_support():
         "https://substrate.office.com/search/api/v1/prompts",
         "https://substrate.office.com/search/api/v1/suggestions",
         "https://substrate.svc.cloud.microsoft/m365Copilot/",
+        # 2026-11-26 (Mio): where share links open, file uploads, Notebooks
+        "https://copilot.cloud.microsoft/",
+        "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads",
+        "https://substrate.office.com/recommended/api/",
     }
     # substrate is the whole M365 back end: only the Copilot paths (audit B5)
     assert not check(s, "https://substrate.office.com/api/v2.0/me/messages").allowed
+    # Graph: the Copilot uploads folder only, never the rest of the account (mail, other files)
+    assert check(s, "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads/children").allowed
+    assert not check(s, "https://graph.microsoft.com/v1.0/me/messages").allowed
+    assert not check(s, "https://graph.microsoft.com/v1.0/me/drive/root/children").allowed
     assert check(s, "https://substrate.office.com/m365Copilot/Chathub/x").allowed
     assert s.websockets_on
     assert set(s.support_hosts("sso")) == {"login.live.com", "login.microsoftonline.com"}

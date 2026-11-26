@@ -28,6 +28,11 @@ in_scope:
   - {value: "https://substrate.office.com/search/api/v1/prompts", note: "prompt gallery and its activity"}
   - {value: "https://substrate.office.com/search/api/v1/suggestions", note: "composer suggestions"}
   - {value: "https://substrate.svc.cloud.microsoft/m365Copilot/", note: "alternate chat hub host (in the app's code, not seen live)"}
+  # Added 2026-11-26 (Mio: every in-scope host the consumer app really uses is a target; MSRC "in scope by default"
+  # for Microsoft online services). Each one was seen in the app's code or traffic, our own objects only.
+  - {value: "https://copilot.cloud.microsoft/", note: "where consumer share links open (/chat/share/<base64 {shareId, conversationId}>); our own shares only"}
+  - {value: "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads", note: "file upload: the user's own OneDrive 'Copilot uploads' folder"}
+  - {value: "https://substrate.office.com/recommended/api/", note: "Notebooks (Loop workspaces): recent, deltasync, findsession"}
 # program and browser cards, pinned in every task from the first leg (audit I7; src/bh/cards/)
 cards: [msrc-copilot, bh-web-manual]
 # chat traffic only from bh-browser (audit B2): a prompt reaches Copilot through the one browser where the operator solves
@@ -136,5 +141,14 @@ identities:
         - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
         - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
         - {wait_for: "button:has-text('New chat'), [aria-label='New chat']", timeout: 60}
+        # copilot.cloud.microsoft (where consumer share links open, 2026-11-26) keeps a session of its own: sign in there too
+        - {goto: "https://copilot.cloud.microsoft/chat"}
+        - {fill: "input[type=email]", value: "{email}", optional: true, timeout: 20}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "[data-test-id], div[role=button]:has-text('@')", optional: true, timeout: 8}
+        - {fill: "input[type=password]", value: "{password}", optional: true, timeout: 10}
+        - {click: "button[type=submit], input[type=submit]", optional: true, timeout: 8}
+        - {click: "button:has-text('Yes'), button:has-text('Continue')", optional: true, timeout: 8}
+        - {wait_for: {url: "copilot.cloud.microsoft"}, optional: true, timeout: 60}
       capture: {cookies: true, authorization: true}
 notes: "MSRC Copilot bounty (https://www.microsoft.com/en-us/msrc/bounty-ai). The MSRC page declares in scope 'copilot.microsoft.com and copilot.ai ... when tested using a personal account': we test our own two personal accounts only (user-a, user-b). Cross-user impact is what pays (program card). Every report gives the conversation identifier, obtained by typing /id in the conversation. Login and asset hosts are support hosts, never targets. substrate.* hosts: our own conversations only. One conversation at a time, never a flood of prompts. Cloudflare Turnstile guards message sending: never solved, evaded or worked around by the agent; the operator passes it in the agent's browser (bh-web wait-human, program card)."
