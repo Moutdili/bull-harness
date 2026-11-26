@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from bh import paths
+from bh.agent.contract import BLOCKER_REASONS, BLOCKER_TTL_S, CHALLENGE_BLOCKER_TTL_S, CHALLENGE_REASONS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -71,13 +72,44 @@ MIGRATIONS = (
     ("findings", "proof", "TEXT"),  # proof.json written by the agent (steps: setup / attack / control)
     ("findings", "replay", "TEXT"),  # verifier stage A: deterministic replay result (JSON)
     ("findings", "poc_triager", "TEXT"),  # PoC generated from the replayed proof, sessions as placeholders
+    ("runs", "blockers", "INTEGER"),  # blocker facts the segment recorded
+    ("runs", "rotations", "INTEGER"),  # fresh sessions started on the context threshold (runner, 4.2b)
+    ("runs", "max_context", "INTEGER"),  # largest per-turn context of the segment, tokens
+    # observation proof (audit I1): {"token": "BH-SECRET-<16 hex>", "victim": ..., "attacker": ...}; the verdict
+    # comes from the gate's journal, read by the host (bh.runner.observation), never from the hunter
+    ("findings", "observation", "TEXT"),
 )
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
 PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
 
-TODO_KINDS = {"auth", "waf", "account", "scope-question", "refusal", "submit", "verify", "quota", "other"}
-FINDING_STATUS = {"new", "verifying", "verified", "inconclusive", "rejected", "submitted", "duplicate"}
-FINDING_FIELDS = ("severity", "vuln_class", "url", "summary", "poc", "evidence", "not_proven", "proof")
+# The only human step left: submitting a verified finding. Anything that blocks the hunt is a blocker fact.
+TODO_KINDS = {"submit"}
+# needs-proof: stage A found no differential (the control answered like the attack). The proof is at fault, not
+# necessarily the finding: the hunter gets one chance to send a better one (issue 34). The column has no CHECK
+# constraint, so a new status needs no schema migration.
+FINDING_STATUS = {
+    "new",
+    "verifying",
+    "verified",
+    # observation proof: the gate saw the victim's canary on the attacker's side, the hunter never sent it (I1)
+    "verified-evidence",
+    "inconclusive",
+    "needs-proof",
+    "rejected",
+    "submitted",
+    "duplicate",
+}
+FINDING_FIELDS = (
+    "severity",
+    "vuln_class",
+    "url",
+    "summary",
+    "poc",
+    "evidence",
+    "not_proven",
+    "proof",
+    "observation",
+)
 
 
 class Board:
@@ -91,6 +123,15 @@ class Board:
         for table, col, typ in MIGRATIONS:
             if col not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        if not self.meta_get("todos-v2"):
+            # Todos of the old model (auth, waf, ...) waited on a human who is no longer in the loop.
+            # They are marked obsolete, not deleted: the history stays readable.
+            self.db.execute(
+                "UPDATE todos SET status='obsolete', closed=? WHERE status='open' AND kind NOT IN "
+                f"({', '.join('?' * len(TODO_KINDS))})",
+                (time.time(), *sorted(TODO_KINDS)),
+            )
+            self.meta_set("todos-v2", str(time.time()))
         self.db.commit()
 
     # ---- meta (cursors, flags)
@@ -132,6 +173,12 @@ class Board:
     def reset_program(self, program: str) -> dict[str, int]:
         """Forget everything about one program (training labs). Returns affected rows per table."""
         out = {t: self.db.execute(f"DELETE FROM {t} WHERE program=?", (program,)).rowcount for t in PROGRAM_TABLES}
+        # the asset graph (bh.assets) lives in the same file: without this a reset lab keeps its old surface
+        if self.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='assets'"):
+            ids = "SELECT id FROM assets WHERE program=?"
+            for t in ("coverage", "tests", "asset_links"):
+                self.db.execute(f"DELETE FROM {t} WHERE asset_id IN ({ids})", (program,))
+            out["assets"] = self.db.execute("DELETE FROM assets WHERE program=?", (program,)).rowcount
         archived = f"{program}~{time.strftime('%Y%m%d-%H%M%S')}"
         out["runs (archived)"] = self.db.execute(
             "UPDATE runs SET program=? WHERE program=?", (archived, program)
@@ -215,6 +262,7 @@ class Board:
         title: str,
         summary: str = "",
         evidence: str = "",
+        *,
         kind: str = "fact",
         run_id: int | None = None,
     ) -> int:
@@ -224,6 +272,29 @@ class Board:
         )
         self.db.commit()
         return int(cur.lastrowid)
+
+    def add_blocker(
+        self,
+        program: str,
+        reason: str,
+        title: str,
+        detail: str = "",
+        *,
+        run_id: int | None = None,
+        host: str | None = None,
+    ) -> int:
+        """A lead the agent cannot finish without a human: recorded, never waited on.
+        Fact kind 'blocker', title "[reason] title"; the host (if any) is kept as evidence "host:<name>"."""
+        if reason not in BLOCKER_REASONS:
+            reason = "other"
+        return self.add_fact(
+            program,
+            f"[{reason}] {title}",
+            detail,
+            f"host:{host}" if host else "",
+            kind="blocker",
+            run_id=run_id,
+        )
 
     def add_intent(self, program: str, title: str, run_id: int | None = None) -> int:
         cur = self.db.execute(
@@ -275,7 +346,7 @@ class Board:
         self, kind: str, title: str, detail: str = "", program: str | None = None, dedup: str | None = None
     ) -> int | None:
         if kind not in TODO_KINDS:
-            kind = "other"
+            raise ValueError(f"todo kind {kind!r} is not post-triage work (blockers go through add_blocker)")
         try:
             cur = self.db.execute(
                 "INSERT INTO todos(program, kind, title, detail, dedup, created) VALUES (?,?,?,?,?,?)",
@@ -294,23 +365,38 @@ class Board:
     def rows(self, sql: str, *args: Any) -> list[sqlite3.Row]:
         return list(self.db.execute(sql, args))
 
-    def frontier(self, program: str, max_facts: int = 25) -> str:
-        """Compact context for the agent: titles only, newest first. Target <= ~40 lines."""
+    def frontier(self, program: str, max_facts: int = 25, *, passthrough: bool = False) -> str:
+        """Compact context for the agent: titles only, newest first. Target <= ~40 lines.
+        `passthrough`: the scope has a host behind a human challenge that the operator passes in bh-web. A captcha or
+        challenge blocker is then a wait, not a wall: shown CHALLENGE_BLOCKER_TTL_S only, under "retry"."""
         # Bookkeeping facts repeat every segment (one HANDOFF, one "gate denied" per run): only the latest
-        # of each kind is worth resending; every other fact stays, newest first.
+        # of each kind is worth resending; every other fact stays, newest first. Blockers have their own section.
         facts = self.rows(
-            "SELECT id, kind, title FROM facts WHERE program=? AND (kind NOT IN ('handoff', 'blocked') OR id IN "
+            "SELECT id, kind, title FROM facts WHERE program=? AND kind != 'blocker' AND "
+            "(kind NOT IN ('handoff', 'blocked') OR id IN "
             "(SELECT MAX(id) FROM facts WHERE program=? AND kind IN ('handoff', 'blocked') GROUP BY kind)) "
             "ORDER BY id DESC LIMIT ?",
             program,
             program,
             max_facts,
         )
+        # Past the TTL a blocker is dropped from view: the wall may be gone, the lead is worth a new look.
+        now = time.time()
+        blockers = self.rows(
+            "SELECT id, title, created FROM facts WHERE program=? AND kind='blocker' AND created>=? "
+            "ORDER BY id DESC LIMIT 10",
+            program,
+            now - BLOCKER_TTL_S,
+        )
+        retry = []
+        if passthrough:
+            waits = tuple(f"[{r}]" for r in CHALLENGE_REASONS)
+            retry = [r for r in blockers if r["title"].startswith(waits)]
+            waiting = {r["id"] for r in retry}
+            blockers = [r for r in blockers if r["id"] not in waiting]
+            retry = [r for r in retry if r["created"] >= now - CHALLENGE_BLOCKER_TTL_S]
         intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)
-        todos = self.rows(
-            "SELECT id, kind, title FROM todos WHERE status='open' AND (program=? OR program IS NULL)", program
-        )
         out: list[str] = []
         if findings:
             out.append("## findings")
@@ -321,9 +407,12 @@ class Board:
         if facts:
             out.append(f"## facts (latest {len(facts)}; details: bh-note show <id>)")
             out += [f"- {r['id']} ({r['kind']}) {r['title']}" for r in reversed(facts)]
-        if todos:
-            out.append("## waiting on human")
-            out += [f"- T{r['id']} [{r['kind']}] {r['title']}" for r in todos]
+        if blockers:
+            out.append("## blocked (do not retry)")
+            out += [f"- {r['id']} {r['title']}" for r in reversed(blockers)]
+        if retry:
+            out.append("## blocked, retry: `bh-web state` (a human challenge the operator may have passed)")
+            out += [f"- {r['id']} {r['title']}" for r in reversed(retry)]
         return "\n".join(out) if out else "(board empty: first session on this program)"
 
     def export_facts(self, program: str, path: Path) -> None:

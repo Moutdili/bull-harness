@@ -18,6 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CARDS_DIR = Path(__file__).parent / "cards"
+# first pass of the access-control classes (idor, broken-access-control): the builtin and the proof it leaves
+AUTHZ_TOOL = (
+    "`bh-authz` (after mapping, 2+ identities): every known endpoint as each identity and anonymous; it flags owner "
+    "data seen by another identity (horizontal) or a role's answer given to a lower role (vertical), and with "
+    "`--write-own` a cross-identity PATCH on your own object. It leaves raw/authz-*/proof.json for the best candidate: "
+    "read it, then `bh-note finding ... --class idor|broken-access-control --proof <that path>`."
+)
 MAX_CARDS = 3  # per segment: cards are resent every turn
 
 
@@ -30,6 +37,7 @@ class VulnClass:
     evidence: str = ""
     card: bool = False  # has a method card
     weight: float = 1.0  # < 1 for signals that match broadly (every /api/ route, every login page)
+    tool: str = ""  # the builtin that does the first pass for this class (shown with the card, not to the verifier)
 
     def __post_init__(self) -> None:  # `(r"x")` is a str, not a tuple: accept both
         for name in ("aliases", "path_signals", "param_signals"):
@@ -54,6 +62,26 @@ CLASSES: tuple[VulnClass, ...] = (
         "request for A's own object works and an unauthenticated request is refused. An empty 200, an OPTIONS "
         "or preflight answer, or public data is not access.",
         True,
+        tool=AUTHZ_TOOL,
+    ),
+    VulnClass(
+        "broken-access-control",
+        (
+            "broken-access-control",
+            "access-control",
+            "missing-access-control",
+            "improper-access-control",
+            "bfla",
+            "broken-function-level-authorization",
+            "missing-function-level-access-control",
+            "vertical-privilege-escalation",
+        ),
+        evidence="A lower-privileged identity (or no session) reads or performs what only a higher role, or only the "
+        "object's owner or tenant, may: the answer holds that role's or owner's data, or the action takes effect. "
+        "Control: the same request as an identity without the right, or without a session, is refused. The same "
+        "public answer for everyone, or an answer without the protected data, is not a bypass.",
+        card=True,
+        tool=AUTHZ_TOOL,
     ),
     VulnClass(
         "auth",
@@ -100,8 +128,10 @@ CLASSES: tuple[VulnClass, ...] = (
         (r"/(search|comment|feedback|review|profile|message|post)",),
         (r"q|query|search|message|comment|name|title|text"),
         "The payload reaches an executable context unencoded (HTML tag or attribute, script, javascript: URL) and "
-        "executes. Reflection alone, or a payload that is HTML-encoded, is not XSS. Without a browser, report the "
-        "exact context and say that execution is not proven.",
+        "executes. Reflection alone, or a payload that is HTML-encoded, is not XSS. Prove execution in a real "
+        "browser: `bh-browse '<url with payload>' --xss <marker>` with a payload that calls alert('<marker>'); "
+        "only `xss CONFIRMED (marker ...)` is proof. Client-side routes (`/#/...`) and DOM sinks are tested the "
+        'same way; in proof.json such a step carries `"browse": {"xss": "<marker>"}`.',
         True,
     ),
     VulnClass(
@@ -111,7 +141,7 @@ CLASSES: tuple[VulnClass, ...] = (
         (r"url|uri|link|src|source|dest|redirect_uri|callback|webhook|image(_?url)?|feed|proxy|fetch|host"),
         "The target's server fetched a URL we chose and returned or acted on internal content (cloud metadata, an "
         "internal-only host). The sandbox has no out-of-band listener: a blind SSRF cannot be proven here; record "
-        "it as a lead for the human.",
+        '`bh-note blocked oob-needed "<url and parameter>"`.',
         True,
     ),
     VulnClass(
@@ -180,6 +210,28 @@ CLASSES: tuple[VulnClass, ...] = (
         True,
         0.1,
     ),
+    VulnClass(
+        "prompt-injection",
+        (
+            "prompt-injection",
+            "indirect-prompt-injection",
+            "cross-domain-prompt-injection",
+            "xpia",
+            "llm-prompt-injection",
+            "ai-prompt-injection",
+        ),
+        (r"/(chat|copilots?|assistants?|conversations?|completions?|prompts?|llm|genai|ai|bots?)(/|$| |\?)",),
+        (r"prompt|system_?prompt|instructions?",),
+        "Content that identity A controls (document, mail, page, file) makes the AI acting for identity B do "
+        "something B did not ask and A may not do (an action in B's account), or return B's data to A. Proof: "
+        "the canary BH-SECRET-<16 hex> planted in B's data only and seen by the gate on A's side (an observation "
+        "proof: never sent by A), or the action seen in B's account read back, outside the model's prose, in k "
+        "of N runs (N >= 3). Control: the same content without the "
+        "instruction, or the same request by B without the poisoned source, shows neither. The model saying it "
+        "leaked data, a jailbreak or harmful text, self-impact (attacker = victim) and system prompt extraction "
+        "are not findings.",
+        True,
+    ),
     # exclusion-only classes (no card): names programs use in their non-qualifying lists
     VulnClass("dos", ("denial-of-service", "ddos", "resource-exhaustion", "dos")),
     VulnClass("race-condition", ("race-condition", "race-conditions")),  # excluding it must not drop business-logic
@@ -214,6 +266,7 @@ _DISTINCT = {
     "bruteforce",
     "nosqli",
     "graphql",
+    "xpia",
 }
 _IN_PHRASE = sorted(((a, cid) for a, cid in _ALIAS.items() if "-" in a or a in _DISTINCT), key=lambda ac: -len(ac[0]))
 _FILLER = {"attack", "attacks", "vulnerability", "vulnerabilities", "issue", "issues", "bug", "bugs", "flaw", "flaws"}
@@ -291,10 +344,45 @@ def select_cards(
     return [cid for _, cid in ranked[:limit]]
 
 
-def cards_block(class_ids: list[str]) -> str:
-    if not class_ids:
+_CARD_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+SANDBOX_CARDS_DIR = "/opt/bh/cards"  # src/bh/cards, mounted read-only in the agent container (compose.yaml)
+
+
+def pinned_cards(scope) -> list[str]:
+    """The scope's `cards:` (audit I7): always injected, from the first leg. Each must name a file of CARDS_DIR;
+    a bad or missing one is an operator error, raised before the segment starts."""
+    names = [str(n) for n in (getattr(scope, "cards", ()) or ())]
+    for n in names:
+        if not _CARD_NAME.fullmatch(n) or not (CARDS_DIR / f"{n}.md").is_file():
+            raise ValueError(f"scope card {n!r}: no {CARDS_DIR.name}/{n}.md")
+    return list(dict.fromkeys(names))
+
+
+def _card(c: str) -> str:
+    cls = BY_ID.get(c)
+    if cls is None or not cls.card:  # a program card: its text only
+        return card_text(c)
+    return (
+        f"{card_text(c)}\n"
+        + (f"Tool: {cls.tool}\n" if cls.tool else "")
+        + f"Proof standard (the verifier applies exactly this): {cls.evidence}"
+    )
+
+
+def cards_block(class_ids: list[str], pinned: list[str] | tuple[str, ...] = ()) -> str:
+    """Cards for one task: the scope's pinned ones first, then those picked from the attack surface (a pinned card is
+    never repeated). Every card is also readable on demand under SANDBOX_CARDS_DIR."""
+    picked = [c for c in class_ids if c not in pinned]
+    if not picked and not pinned:
         return ""
-    cards = [
-        f"{card_text(c)}\nProof standard (the verifier applies exactly this): {BY_ID[c].evidence}" for c in class_ids
-    ]
-    return "\n\n".join(["# Method cards for this segment (picked from the attack surface)", *cards])
+    out = []
+    if pinned:
+        out += ["# Program cards (pinned by the operator for this program)", *(_card(c) for c in pinned)]
+    if picked:
+        out += ["# Method cards for this segment (picked from the attack surface)", *(_card(c) for c in picked)]
+    out.append(f"Other cards: `Read {SANDBOX_CARDS_DIR}/<name>.md` ({', '.join(all_cards())}).")
+    return "\n\n".join(out)
+
+
+def all_cards() -> list[str]:
+    return sorted(p.stem for p in CARDS_DIR.glob("*.md"))

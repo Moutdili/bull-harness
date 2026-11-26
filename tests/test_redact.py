@@ -38,3 +38,23 @@ def test_free_text_and_malformed_proofs():
     assert "hunter2" not in redact.text('{"password": "hunter2"}') and "hunter2" not in redact.text("password=hunter2")
     scope = scope_from_dict({"schema": 1, "program": "p", "platform": "local", "in_scope": ["h.example"]}, origin="t")
     assert triager_poc(scope, {"steps": ["nope", {"url": 5, "headers": "x"}]})  # never raises
+
+
+def test_identity_cookies_never_reach_the_agent_in_clear():
+    from bh.gate import session
+
+    # flow files keep no cookie value, whatever its origin (identity jar or agent)
+    assert redact.header("Set-Cookie", "sid=abc123; Path=/") == "<redacted:set-cookie>"
+    assert redact.header("cookie", "sid=abc123; theme=dark") == "<redacted:cookie>"
+    # the live answer the agent receives under an identity: name and attributes, never the value
+    masked = session.mask_set_cookie("sid=abc123; Path=/; HttpOnly", "<identity:user-a>")
+    assert "abc123" not in masked and masked.startswith("sid=<identity:user-a>;")
+    # session-dead events carry the URL through redact.url: a session token in the query stays out
+    assert "abc123" not in redact.url("https://t/x?session=abc123&a=1")
+
+
+def test_url_redaction_never_raises():
+    """The gate redacts the URL of every event it logs (B4), refusals included: a URL urlsplit rejects is cut."""
+    assert redact.url("https://a.t/x?token=abc&q=1") == "https://a.t/x?token=<redacted:token>&q=1"
+    out = redact.url("http://[::1/x?token=abc")
+    assert "abc" not in out and out.startswith("http://[::1") and out.endswith("<redacted:url>")

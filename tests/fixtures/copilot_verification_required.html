@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- Reconstructed from the live observation of 2026-11-25/26 (docs/research/19, B4), not a saved page: the Copilot
+     chat, a conversation long enough that the 600-character rule alone does not apply, the user's last message held
+     by Turnstile, the widget's iframe (challenges.cloudflare.com) inside the composer area, and the label
+     "Verification required" under the message. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Microsoft Copilot: Your AI companion</title></head>
+<body>
+<nav><a href="/">New chat</a> <a href="/discover">Discover</a> <a href="/library">Library</a></nav>
+<main>
+  <div role="log" aria-label="Conversation">
+    <div class="msg user"><p>Summarise the main differences between TCP and UDP for a network course.</p></div>
+    <div class="msg ai">
+      <p>TCP is connection oriented: a three-way handshake opens the connection, every segment is acknowledged, lost
+      segments are retransmitted and the receiver gets the bytes in order. Flow control (the receive window) and
+      congestion control (slow start, congestion avoidance) keep the sender from overwhelming the network.</p>
+      <p>UDP sends independent datagrams with no handshake, no acknowledgement, no ordering and no retransmission.
+      It has a smaller header and no connection state, which suits DNS queries, streaming media, voice and games
+      where a late packet is worth less than a lost one.</p>
+      <p>In short: choose TCP when every byte must arrive in order, UDP when latency matters more than completeness.</p>
+    </div>
+    <div class="msg user"><p>Now give me three exam questions on that topic, with answers.</p></div>
+    <div class="msg-status"><span>Verification required</span></div>
+  </div>
+  <form class="composer">
+    <div class="turnstile"><iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv/0/abc/0x4AAAAAAA/auto/fbE/new/normal/auto/" title="Widget containing a Cloudflare security challenge" width="300" height="65"></iframe></div>
+    <textarea placeholder="Message Copilot" aria-label="Message Copilot"></textarea>
+    <button type="submit" aria-label="Submit message">Send</button>
+  </form>
+</main>
+<script>/* the app bundle, not visible text */ window.__app = {};</script>
+</body>
+</html>

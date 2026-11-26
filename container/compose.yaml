@@ -1,9 +1,28 @@
 # bull-harness runtime. Podman rootless + podman-compose (docker compose compatible).
-#   sandbox : internal network, NO route out. agent + gate.
+#   sandbox : internal network, NO route out. agent + judge + login + browser + gate.
 #   egress  : normal network. gate only.
 #   lab     : internal network for local practice targets (profile "lab"). gate only.
-# The gate is therefore the only path from the agent to anything.
+# The gate is therefore the only path from the agent (and the judge, and the login browser) to anything.
 name: bh
+
+# What the agent and the judge share: same image, same gate (proxy + Claude API relay), same environment.
+x-sandbox-environment: &sandbox_env
+  # placeholder only: the gate relay injects the real token (src/bh/gate/addon.py, RELAY_PORT)
+  CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-bh-relay-placeholder-the-real-token-lives-in-the-gate-only
+  ANTHROPIC_BASE_URL: http://gate:8081
+  HTTP_PROXY: http://gate:8080
+  HTTPS_PROXY: http://gate:8080
+  http_proxy: http://gate:8080
+  https_proxy: http://gate:8080
+  NO_PROXY: localhost,127.0.0.1,gate
+  no_proxy: localhost,127.0.0.1,gate
+  SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+  NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+  REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+  CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  DISABLE_AUTOUPDATER: "1"
+  BH_GATE: http://gate:8080
 
 networks:
   sandbox:
@@ -14,6 +33,9 @@ networks:
     ipam:
       config:
         - subnet: 10.231.0.0/24
+
+volumes:
+  browser-profile: {}
 
 services:
   gate:
@@ -63,23 +85,14 @@ services:
     cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
     pids_limit: 2048
     mem_limit: 6g
+    # BH_BROWSER_TOKEN (secrets/browser.env, made by `bh up`): the agent's key to bh-browser's narrow API
+    env_file:
+      - ../secrets/browser.env
     environment:
-      # placeholder only: the gate relay injects the real token (src/bh/gate/addon.py, RELAY_PORT)
-      CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-bh-relay-placeholder-the-real-token-lives-in-the-gate-only
-      ANTHROPIC_BASE_URL: http://gate:8081
-      HTTP_PROXY: http://gate:8080
-      HTTPS_PROXY: http://gate:8080
-      http_proxy: http://gate:8080
-      https_proxy: http://gate:8080
-      NO_PROXY: localhost,127.0.0.1,gate
-      no_proxy: localhost,127.0.0.1,gate
-      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
-      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
-      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
-      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-      DISABLE_AUTOUPDATER: "1"
-      BH_GATE: http://gate:8080
+      <<: *sandbox_env
+      NO_PROXY: localhost,127.0.0.1,gate,browser
+      no_proxy: localhost,127.0.0.1,gate,browser
+      BH_BROWSER_URL: http://browser:8790
     volumes:
       - ../var/gate-ca:/gate-ca:ro,z
       - ../var/work:/work:z
@@ -88,9 +101,133 @@ services:
       # sandbox code only (bh.agent): the rest of the harness stays out of the agent's reach
       - ../src/bh/__init__.py:/opt/bh/lib/bh/__init__.py:ro,z
       - ../src/bh/agent:/opt/bh/lib/bh/agent:ro,z
+      # method and program cards, read on demand with the Read tool (audit I7); the task names the pinned ones
+      - ../src/bh/cards:/opt/bh/cards:ro,z
       # pinned nuclei templates, fetched on the host: the gate blocks GitHub
       - ../var/tools/nuclei-templates:/opt/bh/nuclei-templates:ro,z
     networks: [sandbox]
+    restart: unless-stopped
+
+  # The verifier (src/bh/verify.py): replay + claude -p as the Unix user `judge`, in a container of its own.
+  # It reads target answers (prompt injection), so it shares nothing with the hunter but the image and the gate:
+  # its own /work (var/judge, never var/work), its own processes, /tmp and trust store. The gate's relay admits
+  # it by name (BH_JUDGE_HOST, default `judge`). No nuclei templates: the judge does not scan.
+  judge:
+    image: localhost/bh-agent:dev
+    container_name: bh-judge
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 1024
+    mem_limit: 4g
+    environment: *sandbox_env
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+      - ../var/judge:/work:Z
+      - ./agent/bin:/opt/bh/bin:ro,z
+      - ./agent/hooks:/opt/bh/hooks:ro,z
+      - ../src/bh/__init__.py:/opt/bh/lib/bh/__init__.py:ro,z
+      - ../src/bh/agent:/opt/bh/lib/bh/agent:ro,z
+    networks: [sandbox]
+    restart: unless-stopped
+
+  # Independent auditor that runs the code it reviews (container/audit, tools/audit-exec.sh). Profile `audit`: started
+  # only by that script. Sandbox network only; the gate relays its Claude calls by name (role `audit`). It sees a COPY
+  # of the code under /work, never the host tree, secrets/ or var/state; no browser token, no identity.
+  audit:
+    image: localhost/bh-audit:dev
+    container_name: bh-audit
+    profiles: [audit]
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 2048
+    mem_limit: 6g
+    environment:
+      <<: *sandbox_env
+      UV_PROJECT_ENVIRONMENT: /opt/audit-venv
+      UV_OFFLINE: "1"
+      UV_NO_SYNC: "1"
+      PYTHONPATH: /work/repo/src  # the copy under review is the code the tests import (the venv holds the deps only)
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+      - ../var/audit/current:/work:Z
+    command: ["sleep", "infinity"]
+    networks: [sandbox]
+
+  # Browser logins (src/bh/accounts/browser.py): headless Chromium driven by the host through `podman exec -i`,
+  # the script and the credential on stdin. Same image as the agent, sandbox network only, so every request of a
+  # login goes through the gate (scope, rate, required headers). No /work (it never sees the hunter's files), no
+  # Claude relay (no ANTHROPIC_BASE_URL; the gate admits only the agent and the judge by name), no secret at
+  # rest: each login gets a fresh HOME/profile under /tmp/bh-login-*, deleted after it (stack.reset_login).
+  # The gate CA is trusted per login in that HOME's NSS database.
+  login:
+    image: localhost/bh-agent:dev
+    container_name: bh-login
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 512
+    mem_limit: 2g
+    environment:
+      HTTP_PROXY: http://gate:8080
+      HTTPS_PROXY: http://gate:8080
+      http_proxy: http://gate:8080
+      https_proxy: http://gate:8080
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      PLAYWRIGHT_BROWSERS_PATH: /opt/ms-playwright
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+    networks: [sandbox]
+    restart: unless-stopped
+
+  # Persistent headful browser with a remote screen (src/bh/browser_service, docs/research/18): for a human
+  # challenge (Turnstile) that Mio solves himself, in the same browser the agent uses. Profile `browser`: `bh up`
+  # does not start it, `bh browser up` does. Same image, sandbox network only, every request through the gate.
+  # Inside: Xvfb, the distribution's Chromium (headful, stock flags, no user agent of ours) with its profile in the
+  # volume `browser-profile`, CDP and x11vnc on the container's loopback only. The agent reaches the narrow API on
+  # :8790 with BH_BROWSER_TOKEN; the host reaches the control socket and the screen through `podman exec -i` only:
+  # no port is published, the UI relays the screen at /captcha/ behind its login.
+  browser:
+    image: localhost/bh-agent:dev
+    container_name: bh-browser
+    profiles: [browser]
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 1024
+    mem_limit: 3g
+    shm_size: 512m
+    env_file:
+      - ../secrets/browser.env
+    environment:
+      HTTP_PROXY: http://gate:8080
+      HTTPS_PROXY: http://gate:8080
+      http_proxy: http://gate:8080
+      https_proxy: http://gate:8080
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      PLAYWRIGHT_BROWSERS_PATH: /opt/ms-playwright
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+      - browser-profile:/profile
+      # the controller and what it imports, read-only; nothing else of the harness
+      - ../src/bh/__init__.py:/opt/bh/lib/bh/__init__.py:ro,z
+      - ../src/bh/redact.py:/opt/bh/lib/bh/redact.py:ro,z
+      - ../src/bh/browser_service:/opt/bh/lib/bh/browser_service:ro,z
+    networks: [sandbox]
+    command: [python3, -I, -c, "import sys;sys.path.insert(0,'/opt/bh/lib');from bh.browser_service.__main__ import main;main(sys.argv[1:])", serve]
     restart: unless-stopped
 
   # Local practice target: `podman-compose -f container/compose.yaml --profile lab up -d juiceshop`

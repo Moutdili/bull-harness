@@ -1,0 +1,40 @@
+# Local benchmark lab (lab/bench): an unpublished app that measures recall and precision of a hunt. lab/bench/README.md
+# The notes below reach the agent's prompt: they stay neutral on purpose (no hint about what is planted).
+schema: 1
+program: lab-bench
+platform: local
+automation_allowed: true
+scanners_allowed: true
+self_signup: true  # the harness creates its own accounts: `bh accounts enroll scopes/lab/bench.yaml`
+max_rps: 20
+required_headers: {X-Bug-Bounty: bull-harness-lab}
+in_scope:
+  - {value: "10.231.0.20/32", note: "Larkspur Rooms, http://10.231.0.20:8000"}
+out_of_scope: []
+forbidden_vulns: [dos]
+# The app keeps its data in memory: after a restart, `bh accounts refresh` signs the same accounts up again.
+# /api/v1/me answers 401 without a session; the probe also expects the account's email.
+# Role matrix (BH_IDENTITY_ROLES): a sign-up is a `member` with no team, so each account is its own tenant.
+identities:
+  - name: user-a
+    role: member
+    tenant: A
+    probe: {url: "http://10.231.0.20:8000/api/v1/me", status: 200, expect: '"email"'}
+    enroll: &bench
+      email: "bh-{name}-{rand}@lab.local"
+      signup:
+        method: POST
+        url: http://10.231.0.20:8000/api/v1/auth/signup
+        json: {email: "{email}", password: "{password}", name: "{name}"}
+      login:
+        method: POST
+        url: http://10.231.0.20:8000/api/v1/auth/login
+        json: {email: "{email}", password: "{password}"}
+      token: session.token
+      headers: {Authorization: "Bearer {token}", Cookie: "sid={token}"}
+  - name: user-b
+    role: member
+    tenant: B
+    probe: {url: "http://10.231.0.20:8000/api/v1/me", status: 200, expect: '"email"'}
+    enroll: *bench
+notes: "Training target at http://10.231.0.20:8000 . Goal: find reportable vulnerabilities."

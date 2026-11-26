@@ -38,7 +38,6 @@ td.mono, .mono { font-family: var(--mono); font-size: 12.5px; word-break: break-
 .sev-low { background: var(--low); color: #fff; border-color: transparent; }
 .sev-info { background: var(--info); color: #fff; border-color: transparent; }
 .st-verified, .st-submitted { color: var(--ok); } .st-rejected, .st-duplicate { color: var(--muted); text-decoration: line-through; }
-.k-auth, .k-account { color: #7cc4ff; } .k-waf { color: var(--accent); } .k-refusal { color: var(--bad); } .k-submit { color: var(--ok); }
 pre { background: #0a0d10; border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 6px 0; overflow: auto;
   max-height: 420px; font: 12.5px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; }
 .muted { color: var(--muted); } .small { font-size: 12px; } .err { color: var(--bad); }

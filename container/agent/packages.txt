@@ -11,6 +11,8 @@ ca-certificates
 proxychains4
 dnsutils
 util-linux
+# certutil: the gate CA in the NSS DB Chromium reads (bh-browse)
+libnss3-tools
 # recon (ProjectDiscovery and friends)
 subfinder
 httpx-toolkit
@@ -20,7 +22,7 @@ nuclei
 naabu
 assetfinder
 amass
-getallurls
+# gau: not the Kali `getallurls` (gau 1.0.7), the pinned 2.2.4 release (Containerfile step 4b)
 hakrawler
 gospider
 # content discovery / fuzzing

@@ -43,3 +43,11 @@ def test_phases_and_surface(tmp_path):
     s = c.surface(tmp_path)
     assert "2 endpoints (1 with params), 1 tested, 1 untested" in s
     assert "GET /rest/search ?q" in s and "main.js" not in s
+
+
+def test_blocker_contract():
+    assert c.FACT_KINDS == ("fact", "recon", "handoff", "dead-end")
+    assert "blocker" not in c.FACT_KINDS  # host-written only
+    assert {"auth", "waf", "captcha", "write-needed", "oob-needed", "refusal", "other"} <= set(c.BLOCKER_REASONS)
+    assert len(set(c.BLOCKER_REASONS)) == len(c.BLOCKER_REASONS) and c.BLOCKER_REASONS[-1] == "other"
+    assert c.BLOCKER_TTL_S == 7 * 86400

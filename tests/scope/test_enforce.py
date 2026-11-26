@@ -183,3 +183,46 @@ def test_path_exclusion_variants():
     for p in ("/v2/..;/admin", "/v2%2f..%2fadmin", "/v2/%2e%2e/admin"):
         assert not check(s, "https://api.example.com" + p).allowed, p
     assert check(s, "https://api.example.com/v2/users;jsessionid=1").allowed
+
+
+# 0.2b: one '*' inside the first label, and no wildcard over a public suffix
+def _scope(*rules):
+    return scope_from_dict({"program": "p", "platform": "x", "in_scope": list(rules)})
+
+
+@pytest.mark.parametrize(
+    "target,ok",
+    [
+        ("https://api-v2.example.com/", True),
+        ("https://api-.example.com/", False),  # '*' stands for one or more characters
+        ("https://api.example.com/", False),
+        ("https://x.api-v2.example.com/", False),  # one label only, not a subdomain wildcard
+        ("https://api-v2.example.com.evil.com/", False),
+        ("https://api-v2.other.com/", False),
+    ],
+)
+def test_mid_label_wildcard(target, ok):
+    assert check(_scope("api-*.example.com"), target).allowed is ok
+
+
+def test_mid_label_wildcard_in_url_rule():
+    s = _scope("https://api-*.example.com/v1/")
+    assert check(s, "https://api-eu.example.com/v1/users").allowed
+    assert not check(s, "https://api-eu.example.com/v2/").allowed
+
+
+@pytest.mark.parametrize("value", ["*.co.uk", "api-*.co.uk", "*.github.io", "*.com", "https://*.co.uk/", "*-x.com"])
+def test_wildcard_over_public_suffix_refused(value):
+    with pytest.raises(ScopeError, match="public suffix"):
+        _scope(value)
+
+
+@pytest.mark.parametrize("value", ["*.example.co.uk", "*.me.github.io", "api-*.example.co.uk"])
+def test_wildcard_under_owned_name_allowed(value):
+    _scope(value)
+
+
+@pytest.mark.parametrize("value", ["a*b*.example.com", "api-*.*.example.com", "api.*-x.example.com"])
+def test_other_wildcard_shapes_refused(value):
+    with pytest.raises(ScopeError, match="wildcard"):
+        _scope(value)

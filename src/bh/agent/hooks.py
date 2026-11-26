@@ -1,7 +1,9 @@
 """Claude Code hooks for the agent (registered in container/agent/hooks/settings.json).
 
 PreToolUse(Bash):  log the command; enforce the tool lock; record tested endpoints.
-PostToolUse(Bash): long outputs go to raw/, the model sees head + tail + the path.
+PostToolUse(Bash): long outputs go to raw/, the model sees head + tail + the path. Exception: a bare
+`bh-web text` / `bh-web frames` (already bounded by bh-browser; a chat's answer sits at the end and must not be
+elided) is shown whole up to EXEMPT_CHARS.
 
 Both fail open on unexpected errors: a broken hook must not stall the hunt. An unreadable
 coverage file is not an error, it reads as "nothing covered" and keeps the lock closed.
@@ -14,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import sys
 import time
 
@@ -22,15 +25,29 @@ from bh.agent import contract as c
 MAX_LINES = int(os.environ.get("BH_TRUNC_LINES", "80"))
 MAX_CHARS = int(os.environ.get("BH_TRUNC_CHARS", "8000"))
 HEAD, TAIL = 30, 12
+# bh-web text answers at most TAIL_MAX (20 000) characters plus a one-line note; frames at most 200 redacted frames
+EXEMPT_CHARS = int(os.environ.get("BH_TRUNC_EXEMPT_CHARS", "24000"))
+EXEMPT_WEB = ("text", "frames")
+_SHELL_OPS = set(";&|()<>\n`$")
 
 
 # ------------------------------------------------------------------ PreToolUse
 def rules_decision(cmd: str) -> str | None:
     """Program rules the harness enforces in the sandbox: no automated scanner when the program forbids them,
-    and the verifier re-tests by hand only (no scanners, no mapping tools)."""
-    if c.is_verifier() and (c.runs_scanner(cmd) or c.runs_mapper(cmd)):
-        return f"{c.RULES_MARK} the verifier re-tests with single requests (curl / bh-agent replay), no tools."
-    if not c.scanners_allowed() and c.runs_scanner(cmd):
+    and the verifier re-tests by hand only (no scanners, no mapping tools but bh-browse). A bh-note's text is
+    never taken for a tool run."""
+    if c.is_verifier():
+        # bh-browse renders one page: the only way to re-test a DOM XSS or a client-side route
+        tools = c.without_commands(cmd, ("bh-note", "bh-browse"))
+        if c.runs_scanner(tools) or c.runs_mapper(tools):
+            return (
+                f"{c.RULES_MARK} the verifier re-tests with single requests (curl, q, bh-agent replay, bh-browse), "
+                "no other tools."
+            )
+        return None
+    tools = c.without_commands(cmd, ("bh-note",))
+    # one rendered page with one marker is an observation, not a scan (audit I14, Mio's decision)
+    if not c.scanners_allowed() and c.runs_scanner(tools) and not c.single_page_xss(tools):
         return (
             f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
             "hand-made requests at a low rate; do not try another scanner."
@@ -89,6 +106,18 @@ def pre_tool_use(ev: dict) -> dict | None:
 
 
 # ------------------------------------------------------------------ PostToolUse
+def exempt(cmd: str) -> bool:
+    """A single `bh-web text|frames ...` command, no pipe, redirection, substitution or second command: its output
+    is the browser's own bounded answer, so the hook does not elide it (up to EXEMPT_CHARS)."""
+    if not cmd or any(ch in _SHELL_OPS for ch in cmd):
+        return False
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return False
+    return len(words) >= 2 and os.path.basename(words[0]) == "bh-web" and words[1] in EXEMPT_WEB
+
+
 def _shrink(text: str, label: str, tool_id: str) -> tuple[str, dict | None]:
     lines = text.splitlines()
     if len(lines) <= MAX_LINES and len(text) <= MAX_CHARS:
@@ -112,7 +141,13 @@ def post_tool_use(ev: dict) -> dict | None:
     if ev.get("tool_name") != "Bash" or not isinstance(resp, dict):
         return None
     tid = ev.get("tool_use_id") or str(time.time())
-    out, s1 = _shrink(resp.get("stdout") or "", "stdout", tid)
+    inp = ev.get("tool_input")
+    cmd = inp.get("command") if isinstance(inp, dict) else None
+    stdout = resp.get("stdout") or ""
+    if isinstance(cmd, str) and exempt(cmd) and len(stdout) <= EXEMPT_CHARS:
+        out, s1 = stdout, None
+    else:
+        out, s1 = _shrink(stdout, "stdout", tid)
     err, s2 = _shrink(resp.get("stderr") or "", "stderr", tid)
     if not (s1 or s2):
         return None

@@ -59,23 +59,24 @@ async function loadStatus() {
     el("span", {}, status.active_scope ? `scope: ${status.active_scope.program}` : "pas de scope actif"),
     status.running ? el("span", { style: "color:var(--accent)" }, `● run ${status.running.id}`) : null);
   $("#n-find").textContent = status.findings_to_review || "";
-  $("#n-todo").textContent = status.open_todos || "";
+  $("#n-submit").textContent = status.to_submit || "";
+  $("#n-block").textContent = status.blockers_24h || "";
 }
 
 // ------------------------------------------------------------------ dashboard
 views.dash = async () => {
-  const [runs, todos, findings] = await Promise.all([api("/api/runs"), api("/api/todos"), api("/api/findings")]);
+  const [runs, blockers, findings] = await Promise.all([api("/api/runs"), api("/api/blockers"), api("/api/findings")]);
   const s = status.severity;
   fill($("#dash"),
     el("h2", {}, "Findings par sévérité"),
     el("div", { class: "grid" }, ...Object.keys(s).map((k) =>
       el("div", { class: `card kpi ${k === "critical" ? "crit" : k}` }, el("div", { class: "v" }, s[k]), el("div", { class: "k" }, k)))),
     el("div", { class: "grid", style: "margin-top:12px" },
-      kpi("À relire", status.findings_to_review), kpi("Todo humaine", status.open_todos),
-      kpi("Faits sur le board", status.facts), kpi("Runs", status.runs)),
+      kpi("À soumettre", status.to_submit), kpi("Inconclusive", status.inconclusive), kpi("Preuve à refaire", status.needs_proof),
+      kpi("Pistes bloquées (24 h)", status.blockers_24h), kpi("Faits sur le board", status.facts), kpi("Runs", status.runs)),
     el("div", { class: "two" },
-      el("div", {}, el("h2", {}, "Todo humaine (bloque l'agent)"),
-        todos.length ? todoTable(todos.slice(0, 8)) : el("div", { class: "empty" }, "Rien ne bloque l'agent.")),
+      el("div", {}, el("h2", {}, "Pistes bloquées récentes"),
+        blockers.length ? blockerTable(blockers.slice(0, 8)) : el("div", { class: "empty" }, "Aucune piste bloquée.")),
       el("div", {}, el("h2", {}, "Derniers findings"),
         findings.length ? findingTable(findings.slice(0, 8)) : el("div", { class: "empty" }, "Pas encore de finding."))),
     el("h2", {}, "Derniers runs"), runTable(runs.slice(0, 10)));
@@ -170,7 +171,7 @@ async function openFinding(id) {
       const act = (s) => el("button", { class: `btn ${s === "verified" || s === "submitted" ? "primary" : ""}`, onclick: async () => {
         await api(`/api/findings/${f.id}/status`, { status: s, verdict: v.value }); toast(`F${f.id} → ${s}`); openFinding(f.id); refresh(); } }, s);
       fill(pane, el("p", { class: "muted small" }, "Relis la PoC, rejoue-la, puis classe le finding."),
-        el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "duplicate", "rejected", "new"].map(act)));
+        el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "needs-proof", "duplicate", "rejected", "new"].map(act)));
     }
   }
   fill(body, el("div", { class: "row" }, sev(f.severity), el("h3", { style: "margin:0" }, `F${f.id} · ${f.title}`)), sub, pane);
@@ -178,43 +179,66 @@ async function openFinding(id) {
   drawer(body);
 }
 
-// ------------------------------------------------------------------ human todo
-const TODO_HELP = {
-  auth: "Connecte-toi sur la cible, copie les en-têtes de session (Cookie / Authorization) et enregistre une identité ci-dessous.",
-  account: "Crée le compte demandé (2e utilisateur, rôle…) puis enregistre son identité.",
-  waf: "Ouvre l'URL dans ton navigateur, passe le challenge, copie le cookie de clearance (cf_clearance…) dans une identité, ou marque l'hôte comme bloqué.",
-  "scope-question": "Vérifie sur la page du programme si l'actif est dans le scope. Si oui, ajoute-le au YAML de scope.",
-  refusal: "Le modèle a refusé une action. Lis le run, décide : reformuler, faire à la main, ou abandonner.",
-  submit: "Finding vérifié : relis la PoC et soumets sur la plateforme.",
-};
-views.todo = async () => {
+// ------------------------------------------------------------------ to submit (post-triage)
+// The only human step: a verified finding goes to the platform, then Mio ticks it done.
+views.submit = async () => {
   const [open, done] = await Promise.all([api("/api/todos"), api("/api/todos?status=done")]);
-  fill($("#todo"), el("h2", {}, "À faire pour que l'agent continue"),
-    open.length ? todoTable(open, true) : el("div", { class: "empty" }, "Rien à faire. L'agent n'est pas bloqué."),
-    el("h2", {}, "Fait"), done.length ? todoTable(done.slice(0, 20)) : el("div", { class: "empty" }, "—"));
+  fill($("#submit"), el("h2", {}, "Findings vérifiés à soumettre"),
+    el("p", { class: "muted small" }, "Relis la PoC du finding, soumets-le sur la plateforme, puis coche « Soumis »."),
+    open.length ? todoTable(open, true) : el("div", { class: "empty" }, "Rien à soumettre."),
+    el("h2", {}, "Soumis"), done.length ? todoTable(done.slice(0, 20)) : el("div", { class: "empty" }, "—"));
 };
 function todoTable(t, actions) {
-  return el("table", {}, el("tr", {}, ...["#", "type", "programme", "quoi", "depuis", ""].map((h) => el("th", {}, h))),
+  return el("table", {}, el("tr", {}, ...["#", "programme", "quoi", "depuis", ""].map((h) => el("th", {}, h))),
     ...t.map((x) => el("tr", { class: "click", onclick: () => openTodo(x) },
-      el("td", {}, `T${x.id}`), el("td", { class: `k-${x.kind}` }, x.kind), el("td", {}, x.program || "—"), el("td", {}, x.title),
+      el("td", {}, `T${x.id}`), el("td", {}, x.program || "—"), el("td", {}, x.title),
       el("td", { class: "small muted" }, ago(x.created)),
-      el("td", {}, actions && x.status === "open" ? el("button", { class: "btn", onclick: async (e) => { e.stopPropagation(); await api(`/api/todos/${x.id}/done`, {}); toast(`T${x.id} fait`); refresh(); } }, "Fait") : ""))));
+      el("td", {}, actions && x.status === "open" ? el("button", { class: "btn", onclick: async (e) => { e.stopPropagation(); await closeTodo(x); } }, "Soumis") : ""))));
+}
+async function closeTodo(x) {
+  await api(`/api/todos/${x.id}/done`, {}); toast(`T${x.id} soumis`); $("#drawer").classList.add("hidden"); refresh();
 }
 function openTodo(x) {
+  drawer(el("h3", {}, `T${x.id} · ${x.title}`), el("p", { class: "muted" }, x.program || ""),
+    x.detail ? el("pre", {}, x.detail) : null,
+    x.status === "open" ? el("div", { class: "row" }, el("button", { class: "btn primary", onclick: () => closeTodo(x) }, "Marquer comme soumis")) : null);
+}
+
+// ------------------------------------------------------------------ blocked leads (read-only)
+// Recorded by the agent, which moved on to other work. Nobody is waited on; this is for the next onboarding.
+const blockerHost = (x) => (x.evidence || "").startsWith("host:") ? x.evidence.slice(5) : "—";
+views.blockers = async () => {
+  const rows = await api("/api/blockers");
+  fill($("#blockers"), el("h2", {}, "Pistes bloquées (100 dernières)"),
+    el("p", { class: "muted small" }, "Ce que l'agent n'a pas pu finir seul. Il est passé à autre chose ; à relire avant le prochain onboarding."),
+    rows.length ? blockerTable(rows) : el("div", { class: "empty" }, "Aucune piste bloquée."));
+};
+function blockerTable(rows) {
+  return el("table", {}, el("tr", {}, ...["#", "programme", "quoi", "hôte", "run", "quand"].map((h) => el("th", {}, h))),
+    ...rows.map((x) => el("tr", { class: "click", onclick: () => drawer(el("h3", {}, x.title), el("p", { class: "muted" }, `${x.program} · run ${x.run_id ?? "—"} · ${time(x.created)}`), el("pre", {}, x.summary || "(pas de détail)")) },
+      el("td", { class: "small muted" }, x.id), el("td", {}, x.program), el("td", {}, x.title), el("td", { class: "mono small" }, blockerHost(x)),
+      el("td", { class: "small" }, x.run_id ?? "—"), el("td", { class: "small muted" }, ago(x.created)))));
+}
+
+// ------------------------------------------------------------------ identities (set up outside the hunt)
+views.identities = async () => {
+  const progs = (await api("/api/programs")).filter((p) => p.program);
+  if (!progs.length) { fill($("#identities"), el("div", { class: "empty" }, "Aucun programme.")); return; }
+  const prog = el("select", {}, ...progs.map((p) => el("option", { value: p.program, selected: p.program === status.active_scope?.program }, p.program)));
   const name = el("input", { placeholder: "nom de l'identité (ex: user-c)" });
   const overwrite = el("input", { type: "checkbox" });
   const hdr = el("textarea", { placeholder: "Cookie: session=...\nAuthorization: Bearer ..." });
-  const needsIdentity = ["auth", "account", "waf"].includes(x.kind) && x.program;
-  drawer(el("h3", {}, `T${x.id} · ${x.title}`), el("p", { class: `k-${x.kind}` }, x.kind),
-    el("p", { class: "muted" }, TODO_HELP[x.kind] || ""), x.detail ? el("pre", {}, x.detail) : null,
-    needsIdentity ? el("div", {}, el("h2", {}, `Enregistrer une identité pour ${x.program}`),
-      el("p", { class: "small muted" }, "Une ligne « En-tête: valeur » par ligne. Stocké côté hôte (var/state/identities, chmod 600), injecté par le gate quand l'agent envoie X-BH-Identity. L'agent ne voit jamais la valeur."),
-      el("div", { class: "row" }, name, el("label", { class: "small muted" }, overwrite, " remplacer si elle existe")), hdr,
-      el("div", { class: "row" }, el("button", { class: "btn primary", onclick: async () => {
-        try { const r = await api("/api/identities", { program: x.program, name: name.value, headers: hdr.value, overwrite: overwrite.checked, todo_id: x.id }); toast(`identité ${r.identity} enregistrée`); $("#drawer").classList.add("hidden"); refresh(); }
-        catch (e) { toast(`erreur: ${e.message}`); } } }, "Enregistrer et clore la todo"))) : null,
-    x.status === "open" ? el("div", { class: "row" }, el("button", { class: "btn", onclick: async () => { await api(`/api/todos/${x.id}/done`, {}); toast("fait"); $("#drawer").classList.add("hidden"); refresh(); } }, "Marquer comme fait")) : null);
-}
+  fill($("#identities"),
+    el("h2", {}, "Identités de test par programme"),
+    el("table", {}, el("tr", {}, el("th", {}, "programme"), el("th", {}, "identités")),
+      ...progs.map((p) => el("tr", {}, el("td", {}, p.program), el("td", { class: "mono small" }, p.identities.join(", ") || "—")))),
+    el("h2", {}, "Enregistrer une identité"),
+    el("p", { class: "small muted" }, "À faire avant la chasse, jamais pendant un run. Une ligne « En-tête: valeur » par ligne. Stocké côté hôte (var/state/identities, chmod 600), injecté par le gate quand l'agent envoie X-BH-Identity. L'agent ne voit jamais la valeur."),
+    el("div", { class: "row" }, prog, name, el("label", { class: "small muted" }, overwrite, " remplacer si elle existe")), hdr,
+    el("div", { class: "row" }, el("button", { class: "btn primary", onclick: async () => {
+      try { const r = await api("/api/identities", { program: prog.value, name: name.value, headers: hdr.value, overwrite: overwrite.checked }); toast(`identité ${r.identity} enregistrée`); refresh(); }
+      catch (e) { toast(`erreur: ${e.message}`); } } }, "Enregistrer")));
+};
 
 // ------------------------------------------------------------------ traffic
 let flowGrep = "";
@@ -337,4 +361,4 @@ async function refresh() {
 window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (Object.hasOwn(views, t) && t !== current) show(t); });
 const start = (location.hash || "#dash").slice(1);
 show(Object.hasOwn(views, start) ? start : "dash");
-setInterval(() => { if (["dash", "live", "todo", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);
+setInterval(() => { if (["dash", "live", "submit", "blockers", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);
