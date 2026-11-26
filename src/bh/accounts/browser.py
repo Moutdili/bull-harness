@@ -10,7 +10,8 @@ every request of the login goes through the gate (scope, rate, required headers)
 3. answers the script's questions on the same pipe: `{"need": "totp"}` gets the current RFC 6238 code (the seed
    stays on the host), `{"need": "email_code"}` the code read by the host's mailbox (bh.accounts.mail);
 4. reads back `{"result": {...}}`: cookies of the context, the first Authorization header seen on a request, the
-   declared localStorage keys. The host turns that into the session file (bh.accounts.enroll).
+   last Authorization seen per origin (`authorizations`, I19: each origin's audience), the declared localStorage
+   keys. The host turns that into the session file (bh.accounts.enroll).
 
 The script makes a fresh HOME (and TMPDIR, so Chromium's profile lands there too) per login, trusts the gate CA in
 that HOME's NSS database, and deletes it all on exit. A message from the script never carries a value: errors
@@ -44,6 +45,7 @@ BOOT = "import sys;n=int(sys.stdin.readline());exec(compile(sys.stdin.read(n),'<
 # sys.stdout points at stderr so that nothing else can write a line the host would parse.
 LOGIN_SCRIPT = r"""
 import json, os, shutil, subprocess, sys, tempfile, time
+from urllib.parse import urlsplit
 
 OUT = os.fdopen(os.dup(1), "w", buffering=1)
 sys.stdout = sys.stderr
@@ -52,6 +54,21 @@ HEAVY = {"image", "font", "media"}
 
 class Fail(Exception):
     pass
+
+
+MAX_ORIGINS = 16
+
+
+def origin_of(url):
+    try:
+        p = urlsplit(url)
+        port = p.port
+    except ValueError:
+        return None
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return None
+    host = "[" + p.hostname + "]" if ":" in p.hostname else p.hostname.lower()
+    return p.scheme + "://" + host + ":" + str(port or (443 if p.scheme == "https" else 80))
 
 
 def emit(obj):
@@ -106,12 +123,17 @@ def run(p, home):
 
     deadline = time.monotonic() + p["timeout"]
     auth = {}
+    per_origin = {}
 
     def on_request(req):
+        h = req.headers.get("authorization")
+        if not h:
+            return
         if "value" not in auth:
-            h = req.headers.get("authorization")
-            if h:
-                auth["value"], auth["url"] = h, req.url
+            auth["value"], auth["url"] = h, req.url
+        o = origin_of(req.url)
+        if o and (o in per_origin or len(per_origin) < MAX_ORIGINS):
+            per_origin[o] = h  # the latest: a token refreshed during the login replaces the first
 
     def route(r):
         if r.request.resource_type in HEAVY:
@@ -172,7 +194,10 @@ def run(p, home):
             cap = p["capture"]
             if cap["authorization"]:
                 end = time.monotonic() + max(0.0, min(p["auth_wait"], deadline - time.monotonic()))
-                while "value" not in auth and time.monotonic() < end:
+                wanted = cap.get("authorization_origins") or []
+                while time.monotonic() < end and (
+                    "value" not in auth or any(o not in per_origin for o in wanted)
+                ):
                     page.wait_for_timeout(250)
             cookies = ctx.cookies() if cap["cookies"] else []
             ls = {}
@@ -191,6 +216,7 @@ def run(p, home):
         ],
         "authorization": auth.get("value"),
         "authorization_url": auth.get("url"),
+        "authorizations": per_origin if p["capture"]["authorization"] else {},
         "local_storage": ls,
         "final_url": final,
     }

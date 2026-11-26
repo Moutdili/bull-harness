@@ -30,6 +30,7 @@ def addon(monkeypatch):
     finally:
         os.umask(old)
     monkeypatch.setattr(mod, "_LOGIN_IPS", (time.time(), frozenset()))
+    monkeypatch.setattr(mod, "_BROWSER_IPS", (time.time() + 3600, frozenset()))  # no lookup in a test
     yield mod
     sys.modules.pop("bh.gate.addon", None)
 
