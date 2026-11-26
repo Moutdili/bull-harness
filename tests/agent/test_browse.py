@@ -371,7 +371,10 @@ def _har(tmp_path):
             "response": {"headers": [], "content": {"text": json.dumps({"owner": "a@example.com", "id": 7})}},
         },
         {  # another host: credential headers scrubbed all the same
-            "request": {"url": "https://cdn.other.example/app.js", "headers": [{"name": "authorization", "value": "x"}]},
+            "request": {
+                "url": "https://cdn.other.example/app.js",
+                "headers": [{"name": "authorization", "value": "x"}],
+            },
             "response": {"headers": [], "content": {"text": "var a=1;"}},
         },
     ]

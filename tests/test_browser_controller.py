@@ -6,6 +6,7 @@ import base64
 import json
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -19,7 +20,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------- a DOM -> snapshot, as the driver reads it
 class _Snap(HTMLParser):
-    SKIP = {"script", "style", "head", "title"}
+    SKIP: ClassVar[set[str]] = {"script", "style", "head", "title"}
 
     def __init__(self):
         super().__init__()
@@ -290,7 +291,14 @@ def test_net_reports_gate_refusals_with_redacted_urls():
     d = FakeDriver()
     d.net_rows = [
         {"t": 1, "method": "GET", "url": "https://app.example/api?access_token=abcdef123456", "status": 200},
-        {"t": 2, "method": "POST", "url": "https://evil.example/x", "status": 403, "denied": True, "reason": "bh-gate: DENIED (x)"},
+        {
+            "t": 2,
+            "method": "POST",
+            "url": "https://evil.example/x",
+            "status": 403,
+            "denied": True,
+            "reason": "bh-gate: DENIED (x)",
+        },
     ]
     ctl = Controller(d)
     out = ctl.handle(AGENT_OPS, {"op": "net"})[1]
@@ -304,7 +312,8 @@ def test_upload_is_in_memory_and_bounded():
     ctl = Controller(d)
     data = b"%PDF-1.4 hello"
     code, out = ctl.handle(
-        AGENT_OPS, {"op": "upload", "css": "input[type=file]", "name": "doc.pdf", "content_b64": base64.b64encode(data).decode()}
+        AGENT_OPS,
+        {"op": "upload", "css": "input[type=file]", "name": "doc.pdf", "content_b64": base64.b64encode(data).decode()},
     )
     assert code == 200 and out["bytes"] == len(data)
     assert d.calls == [("upload", "input[type=file]", "doc.pdf", "application/pdf", data)]
@@ -336,7 +345,9 @@ def test_no_frame_output_carries_a_challenge_token():
     assert kept[2] and "Paris is the capital" in kept[2]
     assert kept[5] == "<binary 8 bytes>"
     d = FakeDriver()
-    d.frame_rows = [{"t": i, "dir": "recv", "url": "wss://substrate.example/hub", "text": t} for i, t in enumerate(kept) if t]
+    d.frame_rows = [
+        {"t": i, "dir": "recv", "url": "wss://substrate.example/hub", "text": t} for i, t in enumerate(kept) if t
+    ]
     out = Controller(d).handle(AGENT_OPS, {"op": "frames", "last": 50})[1]
     blob = json.dumps(out) + json.dumps(kept)
     assert CHALLENGE_TOKEN not in blob and "eyJzdWIiOiIx" not in blob
@@ -357,3 +368,37 @@ def test_a_cookie_set_after_the_load_is_scrubbed_too():
 def test_x11vnc_exchanges_no_clipboard():
     argv = x11vnc_argv()
     assert "-noclipboard" in argv and "-nosetclipboard" in argv and "-localhost" in argv
+
+
+# ---------------------------------------------------------------- B4 follow-up: a real snapshot, host only
+def test_snapshot_is_a_host_op_the_agent_cannot_ask():
+    with pytest.raises(Refused):
+        validate(AGENT_OPS, {"op": "snapshot"})
+    assert validate(HOST_OPS, {"op": "snapshot"}) == ("snapshot", {})
+    with pytest.raises(Refused):
+        validate(HOST_OPS, {"op": "snapshot", "html": True})
+
+
+def test_snapshot_is_what_detect_reads_scrubbed_and_feeds_challenge_back(tmp_path, monkeypatch):
+    from bh.browser_service import host
+
+    snap = snapshot_of(COPILOT)
+    snap["text"] += f"\nsid={COOKIE_VALUE}"
+    snap["url"] = f"https://copilot.microsoft.com/chats/x?access_token={COOKIE_VALUE}"
+    d = FakeDriver(snapshot=snap)
+    ctl = Controller(d, clock=lambda: 42.0)
+    ctl.handle(HOST_OPS, session_req())
+    code, out = ctl.handle(HOST_OPS, {"op": "snapshot"})
+    assert code == 200 and out["challenge"]["pending"] is True and out["taken_at"] == 42.0
+    assert set(out["snapshot"]) == {"url", "title", "text", "text_len", "frames"}  # never the HTML
+    assert COOKIE_VALUE not in json.dumps(out)
+    assert any("challenges.cloudflare.com" in f["url"] for f in out["snapshot"]["frames"])
+
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    f = tmp_path / "snap.json"
+    got = host.save_snapshot(f, call_=lambda req: {"code": code, **out} if req == {"op": "snapshot"} else {})
+    assert got == {"ok": True, "file": str(f), "challenge": out["challenge"]}
+    assert f.stat().st_mode & 0o777 == 0o600
+    saved = json.loads(f.read_text())
+    assert challenge(saved["snapshot"]) == saved["challenge"]  # the file is a fixture detect can be tested on
+    assert host.save_snapshot(f, call_=lambda req: {"code": 503, "error": "down"})["code"] == 503

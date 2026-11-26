@@ -21,6 +21,7 @@ import subprocess
 import tarfile
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from bh import paths, stack
@@ -180,6 +181,31 @@ def mark_done() -> dict[str, Any]:
     os.replace(tmp, f)
     told = call({"op": "human_done"}, timeout=30).get("code") == 200
     return {"ok": True, "t": rec["t"], "browser_told": told}
+
+
+def snapshot_file():
+    return paths.var() / "browser" / f"snapshot-{time.strftime('%Y%m%dT%H%M%S')}.json"
+
+
+def save_snapshot(path=None, call_=None) -> dict[str, Any]:
+    """The page as detect.challenge() sees it (controller op `snapshot`, host only), written 0600 to `path`
+    (default var/browser/snapshot-<time>.json): a real fixture for the detection tests. The file holds the visible
+    text of the page (redacted of the session's values and JWTs, but a conversation stays a conversation): read it
+    before it goes under tests/fixtures."""
+    out = (call_ or call)({"op": "snapshot"})
+    if out.get("code") != 200:
+        return out
+    f = Path(path) if path else snapshot_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(
+            {"snapshot": out["snapshot"], "challenge": out["challenge"], "taken_at": out.get("taken_at")},
+            fh,
+            ensure_ascii=False,
+            indent=1,
+        )
+    return {"ok": True, "file": str(f), "challenge": out["challenge"]}
 
 
 def view_url(host: str | None = None, port: int = 7340) -> str:

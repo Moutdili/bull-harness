@@ -75,7 +75,9 @@ def test_a_failed_push_and_a_failing_status_are_said_once():
         raise OSError("down")
 
     said2 = []
-    w2 = watch.ChallengeWatcher(status=boom, push=lambda *a: 1 / 0, running=lambda: True, view=lambda: "", say=said2.append)
+    w2 = watch.ChallengeWatcher(
+        status=boom, push=lambda *a: 1 / 0, running=lambda: True, view=lambda: "", say=said2.append
+    )
     w2.tick()
     w2.tick()
     assert said2 == ["bh-browser watcher: OSError: down"]
