@@ -167,7 +167,7 @@ def test_cleared_at_tells_when_the_challenge_went_away():
 
 # ---------------------------------------------------------------- I17: fill budget
 def test_the_81st_fill_of_a_segment_is_refused_and_the_host_resets_it(tmp_path):
-    ctl = Controller(FakeDriver(), store=str(tmp_path), clock=lambda: 1_700_000_000.0)
+    ctl = Controller(FakeDriver(), store=str(tmp_path), clock=lambda: 1_700_000_000.0, fill_day=1000)
     ctl.handle(HOST_OPS, session_req())
     for _ in range(FILL_SEGMENT):
         assert ctl.handle(AGENT_OPS, {"op": "fill", "css": "textarea", "text": "hi"})[0] == 200
@@ -190,7 +190,7 @@ def test_the_daily_budget_is_per_identity_and_survives_a_reset_and_a_restart(tmp
     again = Controller(FakeDriver(), store=str(tmp_path), clock=lambda: day, fill_segment=1000, fill_day=3)
     code, out = again.handle(AGENT_OPS, {"op": "fill", "css": "t", "text": "x"})
     assert code == 429 and "daily" in out["detail"]
-    # another identity has its own day; the next UTC day starts over
+    # another identity has its own day; the next day (host clock, UTC without tz_offset_min) starts over
     again.handle(HOST_OPS, {"op": "reset"})
     again.handle(HOST_OPS, {**session_req(), "identity": "user-b"})
     assert again.handle(AGENT_OPS, {"op": "fill", "css": "t", "text": "x"})[0] == 200
