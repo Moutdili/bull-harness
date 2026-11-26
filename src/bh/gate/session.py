@@ -53,6 +53,8 @@ MAX_COOKIES_PER_DOMAIN = 64
 MAX_COOKIE_BYTES = 4096  # name + value, the usual browser limit
 MAX_ORIGIN_HEADERS = 16  # origins with a captured header of their own
 ORIGIN_HEADER_NAMES = frozenset({"authorization"})  # what may be captured per origin
+# R46: the only shape a bearer learned from bh-browser may have (printable ASCII, bounded): `Bearer <token>`
+BEARER = re.compile(r"Bearer [\x21-\x7e]{8,8000}", re.I)
 DEAD_WINDOW_S = 60  # at most one session-dead event per identity in this window
 # 401 under an identity: dead only when that many distinct routes answer 401 within the window (H4)
 UNAUTH_ROUTES, UNAUTH_WINDOW_S, UNAUTH_ROUTES_MAX = 3, 600.0, 256
@@ -152,6 +154,7 @@ def normalize(raw: Any, now: float | None = None) -> Session | None:
         "expires_at": float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None,
         "probe": (
             {"url": probe["url"], "status": probe["status"]}
+            | ({"method": probe["method"]} if probe.get("method") in ("GET", "POST") else {})
             if isinstance(probe, dict)
             and isinstance(probe.get("url"), str)
             and isinstance(probe.get("status"), int)
@@ -269,10 +272,14 @@ def _domain_matches(host: str, domain: str) -> bool:
     return host == domain or (host.endswith("." + domain) and parse_ip(host) is None)
 
 
-def merge(session: Session, url: str, set_cookies: list[str], now: float | None = None) -> list[str]:
+def merge(
+    session: Session, url: str, set_cookies: list[str], now: float | None = None, *, deletions: bool = True
+) -> list[str]:
     """Fold the Set-Cookie values of one response into the jar. `url` is the request's, its host already judged
     in scope by the caller. A `Domain` that is not this host or one of its parents (another site), or that is a
-    public suffix, is ignored. Max-Age <= 0 or an Expires in the past deletes. Returns the names changed."""
+    public suffix, is ignored. Max-Age <= 0 or an Expires in the past deletes. Returns the names changed.
+    `deletions=False` (R14, bh-browser's answers): only additions enter the jar; a deletion (an expiry in the past,
+    an empty value) is ignored, so a page that signs a cookie out never empties the agent's session."""
     now = time.time() if now is None else now
     parts = urlsplit(url)
     try:
@@ -302,6 +309,8 @@ def merge(session: Session, url: str, set_cookies: list[str], now: float | None 
                 host_only = False
         if c["secure"] and parts.scheme != "https":
             continue  # RFC 6265bis: an insecure origin cannot set a Secure cookie
+        if not deletions and (c["delete"] or not c["value"]):
+            continue
         if c["delete"]:
             if jar.get(domain, {}).pop(c["name"], None) is not None:
                 changed.append(c["name"])
@@ -326,13 +335,46 @@ def merge(session: Session, url: str, set_cookies: list[str], now: float | None 
     return changed
 
 
-def absorb(file: Path | None, url: str, set_cookies: list[str], *, in_scope: bool, now: float | None = None) -> bool:
+def absorb(
+    file: Path | None,
+    url: str,
+    set_cookies: list[str],
+    *,
+    in_scope: bool,
+    now: float | None = None,
+    deletions: bool = True,
+) -> bool:
     """The gate's entry point on a response: the Set-Cookie of an answer to a request made under an identity
     (`file`: that identity's session) to an in-scope target go into the jar. No identity, out of scope, or no
-    Set-Cookie: the file is not touched. True if the file was rewritten."""
+    Set-Cookie: the file is not touched. True if the file was rewritten. `deletions`: see merge."""
     if file is None or not in_scope or not set_cookies:
         return False
-    return update(file, lambda s: bool(merge(s, url, set_cookies, now)), now)
+    return update(file, lambda s: bool(merge(s, url, set_cookies, now, deletions=deletions)), now)
+
+
+def learn_bearer(file: Path, origin_: str, value: str, now: float | None = None) -> bool:
+    """R46: keep the `Authorization: Bearer` bh-browser sent to `origin_` (scheme://host:port) in the identity's
+    `origin_headers`, under the session lock, written atomically, only when it changed. The caller has judged the
+    origin (a target, one of the identity's declared `origins`). A value of another shape, or a new origin past
+    MAX_ORIGIN_HEADERS, is not kept. True if the file was rewritten."""
+    if not BEARER.fullmatch(value) or origin(origin_) != origin_:
+        return False
+
+    def change(s: Session) -> bool:
+        kept = s.setdefault("origin_headers", {})
+        if (kept.get(origin_) or {}).get("Authorization") == value:
+            return False
+        if origin_ not in kept and len(kept) >= MAX_ORIGIN_HEADERS:
+            return False
+        kept[origin_] = {"Authorization": value}
+        return True
+
+    return update(file, change, now)
+
+
+def known_bearer(session: Session, origin_: str) -> str | None:
+    """The Authorization kept for `origin_` in `origin_headers`, if any."""
+    return ((session.get("origin_headers") or {}).get(origin_) or {}).get("Authorization")
 
 
 def expire(session: Session, now: float | None = None) -> bool:
@@ -481,12 +523,13 @@ def dead_reason(
     """Why ONE response to a request under an identity says its session is dead, None if it does not:
     `login-redirect` (a redirect whose Location is the identity's declared login page); `probe` (a GET of the
     declared probe URL that does not answer the expected status). A single 401 is no proof (the control of an
-    access test answers 401 to a live session): see Unauthorized for the repeated-401 rule."""
+    access test answers 401 to a live session): see Unauthorized for the repeated-401 rule. The probe is matched on
+    its own method (`method`, GET by default: a POST probe says nothing about a GET of the same URL)."""
     if status in REDIRECTS and location and login_url and _same_page(urljoin(url, location), login_url):
         return "login-redirect"
     if (
         isinstance(probe, dict)
-        and method == "GET"
+        and method == (probe.get("method") or "GET")
         and isinstance(probe.get("url"), str)
         and isinstance(probe.get("status"), int)
         and _same_page(url, probe["url"])

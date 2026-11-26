@@ -18,6 +18,12 @@ Classes of destination:
             only, the TLS never intercepted (addon: ignore_hosts), nothing of ours inside, bounded
             (PassthroughGuard); a decrypted request to it is refused. Own rate limit, public IPs only, never a test
             (flows class `support`, outside the asset graph and the counts).
+- payload : the scope's `payload_hosts` (D27, O28): data-free hosts the hunter may cite and load (CORS, redirects,
+            an image) without touching a real third party. GET/HEAD/OPTIONS without body from any sandbox client, on
+            80/443, public IPs only, no cookie, no identity, no program header, the program's own rate; every request
+            journaled (flows class `payload`); any other method refused ("payload host: GET/HEAD/OPTIONS only").
+Protected paths (T5): a path matching PROTECTED_DEFAULT or the scope's `protected_urls` is refused to every client,
+bh-browser included, whatever the method ("protected url"): sign-out, password and account changes, payment.
 Websockets (scope `websockets: true`, refused otherwise): the handshake is a target request like any other
 (scope, identity, program headers, rate); then every message is bounded and journaled (WsGuard).
 The persistent browser (`browser`: the client is bh-browser, B2): when the scope has a passthrough host, only it may
@@ -80,7 +86,19 @@ MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a 
 # Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
 # authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S. Only the ids of the
 # path count (I6): a query or body parameter (telemetry `eventid`, a search filter) is no object read.
-ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 12, 600, 5000
+ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 6, 600, 5000  # D26: six distinct ids, the seventh refused
+# T5: paths no client may reach, whatever the method (bh-browser included): they end our session, change our
+# accounts or spend money. Matched case-insensitively on the request PATH only (never the query string), raw and
+# normalized (%xx decoded, ;params dropped, // collapsed); a scope adds its own (`protected_urls`), never removes one.
+PROTECTED_DEFAULT = (
+    r"(^|/)(log-?out|sign-?out)(/|$)",
+    r"(^|/)(reset|forgot|change)[-_]?password",
+    r"(^|/)(delete|close|deactivate)[-_]?account",
+    r"(^|/)(checkout|payment|billing|purchase|subscribe)(/|$)",
+)
+PROTECTED_REASON = "protected url"
+PAYLOAD_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+PAYLOAD_REASON = "payload host: GET/HEAD/OPTIONS only"
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
 # (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
 MISS_LIMIT, MISS_WINDOW_S = 25, 300
@@ -143,7 +161,7 @@ def is_public_ip(ip: str) -> bool:
 @dataclass
 class Verdict:
     allowed: bool
-    klass: str  # system | passive | target | support | deny
+    klass: str  # system | passive | target | support | payload | deny
     reason: str
     rule: str | None = None
     support: str | None = None  # kind of a `support` verdict: "auth" | "assets" | "sso" | "passthrough"
@@ -191,10 +209,12 @@ class Policy:
     waf_seen: dict[str, deque] = field(default_factory=dict)  # host -> deque[ts of WAF answers]
     host_blocked_until: dict[str, float] = field(default_factory=dict)  # host -> end of its WAF cooldown
     local_ips: frozenset[str] = frozenset()  # the gate's own addresses (never a destination, B3)
-    ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # noqa: PLW0108 - defined below
+    ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # a lambda: WsLimits is defined below
     ws_limits_browser: WsLimits = field(default_factory=lambda: WsLimits.from_env(browser=True))
     ws_live: dict[str, WsGuard] = field(default_factory=dict)  # open websocket (flow id) -> its guard
-    passthrough: PassthroughGuard = field(default_factory=lambda: PassthroughGuard.from_env())  # noqa: PLW0108 - below
+    passthrough: PassthroughGuard = field(
+        default_factory=lambda: PassthroughGuard.from_env()
+    )  # a lambda: defined below
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -235,6 +255,17 @@ class Policy:
             return deny(d.reason, d.rule)
         return None
 
+    def protected(self, url: str) -> Verdict | None:
+        """T5: refusal for a protected path (PROTECTED_DEFAULT and the scope's `protected_urls`), None otherwise."""
+        extra = self.scope.protected_urls if self.scope is not None else ()
+        if (rule := protected_rule(url, extra)) is not None:
+            return deny(PROTECTED_REASON, rule)
+        return None
+
+    def is_payload(self, host: str) -> bool:
+        """D27: `host` is one of the scope's payload hosts (exact name)."""
+        return self.scope is not None and _host_key(host) in self.scope.payload_hosts
+
     def has_passthrough(self) -> bool:
         return self.scope is not None and any(s.kind == "passthrough" for s in self.scope.support)
 
@@ -259,6 +290,10 @@ class Policy:
             return _web_port(v, port) or (None if browser else self._waf_cooldown(host, v)) or v
         if is_passive(host):
             return Verdict(port == 443, "passive" if port == 443 else "deny", f"passive source {host}")
+        if self.is_payload(host):
+            if port not in (80, 443):
+                return deny(f"payload host {host}: port {port} (80 and 443 only)")
+            return Verdict(True, "payload", f"payload host {host}")
         return deny(self.scope_error or "not in scope")
 
     def classify_request(
@@ -285,6 +320,8 @@ class Policy:
         if is_self_address(host, self.local_ips):
             return deny(f"{host} is the gate itself", "self")
         v = self._target(url)
+        if protected := self.protected(url):  # after _target: the scope (and its protected_urls) is loaded
+            return protected
         if websocket:  # the scope opts in; then targets only, and the handshake goes through the target rules below
             if self.scope is None or not self.scope.websockets_on:
                 return deny("websockets are not allowed: this program's scope does not enable them (websockets: true)")
@@ -330,6 +367,8 @@ class Policy:
             if any(("/" + path).startswith(p) for p in PASSIVE_DENY_PATHS.get(host.lower(), ())):
                 return deny(f"passive source {host}: path not allowed")
             return Verdict(True, "passive", f"passive source {host}")
+        if self.is_payload(host):
+            return _payload_request(url, host, method, host_header=host_header, body_len=body_len)
         return deny(self.scope_error or "not in scope")
 
     def _support_request(
@@ -456,6 +495,11 @@ class Policy:
         self.reload()
         if self.scope is None:
             return deny(self.scope_error or "no scope")
+        if self.is_payload(host):  # the scope keeps payload hosts apart from every target, exclusion and support host
+            # public addresses only, and never one a rule of the scope names (an excluded or a target CIDR)
+            addr = ip.strip("[]").split("%", 1)[0]
+            ok = is_public_ip(addr) and not check(self.scope, addr).rule
+            return Verdict(ok, "payload" if ok else "deny", "payload host" if ok else f"{host} resolves to {ip}")
         if check(self.scope, host).support is not None:
             d = check_support_resolved(self.scope, host, ip)
             return Verdict(d.allowed, "support" if d.allowed else "deny", d.reason, d.rule, d.support)
@@ -509,6 +553,8 @@ class Policy:
         rps = {"passive": PASSIVE_RPS, "support": SUPPORT_RPS}.get(klass)
         if klass == "target":
             rps = self.target_rps()
+        elif klass == "payload":  # D27: bounded by the program's own rate, in a bucket of its own
+            rps = self.scope.rate if self.scope is not None else None
         if rps is None:
             return None
         b = self.buckets.get(klass)
@@ -540,6 +586,43 @@ class Policy:
 
     def ws_end(self, fid: str) -> WsGuard | None:
         return self.ws_live.pop(fid, None)
+
+
+def protected_rule(url: str, extra=()) -> str | None:
+    """The protected-path regex (PROTECTED_DEFAULT, then `extra`) the path of `url` matches, None if none does. The
+    path is read raw and normalized; an unreadable URL is refused (fail closed)."""
+    try:
+        raw = urlsplit(url).path or "/"
+    except ValueError:
+        return PROTECTED_DEFAULT[0]
+    norm = re.sub(r"/{2,}", "/", re.sub(r";[^/]*", "", unquote(raw)))
+    for pattern in (*PROTECTED_DEFAULT, *extra):
+        rx = _protected_rx(pattern)
+        if rx.search(raw) or rx.search(norm):
+            return pattern
+    return None
+
+
+_PROTECTED_RX: dict[str, re.Pattern[str]] = {}
+
+
+def _protected_rx(pattern: str) -> re.Pattern[str]:
+    rx = _PROTECTED_RX.get(pattern)
+    if rx is None:
+        rx = _PROTECTED_RX[pattern] = re.compile(pattern, re.I)  # the scope validated it at load
+    return rx
+
+
+def _payload_request(url: str, host: str, method: str, *, host_header: str | None, body_len: int) -> Verdict:
+    """D27: a payload host (data-free: example.org, our own bh.datk.ch). GET/HEAD/OPTIONS without body, on 80/443,
+    under its own name; the addon strips every cookie, identity and program header."""
+    if method not in PAYLOAD_METHODS or body_len:
+        return deny(PAYLOAD_REASON)
+    if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
+        return deny("payload host with a different Host header")
+    if _port(url) not in (80, 443):
+        return deny(f"payload host {host}: port {_port(url)} (80 and 443 only)")
+    return Verdict(True, "payload", f"payload host {host}")
 
 
 def _support_client(v: Verdict, host: str, enroll: bool) -> Verdict | None:

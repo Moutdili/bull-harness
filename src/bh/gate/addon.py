@@ -23,7 +23,19 @@ The persistent browser (bh-browser, compose service BH_BROWSER_HOST=`browser`, r
   that identity (flows, events), allowed the identity-only methods (PUT/PATCH/DELETE), its Set-Cookie folded into
   that identity's jar but NOT masked (the browser needs them); nothing is ever injected (it has its own cookies).
 - I6: never paused by the WAF guard, never counted by the not-found guard; its websockets live
-  policy.WS_BROWSER_MAX_SECONDS (BH_WS_MAX_SECONDS overrides).
+  policy.WS_BROWSER_MAX_SECONDS (BH_WS_MAX_SECONDS overrides). Its 429 / 503 still slow the shared rate (R20).
+- R14: its Set-Cookie only ADD to the identity's jar; a deletion (past expiry, empty value) is ignored.
+- R22: recognised only at an address on one of the gate's own interface networks (local_networks).
+- R37: its "not in scope" refusals (a page polling a host of no program) are journaled once per host and
+  NOISE_WINDOW_S, the next line of that host carrying `repeats`; every refusal still happens. Every `blocked` line
+  names its `client` (agent, judge, browser, login, other): the runner counts the agent's and the judge's.
+- R46: under its loaded identity, on a target URL whose origin is one of that identity's declared `origins`, its
+  `Authorization: Bearer` is kept in the identity's `origin_headers` (session.learn_bearer, only when it changed;
+  event `bearer-learned` {identity, origin}, never the value). The agent then gets it under X-BH-Identity on that
+  origin only, masked `<identity:name>` in every flow file. A kept bearer whose JWT `exp` has passed is never sent:
+  the request is refused ("identity bearer expired"), with one `bearer-expired` event per identity and minute.
+Payload hosts (scope `payload_hosts`, policy docstring): GET/HEAD/OPTIONS from any sandbox client, every Cookie and
+Authorization removed, no identity, no program header, flows class `payload`.
 
 Canaries (I1, bh.gate.canary): every request URL and body, response body and websocket frame (both ways) is searched
 for `BH-SECRET-<16 hex>` on its whole content (decoded, bounded to canary.SCAN_BYTES) before any truncation; each hit
@@ -96,6 +108,7 @@ import os
 import re
 import secrets
 import socket
+import struct
 import threading
 import time
 from pathlib import Path
@@ -105,7 +118,8 @@ from mitmproxy.net.http.url import parse_authority, unparse
 from mitmproxy.proxy import mode_specs, server_hooks
 
 from bh import paths, redact
-from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER
+from bh.accounts.expiry import jwt_exp
+from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER, origin
 from bh.gate import canary, session
 from bh.gate.policy import (
     SYSTEM_HOSTS,
@@ -122,6 +136,12 @@ from bh.gate.policy import (
 
 MAX_BODY = 16_384
 PUSHBACK_STATUS = (429, 503)
+# R37: bh-browser's "not in scope" refusals (a page polling a host of no program: admin.microsoft.com once a second)
+# are journaled once per host and NOISE_WINDOW_S; the next line of that host carries `repeats`. Decisions unchanged.
+NOISE_WINDOW_S, NOISE_HOSTS_MAX = 60.0, 1024
+NOISE_REASON = "not in scope"
+# R46: one `bearer-expired` event per identity and BEARER_EXPIRED_WINDOW_S
+BEARER_EXPIRED_REASON, BEARER_EXPIRED_WINDOW_S = "identity bearer expired", 60
 os.umask(0o077)  # logs and flow files hold target data and redacted sessions: owner-only
 
 
@@ -218,6 +238,50 @@ def local_addresses() -> frozenset[str]:
     return frozenset(ips)
 
 
+def _v4(hex_le: str) -> str:
+    """An address of /proc/net/route (32-bit hex, host byte order: little-endian on the gate's x86/arm)."""
+    return str(ipaddress.IPv4Address(struct.pack("<I", int(hex_le, 16))))
+
+
+def local_networks(route: str | None = None, route6: str | None = None) -> frozenset:
+    """R22: the networks the gate's interfaces sit on (routes without a gateway, not the default route, not `lo`),
+    from /proc/net/route and /proc/net/ipv6_route (or the given texts). Unreadable: none, so no address passes."""
+    nets: set = set()
+    if route is None:
+        with contextlib.suppress(OSError):
+            route = Path("/proc/net/route").read_text()
+    for line in (route or "").splitlines()[1:]:
+        f = line.split()
+        with contextlib.suppress(ValueError, IndexError, struct.error):
+            if f[0] == "lo" or int(f[2], 16) or not int(f[7], 16):
+                continue  # loopback, via a router, or the default route
+            nets.add(ipaddress.ip_network(f"{_v4(f[1])}/{_v4(f[7])}", strict=False))
+    if route6 is None:
+        with contextlib.suppress(OSError):
+            route6 = Path("/proc/net/ipv6_route").read_text()
+    for line in (route6 or "").splitlines():
+        f = line.split()
+        with contextlib.suppress(ValueError, IndexError):
+            plen = int(f[1], 16)
+            if f[-1] == "lo" or int(f[4], 16) or not 0 < plen <= 128 or f[0].startswith("ff"):
+                continue
+            addr = ipaddress.IPv6Address(int(f[0], 16))
+            nets.add(ipaddress.ip_network(f"{addr}/{plen}", strict=False))
+    return frozenset(nets)
+
+
+def on_local_networks(ips, nets) -> frozenset[str]:
+    """The addresses of `ips` that belong to one of `nets` (R22): a name that resolves elsewhere (a poisoned resolver,
+    a public address) is never taken for a container of the stack."""
+    out = set()
+    for ip in ips:
+        with contextlib.suppress(ValueError):
+            addr = ipaddress.ip_address(str(ip).split("%", 1)[0])
+            if any(addr.version == n.version and addr in n for n in nets):
+                out.add(str(ip))
+    return frozenset(out)
+
+
 LOGIN_HOST = os.environ.get("BH_LOGIN_HOST", "login")  # the host-driven browser login container (compose `login`)
 _LOGIN_IPS: tuple[float, frozenset[str]] = (0.0, frozenset())
 
@@ -252,10 +316,11 @@ def _from_gate(flow: http.HTTPFlow) -> bool:
 
 
 def _browser_ips(max_age: float = RELAY_IPS_TTL) -> frozenset[str]:
-    """Addresses of bh-browser, cached like the login container's (down: none)."""
+    """Addresses of bh-browser, cached like the login container's (down: none). Only those on a network of the gate's
+    own interfaces (R22): bh-browser is a container of the stack, never an address elsewhere."""
     global _BROWSER_IPS
     if time.time() - _BROWSER_IPS[0] > max_age:
-        _BROWSER_IPS = (time.time(), resolve_hosts((BROWSER_HOST,)))
+        _BROWSER_IPS = (time.time(), on_local_networks(resolve_hosts((BROWSER_HOST,)), local_networks()))
     return _BROWSER_IPS[1]
 
 
@@ -269,7 +334,11 @@ def is_browser_peer(peer: str) -> bool:
 
 def client_kind(flow) -> str:
     """Who sent this flow, for the journal: browser | agent | judge | login (enrollment) | other."""
-    peer = _peer(flow)
+    return peer_kind(_peer(flow))
+
+
+def peer_kind(peer: str) -> str:
+    """client_kind for an address."""
     if peer in LOOPBACK or peer in _login_ips():
         return "login"
     if is_browser_peer(peer):
@@ -409,6 +478,8 @@ class Gate:
         # server connection id -> passthrough host: the only tunnels whose raw bytes may be relayed
         self._tunnels: dict[str, str] = {}
         self._browser_ident: tuple[float, dict] = (-1.0, {})  # (mtime, content) of BROWSER_IDENTITY
+        self._noise: dict[str, list] = {}  # R37: host -> [start of its window, refusals not journaled since]
+        self._bearer_expired = session.DeadLimiter(BEARER_EXPIRED_WINDOW_S)  # one event per identity and minute
 
     def load(self, loader) -> None:
         loader.add_option("bh_state", str, "/state", "bull-harness state dir")
@@ -534,17 +605,39 @@ class Gate:
 
     def _deny(self, flow: http.HTTPFlow, v: Verdict, where: str) -> None:
         refuse(flow, v)  # first: a failing log write must not let the request through
-        self._log(
-            paths.EVENTS,
-            {
-                "kind": "blocked",
-                "where": where,
-                "url": redact.url(self._named(flow)[0]),
-                "method": flow.request.method,
-                "reason": v.reason,
-                "rule": v.rule,
-            },
-        )
+        url, host = self._named(flow)
+        browser = bool(flow.metadata.get("bh_browser"))
+        rec = {
+            "kind": "blocked",
+            "where": where,
+            "url": redact.url(url),
+            "method": flow.request.method,
+            "reason": v.reason,
+            "rule": v.rule,
+            "client": "browser" if browser else client_kind(flow),
+        }
+        if browser and v.reason == NOISE_REASON and not canary.find(host):
+            repeats = self._noise_count(str(host).lower().rstrip("."), time.time())
+            if repeats is None:
+                return  # counted: the host's next line carries it
+            if repeats:
+                rec["repeats"] = repeats
+        self._log(paths.EVENTS, rec)
+
+    def _noise_count(self, host: str, now: float) -> int | None:
+        """R37: None when this refusal falls in the host's current window (counted, not journaled); otherwise the
+        refusals counted since the host's last line (0 for a first one), and a new window starts."""
+        st = self._noise.get(host)
+        if st is not None and now - st[0] < NOISE_WINDOW_S:
+            st[1] += 1
+            return None
+        if len(self._noise) >= NOISE_HOSTS_MAX:  # bounded memory: hosts whose window is over and nothing pending
+            for h in [h for h, (t, n) in self._noise.items() if now - t >= NOISE_WINDOW_S and not n]:
+                del self._noise[h]
+            if len(self._noise) >= NOISE_HOSTS_MAX:
+                self._noise.clear()
+        self._noise[host] = [now, 0]
+        return st[1] if st is not None else 0
 
     # ---- connection-level hooks
     @fail_closed
@@ -620,7 +713,14 @@ class Gate:
         host, port = self._destination(flow.server_conn)
         self._log(
             paths.EVENTS,
-            {"kind": "blocked", "where": "tcp", "host": host, "port": port, "reason": "raw TCP is not allowed"},
+            {
+                "kind": "blocked",
+                "where": "tcp",
+                "host": host,
+                "port": port,
+                "reason": "raw TCP is not allowed",
+                "client": client_kind(flow) if getattr(flow, "client_conn", None) is not None else None,
+            },
         )
 
     @fail_closed
@@ -699,7 +799,15 @@ class Gate:
             if not v.allowed:
                 self._log(
                     paths.EVENTS,
-                    {"kind": "blocked", "where": "resolve", "host": host, "ip": ip, "reason": v.reason, "rule": v.rule},
+                    {
+                        "kind": "blocked",
+                        "where": "resolve",
+                        "host": host,
+                        "ip": ip,
+                        "reason": v.reason,
+                        "rule": v.rule,
+                        "client": peer_kind(str((getattr(data.client, "peername", None) or ("?",))[0])),
+                    },
                 )
                 data.server.error = f"bh-gate: DENIED {host} -> {ip} ({v.reason})"
                 return
@@ -840,18 +948,21 @@ class Gate:
             if scope.user_agent:
                 req.headers["User-Agent"] = scope.user_agent
             if identity and browser:
-                self._label_identity(flow, identity)
-            elif identity:
-                self._apply_identity(flow, identity)
+                self._label_identity(flow, identity, learn=True)
+            elif identity and (refused := self._apply_identity(flow, identity)):
+                self._deny(flow, refused, "request")
+                return
         elif v.klass == "support" and v.support == "sso":
             # the application's own sign-in: no program header, no UA override, no identity header; under an
             # identity, that identity's jar cookies for this host (the browser of our test account, nothing more)
             if identity and browser:
                 self._label_identity(flow, identity)
             elif identity:
-                self._apply_identity(flow, identity, cookies_only=True)
-        elif v.klass == "passive" or (v.klass == "support" and v.support == "assets"):
-            flow.metadata["bh_identity"] = None  # never applied off target: the journal must not claim it was
+                self._apply_identity(flow, identity, cookies_only=True)  # cookies only: no bearer, no refusal
+        elif v.klass in ("passive", "payload") or (v.klass == "support" and v.support == "assets"):
+            # never applied off target: the journal must not claim it was. A payload host (D27) gets nothing of ours,
+            # whoever asks (bh-browser's own cookies included)
+            flow.metadata["bh_identity"] = None
             for k in ("Cookie", "Authorization"):
                 req.headers.pop(k, None)
         # support `auth`: only enrollment reaches it (policy); its own cookies are the login's, left as they are
@@ -867,33 +978,66 @@ class Gate:
         decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
         return {"file": str(path), "login_url": decl.get("login_url"), "probe": decl.get("probe") or sess.get("probe")}
 
-    def _label_identity(self, flow: http.HTTPFlow, name: str) -> None:
+    def _label_identity(self, flow: http.HTTPFlow, name: str, *, learn: bool = False) -> None:
         """bh-browser's traffic under the identity the host loaded (I2): nothing injected (the browser sends its own
-        cookies and headers); only what the response needs to fold its Set-Cookie into that identity's jar."""
+        cookies and headers); only what the response needs to fold its Set-Cookie into that identity's jar.
+        `learn` (a target request, R46): the browser's `Authorization: Bearer` is kept for that origin when the origin
+        is one of the identity's declared `origins`, and masked in the flow file."""
         path = self._identity_file(name)
         sess = session.load(path) if path else None
         if path is None or sess is None:
             flow.metadata["bh_identity"] = None
             return
         flow.metadata["bh_session"] = self._session_info(name, path, sess)
+        if learn:
+            self._learn_bearer(flow, name, path, sess)
 
-    def _apply_identity(self, flow: http.HTTPFlow, name: str, *, cookies_only: bool = False) -> None:
+    def _learn_bearer(self, flow: http.HTTPFlow, name: str, path: Path, sess: dict) -> None:
+        """R46: bh-browser's bearer, under its loaded identity, on a target URL whose origin the identity declares in
+        `origins`: kept in `origin_headers[<origin>]` when it changed. Nothing else is learned (no other header, no
+        other client, no origin outside `origins`, never a support host: the caller only calls it for a target)."""
+        values = flow.request.headers.get_all("authorization")
+        if len(values) != 1 or not session.BEARER.fullmatch(values[0]):
+            return
+        flow.metadata["bh_redact"] = {"authorization": f"<identity:{name}>"}  # the flow file never holds it
+        url = self._named(flow)[0]
+        o = origin(url)
+        decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
+        declared = {origin(u) for u in decl.get("origins") or () if isinstance(u, str)}
+        if o is None or o not in declared or session.known_bearer(sess, o) == values[0]:
+            return
+        try:
+            if session.learn_bearer(path, o, values[0]):
+                self._log(paths.EVENTS, {"kind": "bearer-learned", "identity": name, "origin": o})
+        except OSError as exc:  # a file that cannot be written costs a stale bearer, never the request
+            ctx.log.error(f"bh-gate: cannot keep the bearer of {name}: {type(exc).__name__}")
+
+    def _apply_identity(self, flow: http.HTTPFlow, name: str, *, cookies_only: bool = False) -> Verdict | None:
         """Inject the identity's headers and the cookies its jar holds for this URL (bh.gate.session).
         Cookies: the jar (fresh, rotated by Set-Cookie) beats a static `Cookie` of `headers`; both beat an agent
         cookie of the same name (session.combine), whose name is then recorded in the flow.
-        `cookies_only` (an `sso` host): the jar's cookies for this URL and nothing else, never a header."""
+        `cookies_only` (an `sso` host): the jar's cookies for this URL and nothing else, never a header.
+        Returns a refusal when the bearer kept for this origin (`origin_headers`) is a JWT whose `exp` has passed
+        (R46): it is not sent, and one `bearer-expired` event per identity and minute says so. A bearer without a
+        readable `exp` is sent as before; a 401 to a live one stays the target's 401."""
         path = self._identity_file(name)
-        url = self._named(flow)[0]
+        url, host = self._named(flow)
         sess = session.load(path) if path else None
         if sess is None:
             self._log(paths.EVENTS, {"kind": "identity-missing", "identity": name, "url": redact.url(url)})
-            return
+            return None
         req, mark = flow.request, f"<identity:{name}>"
         decl = next((i for i in self.policy.scope.identities if i.get("name") == name), {})
         # M7: the identity's headers (a bearer token...) and static Cookie only go to its own origins
         own = session.headers_go_to(decl, url) and not cookies_only
         # I19: a header captured on this very origin at enrollment (the bearer of that audience) goes back there only
         per_origin = {} if cookies_only else session.origin_headers_for(sess, url)
+        bearer = next((v for k, v in per_origin.items() if k.lower() == "authorization"), None)
+        if bearer is not None and (exp := jwt_exp(bearer)) is not None and exp <= time.time():
+            now = _now()
+            if self._bearer_expired.allow(name, now):
+                self._log(paths.EVENTS, {"kind": "bearer-expired", "identity": name, "host": host, "ts": now})
+            return deny(BEARER_EXPIRED_REASON)
         if not own and not per_origin:
             flow.metadata["bh_identity_withheld"] = True
         headers = {**(sess["headers"] if own else {}), **per_origin}
@@ -912,6 +1056,7 @@ class Gate:
                 flow.metadata["bh_cookie_replaced"] = replaced
         flow.metadata["bh_redact"] = redacted
         flow.metadata["bh_session"] = self._session_info(name, path, sess)
+        return None
 
     def _identity_response(self, flow: http.HTTPFlow) -> None:
         """Under an identity, on an in-scope target: fold Set-Cookie into the jar (the agent gets them with the
@@ -967,7 +1112,9 @@ class Gate:
             resp.headers.set_all("set-cookie", masked)
         kept = flow.metadata.get("bh_class") == "target" or flow.metadata.get("bh_support") == "sso"
         try:
-            session.absorb(Path(info["file"]), url, set_cookies, in_scope=kept)
+            # R14: from bh-browser, additions only; a page that signs a cookie out does not empty the identity's jar
+            deletions = not flow.metadata.get("bh_browser")
+            session.absorb(Path(info["file"]), url, set_cookies, in_scope=kept, deletions=deletions)
         except OSError as exc:  # a jar that cannot be written costs a stale session, not the answer
             ctx.log.error(f"bh-gate: cannot update the session of {ident}: {exc}")
 
@@ -976,7 +1123,7 @@ class Gate:
         if flow.response is None or flow.metadata.get("bh_denied"):
             return
         flow.response.headers.pop(GATE_HEADER, None)  # only the gate's own refusals carry it
-        if flow.metadata.get("bh_class") not in ("target", "passive", "support"):
+        if flow.metadata.get("bh_class") not in ("target", "passive", "support", "payload"):
             return
         resp = flow.response
         self._canary(flow, "response-body", resp.raw_content, encoding=resp.headers.get("content-encoding"))
@@ -987,6 +1134,9 @@ class Gate:
         ):
             self._identity_cookies(flow)  # a rotated cookie of ours still goes to the jar, never to the client
             self._deny(flow, deny(why), "response")
+            return
+        if flow.metadata.get("bh_class") == "payload":  # D27: one journal line (class payload), never a test
+            self._record(flow, flow.response.status_code)
             return
         if flow.metadata.get("bh_class") == "support":  # one journal line, never a test nor a WAF count
             if flow.metadata.get("bh_support") == "sso":
@@ -1004,8 +1154,10 @@ class Gate:
         server = resp.headers.get("server", "").lower()
         # H3: only the WAF's own answers count (cf-mitigated, challenge or block page), never `Server: cloudflare`
         waf = is_waf(resp.status_code, dict.fromkeys(resp.headers.keys(), ""), resp.raw_content)
-        if (waf or resp.status_code in PUSHBACK_STATUS) and not browser:  # I6: a human passes the browser's challenges
-            self.policy.penalize(host, waf=waf)  # repeated WAF answers pause the host (policy.WAF_LIMIT)
+        if waf and not browser:  # I6: a human passes the browser's challenges, so only its WAF pause is skipped
+            self.policy.penalize(host, waf=True)  # repeated WAF answers pause the host (policy.WAF_LIMIT)
+        elif resp.status_code in PUSHBACK_STATUS:  # R20: bh-browser's 429 / 503 slow the shared rate down too
+            self.policy.penalize(host, waf=False)
         if waf:
             self._log(
                 paths.EVENTS,
@@ -1033,7 +1185,7 @@ class Gate:
     @fail_closed
     def error(self, flow: http.HTTPFlow) -> None:
         """Requests that never got a response (timeouts, resets) are part of the audit trail too."""
-        if flow.metadata.get("bh_class") in ("target", "passive", "support") and flow.response is None:
+        if flow.metadata.get("bh_class") in ("target", "passive", "support", "payload") and flow.response is None:
             self._record(flow, "error", str(flow.error)[:200] if flow.error else "error")
 
     def _record(self, flow: http.HTTPFlow, status, error: str | None = None) -> str:
@@ -1113,6 +1265,7 @@ class Gate:
                 "url": redact.url(self._named(flow)[0]),
                 "reason": why,
                 "closed": closed,
+                "client": "browser" if flow.metadata.get("bh_browser") else client_kind(flow),
             },
         )
 
