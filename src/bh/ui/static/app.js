@@ -307,6 +307,42 @@ views.board = async () => {
         el("td", {}, `I${x.id}`), el("td", {}, x.status), el("td", {}, x.title, x.outcome ? el("div", { class: "small muted" }, x.outcome) : null)))) : el("div", { class: "empty" }, "—"))));
 };
 
+// ------------------------------------------------------------------ lineage (W2-G)
+// Credit counted by the host (gate, judge, canary), next to the cost of each run, never mixed with it. The pseudo is
+// the agent's own word: shown only in the "Declared by the agent" block, escaped by the server (escape_invisible).
+let lineageProg = null;
+const pts = (v) => el("span", { class: v > 0 ? "pos" : v < 0 ? "neg" : "muted" }, v > 0 ? `+${v}` : String(v ?? 0));
+views.lineage = async () => {
+  const { programs } = await api("/api/lineage");
+  if (!programs.length) { fill($("#lineage"), el("div", { class: "empty" }, "Pas encore d'agent numéroté (lignée W2).")); return; }
+  if (!programs.includes(lineageProg)) lineageProg = programs.includes(status.active_scope?.program) ? status.active_scope.program : programs[0];
+  const sel = el("select", { onchange: (e) => { lineageProg = e.target.value; views.lineage(); } }, ...programs.map((n) => el("option", { value: n, selected: n === lineageProg }, n)));
+  const L = await api(`/api/lineage/${encodeURIComponent(lineageProg)}`);
+  const signals = L.ledger.map((r) => r.signal);
+  fill($("#lineage"),
+    el("div", { class: "row" }, "Programme ", sel, el("span", { class: "muted small mono" }, `poids ${L.weights_sha256.slice(0, 12)}`)),
+    el("h2", {}, "Observed by the harness"),
+    el("p", { class: "muted small" }, "Crédit calculé par l'hôte (statuts, étiquettes, clés, compteurs). L'agent en cours ne le voit pas ; le juge non plus."),
+    L.honor.length ? el("div", { class: "card" }, el("b", {}, "Tableau d'honneur (contributions)"), ...L.honor.map((h) => el("div", { class: "small" }, h))) : null,
+    el("h2", {}, "Agents"),
+    L.agents.length ? el("div", { style: "overflow-x:auto" }, el("table", {},
+      el("tr", {}, ...["n°", "génération", "statut", "run", "crédit", ...signals, "coût run", "coût vérif"].map((h) => el("th", {}, h))),
+      ...L.agents.map((a) => el("tr", {},
+        el("td", {}, `#${a.no}`), el("td", {}, a.generation ?? "—"), el("td", {}, el("span", { class: "badge" }, a.status || "—")),
+        el("td", {}, a.run_id ?? "—"), el("td", {}, el("b", {}, pts(a.points))),
+        ...signals.map((s) => el("td", { class: "small" }, a.credit[s] == null ? "—" : pts(a.credit[s]))),
+        el("td", {}, usd(a.cost_usd)), el("td", { class: "small muted" }, usd(a.verify_cost))))))
+      : el("div", { class: "empty" }, "Aucun agent sur ce programme."),
+    el("h2", {}, "Registre par signal"),
+    L.ledger.length ? el("table", {}, el("tr", {}, ...["signal", "lignes", "points"].map((h) => el("th", {}, h))),
+      ...L.ledger.map((r) => el("tr", {}, el("td", { class: "mono small" }, r.signal), el("td", {}, r.n), el("td", {}, pts(r.points)))))
+      : el("div", { class: "empty" }, "Registre vide (calculé à la clôture de chaque agent)."),
+    el("div", { class: "declared" }, el("h2", {}, "Declared by the agent"),
+      el("p", { class: "muted small" }, "Pseudos choisis par les agents : rien de ce bloc n'est vérifié par le harnais."),
+      L.declared.length ? el("table", {}, el("tr", {}, el("th", {}, "n°"), el("th", {}, "pseudo")),
+        ...L.declared.map((d) => el("tr", {}, el("td", {}, `#${d.no}`), el("td", {}, d.pseudo || "—")))) : el("div", { class: "muted small" }, "—")));
+};
+
 // ------------------------------------------------------------------ metrics (observability)
 const usd = (v) => (v == null ? "—" : `$${v.toFixed(2)}`);
 const kTok = (v) => (v == null ? "—" : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v));
