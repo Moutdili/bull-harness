@@ -90,6 +90,9 @@ def test_model_bound_to_the_client():
     # I10: a Mythos hunt goes through the relay; the judge keeps its own list
     assert models["agent"] == {"claude-sonnet-5-5", "claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"}
     assert models["judge"] == {"claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"}
+    # the independent auditor (container/audit): reviewing models only, never the hunter's sonnet
+    assert models["audit"] == {"claude-mythos-5-2", "claude-opus-5-5", "claude-haiku-5-5"}
+    assert check(body(model="claude-sonnet-5-5"), models=models["audit"])[0].startswith("model 'claude-sonnet-5-5'")
     assert check(body(model="claude-mythos-5-2"), models=models["agent"])[0] is None
     assert check(body(model="claude-mythos-5-2"), models=models["judge"])[0] is None
     assert check(body(model="claude-sonnet-5-5"), models=models["judge"])[0].startswith("model 'claude-sonnet-5-5'")

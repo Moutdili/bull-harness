@@ -131,8 +131,9 @@ def _now() -> float:
 
 AGENT_HOST = os.environ.get("BH_AGENT_HOST", "agent")
 JUDGE_HOST = os.environ.get("BH_JUDGE_HOST", "judge")  # the verifier's own container (compose service `judge`)
+AUDIT_HOST = os.environ.get("BH_AUDIT_HOST", "audit")  # independent auditor (compose service `audit`)
 # the only clients of the relay: the hunter's container and the judge's. Nothing else on the gate's networks.
-RELAY_CLIENT_HOSTS = (AGENT_HOST, JUDGE_HOST)
+RELAY_CLIENT_HOSTS = (AGENT_HOST, JUDGE_HOST, AUDIT_HOST)
 # The only Claude API calls Claude Code makes with nonessential traffic off (measured 2026-11-24 on 2.1.330).
 RELAY_PATHS = frozenset({("POST", "/v1/messages"), ("POST", "/v1/messages/count_tokens")})
 RELAY_DEFAULT_MAX = 200  # requests per activation of a run when the runner names no budget
@@ -140,7 +141,7 @@ RELAY_DEFAULT_MAX = 200  # requests per activation of a run when the runner name
 METHOD_OVERRIDES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
 
 
-RELAY_ROLES = {AGENT_HOST: "agent", JUDGE_HOST: "judge"}
+RELAY_ROLES = {AGENT_HOST: "agent", JUDGE_HOST: "judge", AUDIT_HOST: "audit"}
 RELAY_MODELS = relay_models()  # role -> model ids it may ask for (BH_RELAY_MODELS_AGENT / _JUDGE)
 RELAY_BETAS = relay_betas()  # anthropic-beta values let through (BH_RELAY_BETAS)
 RELAY_IPS_TTL, RELAY_IPS_RETRY = 60.0, 5.0

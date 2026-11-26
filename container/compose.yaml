@@ -133,6 +133,32 @@ services:
     networks: [sandbox]
     restart: unless-stopped
 
+  # Independent auditor that runs the code it reviews (container/audit, tools/audit-exec.sh). Profile `audit`: started
+  # only by that script. Sandbox network only; the gate relays its Claude calls by name (role `audit`). It sees a COPY
+  # of the code under /work, never the host tree, secrets/ or var/state; no browser token, no identity.
+  audit:
+    image: localhost/bh-audit:dev
+    container_name: bh-audit
+    profiles: [audit]
+    depends_on: [gate]
+    init: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, KILL]
+    pids_limit: 2048
+    mem_limit: 6g
+    environment:
+      <<: *sandbox_env
+      UV_PROJECT_ENVIRONMENT: /opt/audit-venv
+      UV_OFFLINE: "1"
+      UV_NO_SYNC: "1"
+      PYTHONPATH: /work/repo/src  # the copy under review is the code the tests import (the venv holds the deps only)
+    volumes:
+      - ../var/gate-ca:/gate-ca:ro,z
+      - ../var/audit/current:/work:Z
+    command: ["sleep", "infinity"]
+    networks: [sandbox]
+
   # Browser logins (src/bh/accounts/browser.py): headless Chromium driven by the host through `podman exec -i`,
   # the script and the credential on stdin. Same image as the agent, sandbox network only, so every request of a
   # login goes through the gate (scope, rate, required headers). No /work (it never sees the hunter's files), no

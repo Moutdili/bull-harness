@@ -318,10 +318,10 @@ def _dns(table):
     return getaddrinfo
 
 
-def test_relay_admits_the_agent_and_the_judge_only(addon, monkeypatch):
-    assert addon.RELAY_CLIENT_HOSTS == ("agent", "judge")
+def test_relay_admits_the_agent_the_judge_and_the_auditor_only(addon, monkeypatch):
+    assert addon.RELAY_CLIENT_HOSTS == ("agent", "judge", "audit")
     dns = _dns({"agent": ["10.89.0.5"], "judge": ["10.89.0.6"], "juiceshop": ["10.231.0.10"]})
-    allowed = addon.resolve_hosts(addon.RELAY_CLIENT_HOSTS, dns)
+    allowed = addon.resolve_hosts(addon.RELAY_CLIENT_HOSTS, dns)  # the auditor is down: no address, nothing admitted
     assert allowed == {"10.89.0.5", "10.89.0.6"}
     assert addon.relay_client_allowed("10.89.0.5", allowed)
     assert addon.relay_client_allowed("10.89.0.6", allowed)

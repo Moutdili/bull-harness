@@ -42,9 +42,14 @@ def pid_alive(pidfile: Path) -> int | None:
 
 
 def container_running(name: str) -> bool:
-    r = subprocess.run(
-        ["podman", "container", "inspect", "-f", "{{.State.Running}}", name], capture_output=True, text=True
-    )
+    """False when the container is not running, and when podman itself is missing (a host without it, the audit
+    container): a status page answers "down" rather than failing."""
+    try:
+        r = subprocess.run(
+            ["podman", "container", "inspect", "-f", "{{.State.Running}}", name], capture_output=True, text=True
+        )
+    except OSError:
+        return False
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 

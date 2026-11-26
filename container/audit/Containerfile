@@ -1,0 +1,13 @@
+# bh-audit: an independent auditor (Mythos via `claude -p`) that RUNS the code it reviews: the agent image plus uv and
+# the project's locked dependencies, so `uv run pytest` works with no network at run time. Build from the repo root:
+#   podman build -t localhost/bh-audit:dev -f container/audit/Containerfile .
+# Sandbox network only (compose service `audit`, profile `audit`): its only way out is the gate, whose relay admits it
+# by name for the audit models (BH_RELAY_MODELS_AUDIT), and the scope in force (tools/audit-exec.sh activates the lab
+# scope, never a real program). It mounts a COPY of the code (var/audit/<id>/repo), never the host's tree or secrets.
+FROM localhost/bh-agent:dev
+COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /usr/local/bin/uv
+ENV UV_PROJECT_ENVIRONMENT=/opt/audit-venv UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
+COPY pyproject.toml uv.lock /opt/audit-deps/
+RUN cd /opt/audit-deps && uv sync --frozen --no-install-project --group dev && chmod -R a+rX /opt/audit-venv
+# at run time: offline, and the copy under /work is the project (uv run --no-sync uses the venv above as is)
+ENV UV_OFFLINE=1 UV_NO_SYNC=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/work/repo/src

@@ -755,6 +755,8 @@ RELAY_EGRESS_FIELDS = ("mcp_servers", "container")
 RELAY_MODELS_DEFAULT = {
     "agent": ("claude-sonnet-5-5", "claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"),
     "judge": ("claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"),
+    # independent auditor (container/audit): the reviewing models, haiku for Claude Code's background calls
+    "audit": ("claude-mythos-5-2", "claude-opus-5-5", "claude-haiku-5-5"),
 }
 # anthropic-beta values the relay lets through (BH_RELAY_BETAS replaces the list). Taken from the beta table of
 # Claude Code 2.1.330 (strings of the binary), keeping only those that change how a request is answered (auth,
