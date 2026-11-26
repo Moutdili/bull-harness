@@ -61,8 +61,8 @@ identities:
     origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
     role: member
     tenant: A
-    # measured 2026-11-26: signed in, /chat is 200 and carries signInState; signed out it is a 302 to the login
-    probe: {url: "https://copilot.com/chat", status: 200, expect: "signInState"}
+    # measured 2026-11-26: signed in, /chat is 200 (JSON for a client without Accept: text/html); signed out, a 302
+    probe: {url: "https://copilot.com/chat", status: 200}
     enroll:
       kind: browser
       steps:
@@ -99,8 +99,8 @@ identities:
     origins: ["https://copilot.microsoft.com/", "https://copilot.com/"]  # where its captured Authorization may go
     role: member
     tenant: B
-    # measured 2026-11-26: signed in, /chat is 200 and carries signInState; signed out it is a 302 to the login
-    probe: {url: "https://copilot.com/chat", status: 200, expect: "signInState"}
+    # measured 2026-11-26: signed in, /chat is 200 (JSON for a client without Accept: text/html); signed out, a 302
+    probe: {url: "https://copilot.com/chat", status: 200}
     enroll:
       kind: browser
       steps:
