@@ -74,3 +74,36 @@ def test_scanner_detection_sees_through_quotes_paths_and_the_entry_point():
         assert c.runs_scanner(cmd), cmd
     for cmd in ("bh-crawl http://h", "katana -u http://h -d 3", "curl -s http://h/api", "bh-note fact 'mapped /api'"):
         assert not c.runs_scanner(cmd), cmd
+
+
+def test_bh_web_text_and_frames_are_shown_whole(tmp_path, monkeypatch):
+    """A chat's answer sits at the end of `bh-web text --tail N`: the hook must not elide it (bounded by bh-browser)."""
+    monkeypatch.setenv("BH_DIR", str(tmp_path))
+    text = "\n".join(f"line {i}" for i in range(500)) + "\nTHE-CHAT-ANSWER"
+
+    def post(cmd, stdout=text, stderr=""):
+        ev = {**_ev(cmd), "tool_use_id": "t1", "tool_response": {"stdout": stdout, "stderr": stderr}}
+        return hooks.post_tool_use(ev)
+
+    for cmd in ("bh-web text --tail 20000", "bh-web text", "bh-web frames --last 200", "/opt/bh/bin/bh-web text"):
+        assert post(cmd) is None, cmd
+        assert hooks.exempt(cmd)
+    # a long stderr is still shrunk, the stdout stays whole
+    out = post("bh-web text", stderr="\n".join(["e"] * 500))["hookSpecificOutput"]["updatedToolOutput"]
+    assert out["stdout"] == text and "lines elided" in out["stderr"]
+    # anything else, or a composed command, is truncated as before
+    for cmd in (
+        "bh-web net",
+        "bh-web text | cat",
+        "bh-web text; cat big.json",
+        "cat big.json && bh-web text",
+        "bh-web text > /tmp/x",
+        "bh-web text $(cat x)",
+        "q https://a.test/ # bh-web text",
+        "echo bh-web text",
+    ):
+        assert not hooks.exempt(cmd), cmd
+        shown = post(cmd)["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        assert "lines elided" in shown, cmd
+    # beyond the browser's own bound, the usual head + tail
+    assert post("bh-web text", stdout="x\n" * (hooks.EXEMPT_CHARS // 2 + 10)) is not None

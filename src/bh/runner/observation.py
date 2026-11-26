@@ -4,15 +4,17 @@ The hunter plants a canary `BH-SECRET-<16 hex>` in the victim's data only, then 
 `bh-note finding ... --observation <canary> --victim <B> --attacker <A>`. It never writes the verdict: the gate looks
 for the canary pattern in every request, response and websocket frame it relays and logs one event per hit:
 
-  {"kind": "canary", "token": "BH-SECRET-...", "where": "request|response|ws-client|ws-server",
-   "identity": <identity name or null>, "client": "agent|browser|judge|...", "host": ..., "ts": ..., "program": ...}
+  {"kind": "canary", "token": "BH-SECRET-...", "where": <one of bh.gate.canary.WHERE: request-url | request-body |
+   response-body | ws-client | ws-server>, "identity": <identity name or null>, "client": <one of
+   bh.gate.canary.CLIENTS: browser | agent | judge | login | other>, "host": ..., "url": ..., "ts": ..., ...}
 
 Decision (pure, `decide`):
-- the attacker's side saw it: a `response` or `ws-server` event whose identity is the attacker; or the victim's
-  browser sent it (`request` from client `browser`, identity the victim) to a host outside the scope, which only a
-  payload can have named (the gate refuses it and logs the hit);
-- and no event shows it SENT (`request`, `ws-client`) by anyone but the victim before that first sighting. An unnamed
-  sender counts as the attacker: the hunter holds both identities and the anonymous path too.
+- the attacker's side saw it: a `response-body` or `ws-server` event whose identity is the attacker; or the victim's
+  browser sent it (`request-url` / `request-body` from client `browser`, identity the victim) to a host outside the
+  scope, which only a payload can have named (the gate refuses it and logs the hit);
+- and no event shows it SENT (`request-url`, `request-body`, `ws-client`) by anyone but the victim before that first
+  sighting. An unnamed sender counts as the attacker: the hunter holds both identities and the anonymous path too.
+  An unknown `where` counts for neither side (shown in the table only).
 Both -> `verified-evidence`. Sent by someone else first -> `rejected` (the attacker typed it). Otherwise -> no
 sighting, `inconclusive`. The judge reads the table and can only lower this verdict.
 """
@@ -27,8 +29,10 @@ from pathlib import Path
 from bh import paths
 from bh.agent import contract as c
 
-RECEIVED = frozenset({"response", "ws-server"})
-SENT = frozenset({"request", "ws-client"})
+# the gate's values (bh.gate.canary.WHERE), split by direction
+REQUEST = frozenset({"request-url", "request-body"})
+RECEIVED = frozenset({"response-body", "ws-server"})
+SENT = REQUEST | {"ws-client"}
 TABLE_MAX = 20  # events shown to the judge and kept with the finding
 
 
@@ -70,7 +74,7 @@ def decide(events: Iterable[dict], obs: dict, offscope: Callable[[str], bool] = 
         if where in RECEIVED and ident == attacker:
             return f"received by {attacker} ({where}, client {e.get('client')})"
         host = e.get("host") if isinstance(e.get("host"), str) else ""
-        if where == "request" and ident == victim and e.get("client") == "browser" and host and offscope(host):
+        if where in REQUEST and ident == victim and e.get("client") == "browser" and host and offscope(host):
             return f"sent by {victim}'s browser to {host}, a host outside the scope"
         return None
 

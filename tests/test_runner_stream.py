@@ -260,3 +260,37 @@ def test_a_streamed_refusal_closes_its_page(seg):
     res, _ = go(lines=lines, relay=[{"msg_id": "m2"}])
     assert res.status == "refusal" and res.refusal_repeat  # same page: counted once
     assert len(run.recent_refusals(board, "p")) == 1
+
+
+def test_browser_watcher_gets_the_program_live_identities_and_say(seg, monkeypatch):
+    """S2's contract: prepare() and the ChallengeWatcher get the segment's `say`, and the watcher the program and the
+    live identities (it carries out the agent's switch requests among them only)."""
+    _, go = seg
+    seen: dict = {}
+
+    class Watcher:
+        def __init__(self, **kw):
+            seen["watcher"] = kw
+
+        def start(self):
+            seen["started"] = True
+            return self
+
+        def stop(self):
+            seen["stopped"] = True
+
+    monkeypatch.setattr(run.browser_watch, "wanted", lambda scope: True)
+    monkeypatch.setattr(run.browser_watch, "prepare", lambda scope, ids, say: seen.update(prepare=(ids, say)))
+    monkeypatch.setattr(run.browser_watch, "ChallengeWatcher", Watcher)
+    monkeypatch.setattr(run, "live_identities", lambda *a, **k: ["user-a", "user-b"])
+    go(lines=[_assistant("m1"), DONE])
+    kw = seen["watcher"]
+    assert kw["program"] == "p" and kw["identities"] == ["user-a", "user-b"]
+    assert seen["prepare"] == (["user-a", "user-b"], kw["say"]) and callable(kw["say"])
+    assert seen.get("started") and seen.get("stopped")
+    import inspect
+
+    from bh.browser_service import watch
+
+    inspect.signature(watch.ChallengeWatcher).bind(**kw)  # the real constructor takes exactly these names
+    inspect.signature(watch.prepare).bind(object(), ["user-a"], kw["say"])

@@ -247,22 +247,17 @@ def cmd_unpark(args) -> int:
     return 0
 
 
-def _rotate(module: str, func: str, secret_file: str) -> int:
-    """B1: call the rotation S2 provides; never print the new value."""
-    import importlib
-
-    try:
-        fn = getattr(importlib.import_module(module), func)
-    except (ImportError, AttributeError):
-        print(f"{module}.{func}() does not exist yet in this checkout: nothing rotated", file=sys.stderr)
-        return 2
+def _rotate(fn, secret_file) -> int:
+    """B1: rotate a secret; its new value is never printed (whatever `fn` returns), only the file that holds it."""
     fn()
     print(f"rotated; read it in your own terminal: cat {secret_file}")
     return 0
 
 
 def cmd_notify(args) -> int:
-    return _rotate("bh.browser_service.notify", "rotate", "secrets/ntfy.env")
+    from bh.browser_service import notify
+
+    return _rotate(notify.rotate, notify.env_path())
 
 
 def cmd_verify(args) -> int:
@@ -525,7 +520,9 @@ def ui_start_daemon(host: str | None, port: int) -> int:
 
 def cmd_ui(args) -> int:
     if args.action == "rotate-token":
-        return _rotate("bh.ui.server", "rotate_token", "secrets/ui.token")
+        from bh.ui import server
+
+        return _rotate(server.rotate_token, server.token_path())
     if args.stop:
         if pid := stack.pid_alive(ui_pidfile()):
             os.kill(pid, signal.SIGTERM)
@@ -781,8 +778,8 @@ def cmd_browser_load(args) -> int:
     from bh.browser_service import host as bhost
 
     scope = _load_scope_or_exit(args.scope)
-    req, headers = bhost.identity_payload(scope.program, args.identity)
-    out = bhost.call(req)
+    _, headers = bhost.identity_payload(scope.program, args.identity)
+    out = bhost.load(scope.program, args.identity)  # on success, writes browser-identity.json for the gate
     if rc := _browser_reply(out):
         return rc
     print(f"{scope.program}/{args.identity}: {out.get('cookies')} cookie(s) loaded in {stack.BROWSER_CTR}")
@@ -797,7 +794,8 @@ def cmd_browser_reset(args) -> int:
     if not args.yes:
         print("reset wipes the browser profile (cookies, storage, history): add --yes", file=sys.stderr)
         return 2
-    return _browser_reply(bhost.call({"op": "reset"}))
+    program = _load_scope_or_exit(args.scope).program if args.scope else ""
+    return _browser_reply(bhost.reset(program, force=args.force))  # on success, the gate sees no identity
 
 
 def cmd_browser_view(args) -> int:
@@ -966,6 +964,8 @@ def build_parser() -> argparse.ArgumentParser:
     bl_.set_defaults(func=cmd_browser_load)
     rs = brs.add_parser("reset", help="wipe the browser profile and restart Chromium")
     rs.add_argument("--yes", action="store_true", help="confirm")
+    rs.add_argument("--scope", help="scope YAML: the program recorded for the gate (default: none)")
+    rs.add_argument("--force", action="store_true", help="reset even while a human challenge is on screen (it is lost)")
     rs.set_defaults(func=cmd_browser_reset)
     vw = brs.add_parser("view", help="print the UI page that shows the browser's screen (/captcha/)")
     vw.add_argument("--host")
