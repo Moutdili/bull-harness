@@ -42,7 +42,7 @@ from bh.board import Board
 from bh.runner import prompt as prompts
 from bh.runner import run as runner
 from bh.scope import Scope
-from bh.text import one_line
+from bh.text import INVISIBLE, escape_invisible, one_line
 
 VERIFIER_TURNS, VERIFIER_MINUTES = 8, 5
 # The judge is never the hunter's model (correlated errors, audit I10). BH_VERIFIER_MODEL names it; empty, it is Opus,
@@ -304,12 +304,112 @@ def _misses(replay: dict) -> str:
     )
 
 
-def triager_poc(scope: Scope, proof: dict) -> str:
+DECLARED = "Declared by the agent"
+OBSERVED = "Observed by the harness"
+
+
+def _flat(value, n: int = 2000) -> str:
+    """Hunter, judge or target text for one `#` line of a shell script: every line break (the shell's \\n and the
+    ones a reader sees: \\r, \\v, \\f, U+0085, U+2028, U+2029) shown as ⏎, invisible characters escaped, cut at n."""
+    s = escape_invisible(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str))
+    s = " ⏎ ".join(s.splitlines()) if s else ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _shell_arg(arg: str) -> str:
+    """shlex.quote, except for an argument holding an invisible character: bash ANSI-C quoting, so the request
+    stays the replayed one and every such character reads `\\uXXXX`."""
+    if not INVISIBLE.search(arg) and not any(ord(ch) < 32 or ord(ch) == 127 for ch in arg):
+        return shlex.quote(arg)
+    out = []
+    for ch in arg:
+        if ch in "\\'":
+            out.append("\\" + ch)
+        elif INVISIBLE.fullmatch(ch):
+            out.append(f"\\u{ord(ch):04X}")
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append(f"\\x{ord(ch):02X}")
+        else:
+            out.append(ch)
+    return "$'" + "".join(out) + "'"
+
+
+def _attack_step(steps: list[dict]) -> dict:
+    return next((s for s in steps if s.get("role") == "attack"), steps[0] if steps else {})
+
+
+def _observed_lines(replay: dict | None, verdict: tuple[str, str] | None) -> list[str]:
+    if not isinstance(replay, dict):
+        lines = ["replay: not run yet"]
+    else:
+        lines = [
+            f"replay: reproduced={bool(replay.get('reproduced'))}, "
+            f"control_disproves={bool(replay.get('control_disproves'))}"
+        ]
+        for n, rnd in enumerate(r for r in (replay.get("rounds") or []) if isinstance(r, list)):
+            cells = [
+                f"{_flat(s.get('role'), 20)} {_flat(s.get('status'), 10)} "
+                + ("ok" if s.get("ok") else "missed: " + _flat("; ".join(map(str, s.get("misses") or [])), 300))
+                for s in rnd
+                if isinstance(s, dict)
+            ]
+            lines.append(f"round {n + 1}: " + " | ".join(cells))
+    if verdict:
+        lines.append(f"status: {_flat(verdict[0], 40)}")
+        lines.append(f"verdict: {_flat(verdict[1], 2000)}")
+    else:
+        lines.append("verdict: not decided yet")
+    return lines
+
+
+def _declared_lines(finding: dict | None) -> list[str]:
+    """The hunter's own words, read with an empty default (`counter`, `severity_if`, `severity_why` may not exist)."""
+    f = finding or {}
+    fields = (
+        ("title", "title"),
+        ("severity", "severity"),
+        ("severity if", "severity_if"),
+        ("severity why", "severity_why"),
+        ("summary", "summary"),
+        ("not proven", "not_proven"),
+        ("counter-proof", "counter"),
+    )
+    return [f"{label}: {_flat(f.get(key) or '')}" for label, key in fields]
+
+
+def poc_title(finding: dict | None, proof: dict) -> str:
+    """The PoC's title, from the harness's side only: the finding's class and the replayed attack request."""
+    steps = [s for s in (proof.get("steps") or []) if isinstance(s, dict)]
+    att = _attack_step(steps)
+    cls = classes.canonical(str((finding or {}).get("vuln_class") or "")) or "unclassified"
+    method = _flat(str(att.get("method", "GET")).upper(), 10)
+    return f"{_flat(cls, 60)} on {method} {_flat(redact.url(str(att.get('url', ''))), 300)}"
+
+
+def triager_poc(
+    scope: Scope,
+    proof: dict,
+    finding: dict | None = None,
+    replay: dict | None = None,
+    verdict: tuple[str, str] | None = None,
+) -> str:
     """curl commands a triager can run outside the harness: program headers included, sessions and every
-    credential or personal value as placeholders (bh.redact). Robust to a malformed stored proof."""
+    credential or personal value as placeholders (bh.redact). Robust to a malformed stored proof.
+
+    Provenance (audit T3): the title is built from the class and the replayed attack URL, never from the hunter's
+    title; what the hunter wrote and what the harness saw sit in two titled blocks."""
     lines = [
+        f"# {poc_title(finding, proof)}",
         f"# {scope.platform}/{scope.program} — generated from the replayed proof",
         "# credentials and personal data are <redacted:...>: put your own test-account values back before running",
+        "# \\u{XXXX} or $'...\\uXXXX...' marks an invisible character of the original text",
+        "#",
+        f"# == {OBSERVED} ==",
+        *(f"#   {x}" for x in _observed_lines(replay, verdict)),
+        "#",
+        f"# == {DECLARED} (the hunter's words, not checked by the harness) ==",
+        *(f"#   {x}" for x in _declared_lines(finding)),
+        "#",
         "set -u",
     ]
     for i, st in enumerate(s for s in (proof.get("steps") or []) if isinstance(s, dict)):
@@ -329,9 +429,9 @@ def triager_poc(scope: Scope, proof: dict) -> str:
             parts += ["--data-raw", json.dumps(body) if isinstance(body, (dict, list)) else str(body)]
         lines += [
             "",
-            f"# step {i + 1} ({st.get('role')}): {st.get('name', '')}",
-            f"# expect: {json.dumps(st.get('expect'))}",
-            shlex.join(parts),
+            f"# step {i + 1} ({_flat(st.get('role'), 20)}): {_flat(st.get('name', ''), 300)}",
+            f"# expect: {_flat(json.dumps(st.get('expect')))}",
+            " ".join(_shell_arg(str(p)) for p in parts),
         ]
     return "\n".join(lines) + "\n"
 
@@ -400,7 +500,7 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
     say(
         f"  ↳ F{fid} stage A: reproduced={replay.get('reproduced')} control_disproves={replay.get('control_disproves')}"
     )
-    board.finding_set(fid, replay=json.dumps(replay)[:200_000], poc_triager=triager_poc(scope, proof))
+    board.finding_set(fid, replay=json.dumps(replay)[:200_000], poc_triager=triager_poc(scope, proof, finding, replay))
     if gate_refused(replay):  # the gate's word, not a doubt about the finding: no judge, no escalation
         return _defer(board, scope, fid, "stage A: a replay step was refused by the gate", count=True, say=say)
     if replay.get("control_disproves"):
@@ -426,6 +526,7 @@ def _verify(board: Board, scope: Scope, finding: dict, *, run_id: int, model: st
                 model=second,
             )
     board.set_finding(fid, status, why)
+    board.finding_set(fid, poc_triager=triager_poc(scope, proof, finding, replay, (status, why)))
     if status == "verified":
         board.add_todo(
             "submit",

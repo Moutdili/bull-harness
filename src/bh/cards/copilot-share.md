@@ -1,41 +1,38 @@
-## Share links: who can read a shared conversation or page, and for how long
-When: the UI has a share control (conversation, page, group) or `bh-web net` shows a share route.
-Never: guess, shorten or increment a link; open a link you did not create; leave a share alive after the test; a
+## Share links: what a share link opens, and with which ids
+When: the UI has a share control (conversation, page, group) or `bh-web net` shows a `sharelinks` route.
+Never: guess, shorten or increment a link or an id; open a link you did not create; leave a share alive after the
+test; request the share page host `copilot.cloud.microsoft` (not in the scope, the operator has not decided); a
 challenge touched or a prompt sent outside `bh-web`. Someone else's content behind a link: stop,
 `bh-note blocked third-party-data "<link host and path shape, no content>"`.
 Do:
 1. Owner = the identity `bh-web state` names; reader = the other identity, over HTTP.
-2. Content (2 fills): a new conversation holding a canary (`bh-note canary`), then `/id`, as in step 2 of the
-   card ai-conversation-isolation. Reuse that conversation if the board already has one.
-3. Share it: find the control with `bh-web outline`, click it, then read the link: `bh-web text --tail 800`,
-   or `bh-web attr '<css of the link field>' value` (or `href`), or the create request in `bh-web net --last 30`.
-   No control found in 6 turns: `bh-note fact "share: no control found" -s "<outline lines seen>" -k dead-end`,
-   next surface. Found: `bh-note fact "copilot share" -s "control=<css>; create=<METHOD url>; link=<host and
-   path shape, id length>" -k recon`.
-4. Baseline, without the reader: `q -a <owner> -n 300 <link>` and `q -n 300 <link>` (anonymous). A public link
-   that everyone reads is the product's design, not a finding.
-5. Revocation, the test that matters: unshare or delete the share in the UI, note the UTC time,
-   `bh-web wait 30000`, then `q -a <reader> -n 2000 <link>` 3 times over 5 minutes. 200 with the canary =
-   candidate, with k/3.
-6. Deletion: delete the test conversation as the owner, then one `q -a <reader> -n 2000 <link>` on its old link.
-7. A share made by the wrong account: replay the create request of step 3 as the reader on the owner's
-   conversation id, once: `q -a <reader> -X <method> -j '<the same JSON body>' <create url>`. A link in the
-   answer = candidate.
-8. Shares limited to signed-in or named people: `qq <link>`. 200 with the canary for the account that was not
-   invited = candidate.
-9. What the reader's browser renders: `bh-browse '<link>' --as <reader>` once (status, title, requests). Markers
-   and script: card ai-output-rendering.
-10. Clean up: unshare, delete the test conversation; `q -n 200 <link>` must no longer return the canary.
-Watch: before step 5 the reader must never have fetched the link (`qq` would do it): the gate would then show the
-canary reaching the reader while the share was valid. A cached answer: `bh-web wait 30000` and read again before
-concluding. A link only the owner's session can read is a private URL, not a share.
-Proof: steps 7 and 8 replay over HTTP. proof.json: attack `"as": "<reader>"` expecting the canary (or the new
-link), twin control `"as": null` on the same method and URL expecting `{"status": [401, 403]}`. Then:
-`bh-note finding "<title>" --severity <s> --class broken-access-control --url <u> --proof proof.json --summary
-"<...>" --not-proven "<...>"`.
-Steps 5 and 6 have no twin (everyone gets the same answer): the canary must reach the reader only after the
-revoke. `bh-note finding "<title>" --severity <s> --class broken-access-control --url <link> --observation
-<canary> --victim <owner> --attacker <reader> --summary "<revoked at HH:MM:SS UTC, read at ..., k/3>" -e <file>`.
-MSRC wants: the link, both personal accounts (user-a, user-b), the conversation id from `/id`, the prompt of
-step 2 word for word, k/N, UTC times of share, revoke and each read. The model's words are never evidence.
+2. Content (4 fills): two new conversations of the owner, each with its own canary (`bh-note canary`) and its
+   `/id`, as in step 2 of the card ai-conversation-isolation. Reuse those the board already has.
+3. Share the first one: find the control with `bh-web outline`, click it. The create request is
+   `POST …/m365Copilot/conversations/<id>/sharelinks`, under the browser's bearer: its number `i` in
+   `bh-web net --last 30`, the link in `bh-web net --body <i>`, or `bh-web text --clipboard` after the Copy
+   control. The link carries a `shareId` and the `conversationId` (base64 JSON). No control found in 6 turns:
+   `bh-note fact "share: no control found" -s "<outline lines seen>" -k dead-end`, next surface. Found:
+   `bh-note fact "copilot share" -s "control=<css>; create=<METHOD url>; link=<host and path shape>" -k recon`.
+4. Reading the link as the owner and anonymously: the link opens on `copilot.cloud.microsoft`, not in the scope.
+   Never a request there: `bh-note blocked other "share read, copilot.cloud.microsoft"`.
+5. Revocation, 6. deletion, 7. a share made by the wrong account, 8. shares limited to named people, 9. what the
+   reader's browser renders: each needs that page or its requests. Never a request:
+   `bh-note blocked other "share <step>, copilot.cloud.microsoft"`, once for all, then step 10.
+10. Redeem with another conversation, under the `/m365Copilot/` prefix already in scope: the redeem request
+   of the app (its path in the app's JS from `bh-crawl`, or in `bh-web net`; none found: `bh-note fact "share:
+   no redeem route" -k dead-end`). As the reader, once: the valid `shareId` of step 3 with the `conversationId`
+   of the owner's SECOND conversation, ours: `q -a <reader> -X POST -j '<the redeem body>' <redeem url>`. The
+   second canary in the answer = candidate.
+11. Clean up: unshare in the UI, delete both test conversations.
+Watch: the two promises of the app to test: "Anyone with a link can access a copy of this chat" and "Content
+referenced in this chat can only be viewed with permission". A share of the first conversation that opens the
+second breaks both. A public copy that everyone with the link reads is the design, not a finding.
+Proof: step 10 replays over HTTP. proof.json: attack `"as": "<reader>"`, the redeem request with the second
+conversation's id, expecting `{"contains": ["<second canary>"]}`; twin control, same method and URL, `"as":
+"<reader>"`, the same `shareId` with the shared conversation's own id, expecting `{"absent": ["<second
+canary>"]}`. Then: `bh-note finding "<title>" --severity <s> --class broken-access-control --url <u> --proof
+proof.json --summary "<...>" --not-proven "<...>"`.
+MSRC wants: the link, both personal accounts (user-a, user-b), the conversation ids from `/id`, the prompts of
+step 2 word for word, k/N, UTC times of share and each read. The model's words are never evidence.
 Next: `bh-note intent "share: step <n>"` for the first step without a fact on the board, then run it.

@@ -142,12 +142,30 @@ async function openFinding(id) {
   const sub = el("div", { class: "subtabs" }, ...Object.entries(tabs).map(([k, v]) => el("button", { "data-k": k, onclick: () => sel(k) }, v)));
   function sel(k) {
     sub.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.k === k));
-    if (k === "overview") fill(pane, el("dl", {},
-      el("dt", {}, "Sévérité"), el("dd", {}, sev(f.severity)), el("dt", {}, "Statut"), el("dd", { class: `st-${f.status}` }, f.status),
-      el("dt", {}, "Classe"), el("dd", {}, f.vuln_class || "—"), el("dt", {}, "Programme"), el("dd", {}, f.program),
-      el("dt", {}, "URL"), el("dd", { class: "mono" }, f.url || "—"), el("dt", {}, "Créé"), el("dd", {}, time(f.created)),
-      el("dt", {}, "Verdict"), el("dd", {}, f.verdict || "—"), el("dt", {}, "Preuve (fichier)"), el("dd", { class: "mono" }, f.evidence || "—")),
-      el("h2", {}, "Impact / résumé"), el("pre", {}, f.summary || ""));
+    // Provenance (audit T3): what the harness replayed and decided, then what the hunter wrote, never mixed.
+    if (k === "overview") {
+      const P = f.provenance || { declared: {}, observed: {} }, D = P.declared || {}, O = P.observed || {};
+      const r = O.replay || null;
+      fill(pane,
+        el("h2", {}, "Observed by the harness"),
+        el("dl", {},
+          el("dt", {}, "Statut"), el("dd", { class: `st-${O.status}` }, O.status || "—"),
+          el("dt", {}, "Rejeu"), el("dd", {}, r ? (r.observation ? `observation : ${r.observation.status || "?"}` : `reproduit=${!!r.reproduced}, le contrôle infirme=${!!r.control_disproves}, ${(r.rounds || []).length} tour(s)`) : "pas encore rejoué"),
+          el("dt", {}, "Verdict"), el("dd", {}, O.verdict || "—"),
+          el("dt", {}, "Programme"), el("dd", {}, f.program), el("dt", {}, "Créé"), el("dd", {}, time(f.created))),
+        el("h2", {}, "Declared by the agent"),
+        el("p", { class: "muted small" }, "Texte du chasseur : rien de ce bloc n'est vérifié par le harnais."),
+        el("dl", {},
+          el("dt", {}, "Titre"), el("dd", {}, D.title || "—"),
+          el("dt", {}, "Sévérité"), el("dd", {}, sev(D.severity), D.severity_if ? ` si ${D.severity_if}` : ""),
+          el("dt", {}, "Pourquoi"), el("dd", {}, D.severity_why || "—"),
+          el("dt", {}, "Classe"), el("dd", {}, f.vuln_class || "—"),
+          el("dt", {}, "URL"), el("dd", { class: "mono" }, f.url || "—"),
+          el("dt", {}, "Preuve (fichier)"), el("dd", { class: "mono" }, f.evidence || "—")),
+        el("h3", {}, "Résumé"), el("pre", {}, D.summary || ""),
+        el("h3", {}, "Non prouvé"), el("pre", {}, D.not_proven || "(rien déclaré)"),
+        el("h3", {}, "Contre-preuve"), el("pre", {}, D.counter || "(rien déclaré)"));
+    }
     if (k === "verify") {
       let replay = null; try { replay = f.replay ? JSON.parse(f.replay) : null; } catch (e) { replay = null; }
       const steps = (replay?.rounds || []).flatMap((r, i) => r.map((s) => el("tr", {},
@@ -174,7 +192,8 @@ async function openFinding(id) {
         el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "needs-proof", "duplicate", "rejected", "new"].map(act)));
     }
   }
-  fill(body, el("div", { class: "row" }, sev(f.severity), el("h3", { style: "margin:0" }, `F${f.id} · ${f.title}`)), sub, pane);
+  // the header: status, class and URL; the hunter's free-text title is shown only in the "Declared by the agent" block
+  fill(body, el("div", { class: "row" }, el("span", { class: `st-${f.status}` }, f.status), el("h3", { style: "margin:0" }, `F${f.id} · ${f.vuln_class || "?"}`), el("span", { class: "mono small muted" }, f.url || "")), sub, pane);
   sel("overview");
   drawer(body);
 }

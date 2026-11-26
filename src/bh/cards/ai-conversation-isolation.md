@@ -1,7 +1,7 @@
 ## AI conversation isolation: one account reads the other's objects
 When: an API route carries the id of a conversation, an attachment, a generated image or a memory entry.
-Never: an id that is not user-a's or user-b's; guessing or enumerating ids (more than 4 distinct ids on a route
-in 10 min is refused); a challenge touched or a prompt sent outside `bh-web`. Third-party data in an answer:
+Never: an id that is not user-a's or user-b's; guessing or enumerating ids (stay far below the gate's limit of
+distinct ids per route); a challenge touched or a prompt sent outside `bh-web`. Third-party data in an answer:
 stop, do not re-read, `bh-note blocked third-party-data "<route, no content>"`.
 Do:
 1. Victim = the identity `bh-web state` names (no switch); attacker = the other one, over HTTP only.
@@ -34,7 +34,7 @@ control `"as": null` expecting `{"status": [401, 403]}`. Then:
 `bh-note finding "<title>" --severity high --class idor --url <url> --proof proof.json --summary "<who read
 what, 3/3 reads>" --not-proven "<what you did not test>"`.
 Step 7 only (nothing to replay over HTTP): `bh-note finding "<title>" --severity high --class idor --url <url>
---observation <canary> --victim <victim> --attacker <attacker> --summary "<...>" -e <transcript file>`.
+--observation <canary> --victim <identity> --attacker <the other> --summary "<...>" -e <transcript file>`.
 MSRC wants: the conversation id from `/id`, both personal accounts (user-a, user-b), the prompt of step 2 word
 for word, k/N over 3 reads, UTC times. The model's words are never evidence; here the response body is.
 Next: `bh-note intent "isolation: <next route family>"`, then run step 5 on it.
