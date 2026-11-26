@@ -998,22 +998,54 @@ class PlaywrightDriver:
                 route.close(code=code, reason=reason or "")
 
         def from_page(message: Any) -> None:
-            out, done = message, False
-            r = self._rule_live()
-            if r:
-                out, done = rewrite_client_frame(message, r["find"], r["replace"])
-            if done and r:
-                r["used"] = True
-                sizes = f"{len(r['find'])} -> {len(r['replace'])} chars"
-                note = f"rewrote 1 occurrence ({sizes}) in a {len(message)}-char frame"
-                self.frame_log.append({"t": time.time(), "dir": "rewrite", "url": redact.url(url), "text": note})
-                print(f"bh-browser: ws-rewrite applied on {redact.url(url)[:80]}: {note}", file=sys.stderr, flush=True)
-            self._frame("sent", url, out)  # what really left the browser (routed frames may not raise framesent)
-            server.send(out)
+            out = message
+            try:
+                r = self._rule_live()
+                done = False
+                if r:
+                    out, done = rewrite_client_frame(message, r["find"], r["replace"])
+                if done and r:
+                    r["used"] = True
+                    sizes = f"{len(r['find'])} -> {len(r['replace'])} chars"
+                    note = f"rewrote 1 occurrence ({sizes}) in a {len(message)}-char frame"
+                    self.frame_log.append({"t": time.time(), "dir": "rewrite", "url": redact.url(url), "text": note})
+                    print(
+                        f"bh-browser: ws-rewrite applied on {redact.url(url)[:80]}: {note}", file=sys.stderr, flush=True
+                    )
+                elif r and isinstance(message, str) and len(message) > 200:
+                    print(
+                        f"bh-browser: ws-rewrite: a {len(message)}-char client frame without the string",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                self._frame("sent", url, out)  # what really left the browser (routed frames may not raise framesent)
+            except Exception as exc:  # noqa: BLE001 - never lose a frame: forward it as the page wrote it
+                out = message
+                print(
+                    f"bh-browser: ws-rewrite handler error {type(exc).__name__}: {str(exc)[:160]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
+                server.send(out)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"bh-browser: ws-rewrite: send to server failed {type(exc).__name__}: {str(exc)[:160]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         def from_server(message: Any) -> None:
-            self._frame("recv", url, message)
-            route.send(message)
+            with contextlib.suppress(Exception):
+                self._frame("recv", url, message)
+            try:
+                route.send(message)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"bh-browser: ws-rewrite: send to page failed {type(exc).__name__}: {str(exc)[:160]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         route.on_message(from_page)
         server.on_message(from_server)
