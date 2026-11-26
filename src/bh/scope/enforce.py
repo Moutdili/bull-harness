@@ -191,3 +191,16 @@ def check_support_resolved(scope: Scope, host: str, ip: str | IPAddress) -> Deci
     if _non_public(addr):
         return Decision(False, f"support host {host} resolves to non-public {addr}")
     return Decision(True, "support host, public address", support=d.support)
+
+
+def browser_only(scope: Scope, target: str) -> Rule | None:
+    """The `browser_only` prefix that covers `target` (a URL), None if none does. Matched wide, like an exclusion:
+    any scheme and port, case-insensitive, and `/Chathub/` also covers `/chathub;x`, `/chathub.json`, `/chathub%..`.
+    A target that cannot be parsed is covered by any prefix of the scope (fail closed)."""
+    if not scope.browser_only:
+        return None
+    try:
+        t = parse_target(target)
+    except TargetError:
+        return scope.browser_only[0]
+    return next((r for r in scope.browser_only if _match(r, t, out=True)), None)

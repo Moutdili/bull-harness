@@ -100,6 +100,7 @@ def test_browser_recipe_is_checked_and_its_origins_derived():
         "cookies": True,
         "authorization": True,
         "local_storage": {"token": {"Authorization": "Bearer {value}"}},
+        "authorization_origins": [],
     }
     assert ident["origins"] == ["https://app.test:443/"]  # M7: its bearer goes to the login's origin only
     assert _scope(enroll=BROWSER, origins=[f"{API}/"]).identities[0]["origins"] == [f"{API}/"]

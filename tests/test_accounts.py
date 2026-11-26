@@ -64,7 +64,7 @@ class FakeGate:
 
 
 def probe_ok(s):
-    assert s["step"] == "probe" and s["headers"] == {"X-BH-Identity": "user-a"}
+    assert s["step"] == "probe" and s["headers"] == {"X-BH-Identity": "user-a", "X-BH-Probe": "1"}
     return {"step": "probe", "status": 200, "match": True}
 
 

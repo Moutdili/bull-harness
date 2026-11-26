@@ -9,8 +9,10 @@ recipe kinds (`bh.accounts.recipe`):
   environment; the script answers with statuses, the token and the Set-Cookie of the login.
 - `browser`: an optional HTTP sign-up as above, then headless Chromium in the `bh-login` container, behind the gate
   (`bh.accounts.browser`). TOTP codes are computed on the host (`bh.accounts.totp`), mailed codes read by the host
-  (`bh.accounts.mail`). The session is the context's in-scope cookies, the first Authorization header seen, and
-  declared localStorage keys rendered as headers.
+  (`bh.accounts.mail`). The session is the context's in-scope cookies, the first Authorization header seen, the
+  last Authorization seen per in-scope target origin (`origin_headers`, I19: the gate sends each back to its own
+  origin only, so `q -a` reaches an API of another audience with the right bearer), and declared localStorage keys
+  rendered as headers.
 - `oauth_refresh`: POST grant_type=refresh_token to the recipe's token URL, through the gate as for `json`. The
   refresh token (deposited once by a human at onboarding: first consent, MFA) lives in the secrets file; a new one
   returned by the server replaces it there BEFORE the session is written.
@@ -233,7 +235,10 @@ def probe(ident: Identity) -> tuple[bool | None, str]:
         return None, "no probe declared"
     if not ident.session_file.is_file():
         return None, "no session"
-    step = {"step": "probe", "method": "GET", "url": pr["url"], "headers": {"X-BH-Identity": ident.name}}
+    # X-BH-Probe: the gate lends the identity's session to this request (it comes from the gate's own loopback);
+    # every other enrollment request logs in with its own credentials and never borrows a session
+    headers = {"X-BH-Identity": ident.name, "X-BH-Probe": "1"}
+    step = {"step": "probe", "method": "GET", "url": pr["url"], "headers": headers}
     if pr.get("expect"):
         step["expect"] = pr["expect"]
     rec = run_steps([step])[0]
@@ -269,6 +274,7 @@ def _save_session(ident: Identity, sess: dict[str, Any]) -> None:
 def _new_session(ident: Identity, headers: dict[str, str], now: float) -> dict[str, Any]:
     return {
         "headers": headers,
+        "origin_headers": {},
         "cookies": {},
         "expires_at": None,
         "probe": {"url": ident.probe["url"], "status": ident.probe["status"]} if ident.probe else None,
@@ -359,6 +365,12 @@ def _host_ok(ident: Identity, host: str) -> bool:
     return any((o := origin(u)) and o.split("://", 1)[1].rsplit(":", 1)[0].strip("[]") == host for u in own)
 
 
+def _is_target(scope: Scope, url: str) -> bool:
+    from bh.scope.enforce import check
+
+    return bool(check(scope, url))
+
+
 def browser_jar(ident: Identity, cookies: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:
     """`context.cookies()` as a session jar: in-scope domains only, values a Cookie header can carry, bounded."""
     jar: dict[str, dict[str, Any]] = {}
@@ -410,6 +422,24 @@ def browser_session(ident: Identity, result: dict[str, Any], now: float) -> dict
         if _host_ok(ident, host):
             headers["Authorization"] = auth
             tokens.append(auth)
+    origin_headers: dict[str, dict[str, str]] = {}
+    per_origin = result.get("authorizations") if isinstance(result.get("authorizations"), dict) else {}
+    if cap["authorization"]:
+        for o, value in per_origin.items():
+            if len(origin_headers) >= session.MAX_ORIGIN_HEADERS:
+                break
+            if not isinstance(o, str) or origin(o) != o or not isinstance(value, str) or not value:
+                continue
+            if not rc.HEADER_VALUE.fullmatch(value):
+                raise AccountError("login: an Authorization header seen is not printable ASCII (refused)")
+            # a target only: an identity's header never goes to a support host (sso, auth) nor out of scope
+            if ident.scope is None or not _is_target(ident.scope, o):
+                continue
+            origin_headers[o] = {"Authorization": value}
+            tokens.append(value)
+    missing = [o for o in rc.auth_origins(recipe) if o not in origin_headers]
+    if missing:
+        raise AccountError(f"login: no Authorization seen on {', '.join(missing)} (capture.authorization_origins)")
     ls = result.get("local_storage") if isinstance(result.get("local_storage"), dict) else {}
     for key, hdrs in cap["local_storage"].items():
         v = ls.get(key)
@@ -421,9 +451,10 @@ def browser_session(ident: Identity, result: dict[str, Any], now: float) -> dict
         for name, tmpl in hdrs.items():
             headers[name] = rc.render(tmpl, {"value": v})
     sess = _new_session(ident, headers, now)
+    sess["origin_headers"] = origin_headers
     if cap["cookies"]:
         sess["cookies"] = browser_jar(ident, result.get("cookies") or [], now)
-    if not headers and not sess["cookies"]:
+    if not headers and not sess["cookies"] and not origin_headers:
         raise AccountError("login: the browser ended with no cookie and no header to keep")
     sess["expires_at"] = expiry.known(tokens=tokens, jar=sess["cookies"], now=now)
     return sess

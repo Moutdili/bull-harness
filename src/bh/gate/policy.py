@@ -11,14 +11,19 @@ Classes of destination:
             without body from any sandbox client, no program headers, no identity, no Cookie / Authorization.
             `auth` (our own login): the enrollment sources only (the gate and bh-login), the login's methods;
             the hunter and the judge are refused ("login host, enrollment only"). `sso` (a login host the
-            application calls while in use: silent sign-in iframe, token exchange): any sandbox client, GET/HEAD
-            without body, POST only on the scope's `token_paths` (the enrollment sources: the login's methods);
-            no program header, only the identity's own jar cookies for that host. `passthrough` (a third-party
-            anti-bot challenge): CONNECT to 443 only, the TLS never intercepted (addon: next_layer -> raw TCP),
-            nothing of ours inside, bounded (PassthroughGuard); a decrypted request to it is refused. Own rate
-            limit, public IPs only, never a test (flows class `support`, outside the asset graph and the counts).
+            application calls while in use: silent sign-in iframe, token exchange): GET/HEAD without body only under
+            the scope's `get_paths` (bh-browser: any path, it is the application), POST only on its `token_paths`
+            (the enrollment sources: the login's methods anywhere); no program header, only the identity's own jar
+            cookies for that host. `passthrough` (a third-party anti-bot challenge): CONNECT to 443 from bh-browser
+            only, the TLS never intercepted (addon: ignore_hosts), nothing of ours inside, bounded
+            (PassthroughGuard); a decrypted request to it is refused. Own rate limit, public IPs only, never a test
+            (flows class `support`, outside the asset graph and the counts).
 Websockets (scope `websockets: true`, refused otherwise): the handshake is a target request like any other
-(scope, identity, program headers, rate); then every client message is bounded and journaled (WsGuard).
+(scope, identity, program headers, rate); then every message is bounded and journaled (WsGuard).
+The persistent browser (`browser`: the client is bh-browser, B2): when the scope has a passthrough host, only it may
+open the passthrough tunnel and a websocket; a target path under the scope's `browser_only` prefixes is refused to
+every other client, whatever the method ("browser only"). Its traffic is never paused by the WAF guard nor counted by
+the not-found guard (a human passes its challenges, the application makes its own 404s).
 Everything else is denied. Decisions are made on the real destination (the CONNECT target or the
 absolute request URL), never on the Host header alone.
 """
@@ -26,7 +31,6 @@ absolute request URL), never on the Host header alone.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import ipaddress
 import json
@@ -36,11 +40,10 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from bh.agent.contract import (
     API_PATH,
-    ID_SEGMENT,
     IDENTITY_ONLY_METHODS,
     PASSIVE_DENY_PATHS,
     is_passive,
@@ -49,7 +52,7 @@ from bh.agent.contract import (
 )
 from bh import redact
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
-from bh.scope.enforce import check_support_resolved, support_entry
+from bh.scope.enforce import browser_only, check_support_resolved, support_entry
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
 SYSTEM_HOSTS = ("api.anthropic.com",)
@@ -63,7 +66,7 @@ SUPPORT_AUTH_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST"})
 # a passthrough tunnel (anti-bot challenge, never intercepted): new tunnels per minute, open at once, bytes both ways
 # and lifetime per tunnel. A challenge loads a script and an iframe: a few tunnels, a few hundred kB.
 PASSTHROUGH_PER_MIN, PASSTHROUGH_OPEN = 20, 6
-PASSTHROUGH_MAX_BYTES, PASSTHROUGH_MAX_SECONDS = 16 << 20, 600.0
+PASSTHROUGH_MAX_BYTES, PASSTHROUGH_MAX_SECONDS = 16 << 20, 600.0  # overridable: BH_PASSTHROUGH_* (PassthroughGuard)
 # Ports a domain/wildcard rule authorizes; a CIDR rule (explicit IP range, e.g. a lab) authorizes any port.
 WEB_PORTS = frozenset({80, 443, 8000, 8008, 8080, 8443, 8888})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -75,16 +78,12 @@ BACKOFF_FACTOR, BACKOFF_SECONDS, MIN_RPS = 0.5, 300.0, 0.2
 WAF_LIMIT, WAF_WINDOW_S, WAF_COOLDOWN_S = 3, 600.0, 3600.0
 MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a proof
 # Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
-# authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S.
-ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 4, 600, 5000
+# authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S. Only the ids of the
+# path count (I6): a query or body parameter (telemetry `eventid`, a search filter) is no object read.
+ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 12, 600, 5000
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
 # (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
 MISS_LIMIT, MISS_WINDOW_S = 25, 300
-# An id can also travel outside the path: ?id=7, {"orderId": 7}, GraphQL variables or `user(id: 7)`.
-# A parameter counts when its name names an id and its value looks like one.
-ID_KEY = re.compile(r"^(pk|key|ref|no|num|number)$|(id|uuid|_no|_number)$", re.I)
-_GRAPHQL_ARG = re.compile(r'\b(\w+)\s*:\s*\\?"?([\w-]+)')
-BODY_SCAN_BYTES = 64 << 10
 # What makes an answer a WAF's own page (challenge, block page), not the application's. Never the Server header
 # alone: Cloudflare or Akamai put their name on every answer they relay, the application's 403 included.
 WAF_MARKERS = re.compile(
@@ -193,8 +192,9 @@ class Policy:
     host_blocked_until: dict[str, float] = field(default_factory=dict)  # host -> end of its WAF cooldown
     local_ips: frozenset[str] = frozenset()  # the gate's own addresses (never a destination, B3)
     ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # noqa: PLW0108 - defined below
+    ws_limits_browser: WsLimits = field(default_factory=lambda: WsLimits.from_env(browser=True))
     ws_live: dict[str, WsGuard] = field(default_factory=dict)  # open websocket (flow id) -> its guard
-    passthrough: PassthroughGuard = field(default_factory=lambda: PassthroughGuard())  # noqa: PLW0108 - below
+    passthrough: PassthroughGuard = field(default_factory=lambda: PassthroughGuard.from_env())  # noqa: PLW0108 - below
 
     def reload(self) -> None:
         """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
@@ -235,8 +235,12 @@ class Policy:
             return deny(d.reason, d.rule)
         return None
 
-    def classify_connect(self, host: str, port: int, *, enroll: bool = False) -> Verdict:
-        """CONNECT host:port, before any byte of the tunnel is seen. `enroll`: the client is an enrollment source."""
+    def has_passthrough(self) -> bool:
+        return self.scope is not None and any(s.kind == "passthrough" for s in self.scope.support)
+
+    def classify_connect(self, host: str, port: int, *, enroll: bool = False, browser: bool = False) -> Verdict:
+        """CONNECT host:port, before any byte of the tunnel is seen. `enroll`: the client is an enrollment source;
+        `browser`: the client is bh-browser."""
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         if is_self_address(host, self.local_ips):
@@ -246,11 +250,13 @@ class Policy:
         if v is not None and v.klass == "support":
             if v.support == "passthrough" and port != 443:
                 return deny(f"passthrough host {host}: port {port} (a TLS tunnel to 443 only, never in clear)")
+            if v.support == "passthrough" and not browser:
+                return deny(f"browser only: the challenge host {host} is reached by bh-browser only", "browser-only")
             if port not in (80, 443):
                 return deny(f"support host {host}: port {port} (80 and 443 only)")
             return _support_client(v, host, enroll) or v
         if v is not None:
-            return _web_port(v, port) or self._waf_cooldown(host, v) or v
+            return _web_port(v, port) or (None if browser else self._waf_cooldown(host, v)) or v
         if is_passive(host):
             return Verdict(port == 443, "passive" if port == 443 else "deny", f"passive source {host}")
         return deny(self.scope_error or "not in scope")
@@ -268,9 +274,11 @@ class Policy:
         authenticated: bool = False,
         enroll: bool = False,
         websocket: bool = False,
+        browser: bool = False,
     ) -> Verdict:
         """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent.
-        `enroll`: the client is an enrollment source (the gate itself, bh-login). `websocket`: an upgrade handshake."""
+        `enroll`: the client is an enrollment source (the gate itself, bh-login). `websocket`: an upgrade handshake.
+        `browser`: the client is bh-browser (B2: websockets and `browser_only` paths are its own)."""
         method = method.upper()
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
@@ -282,16 +290,20 @@ class Policy:
                 return deny("websockets are not allowed: this program's scope does not enable them (websockets: true)")
             if v is None or v.klass != "target":
                 return v if v is not None and not v.allowed else deny("websockets go to the scope's targets only")
+            if not browser and self.has_passthrough():
+                return deny("browser only: on this program a websocket is opened by bh-browser only", "browser-only")
             if method != "GET":
                 return deny(f"websocket handshake with {method}")
             if len(self.ws_live) >= self.ws_limits.max_open:
                 return deny(f"websockets: {self.ws_limits.max_open} already open (close one first)")
         if v is not None and v.klass == "support":
             return self._support_request(
-                v, url, host, method, host_header=host_header, body_len=body_len, enroll=enroll
+                v, url, host, method, host_header=host_header, body_len=body_len, enroll=enroll, browser=browser
             )
         if v is not None and v.allowed:
-            if paused := self._waf_cooldown(host, v):
+            if not browser and self.scope is not None and (rule := browser_only(self.scope, url)):
+                return deny(f"browser only: {rule.value} is driven through bh-browser (bh-web)", "browser-only")
+            if not browser and (paused := self._waf_cooldown(host, v)):
                 return paused
             if bad_port := _web_port(v, _port(url)):
                 return bad_port
@@ -305,7 +317,8 @@ class Policy:
                 return deny(f"{method} only as one of your identities (X-BH-Identity)")
             if body_len > MAX_BODY_BYTES:
                 return deny(f"request body over {MAX_BODY_BYTES} bytes")
-            return self._scanning(url) or self._enumeration(url, authenticated or bool(identity), body) or v
+            scanning = None if browser else self._scanning(url)
+            return scanning or self._enumeration(url, authenticated or bool(identity)) or v
         if v is not None:
             return v
         if is_passive(host):
@@ -320,10 +333,20 @@ class Policy:
         return deny(self.scope_error or "not in scope")
 
     def _support_request(
-        self, v: Verdict, url: str, host: str, method: str, *, host_header: str | None, body_len: int, enroll: bool
+        self,
+        v: Verdict,
+        url: str,
+        host: str,
+        method: str,
+        *,
+        host_header: str | None,
+        body_len: int,
+        enroll: bool,
+        browser: bool = False,
     ) -> Verdict:
         """A request to a support host: never a test. assets: GET/HEAD without body; auth: enrollment sources only;
-        sso: GET/HEAD without body, POST on the declared token paths (enrollment: the login's methods); passthrough:
+        sso: GET/HEAD without body under the declared get_paths (bh-browser: anywhere), POST on the declared token
+        paths (enrollment: the login's methods); passthrough:
         never decrypted, so a request seen here is refused (the tunnel was intercepted, or it is plain HTTP)."""
         if v.support == "passthrough":
             return deny(f"passthrough host {host}: CONNECT to 443 only, never intercepted nor in clear")
@@ -347,6 +370,10 @@ class Policy:
                     return deny(f"support host {host} (sso): POST only to its declared token_paths")
             elif method not in ("GET", "HEAD") or body_len:
                 return deny(f"support host {host} (sso): GET/HEAD without body, or POST to a token path, not {method}")
+            elif not browser:
+                entry = support_entry(self.scope, url) if self.scope is not None else None
+                if entry is None or not entry.get_path(urlsplit(url).path):
+                    return deny(f"support host {host} (sso): GET only under its declared get_paths")
         if body_len > MAX_BODY_BYTES:
             return deny(f"request body over {MAX_BODY_BYTES} bytes")
         return v
@@ -363,9 +390,10 @@ class Policy:
             return f"redirect to the passthrough host {urlsplit(target).hostname} under an identity (never followed)"
         return None
 
-    def note_answer(self, url: str, status: int) -> None:
-        """Target answers feed the scanner guard (only where the program forbids scanners)."""
-        if status == 404 and self.scope is not None and not self.scope.scanners_on:
+    def note_answer(self, url: str, status: int, *, browser: bool = False) -> None:
+        """Target answers feed the scanner guard (only where the program forbids scanners). bh-browser's are the
+        application's own requests: never counted."""
+        if status == 404 and not browser and self.scope is not None and not self.scope.scanners_on:
             self.misses.setdefault(origin(url) or "?", deque()).append(time.time())
 
     def _scanning(self, url: str) -> Verdict | None:
@@ -383,22 +411,18 @@ class Policy:
             )
         return None
 
-    def _enumeration(self, url: str, authenticated: bool, body: bytes | None = None) -> Verdict | None:
+    def _enumeration(self, url: str, authenticated: bool) -> Verdict | None:
         """Deny the (ID_LIMIT+1)-th distinct object id on one route within the window. The route is the path as
         the server's router sees it: case, //, a trailing slash, ;params and %xx do not make a new route.
-        Ids carried by a parameter (query string, form or JSON body, GraphQL) count on "path ?name"."""
+        Only the path's ids count (I6): parameters (query string, bodies) are not looked at."""
         path = _route_path(urlsplit(url).path)
         if not (authenticated or API_PATH.search(path)):
             return None
         key = path_key(path)
-        routes: list[tuple[str, str]] = []
-        if "{id}" in key:
-            ids = "/".join(seg for seg, k in zip(path.split("/"), key.split("/"), strict=False) if k == "{id}")
-            routes.append((key, ids))
-        base = "/".join("{id}" if k == "{id}" else seg for seg, k in zip(path.split("/"), key.split("/"), strict=False))
-        routes += [(f"{base} ?{name}", value) for name, value in sorted(id_params(url, body))]
-        if not routes:
+        if "{id}" not in key:
             return None
+        ids = "/".join(seg for seg, k in zip(path.split("/"), key.split("/"), strict=False) if k == "{id}")
+        routes = [(key, ids)]
         now = time.time()
         wanted: dict[str, set[str]] = {}
         for route_key, ids in routes:
@@ -493,14 +517,16 @@ class Policy:
         return b
 
     # ------------------------------------------------------------------ websockets
-    def ws_start(self, fid: str, now: float | None = None) -> str | None:
-        """A websocket that completed its handshake. Refusal reason, or None (its guard is then live)."""
+    def ws_start(self, fid: str, now: float | None = None, *, browser: bool = False) -> str | None:
+        """A websocket that completed its handshake. Refusal reason, or None (its guard is then live). bh-browser's
+        connections live longer (WsLimits.from_env(browser=True)): the chat stays open while the page is."""
         self.reload()
         if self.scope is None or not self.scope.websockets_on:
             return "websockets are not allowed by the active scope"
         if fid not in self.ws_live and len(self.ws_live) >= self.ws_limits.max_open:
             return f"websockets: {self.ws_limits.max_open} already open"
-        self.ws_live[fid] = WsGuard(self.ws_limits, _now() if now is None else now)
+        limits = self.ws_limits_browser if browser else self.ws_limits
+        self.ws_live[fid] = WsGuard(limits, _now() if now is None else now)
         return None
 
     def ws_message(
@@ -536,7 +562,8 @@ def _env_num(name: str, default: float, env=None) -> float:
 @dataclass(frozen=True)
 class WsLimits:
     """Per connection: client messages per minute, bytes per client message (server: WS_SERVER_FACTOR times), lifetime;
-    and how many connections may be open at once. Overridable in the gate's environment (BH_WS_*)."""
+    and how many connections may be open at once. Overridable in the gate's environment (BH_WS_*). Lifetime by default:
+    600 s, WS_BROWSER_MAX_SECONDS (3600) for bh-browser; BH_WS_MAX_SECONDS, when set, applies to both."""
 
     msgs_per_min: int = 12
     max_bytes: int = 64 << 10
@@ -544,8 +571,8 @@ class WsLimits:
     max_open: int = 2
 
     @classmethod
-    def from_env(cls, env=None) -> WsLimits:
-        d = cls()
+    def from_env(cls, env=None, *, browser: bool = False) -> WsLimits:
+        d = cls(max_seconds=WS_BROWSER_MAX_SECONDS) if browser else cls()
         return cls(
             msgs_per_min=int(_env_num("BH_WS_MSGS_PER_MIN", d.msgs_per_min, env)),
             max_bytes=int(_env_num("BH_WS_MAX_BYTES", d.max_bytes, env)),
@@ -554,6 +581,7 @@ class WsLimits:
         )
 
 
+WS_BROWSER_MAX_SECONDS = 3600.0  # a bh-browser websocket (the chat page stays open)
 WS_PREVIEW_CHARS = 200
 WS_SERVER_FACTOR = 16  # a server frame (a streamed answer) may be this many times the client bound
 
@@ -613,6 +641,16 @@ class PassthroughGuard:
     max_seconds: float = PASSTHROUGH_MAX_SECONDS
     recent: deque = field(default_factory=deque)  # start times of the tunnels of the last minute
     live: dict[str, dict] = field(default_factory=dict)  # tunnel id -> {host, start, up, down, closed}
+
+    @classmethod
+    def from_env(cls, env=None) -> PassthroughGuard:
+        """Bounds overridable in the gate's environment: BH_PASSTHROUGH_PER_MIN, _OPEN, _MAX_BYTES, _MAX_SECONDS."""
+        return cls(
+            per_min=int(_env_num("BH_PASSTHROUGH_PER_MIN", PASSTHROUGH_PER_MIN, env)),
+            max_open=int(_env_num("BH_PASSTHROUGH_OPEN", PASSTHROUGH_OPEN, env)),
+            max_bytes=int(_env_num("BH_PASSTHROUGH_MAX_BYTES", PASSTHROUGH_MAX_BYTES, env)),
+            max_seconds=_env_num("BH_PASSTHROUGH_MAX_SECONDS", PASSTHROUGH_MAX_SECONDS, env),
+        )
 
     def open(self, tid: str, host: str, now: float) -> str | None:
         """A tunnel about to start. Refusal reason, or None (it is then counted)."""
@@ -676,52 +714,6 @@ def _port(url: str) -> int:
         return -1
 
 
-def id_params(url: str, body: bytes | None) -> set[tuple[str, str]]:
-    """(name, value) pairs that carry an object id: query string, form or JSON body, GraphQL query text."""
-    found: set[tuple[str, str]] = set()
-
-    def add(name, value) -> None:
-        if isinstance(value, bool) or not isinstance(value, (str, int)):
-            return
-        v = str(value).strip()
-        if ID_KEY.search(str(name)) and ID_SEGMENT.match(v):
-            found.add((str(name).lower(), v.lower()))
-
-    def walk(obj, depth=0) -> None:
-        if depth > 8:
-            return
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, (dict, list)):
-                    walk(v, depth + 1)
-                elif k == "query" and isinstance(v, str):
-                    for name, value in _GRAPHQL_ARG.findall(v):
-                        add(name, value)
-                else:
-                    add(k, v)
-        elif isinstance(obj, list):
-            for v in obj[:200]:
-                walk(v, depth + 1)
-
-    for k, v in parse_qsl(urlsplit(url).query, keep_blank_values=True):
-        if k == "query":
-            walk({"query": v})
-        elif k == "variables":
-            with contextlib.suppress(ValueError):
-                walk(json.loads(v))
-        else:
-            add(k, v)
-    if body:
-        text = body[:BODY_SCAN_BYTES].decode("utf-8", "replace")
-        try:
-            walk(json.loads(text))
-        except ValueError:
-            if "=" in text and "\n" not in text.strip():
-                for k, v in parse_qsl(text, keep_blank_values=True):
-                    add(k, v)
-    return found
-
-
 def _route_path(path: str) -> str:
     path = re.sub(r";[^/]*", "", unquote(path)).lower()
     return re.sub(r"/{2,}", "/", path).rstrip("/") or "/"
@@ -754,13 +746,14 @@ _TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,128}")
 # top-level fields that hand Anthropic a network reach or a sandbox of its own
 RELAY_EGRESS_FIELDS = ("mcp_servers", "container")
 # Models per relay client (the container that sent the request), overridable with BH_RELAY_MODELS_AGENT /
-# BH_RELAY_MODELS_JUDGE (comma-separated ids). Exact API ids: Claude Code resolves its aliases before sending.
-# hunter: `sonnet` (DEFAULT_MODEL) or `opus`, as Claude Code 2.1.330 resolves them; judge: `opus`
-# (BH_VERIFIER_MODEL) and the escalation model (BH_ESCALATION_MODEL).
+# BH_RELAY_MODELS_JUDGE in the gate's environment (comma-separated ids; a set variable REPLACES the default list, so
+# it names every model that client needs). Exact API ids: Claude Code resolves its aliases before sending.
+# hunter: `sonnet` (DEFAULT_MODEL), `opus` as Claude Code 2.1.330 resolves them, or `claude-mythos-5-2` (a Mythos
+# hunt, I10); judge: `opus` (BH_VERIFIER_MODEL) and the escalation model (BH_ESCALATION_MODEL).
 # claude-haiku-5-5: Claude Code's own small model for background calls (seen 4 times in the relay log); a model
 # gives no network access, refusing it would only break Claude Code in ways the run does not show
 RELAY_MODELS_DEFAULT = {
-    "agent": ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"),
+    "agent": ("claude-sonnet-5-5", "claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"),
     "judge": ("claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"),
 }
 # anthropic-beta values the relay lets through (BH_RELAY_BETAS replaces the list). Taken from the beta table of

@@ -32,7 +32,12 @@ SCOPE = {
     "user_agent": "bh-ua",
     "identities": [{"name": "user-a", "origins": ["https://app.example.com/"]}],
     "support": [
-        {"value": "login.example.org", "kind": "sso", "token_paths": ["/*/oauth2/v2.0/token", "/token.srf"]},
+        {
+            "value": "login.example.org",
+            "kind": "sso",
+            "token_paths": ["/*/oauth2/v2.0/token", "/token.srf"],
+            "get_paths": ["/*/oauth2/v2.0/authorize", "/savedusers", "/x"],
+        },
         {"value": "challenges.example.net", "kind": "passthrough"},
         {"value": "cdn.example.net", "kind": "assets"},
         {"value": "signin.example.org", "kind": "auth"},
@@ -77,6 +82,24 @@ def test_sso_post_only_on_a_token_path(tmp_path):
         assert not v.allowed and "token_paths" in v.reason, url
 
 
+def test_sso_get_only_under_get_paths_for_the_hunter(tmp_path):
+    """I13: the hunter and the judge GET an sso host under its get_paths only; bh-browser (the application) and
+    enrollment anywhere."""
+    p = _policy(tmp_path)
+    for url in (
+        "https://login.example.org/common/oauth2/v2.0/devicecode",
+        f"https://login.example.org/{TENANT}/oauth2/v2.0/authorize/../devicecode",
+        f"https://login.example.org/{TENANT}/oauth2/v2.0/authorizeX",
+        "https://login.example.org/",
+    ):
+        v = req(p, url)
+        assert not v.allowed and "get_paths" in v.reason, url
+        assert req(p, url, browser=True).allowed, url
+        assert req(p, url, enroll=True).allowed, url
+    assert req(p, f"https://login.example.org/{TENANT}/oauth2/v2.0/authorize/sub?x=1").allowed
+    assert req(p, "https://login.example.org/savedusers", "HEAD").allowed
+
+
 @pytest.mark.parametrize("method", ["PUT", "DELETE", "PATCH", "OPTIONS"])
 def test_sso_refuses_other_methods_and_bodies(tmp_path, method):
     p = _policy(tmp_path)
@@ -105,14 +128,17 @@ def test_sso_connect_and_resolution(tmp_path):
 # ------------------------------------------------------------------ policy: passthrough
 def test_passthrough_connect_443_only_and_never_decrypted(tmp_path):
     p = _policy(tmp_path)
-    v = p.classify_connect("challenges.example.net", 443)
+    v = p.classify_connect("challenges.example.net", 443, browser=True)
     assert v.allowed and v.klass == "support" and v.support == "passthrough"
+    for enroll in (False, True):  # B2: the hunter, the judge and enrollment never open the challenge
+        v = p.classify_connect("challenges.example.net", 443, enroll=enroll)
+        assert not v.allowed and v.reason.startswith("browser only")
     for port in (80, 8443):
-        assert not p.classify_connect("challenges.example.net", port).allowed
+        assert not p.classify_connect("challenges.example.net", port, browser=True).allowed
     # a request the gate can read means the tunnel was intercepted, or it is plain HTTP: refused either way
     for url in ("https://challenges.example.net/turnstile/v0/api.js", "http://challenges.example.net/"):
-        for enroll in (False, True):
-            d = req(p, url, enroll=enroll)
+        for kw in ({}, {"enroll": True}, {"browser": True}):
+            d = req(p, url, **kw)
             assert not d.allowed and "never intercepted" in d.reason
     assert not req(p, "https://challenges.example.net/", websocket=True).allowed
     assert p.check_ip("challenges.example.net", "104.16.1.1").allowed
@@ -161,6 +187,7 @@ def addon(monkeypatch):
     finally:
         os.umask(old)
     monkeypatch.setattr(mod, "_LOGIN_IPS", (time.time(), frozenset()))
+    monkeypatch.setattr(mod, "_BROWSER_IPS", (time.time() + 3600, frozenset()))  # no lookup in a test
     yield mod
     sys.modules.pop("bh.gate.addon", None)
 
@@ -234,6 +261,7 @@ def _gate(addon, tmp_path, monkeypatch):
     )
     g = addon.Gate()
     g.state, g.policy = tmp_path, p
+    monkeypatch.setattr(addon, "_BROWSER_IPS", (time.time() + 3600, frozenset({BROWSER_IP})))
     monkeypatch.setattr(g, "_is_relay", lambda flow: False)
     monkeypatch.setattr(addon, "ctx", SimpleNamespace(options=Options(), log=mock.MagicMock()))
     return g
@@ -331,12 +359,15 @@ def test_a_target_redirect_to_a_passthrough_host_under_an_identity_is_refused(ad
     assert any(e.get("where") == "response" and "passthrough" in e["reason"] for e in _events(tmp_path))
 
 
-def _connect(host, port=443, sid="s1"):
+BROWSER_IP = "10.89.0.9"
+
+
+def _connect(host, port=443, sid="s1", peer=BROWSER_IP):
     return SimpleNamespace(
         request=SimpleNamespace(host=host, port=port, method="CONNECT", url=f"{host}:{port}"),
         response=None,
         metadata={},
-        client_conn=SimpleNamespace(id="c1", peername=("10.89.0.5", 40000)),
+        client_conn=SimpleNamespace(id="c1", peername=(peer, 40000)),
         server_conn=SimpleNamespace(id=sid, address=("104.16.1.1", port)),
     )
 
@@ -378,6 +409,15 @@ def test_passthrough_connect_is_never_intercepted_and_only_counted(addon, tmp_pa
     assert set(ev) == {"kind", "host", "bytes_up", "bytes_down", "seconds", "ts", "program", "run"}
     assert (ev["host"], ev["bytes_up"], ev["bytes_down"]) == ("challenges.example.net", len(HELLO), 103)
     assert not g._tunnels and not g.policy.passthrough.live
+
+
+def test_passthrough_connect_from_the_agent_is_browser_only(addon, tmp_path, monkeypatch):
+    g = _gate(addon, tmp_path, monkeypatch)
+    f = _connect("challenges.example.net", peer="10.89.0.5")
+    g.http_connect(f)
+    assert f.metadata.get("bh_denied") and not g._tunnels
+    (ev,) = [e for e in _events(tmp_path) if e["kind"] == "blocked"]
+    assert ev["where"] == "connect" and ev["reason"].startswith("browser only")
 
 
 def test_passthrough_on_another_port_or_in_clear_is_refused(addon, tmp_path, monkeypatch):

@@ -7,6 +7,9 @@ in the agent. Every field but `headers` is optional, so a file of the old shape 
 
     {
       "headers":    {"Authorization": "Bearer ..."},       # injected as is (a "Cookie" header joins the jar's)
+      "origin_headers": {"https://substrate.example:443": {"Authorization": "Bearer ..."}},
+                                                          # I19: captured per origin (audience) at enrollment, sent
+                                                          # back to that exact origin only, over `headers`
       "cookies":    {"<domain>": {"<name>": {"value": "...", "path": "/", "expires": 1767225600.0 | null,
                                              "host_only": true, "secure": false}}},
       "expires_at": 1767225600.0 | null,                  # the session as a whole (written by the host's login)
@@ -48,6 +51,8 @@ from bh.scope.psl import is_public_suffix
 MAX_DOMAINS = 16  # a hostile target must not grow the session file without bound
 MAX_COOKIES_PER_DOMAIN = 64
 MAX_COOKIE_BYTES = 4096  # name + value, the usual browser limit
+MAX_ORIGIN_HEADERS = 16  # origins with a captured header of their own
+ORIGIN_HEADER_NAMES = frozenset({"authorization"})  # what may be captured per origin
 DEAD_WINDOW_S = 60  # at most one session-dead event per identity in this window
 # 401 under an identity: dead only when that many distinct routes answer 401 within the window (H4)
 UNAUTH_ROUTES, UNAUTH_WINDOW_S, UNAUTH_ROUTES_MAX = 3, 600.0, 256
@@ -103,6 +108,33 @@ def _norm_jar(raw: Any, now: float) -> dict[str, dict[str, Cookie]]:
     return jar
 
 
+def _norm_origin_headers(raw: Any) -> dict[str, dict[str, str]]:
+    """`origin_headers`: {origin (scheme://host:port, as bh.agent.contract.origin writes it): {Authorization: value}},
+    bounded; anything else is dropped."""
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for o, hs in raw.items():
+        if len(out) >= MAX_ORIGIN_HEADERS:
+            break
+        if not isinstance(o, str) or origin(o) != o or not isinstance(hs, dict):
+            continue
+        kept = {
+            k: v
+            for k, v in hs.items()
+            if isinstance(k, str) and k.lower() in ORIGIN_HEADER_NAMES and isinstance(v, str) and v
+        }
+        if kept:
+            out[o] = kept
+    return out
+
+
+def origin_headers_for(session: Session, url: str) -> dict[str, str]:
+    """The headers captured on `url`'s own origin at enrollment (I19), {} if none."""
+    o = origin(url)
+    return dict((session.get("origin_headers") or {}).get(o, {})) if o else {}
+
+
 def normalize(raw: Any, now: float | None = None) -> Session | None:
     """A session file's content in the current shape (expired cookies dropped), None if it is no session."""
     if not isinstance(raw, dict):
@@ -115,6 +147,7 @@ def normalize(raw: Any, now: float | None = None) -> Session | None:
     exp = raw.get("expires_at")
     return {
         "headers": {str(k): str(v) for k, v in headers.items() if isinstance(v, str)},
+        "origin_headers": _norm_origin_headers(raw.get("origin_headers")),
         "cookies": _norm_jar(raw.get("cookies"), now),
         "expires_at": float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None,
         "probe": (

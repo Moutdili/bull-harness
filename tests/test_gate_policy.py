@@ -171,12 +171,13 @@ def test_token_bucket_rate():
 def test_id_enumeration_is_refused(tmp_path):
     p = _policy(tmp_path)
     url = "https://a.example.com/api/baskets/{}"
-    for i in range(1, 5):
+    assert pol.ID_LIMIT == 12
+    for i in range(1, pol.ID_LIMIT + 1):
         assert req(p, url.format(i), "a.example.com", authenticated=True).allowed, i
-    v = req(p, url.format(5), "a.example.com", authenticated=True)
+    v = req(p, url.format(pol.ID_LIMIT + 1), "a.example.com", authenticated=True)
     assert not v.allowed and "enumeration" in v.reason
     assert req(p, url.format(2), "a.example.com", authenticated=True).allowed  # an id already seen
-    for i in range(1, 9):  # public, non-API pages (blog posts, products) are not limited
+    for i in range(1, pol.ID_LIMIT * 2):  # public, non-API pages (blog posts, products) are not limited
         assert req(p, f"https://a.example.com/blog/{i}", "a.example.com").allowed
 
 
@@ -214,59 +215,27 @@ def test_web_ports_on_every_request_not_only_connect(tmp_path):
 
 def test_id_enumeration_sees_through_path_variants(tmp_path):
     p = _policy(tmp_path)
-    for i in range(1, 5):
+    for i in range(1, pol.ID_LIMIT + 1):
         assert req(p, f"https://a.example.com/api/baskets/{i}", "a.example.com", authenticated=True).allowed
-    for variant in ("/api/baskets/5/", "/API/baskets/6", "/api//baskets/7", "/api/baskets/8;x=1", "/api/baskets/%39"):
+    for variant in (
+        "/api/baskets/50/",
+        "/API/baskets/60",
+        "/api//baskets/70",
+        "/api/baskets/80;x=1",
+        "/api/baskets/%39%39",
+    ):
         v = req(p, "https://a.example.com" + variant, "a.example.com", authenticated=True)
         assert not v.allowed and "enumeration" in v.reason, variant
 
 
-def test_id_enumeration_in_query_body_and_graphql(tmp_path):
+def test_id_enumeration_counts_path_ids_only(tmp_path):
+    """I6: a parameter (telemetry `eventid`, a body id) is not an object read; only the path's ids count."""
     p = _policy(tmp_path)
     host = "a.example.com"
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/api/order?id={i}&page=2", host).allowed, i
-    v = req(p, f"https://{host}/api/order?id=5&page=2", host)
-    assert not v.allowed and "?id" in v.reason
-    assert req(p, f"https://{host}/api/order?id=3&page=9", host).allowed  # an id already seen, other params free
-
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/api/cart", host, "POST", body=b'{"cart": {"basketId": %d}}' % i).allowed
-    assert not req(p, f"https://{host}/api/cart", host, "POST", body=b'{"cart": {"basketId": 5}}').allowed
-
-    gql = b'{"query": "query { user(id: %d) { email } }"}'
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/graphql", host, "POST", body=gql % i).allowed, i
-    assert not req(p, f"https://{host}/graphql", host, "POST", body=gql % 5).allowed
-    variables = b'{"query": "query($u: ID!) { user(id: $u) { email } }", "variables": {"userId": "%d"}}'
-    for i in range(1, 5):
-        assert req(p, f"https://{host}/graphql", host, "POST", body=variables % (100 + i)).allowed, i
-    assert not req(p, f"https://{host}/graphql", host, "POST", body=variables % 200).allowed
-
-
-def test_id_enumeration_batch_in_one_request(tmp_path):
-    p = _policy(tmp_path)
-    batch = b"[%s]" % b",".join(b'{"query": "{ user(id: %d) { email } }"}' % i for i in range(1, 7))
-    v = req(p, "https://a.example.com/graphql", "a.example.com", "POST", body=batch)
-    assert not v.allowed and "enumeration" in v.reason
-    # anonymous, non-API pages stay free: search filters are not object reads
-    for i in range(1, 9):
-        assert req(p, f"https://a.example.com/shop?categoryId={i}", "a.example.com").allowed
-
-
-def test_id_enumeration_in_a_form_body_when_authenticated(tmp_path):
-    p = _policy(tmp_path)
-    for i in range(1, 5):
-        assert req(
-            p,
-            "https://a.example.com/account/show",
-            "a.example.com",
-            "POST",
-            body=b"account_id=%d&x=1" % i,
-            authenticated=True,
-        ).allowed
-    v = req(p, "https://a.example.com/account/show", "a.example.com", "POST", body=b"account_id=5", authenticated=True)
-    assert not v.allowed and "?account_id" in v.reason
+    for i in range(1, pol.ID_LIMIT * 3):
+        assert req(p, f"https://{host}/api/events?eventid={i}", host, authenticated=True).allowed, i
+        body = b'{"query": "query { user(id: %d) { email } }"}' % i
+        assert req(p, f"https://{host}/graphql", host, "POST", body=body, authenticated=True).allowed, i
 
 
 def _waf_policy(tmp_path, monkeypatch, clock):

@@ -26,7 +26,10 @@ Three kinds (`kind`, default `json`):
         - {wait_for: {url: "#/search"}}                    # or {wait_for: "css"}, {wait_for: {selector: "css"}}
       capture:                                             # what becomes the session (defaults shown)
         cookies: true                                      # the context's cookies, in-scope domains only
-        authorization: true                                # Authorization of the first authenticated request
+        authorization: true                                # Authorization of the first authenticated request, and
+                                                           # the last one seen per origin (I19: `origin_headers`)
+        authorization_origins: []                          # targets whose own Authorization the login waits for
+                                                           # (e.g. ["https://api.example/"]: another audience)
         local_storage: {}                                  # e.g. {token: {Authorization: "Bearer {value}"}}
 
     enroll:                                                # kind: oauth_refresh, the refresh token is a secret
@@ -55,7 +58,8 @@ BROWSER_KEYS = {"kind", "email", "signup", "steps", "capture"}
 OAUTH_KEYS = {"kind", "token_url", "client_id", "scope", "headers"}
 ACTIONS = ("goto", "fill", "click", "wait_for", "totp", "email_code", "select")
 STEP_OPTIONS = {"value", "optional", "timeout", "from"}
-CAPTURE_KEYS = {"cookies", "authorization", "local_storage"}
+CAPTURE_KEYS = {"cookies", "authorization", "local_storage", "authorization_origins"}
+MAX_AUTH_ORIGINS = 8
 OAUTH_VARS = frozenset({"access_token"})
 MAX_STEPS = 40
 REQUEST_KEYS = {"method", "url", "json", "form"}
@@ -245,6 +249,17 @@ def _check_browser(enroll: dict[str, Any], ctx: str) -> dict[str, Any]:
     }
     if not isinstance(capture["cookies"], bool) or not isinstance(capture["authorization"], bool):
         raise RecipeError(f"{ctx}.capture: 'cookies' and 'authorization' are true or false")
+    wanted = cap.get("authorization_origins", [])
+    if (
+        not isinstance(wanted, list)
+        or len(wanted) > MAX_AUTH_ORIGINS
+        or not all(isinstance(u, str) and _origin(u) for u in wanted)
+        or (wanted and not capture["authorization"])
+    ):
+        raise RecipeError(
+            f"{ctx}.capture.authorization_origins: at most {MAX_AUTH_ORIGINS} http(s) URLs, with authorization: true"
+        )
+    capture["authorization_origins"] = sorted({_origin(u) for u in wanted})
     ls = capture["local_storage"]
     if not isinstance(ls, dict) or len(ls) > 8:
         raise RecipeError(f"{ctx}.capture.local_storage: a mapping key -> {{Header: 'template with {{value}}'}}")
@@ -291,6 +306,17 @@ def _check_oauth(enroll: dict[str, Any], ctx: str) -> dict[str, Any]:
 def kind(recipe: dict[str, Any] | None) -> str | None:
     """The kind of a checked recipe (`json` when absent: recipes written before kinds existed)."""
     return None if not recipe else recipe.get("kind", "json")
+
+
+def _origin(url: str) -> str | None:
+    from bh.agent.contract import origin
+
+    return origin(url)
+
+
+def auth_origins(recipe: dict[str, Any] | None) -> list[str]:
+    """Origins a checked browser recipe waits for an Authorization of (they must be targets)."""
+    return list(((recipe or {}).get("capture") or {}).get("authorization_origins") or [])
 
 
 def urls(recipe: dict[str, Any] | None) -> list[tuple[str, str]]:

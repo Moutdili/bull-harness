@@ -87,11 +87,12 @@ def test_anthropic_beta_outside_the_list_is_refused():
 
 def test_model_bound_to_the_client():
     models = pol.relay_models()
-    assert models["agent"] == {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"}
+    # I10: a Mythos hunt goes through the relay; the judge keeps its own list
+    assert models["agent"] == {"claude-sonnet-5-5", "claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"}
     assert models["judge"] == {"claude-opus-5-5", "claude-mythos-5-2", "claude-haiku-5-5"}
-    assert check(body(model="claude-mythos-5-2"))[0].startswith("model 'claude-mythos-5-2' is not allowed")
+    assert check(body(model="claude-mythos-5-2"), models=models["agent"])[0] is None
     assert check(body(model="claude-mythos-5-2"), models=models["judge"])[0] is None
-    assert check(body(model="claude-mythos-5-2"))[0].startswith("model 'claude-mythos-5-2'")  # judge only
+    assert check(body(model="claude-sonnet-5-5"), models=models["judge"])[0].startswith("model 'claude-sonnet-5-5'")
     assert check(body(model=None))[0].startswith("model None")
     env = {"BH_RELAY_MODELS_AGENT": "claude-haiku-5-5"}
     assert pol.relay_models(env)["agent"] == {"claude-haiku-5-5"}
@@ -99,7 +100,7 @@ def test_model_bound_to_the_client():
     # fallbacks may not reach another model; the server's "default" routing stays allowed
     assert check(body(fallbacks="default"))[0] is None
     assert check(body(fallbacks=[{"model": "claude-opus-5-5"}]))[0] is None
-    assert "fallbacks" in check(body(fallbacks=[{"model": "claude-mythos-5-2"}]))[0]
+    assert "fallbacks" in check(body(fallbacks=[{"model": "claude-fable-9"}]))[0]
     assert "speed" in check(body(speed="fast"))[0]
 
 
@@ -124,6 +125,8 @@ def addon(monkeypatch):
     finally:
         os.umask(old)
     monkeypatch.setattr(mod, "_RELAY_IPS", (time.time(), {"agent": {"10.89.0.5"}, "judge": {"10.89.0.6"}}))
+    monkeypatch.setattr(mod, "_BROWSER_IPS", (time.time() + 3600, frozenset()))
+    monkeypatch.setattr(mod, "_LOGIN_IPS", (time.time() + 3600, frozenset()))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
     yield mod
     sys.modules.pop("bh.gate.addon", None)
@@ -191,7 +194,7 @@ def test_relay_lets_a_clean_request_through_with_the_token(addon, tmp_path):
         ("10.89.0.5", body(mcp_servers=[{"type": "url", "url": "https://x", "name": "x"}]), None, "mcp_servers"),
         ("10.89.0.5", body(), "oauth-2025-04-20,mcp-servers-2025-12-04", "anthropic-beta"),
         ("10.89.0.5", b"\x00garbage", None, "unreadable"),
-        ("10.89.0.5", body(model="claude-mythos-5-2"), None, "model"),  # the hunter may not use the judge's model
+        ("10.89.0.5", body(model="claude-fable-9"), None, "model"),  # a model on no list
         ("10.89.0.6", body(model="claude-sonnet-5-5"), None, "model"),  # nor the judge the hunter's
     ],
 )
@@ -228,6 +231,7 @@ def test_relay_roles_follow_the_compose_service(addon):
     assert addon.relay_models_for(frozenset(), "/v1/messages") == frozenset()
     assert addon.relay_models_for(frozenset({"agent", "judge"}), "/v1/messages") == {
         "claude-opus-5-5",
+        "claude-mythos-5-2",
         "claude-haiku-5-5",
     }
 
