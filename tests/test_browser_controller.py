@@ -239,6 +239,53 @@ def test_while_the_operator_looks_the_agent_only_reads():
     assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 200
 
 
+def test_j_ai_fini_turns_the_open_screen_into_a_spectator_and_the_agent_goes_on():
+    now = [1000.0]
+    d = FakeDriver()
+    ctl = Controller(d, clock=lambda: now[0])
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 409
+    code, out = ctl.handle(HOST_OPS, {"op": "human_done"})
+    assert code == 200 and out["watching"] is True and out["challenge_pending"] is False
+    st = ctl.handle(AGENT_OPS, {"op": "state"})[1]
+    assert st["human_viewing"] is False and st["human_watching"] is True
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 200
+    # the UI keeps re-asserting "on" while the screen stays open: still a spectator
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    assert ctl.handle(AGENT_OPS, {"op": "press", "key": "Enter"})[0] == 200
+
+
+def test_a_new_challenge_gives_the_screen_back_to_the_operator():
+    d = FakeDriver()
+    ctl = Controller(d, clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    ctl.handle(HOST_OPS, {"op": "human_done"})
+    d.snap = {**d.snap, "frames": [{"url": TURNSTILE, "visible": True}]}
+    st = ctl.handle(AGENT_OPS, {"op": "state"})[1]
+    assert st["challenge"]["pending"] and st["human_viewing"] is True and st["human_watching"] is False
+    d.snap = {**d.snap, "frames": []}
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 409  # solved, but not handed back yet
+
+
+def test_j_ai_fini_while_the_challenge_is_still_there_keeps_the_agent_off():
+    d = FakeDriver()
+    d.snap = {**d.snap, "frames": [{"url": TURNSTILE, "visible": True}]}
+    ctl = Controller(d, clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    code, out = ctl.handle(HOST_OPS, {"op": "human_done"})
+    assert code == 200 and out["watching"] is False and out["challenge_pending"] is True
+    assert ctl.handle(AGENT_OPS, {"op": "state"})[1]["human_viewing"] is True
+
+
+def test_closing_the_last_screen_ends_the_spectator_mode():
+    ctl = Controller(FakeDriver(), clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    ctl.handle(HOST_OPS, {"op": "human_done"})
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": False})
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})  # reopened: the operator's hand again
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 409
+
+
 def test_the_agent_cannot_set_human_viewing():
     with pytest.raises(Refused):
         validate(AGENT_OPS, {"op": "human_viewing", "on": False})

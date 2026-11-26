@@ -160,3 +160,19 @@ def test_print_exit_codes(capsys):
     assert web._print({"error": "goto: TimeoutError: x"}, "goto") == 1
     assert web._print({"text": "abc", "truncated": True, "length": 9, "from": "tail"}, "text") == 0
     assert "truncated at the start: 9" in capsys.readouterr().out
+
+
+def test_wait_human_waits_for_the_screen_to_be_handed_back(capsys):
+    """N3: the challenge is gone but the operator still has the screen; rc 0 only once he clicks J'ai fini."""
+    states = iter(
+        [
+            {"challenge": {"pending": True}, "human_viewing": True},
+            {"challenge": {"pending": False}, "human_viewing": True},
+            {"challenge": {"pending": False}, "human_viewing": False, "human_done_at": 5.0},
+        ]
+    )
+    assert web.wait_human(100, call=lambda r, t: next(states), sleep=lambda s: None) == 0
+    assert '"cleared"' in capsys.readouterr().out
+    t = iter([0, 200])
+    viewing = {"challenge": {"pending": False}, "human_viewing": True}
+    assert web.wait_human(100, call=lambda r, t_: viewing, sleep=lambda s: None, clock=lambda: next(t)) == 3

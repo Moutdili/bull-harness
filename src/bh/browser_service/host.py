@@ -179,8 +179,16 @@ def mark_done() -> dict[str, Any]:
     tmp = f.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec))
     os.replace(tmp, f)
-    told = call({"op": "human_done"}, timeout=30).get("code") == 200
-    return {"ok": True, "t": rec["t"], "browser_told": told}
+    out = call({"op": "human_done"}, timeout=30)
+    told = out.get("code") == 200
+    # watching: the screen turns spectator (the agent goes on); challenge_pending: the click came too early
+    return {
+        "ok": True,
+        "t": rec["t"],
+        "browser_told": told,
+        "watching": bool(out.get("watching")) if told else False,
+        "challenge_pending": bool(out.get("challenge_pending")) if told else None,
+    }
 
 
 def snapshot_file():

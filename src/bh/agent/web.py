@@ -171,7 +171,11 @@ def _print(out: dict, op: str = "") -> int:
         print("a human challenge is on screen: run `bh-web wait-human`; never try to pass it yourself", file=sys.stderr)
         return 3
     if out.get("error") == "human-viewing":
-        print("the operator is at the screen: only state, text and frames until he closes it", file=sys.stderr)
+        print(
+            'the operator is at the screen: only state, text and frames until he clicks "J\'ai fini" or closes it;'
+            " `bh-web wait-human` waits for it",
+            file=sys.stderr,
+        )
         return 3
     if out.get("error") == "fill-budget":
         print("prompt budget spent: no more fill; work another surface", file=sys.stderr)
@@ -189,7 +193,7 @@ def wait_human(timeout: float, call=_call, sleep=time.sleep, clock=time.monotoni
         if st.get("error"):
             print(json.dumps(st))
             return 1
-        if not ch.get("pending"):
+        if not ch.get("pending") and not st.get("human_viewing"):  # N3: solved, and the screen handed back
             print(
                 json.dumps(
                     {
@@ -203,6 +207,13 @@ def wait_human(timeout: float, call=_call, sleep=time.sleep, clock=time.monotoni
             print(RESUME, file=sys.stderr)
             return 0
         if clock() >= end:
+            if not ch.get("pending"):
+                print(json.dumps({"challenge": "cleared", "human_viewing": True}))
+                print(
+                    "the challenge is gone but the operator still has the screen: check `bh-web state` later",
+                    file=sys.stderr,
+                )
+                return 3
             print(json.dumps({"challenge": "still pending", "since": ch.get("since")}))
             print(
                 "not solved yet: `bh-note blocked captcha ...`, work on another surface, check `bh-web state` later",

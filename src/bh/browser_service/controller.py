@@ -115,8 +115,8 @@ HUMAN_NEEDED = (
     "(bh browser view); poll state() until challenge.pending is false, or record the blocker and move on"
 )
 HUMAN_VIEWING = (
-    "the operator has the screen open: only state, text and frames are accepted until he closes it; "
-    "poll state() until human_viewing is false"
+    'the operator has the screen open: only state, text and frames are accepted until he clicks "J\'ai fini" '
+    "(then he only watches) or closes it; poll state() until human_viewing is false"
 )
 SWITCH_NOTE = (
     "the host wipes the profile and loads this identity within a few seconds (only a live identity of this program); "
@@ -365,6 +365,9 @@ class Controller:
         self.switch_requested: str | None = None
         self.switch_error: str | None = None
         self.viewing_until: float | None = None
+        # "J'ai fini" with no challenge left: the open screen turns spectator (view-only in the UI) and the agent
+        # goes on under the operator's eyes. A new challenge, a reset or the last screen closing ends it.
+        self.watching = False
         self._mem: dict[str, Any] = {}  # marker and fills when there is no store
 
     def handle(self, ops: frozenset[str], req: Any) -> tuple[int, dict[str, Any]]:
@@ -492,6 +495,10 @@ class Controller:
 
     # -- helpers
     def _viewing(self) -> bool:
+        """The operator has the screen in hand: the agent only reads. A spectator screen does not count."""
+        return not self.watching and self._screen_open()
+
+    def _screen_open(self) -> bool:
         return self.viewing_until is not None and self.clock() < self.viewing_until
 
     def _state_dict(self) -> dict[str, Any]:
@@ -500,6 +507,7 @@ class Controller:
         if ch["pending"]:
             if self.pending_since is None:
                 self.pending_since = self.clock()
+                self.watching = False  # a new challenge: the screen is the operator's again
                 print(f"bh-browser: human challenge on screen ({ch['reason']})", file=sys.stderr, flush=True)
         elif self.pending_since is not None:
             self.pending_since, self.cleared_at = None, self.clock()
@@ -512,6 +520,7 @@ class Controller:
             "challenge": {**ch, "since": self.pending_since, "cleared_at": self.cleared_at},
             "human_done_at": self.human_done,
             "human_viewing": self._viewing(),
+            "human_watching": self.watching and self._screen_open(),
             "identity": m["identity"] if m else None,
             "program": m["program"] if m else None,
             "switch_requested": self.switch_requested,
@@ -667,16 +676,26 @@ class Controller:
         self.driver.wipe()
         self.secrets.clear()
         self.cookies_loaded, self.human_done, self.pending_since = 0, None, None
+        self.watching = False
         self.switch_requested = None
         return {"ok": True, "reset": True}
 
     def _op_human_done(self) -> dict[str, Any]:
         self.human_done = self.clock()
-        print("bh-browser: the operator says the challenge is done", file=sys.stderr, flush=True)
-        return {"ok": True, "human_done_at": self.human_done}
+        pending = self._state_dict()["challenge"]["pending"]
+        self.watching = not pending  # never hand the page back while a challenge is still on it
+        print(
+            "bh-browser: the operator says the challenge is done"
+            + (" but it is still on screen" if pending else "; the screen is now a spectator"),
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"ok": True, "human_done_at": self.human_done, "watching": self.watching, "challenge_pending": pending}
 
     def _op_human_viewing(self, on: bool) -> dict[str, Any]:
         self.viewing_until = self.clock() + VIEWING_TTL_S if on else None
+        if not on:
+            self.watching = False  # the next screen opened is the operator's hand again
         return {"ok": True, "human_viewing": self._viewing()}
 
     def _op_fill_budget_reset(self) -> dict[str, Any]:
