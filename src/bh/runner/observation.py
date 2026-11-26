@@ -21,6 +21,8 @@ sighting, `inconclusive`. The judge reads the table and can only lower this verd
 The control (audit N6): the hunter also ran the same steps without A's payload, N times, and the canary crossed k of
 them (`control: "k/N"`). A sighting proves the leak, not that A's content caused it (B's own prompt, a share B made):
 without a well-formed control, or with k > 0, a sighting stays `inconclusive`. Never `verified-evidence` without it.
+The host's verdict (`check`) always demands it (`need_control=True`); `decide` alone judges the sighting, and applies
+the control as soon as the observation carries a `control` key, even a malformed one.
 """
 
 from __future__ import annotations
@@ -70,8 +72,15 @@ def _row(e: dict) -> dict:
     }
 
 
-def decide(events: Iterable[dict], obs: dict, offscope: Callable[[str], bool] = lambda _h: False) -> dict:
-    """{"status", "why", "events"} from the canary events of one token (already filtered on it)."""
+def decide(
+    events: Iterable[dict],
+    obs: dict,
+    offscope: Callable[[str], bool] = lambda _h: False,
+    *,
+    need_control: bool = False,
+) -> dict:
+    """{"status", "why", "events"} from the canary events of one token (already filtered on it). The control (N6) is
+    applied when `need_control` (the host's verdict, `check`) or when `obs` carries a `control` key."""
     token, victim, attacker = obs["token"], obs["victim"], obs["attacker"]
     evs = sorted(
         (e for e in events if isinstance(e, dict) and e.get("kind") == "canary" and e.get("token") == token), key=_ts
@@ -102,6 +111,8 @@ def decide(events: Iterable[dict], obs: dict, offscope: Callable[[str], bool] = 
             "events": table,
         }
     why = f"{token} {why}; never sent by anyone but {victim}"
+    if not need_control and "control" not in obs:
+        return {"status": "verified-evidence", "why": why, "events": table}
     control = c.parse_control(obs.get("control"))
     if control is None:
         return {
@@ -166,4 +177,4 @@ def check(obs: dict, scope=None) -> dict:
             return False
         return not scope_check(scope, f"https://{host}/").allowed
 
-    return decide(journal(obs["token"], getattr(scope, "program", None)), obs, offscope)
+    return decide(journal(obs["token"], getattr(scope, "program", None)), obs, offscope, need_control=True)

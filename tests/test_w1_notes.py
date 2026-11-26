@@ -239,9 +239,16 @@ SEEN = [
 ]
 
 
-def test_observation_without_control_is_inconclusive():
-    out = observation.decide(SEEN, OBS)
+def test_observation_without_control_is_inconclusive(monkeypatch):
+    # the host's verdict (check) always demands the control
+    monkeypatch.setattr(observation, "journal", lambda token, program=None: list(SEEN))
+    out = observation.check(OBS)
     assert out["status"] == "inconclusive" and "no control" in out["why"]
+    assert observation.check({**OBS, "control": "0/3"})["status"] == "verified-evidence"
+    out = observation.decide(SEEN, OBS, need_control=True)
+    assert out["status"] == "inconclusive" and "no control" in out["why"]
+    # decide alone judges the sighting; any control key it carries is applied
+    assert observation.decide(SEEN, OBS)["status"] == "verified-evidence"
     assert observation.decide(SEEN, {**OBS, "control": "0/3"})["status"] == "verified-evidence"
     out = observation.decide(SEEN, {**OBS, "control": "1/3"})
     assert out["status"] == "inconclusive" and "1/3" in out["why"]
