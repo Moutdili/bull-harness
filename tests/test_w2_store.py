@@ -569,3 +569,26 @@ def test_lineage_imports_no_network_module():
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "__import__":
                 bad.append(f"{f.name}: __import__")
     assert bad == []
+
+
+def test_backfill_pours_pre_lineage_runs_dated_at_their_end(board):
+    """Run 69 (lab, 2026-11-27): the first agent of the lineage started with "0 items" in memory although 68 runs
+    had worked the program. backfill() pours those runs, as agent #0, dated when they ran."""
+    rid, _, fv = _hunt(board)
+    board.db.execute("UPDATE runs SET started=?, ended=? WHERE id=?", (1000.0, 2000.0, rid))
+    board.db.commit()
+    n = store.backfill(board, "p")
+    assert n > 0 and _count(board) > 0
+    rows = board.db.execute("SELECT agent_no, valid_from, created FROM mem_items WHERE program='p'").fetchall()
+    assert {r["agent_no"] for r in rows} == {0} and {r["valid_from"] for r in rows} == {2000.0}
+    assert {r["created"] for r in rows} == {2000.0}
+    assert store.backfill(board, "p") == 0  # idempotent
+    assert _by_src(board, "finding", fv)["label"] == "JUDGED"
+
+
+def test_backfill_skips_runs_an_agent_owns(board):
+    rid, _, _ = _hunt(board)
+    store.ensure(board)  # holds the agents table (lot D writes its rows)
+    board.db.execute("INSERT INTO agents(no, program, run_id) VALUES (1, 'p', ?)", (rid,))
+    board.db.commit()
+    assert store.backfill(board, "p") == 0 and _count(board) == 0

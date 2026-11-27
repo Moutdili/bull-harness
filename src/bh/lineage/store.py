@@ -643,6 +643,38 @@ def _summary(board: Board, program: str, run: dict, agent_no: int) -> dict:
     }
 
 
+def backfill(board: Board, program: str, *, before: int | None = None) -> int:
+    """Pour into memory the runs of `program` that ran before the lineage (no agent owns them), as agent #0, and date
+    each item at its run's end, not today: what an agent finds by `bh-recall` on a program already worked must not
+    start from nothing, and an old blocker must age like one. Idempotent (ingest_run is). Returns items written."""
+    ensure(board)
+    owned = (
+        {int(r[0]) for r in board.db.execute("SELECT run_id FROM agents WHERE program=?", (program,))}
+        if _has(board, "agents")
+        else set()
+    )
+    sql = "SELECT id, COALESCE(ended, started) AS t FROM runs WHERE program=?" + (" AND id<?" if before else "")
+    runs = board.db.execute(sql + " ORDER BY id", (program, before) if before else (program,)).fetchall()
+    n = 0
+    for rid, t in runs:
+        if int(rid) in owned:
+            continue
+        n += ingest_run(board, program, int(rid), 0)
+        if t:
+            board.db.execute(
+                "UPDATE mem_items SET valid_from=?, created=? WHERE program=? AND run_id=? AND agent_no=0",
+                (float(t), float(t), program, int(rid)),
+            )
+    board.db.commit()
+    return n
+
+
+def _has(board: Board, table: str) -> bool:
+    return (
+        board.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+    )
+
+
 def ingest_run(board: Board, program: str, run_id: int, agent_no: int) -> int:
     """Write the memory items of one run of `program` (see _run_items, _summary). Returns the items written or
     merged. Idempotent: a source already ingested with the same text is skipped; one whose text changed (a finding
