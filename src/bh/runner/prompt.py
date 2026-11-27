@@ -148,10 +148,18 @@ Options for all: `--as <identity>` (authenticated), `--timeout <s>`. They run fo
   With 2+ identities, run it once mapping is done and before testing access control by hand
 """
 
+# W3: skills and the sandbox's MCP servers, the same two lines for both arsenals (no scanner named: audit I8). Their
+# tools and skills carry their own descriptions: the doctrine only says they exist and that the hooks treat them alike.
+_SKILLS_MCP = """\
+- Skills hold the method for one class or surface: load the matching skill before you test that class or surface.
+- `mcp__bh__*` tools are these same commands, typed, with the same refusals; `mcp__hexstrike__tools_list` says what else is installed and allowed on this program.
+"""
+
 _REQUESTS = """\
 Hand-made requests: use `q` and `qq` rather than long curl lines (each line you write stays in your context).
 - `q [-a <identity>] [-X M] [-d body | -j json] [-H 'K: V'] [-n bytes] [-i] <url|/path>`: one request, prints
   status, size, type and the first 400 bytes (full body saved, path shown). A `/path` reuses the last origin.
+  A body holding `$`, backquotes, double quotes or `!` goes between single quotes (or `curl -d @file`): else the shell changes it first.
 - `qq <url|/path>`: the same GET as each of your identities and anonymous, one line each (status, size, hash,
   `==` when two answers are identical). The first check for IDOR and broken access control.
 """
@@ -174,6 +182,7 @@ _METHOD_SCANNERS = """\
    (parameters -> bh-sqli / bh-xss / bh-params). Then manual requests for what tools cannot judge:
    IDOR/BOLA between your identities, auth/session flaws, business logic, SSRF.
 3. Prove, then record. Scanner output is a lead, never a finding until you reproduced the impact by hand.
+- An abnormal answer: first one variant that keeps the syntax, then two close controls at most, before you widen.
 - Missing headers, banner versions, self-XSS and info-level template hits do not pay.
 - Long outputs are cut by the harness and saved to a file (path shown): query it with grep/jq/sed -n.
 """
@@ -185,6 +194,7 @@ _METHOD_LIGHT = """\
 2. Test: work that untested list (or the surfaces of the program card), highest value first, by hand and at a
    low rate: IDOR/BOLA between your identities, auth/session flaws, business logic, SSRF.
 3. Prove, then record. A tool's output is a lead, never a finding until you reproduced the impact by hand.
+- An abnormal answer: first one variant that keeps the syntax, then two close controls at most, before you widen.
 - Missing headers, banner versions and self-XSS do not pay.
 - Long outputs are cut by the harness and saved to a file (path shown): query it with grep/jq/sed -n.
 """
@@ -296,8 +306,10 @@ def doctrine(scanners: bool = True, opening: str | None = None) -> str:
         .replace("{id_window}", _window(policy.ID_WINDOW_S))
     )
     if scanners:
-        return head + "\n" + _ARSENAL_SCANNERS + _REQUESTS + _LOCK_SCANNERS + "\n" + _METHOD_SCANNERS + "\n" + _TAIL
-    return head + "\n" + _ARSENAL_LIGHT + _REQUESTS + _LOCK_LIGHT + "\n" + _METHOD_LIGHT + "\n" + _TAIL
+        arsenal, lock, method = _ARSENAL_SCANNERS, _LOCK_SCANNERS, _METHOD_SCANNERS
+    else:
+        arsenal, lock, method = _ARSENAL_LIGHT, _LOCK_LIGHT, _METHOD_LIGHT
+    return head + "\n" + arsenal + _SKILLS_MCP + _REQUESTS + lock + "\n" + method + "\n" + _TAIL
 
 
 def __getattr__(name: str) -> str:
@@ -436,8 +448,38 @@ def scope_block(scope: Scope, identities: list[str] | None = None, *, verifier: 
     return "\n".join(lines)
 
 
-def build_system_prompt(scope: Scope, identities: list[str] | None = None) -> str:
-    return doctrine(scope.scanners_on) + "\n" + scope_block(scope, identities) + "\n"
+# One Arsenal entry: `- `bh-<name>` at the start of a line or after a run of spaces (two entries share some lines)
+_ENTRY = re.compile(r"(?:^|(?<=\s\s))- `(bh-[a-z]+)")
+
+
+def _arsenal_without(doc: str, missing: set[str]) -> str:
+    """The doctrine minus the Arsenal entries of the builtins in `missing` (W3: the prompt offers no tool the sandbox
+    lacks). An entry goes with its indented continuation lines; a line that shared it with another keeps the other."""
+    head, sep, rest = doc.partition("## Arsenal")
+    if not sep or not missing:
+        return doc
+    section, cut, after = rest.partition("\nHand-made requests:")
+    out: list[str] = []
+    dropped = False  # the last entry seen was dropped: its continuation lines go too
+    for line in section.split("\n"):
+        starts = [m.start() for m in _ENTRY.finditer(line)]
+        if not starts:
+            if not (dropped and line.startswith("  ")):
+                out.append(line)
+                dropped = False
+            continue
+        cells = [line[a:b].rstrip() for a, b in zip(starts, [*starts[1:], len(line)], strict=True)]
+        kept = [cell for cell in cells if _ENTRY.match(cell).group(1) not in missing]
+        dropped = _ENTRY.match(cells[-1]).group(1) in missing
+        if kept:
+            out.append(line[: starts[0]] + "   ".join(kept) if len(kept) < len(cells) else line)
+    return head + sep + "\n".join(out) + cut + after
+
+
+def build_system_prompt(scope: Scope, identities: list[str] | None = None, *, missing_tools=()) -> str:
+    """`missing_tools`: the builtins the sandbox lacks (`bh-zap` or `zap`); their Arsenal lines are left out."""
+    missing = {t if t.startswith("bh-") else f"bh-{t}" for t in missing_tools}
+    return _arsenal_without(doctrine(scope.scanners_on), missing) + "\n" + scope_block(scope, identities) + "\n"
 
 
 def build_task(
@@ -508,6 +550,14 @@ Rules:
 - Check first what the hunter says he could not rule out (`counter`, `not_proven`): a false positive hides there.
 - Ask whether it is the intended behaviour, whether the "secret" was supplied by the attacker, whether the
   program excludes it, and whether the evidence comes from THIS mechanism and not from another bug.
+- A parameter, header or token the server accepts is not one it needs: re-test with it and without; same answer, no flaw.
+- By design: a visibility setting, the product's documentation or its open-source upstream doing the same is the feature.
+- 200 with the same HTML on any path is the single-page app's shell: no file, route or API answer is exposed by it.
+- A key public by construction (publishable payment, backend or analytics key) is no secret: judge only what it opens.
+- Demo or seed data (placeholders, repeated patterns, a test tenant) shows the vector, never the harm to a real user.
+- A 403 or challenge from the edge (WAF, CDN) is not the application refusing: no control, and its absence no bypass.
+- A write answered 200 or 204 proves nothing until the object, read back, shows the change.
+- A chain with one link nobody ran is a theory: every link needs its own request and answer.
 - Floor: if nobody is harmed (no user or company loses data, money, access or control of an account), it is not a
   finding: `rejected`. Two tests before `confirmed`: the hunter's own justification (summary, `severity_why`,
   `counter`) does not refute the finding; the criterion the proof reaches is the one the finding announces.

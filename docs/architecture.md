@@ -31,7 +31,10 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
  │  agent (kali-rolling + headless)    │
  │   · claude -p (headless, OAuth Pro) │
  │   · hooks Pre/PostToolUse           │
+ │     (Bash et mcp__.*)               │
  │   · /opt/bh/bin : alias + builtins  │
+ │   · MCP stdio : bh, hexstrike (W3)  │
+ │   · skills (W3)                     │
  └─────────────────────────────────────┘
  ┌─────────────────────────────────────┐
  │  judge (même image, même gate)      │ ← vérificateur : son /work (var/judge),
@@ -159,8 +162,13 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 - Pas de secrets cibles dans le conteneur : les cookies sont injectés par le gate.
 
 ### 4. `tokens/` — économie de tokens
-- **Hook PreToolUse** : journalise chaque commande (JSONL) ; si la commande correspond à une recette avec filtre, il la réécrit vers `bhf <recette> -- <cmd>` (`updatedInput`).
-- **Hook PostToolUse** : au-delà de N lignes ou K octets, il remplace la sortie par un résumé + `raw: /work/raw/<id>.log` (`updatedToolOutput`).
+- **Hook PreToolUse** (`bh-agent hook-pre`, `src/bh/agent/hooks.py`, déclaré dans `container/agent/hooks/settings.json`
+  pour `Bash` et pour `mcp__.*`) : journalise chaque appel dans `commands.jsonl` (outil, classe, décision) et applique
+  les règles du programme et le verrou (§5). Il ne réécrit aucune commande : la réécriture vers un filtre de recette
+  (`bhf`, `updatedInput`) prévue en v0 n'existe pas.
+- **Hook PostToolUse** (`bh-agent hook-post`) : sur `Bash`, au-delà de `BH_TRUNC_CHARS` (8000 caractères par défaut),
+  la sortie devient tête + queue + le chemin du brut sous `raw/` (`updatedToolOutput`). Sur `mcp__.*`, aucune
+  réécriture (la forme du résultat est celle du serveur) : une sortie trop longue est notée dans `trunc.jsonl`.
 - **Mineur** (le « watchdog ») : lit le JSONL des hooks, extrait préfixe + emplacements d'argument et classe par `économie × fréquence`. Il propose, il n'applique pas.
 - **Compilateur d'alias** : écrit des wrappers dans `/opt/bh/bin/<symbole>` qui passent `"$@"`, refuse les collisions PATH/builtins/mots réservés, et n'aliase jamais une commande destructive.
 - **Calibrage sur Claude** : pas d'API key sur Pro → mesure différentielle via `claude -p --output-format json` (champ `usage`), avec et sans le symbole. ⚠ À valider : bruit dû au cache.
@@ -174,6 +182,13 @@ Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/age
 - `bh-crawl` = katana + extracteur maison des chemins cités dans le JS/HTML (avec le verbe HTTP quand il est visible).
 - **Verrou** (hook PreToolUse) : `curl`/`wget`/`python`… vers une origine sont refusés tant que crawl, content et scan
   n'y ont pas tourné. Le message `[bh-lock]` donne les commandes exactes.
+- **Outils MCP** (W3) : le même hook PreToolUse voit chaque appel `mcp__<serveur>__<outil>` et le classe avec la table
+  de `src/bh/agent/mcp_policy.py` (mapper, scanner, request, note, passive, browser) : un outil absent de la table est
+  refusé, un scanner l'est quand le programme interdit les scanners, un outil `request` est sous le même verrou que
+  `curl` sur les origines de ses URL, et le juge n'a aucun outil MCP. Une erreur du hook refuse l'appel (à l'inverse
+  de `Bash`, où il laisse passer : le gate reste la frontière).
+- **Skills** (W3) : une méthode par classe ou par surface, `src/bh/skills/<nom>/SKILL.md`, que l'agent charge avant
+  de tester ; elles prennent la place des cartes épinglées (`src/bh/cards/` reste). La doctrine ne fait que les nommer.
 - **File de surface** : le runner ajoute au board les endpoints trouvés et pas encore testés (testé = touché par un
   `curl` autorisé ou un builtin de test).
 - Métrique par run : commandes arsenal / manuelles / verrouillées (`runs.arsenal_calls` …).
@@ -238,17 +253,23 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   pour subir la même politique que l'agent.
 - **Session morte** : un 401 sous identité peut être un refus d'accès légitime (objet d'un autre). La marque « périmée »
   qu'il pose est levée au segment suivant si la sonde de l'identité (`probe`, avec contenu attendu) répond bien.
-- **MCP** : la session de l'agent et celle du juge ne chargent aucun serveur MCP (`--strict-mcp-config` sans
-  `--mcp-config`), et un `.mcp.json` laissé dans le dossier de travail est effacé entre deux segments. Raison : les hooks
-  ne voient que `Bash`. Les outils tiers entrent comme builtins `bh-*` (`research/08-mcp-arsenal.md`).
+- **MCP** (W3) : la session de l'agent charge deux serveurs stdio, lancés dans le conteneur agent par
+  `bh-agent mcp bh` (les builtins en 12 outils typés, `mcp__bh__*`) et `bh-agent mcp hexstrike` (trois méta-outils,
+  `mcp__hexstrike__tools_list`, `tool_help`, `tool_run`) ; aucun autre serveur ne démarre, et l'agent voit 20 outils
+  MCP au plus. Le juge n'en charge aucun (`--strict-mcp-config` sans `--mcp-config`) et son hook refuse tout outil
+  `mcp__*`. Un `.mcp.json` laissé dans le dossier de travail est toujours effacé entre deux segments. Le hook
+  PreToolUse couvre `Bash` et `mcp__.*` avec la même classification (§5) ; ce sont des aides, le gate reste la
+  frontière : une requête lancée par un outil MCP passe par lui comme celle d'une commande `Bash`. Le relais ne
+  change pas (paragraphe suivant).
 - **Jeton OAuth** : n'existe que dans le gate ; l'agent a un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081`.
   Le relais n'accepte que les conteneurs agent et juge (résolus par nom, `BH_AGENT_HOST` / `BH_JUDGE_HOST`, cache
   60 s, une relecture DNS au plus toutes les 5 s pour une IP refusée ; le gate est aussi sur le réseau du lab, qui
   reste refusé), que les deux appels que fait
   Claude Code (`POST /v1/messages`, `/v1/messages/count_tokens`, mesuré sur 2.1.330), seulement pendant un run, et
   au plus `3 × max_turns + 30` requêtes par segment (plus un budget pendant la vérification). Il lit le corps :
-  outils serveur (`web_search`, `web_fetch`…), `mcp_servers`, sources URL et en-têtes `anthropic-beta` hors liste
-  sont refusés, et chaque conteneur a sa liste de modèles (audit H1). Il journalise statut, id de message et
+  outils serveur (`web_search`, `web_fetch`…), `mcp_servers` (serveur MCP distant), sources URL et en-têtes
+  `anthropic-beta` hors liste sont refusés (inchangé en W3 : les outils des serveurs stdio du sandbox arrivent au
+  relais comme des outils client ordinaires), et chaque conteneur a sa liste de modèles (audit H1). Il journalise statut, id de message et
   `stop_reason` de chaque réponse, que le runner croise avant de croire un quota ou un refus. Reste : dans ce budget, un `claude -p` imbriqué consomme le
   quota (sans jeton à exfiltrer).
 - **Le sandbox n'est pas une frontière** : hooks, verrou d'outils et fichiers du contrat sont des aides. Les garanties
