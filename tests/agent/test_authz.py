@@ -280,3 +280,50 @@ def test_known_endpoints_api_first_and_never_logout(env):
 def test_bh_authz_is_a_link_to_the_entry_point():
     link = ROOT / "container/agent/bin/bh-authz"
     assert link.is_symlink() and os.readlink(link) == "bh-agent"
+
+
+# ------------------------------------------------------------------ T25: the baseline per role
+def test_baseline_writes_each_identitys_routes_without_any_attack_request(env, monkeypatch, capsys):
+    sent = []
+    monkeypatch.setattr(az, "_send", lambda *a, **k: sent.append(a))  # no request of bh-authz's own
+    seen = {"user-a": [f"{ORIGIN}/#/home", f"{ORIGIN}/#/home", "not a url"], "user-b": None}
+    asked = []
+
+    def browse(url, who):
+        asked.append((url, who))
+        return seen[who]
+
+    monkeypatch.setattr(az, "browse_routes", lambda url, who, timeout=az.BASELINE_TIMEOUT_S: browse(url, who))
+    az.main(["--baseline", f"{ORIGIN}/"])
+    out = capsys.readouterr().out
+    assert asked == [(f"{ORIGIN}/", "user-a"), (f"{ORIGIN}/", "user-b")] and sent == []
+    doc = json.loads((env / "baseline" / "user-a.json").read_text())
+    assert doc["routes"] == [f"{ORIGIN}/#/home"] and isinstance(doc["ts"], float)
+    assert not (env / "baseline" / "user-b.json").exists()
+    assert "user-b: bh-browse failed" in out and "[bh-fail] unreachable" in out and out.count("\n") <= az.MAX_LINES
+
+
+def test_baseline_takes_one_url_and_known_identities(env, monkeypatch):
+    with pytest.raises(SystemExit):
+        az.main(["--baseline"])
+    with pytest.raises(SystemExit):
+        az.main(["--baseline", f"{ORIGIN}/", "--write-own"])
+    with pytest.raises(SystemExit, match="unknown identity"):
+        az.main(["--baseline", f"{ORIGIN}/", "--as", "user-a,mallory"])
+
+
+def test_browse_routes_reads_the_raw_routes_of_bh_browse(tmp_path, monkeypatch):
+    raw = tmp_path / "raw" / "browse-x"
+    raw.mkdir(parents=True)
+    (raw / "routes.txt").write_text(f"{ORIGIN}/\n{ORIGIN}/#/admin\n\n")
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return az.subprocess.CompletedProcess(argv, 0, f"bh-browse ...\nraw: {raw}/\nnext: x\n", "")
+
+    monkeypatch.setattr(az.subprocess, "run", fake_run)
+    assert az.browse_routes(f"{ORIGIN}/", "user-a", 30) == [f"{ORIGIN}/", f"{ORIGIN}/#/admin"]
+    assert calls == [["bh-browse", f"{ORIGIN}/", "--routes", "--as", "user-a", "--timeout", "30"]]
+    monkeypatch.setattr(az.subprocess, "run", lambda argv, **kw: az.subprocess.CompletedProcess(argv, 1, "", ""))
+    assert az.browse_routes(f"{ORIGIN}/", "user-a") is None

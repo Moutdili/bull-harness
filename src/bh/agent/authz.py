@@ -2,6 +2,7 @@
 
   bh-authz [<url>...] [--from endpoints|touched] [--owner ID] [--as ID,ID] [--anon] [--methods GET,HEAD]
            [--write-own] [--max N]
+  bh-authz --baseline <url> [--as ID,ID]
 
 1. Ownership markers: each identity's own "me" page (/me, /api/me, whoami, /profile, /account..., at most
    ME_PROBES requests each) gives its ids, emails and names. Only markers no other identity shares are kept.
@@ -25,6 +26,11 @@ best candidate (format of bh.agent.proof, validated), coverage phase `authz`, te
 The summary ends with `N routes in, N tested, missing: ...` (the routes given or known, against the rows tested) and
 `next: <one action>`; a run where the owner got no usable answer at all (gate refusals, rate limit, unreachable, 401
 everywhere) prints `[bh-fail] <class>: <action>` and marks nothing tested.
+Baseline per role (T25, --baseline): no attack request at all. For each identity (BH_IDENTITIES, or --as), the routes
+the interface offers it: `bh-browse <url> --routes --as <identity>` (its raw routes.txt), written to
+<BH_DIR>/baseline/<identity>.json = {"routes": [...], "ts"}. The host copies it after the segment, keeping only the
+routes the gate saw under that identity (bh.accounts.baseline): the judge weighs a vertical finding against it.
+
 Classification: a mapper; with --write-own a scanner (refused where the program forbids scanners). The verifier
 may not run it.
 """
@@ -37,6 +43,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -613,7 +620,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--methods", default="GET", help="read methods, among GET and HEAD")
     p.add_argument("--write-own", action="store_true", help="cross-identity PATCH/PUT on the owner's objects")
     p.add_argument("--max", type=int, default=DEFAULT_MAX, help="endpoints at most")
+    p.add_argument(
+        "--baseline", action="store_true", help="per identity, the routes the interface offers (bh-browse --routes)"
+    )
     a = p.parse_args(argv)
+    if a.baseline and (len(a.urls) != 1 or a.write_own or a.owner):
+        p.error("--baseline: one start URL, no --write-own, no --owner")
     a.methods = {m.strip().upper() for m in a.methods.split(",") if m.strip()}
     if a.methods - {"GET", "HEAD"}:
         p.error("--methods: GET and HEAD only (writes: --write-own)")
@@ -629,6 +641,15 @@ def main(argv: list[str]) -> None:
     names = [i for i in os.environ.get("BH_IDENTITIES", "").split(",") if i]
     if not names:
         sys.exit("bh-authz: no identity for this program (BH_IDENTITIES): nothing to compare")
+    if a.baseline:
+        who = [w for w in (a.others.split(",") if a.others else names) if w]
+        if unknown := [w for w in who if w not in names]:
+            sys.exit(f"bh-authz: unknown identity {unknown[0]!r}")
+        url = a.urls[0] if "://" in a.urls[0] else f"https://{a.urls[0]}"
+        if c.origin(url) is None:
+            sys.exit("bh-authz: need an http(s) URL")
+        print("\n".join(baseline(url, who)))
+        return
     owner = a.owner or names[0]
     if owner not in names:
         sys.exit(f"bh-authz: unknown owner {owner!r} (identities: {', '.join(names)})")
@@ -647,6 +668,59 @@ def main(argv: list[str]) -> None:
     routes_in = list(eps)
     eps = eps[: max(1, a.max)]
     run(eps, owner, others, with_anon=with_anon, write_own=a.write_own, limit=max(1, a.max), routes_in=routes_in)
+
+
+# ------------------------------------------------------------------ baseline per role (T25)
+BASELINE_DIR = "baseline"
+BASELINE_TIMEOUT_S = 120
+BASELINE_ROUTES_MAX = 500
+
+
+def browse_routes(url: str, who: str, timeout: int = BASELINE_TIMEOUT_S) -> list[str] | None:
+    """The routes `bh-browse <url> --routes --as <who>` saw (its raw routes.txt); None when it failed."""
+    try:
+        r = subprocess.run(
+            ["bh-browse", url, "--routes", "--as", who, "--timeout", str(timeout)],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"^raw: (.+?)/?$", r.stdout or "", re.M)
+    if r.returncode or m is None:
+        return None
+    f = Path(m.group(1)) / "routes.txt"
+    try:
+        return [line.strip() for line in f.read_text().splitlines() if line.strip()]
+    except OSError:
+        return None
+
+
+def baseline(url: str, names: list[str], *, browse=None, now: float | None = None) -> list[str]:
+    """One bh-browse per identity, no attack; <BH_DIR>/baseline/<identity>.json each. The summary lines."""
+    browse = browse or browse_routes
+    d = c.bh_dir() / BASELINE_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    lines, failed = [f"bh-authz --baseline {url}: the routes the interface offers each identity (no attack)"], []
+    for who in names:
+        routes = browse(url, who)
+        if routes is None:
+            failed.append(who)
+            lines.append(f"  {who}: bh-browse failed, no baseline")
+            continue
+        routes = [r for r in dict.fromkeys(routes) if c.origin(r) is not None][:BASELINE_ROUTES_MAX]
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", who)[:40]
+        doc = {"routes": routes, "ts": round(time.time() if now is None else now, 3)}
+        (d / f"{name}.json").write_text(json.dumps(doc) + "\n")
+        lines.append(f"  {who}: {len(routes)} routes -> {d / name}.json")
+    lines.append("the host keeps, per identity, only the routes the gate saw under it (the judge reads that copy)")
+    if failed:
+        lines.append(fail.line("unreachable"))
+    retry = f"bh-browse {url} --as {failed[0]} alone, to see why it failed" if failed else ""
+    lines.append("next: " + (retry or "bh-authz on the known endpoints"))
+    return lines[:MAX_LINES]
 
 
 def _route(ep: Endpoint) -> str:
