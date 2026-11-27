@@ -13,6 +13,10 @@ from bh.board import Board
 
 ROOT = Path(__file__).resolve().parents[1]
 ANSWERS = ROOT / "lab" / "bench" / "ANSWERS.md"
+
+NEEDS_KEY = pytest.mark.skipif(
+    not ANSWERS.exists(), reason="the bench answer key is kept out of the auditor's copy (.gitattributes export-ignore)"
+)
 H = "http://10.231.0.20:8000"
 REF = "bk_6c49e125463f"
 
@@ -52,6 +56,7 @@ def _finding(b, rid, title, klass, url, status, proof=None) -> int:
 
 
 # ---------------------------------------------------------------- the oracle
+@NEEDS_KEY
 def test_the_bench_grid_is_read_as_typed_entries():
     entries = audit.load_oracle(ANSWERS)
     vulns = {e["id"]: e for e in entries if e["kind"] == "vuln"}
@@ -90,6 +95,7 @@ def test_no_juiceshop_oracle_is_invented():
 
 
 # ---------------------------------------------------------------- one run
+@NEEDS_KEY
 def test_run_audit_counts_from_host_verdicts_classes_and_routes(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     b, rid = _board(tmp_path)
@@ -135,6 +141,7 @@ def test_run_audit_counts_from_host_verdicts_classes_and_routes(tmp_path, monkey
     assert json.loads((tmp_path / "var" / "measure" / "lab-bench" / f"run-{rid}.json").read_text())["run_id"] == rid
 
 
+@NEEDS_KEY
 def test_an_unknown_method_is_credited_once_only(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     b, rid = _board(tmp_path)
@@ -146,6 +153,7 @@ def test_an_unknown_method_is_credited_once_only(tmp_path, monkeypatch):
     assert audit.run_audit(b, rid, ANSWERS, save=False)["recalled"] == ["V1", "V2"]
 
 
+@NEEDS_KEY
 def test_audit_reads_the_runner_columns(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     b, rid = _board(tmp_path, extra_cols=True, cost=0, verify=None)
@@ -158,6 +166,7 @@ def test_audit_reads_the_runner_columns(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- T19 (b): the oracle out of reach
+@NEEDS_KEY
 @pytest.mark.parametrize("where", ["var/work/lab-bench/.bh", "var/judge/x", "var/audit/current/repo"])
 def test_an_oracle_a_container_mounts_is_refused(tmp_path, monkeypatch, where):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
@@ -203,6 +212,7 @@ def test_no_container_mounts_the_oracle():
 
 
 # ---------------------------------------------------------------- several runs
+@NEEDS_KEY
 def test_summary_groups_runs_by_setup_and_keeps_audits_across_a_reset(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     (tmp_path / "lab" / "bench").mkdir(parents=True)

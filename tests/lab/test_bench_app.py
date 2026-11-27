@@ -22,6 +22,10 @@ from bh.scope.model import load_scope
 ROOT = Path(__file__).resolve().parents[2]
 APP = ROOT / "lab" / "bench" / "app.py"
 ANSWERS = ROOT / "lab" / "bench" / "ANSWERS.md"
+
+NEEDS_KEY = pytest.mark.skipif(
+    not ANSWERS.exists(), reason="the bench answer key is kept out of the auditor's copy (.gitattributes export-ignore)"
+)
 SCOPE = ROOT / "scopes" / "lab" / "bench.yaml"
 
 
@@ -312,6 +316,7 @@ def _sample(template: str) -> str:
     return template.replace("{ref}", "bk_" + "0" * 12).replace("{id}", "1")
 
 
+@NEEDS_KEY
 def test_answer_key_routes_exist(mod):
     text = ANSWERS.read_text(encoding="utf-8")
     api = re.findall(r"`(GET|POST|PATCH|DELETE) (/[^`\s?]*)", text)
