@@ -309,6 +309,8 @@ NOTE_OPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "done": (("intent", "outcome"), ("reached", "closure", "why")),
     "blocked": (("reason", "title"), ("tried", "would_prove", "detail", "intent", "host")),
     "think": (("title",), ("why",)),
+    "threat-model": (("title",), ("line", "flow")),
+    "scope-request": (("prefix", "why_seen"), ()),
     "handoff": ((), ("state", "dead", "next", "files")),
     "cover": (("endpoint", "class", "status"), ("evidence",)),
     "reorder": (("intents",), ()),
@@ -316,6 +318,7 @@ NOTE_OPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "frontier": ((), ()),
 }
 FLAG = {"closure": "--outcome"}  # the rest: --<name with dashes>
+REPEATED = frozenset({"line"})  # options bh-note takes once per value
 T = 4000  # characters of a free-text field
 NOTE = _obj(
     {
@@ -352,6 +355,14 @@ NOTE = _obj(
         "dead": _str("handoff: required, leads abandoned and why (none if none)", maxLength=T),
         "next": _str("handoff: required, what to try next", maxLength=T),
         "files": _str("handoff: required, the files that hold the work", maxLength=T),
+        "line": {
+            "type": "array",
+            "description": 'threat-model: up to 8 lines, each "<claim> :: <exact quote>" (without a quote: inferred)',
+            "items": {"type": "string", "maxLength": 1000},
+            "maxItems": 8,
+        },
+        "prefix": _str("scope-request: the https prefix the target uses (the host's judge decides)", maxLength=300),
+        "why_seen": _str("scope-request: where it was seen (page, JS bundle, response)", maxLength=1000),
         "endpoint": _str('cover: "METHOD /route" or a URL', maxLength=8000),
         "status": _enum("cover: the coverage of this (endpoint, class)", c.COVER_OUTCOMES),
         "intents": {
@@ -378,7 +389,14 @@ def _value(v: object) -> str:
 def note_argv(op: str, args: dict, positionals: tuple[str, ...], options: tuple[str, ...]) -> list[str]:
     """bh-note's argv: options as --name=value (a value starting with '-' stays a value), then `--` and the
     positionals in their order. A missing positional is left out: bh-note refuses it as on the command line."""
-    argv = [op, *(f"{_flag(k)}={_value(args[k])}" for k in options if k in args)]
+    argv = [op]
+    for k in options:
+        if k not in args:
+            continue
+        if k in REPEATED:  # one flag per value (bh-note's action="append")
+            argv += [f"{_flag(k)}={v}" for v in args[k]]
+        else:
+            argv.append(f"{_flag(k)}={_value(args[k])}")
     pos: list[str] = []
     for k in positionals:
         if k in args:

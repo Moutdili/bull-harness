@@ -190,6 +190,8 @@ def test_twelve_tools_strict_schemas():
         "done",
         "blocked",
         "think",
+        "threat-model",
+        "scope-request",
         "handoff",
         "cover",
         "reorder",
@@ -432,3 +434,18 @@ def test_server_imports_no_socket_and_no_shell():
                 assert (node.module or "").split(".")[0] not in ("socket", "subprocess"), f
             if isinstance(node, ast.keyword) and node.arg == "shell":
                 pytest.fail(f"shell= in {f}")
+
+
+def test_note_threat_model_and_scope_request_reach_bh_note(monkeypatch):
+    """Run 74 (lab, 2026-11-27): through MCP the hunter could neither write its threat model nor ask the judge for an
+    endpoint (D40): `note` knew neither op."""
+    from bh.agent import note
+    from bh.agent.mcp import tools as mt
+
+    seen = []
+    monkeypatch.setattr(note, "main", lambda argv: seen.append(argv))
+    _call("note", {"op": "threat-model", "title": "tm", "line": ["a :: x", "b"], "flow": "1-abcdef-2"})
+    _call("note", {"op": "scope-request", "prefix": "https://a.test/api/", "why_seen": "JS bundle"})
+    assert seen[0] == ["threat-model", "--line=a :: x", "--line=b", "--flow=1-abcdef-2", "--", "tm"]
+    assert seen[1] == ["scope-request", "--", "https://a.test/api/", "JS bundle"]
+    assert {"threat-model", "scope-request"} <= set(mt.NOTE_OPS)
