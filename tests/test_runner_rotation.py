@@ -129,7 +129,8 @@ def seg(tmp_path, monkeypatch):
             return None, False
         sid = f"s{len(state['cmds'])}"
         res.session_id = sid
-        return {"subtype": "success", "num_turns": len(spec["ctx"]), "session_id": sid, "result": "done"}, False
+        sub = spec.get("subtype", "success")
+        return {"subtype": sub, "num_turns": len(spec["ctx"]), "session_id": sid, "result": "done"}, False
 
     monkeypatch.setattr(run, "run_leg", fake_leg)
 
@@ -263,3 +264,62 @@ def test_pending_challenge_opens_the_next_leg(seg, monkeypatch):
     _res, st = go([{"ctx": [500, 600], "notes": [{"op": "intent", "title": "send prompt 3"}]}, {"ctx": [500]}])
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
     assert task.startswith("A human challenge was pending: `bh-web state` first, then resume")
+
+
+# ------------------------------------------------------------------ T17: a segment on a mission (BH_MISSIONS=1)
+def _arg(cmd: list[str], flag: str) -> str:
+    return cmd[cmd.index(flag) + 1]
+
+
+def test_without_missions_the_segment_has_none(seg, monkeypatch):
+    monkeypatch.delenv("BH_MISSIONS", raising=False)
+    board, go = seg
+    res, st = go([{"ctx": [500]}])
+    assert _arg(st["cmds"][0], "--max-turns") == "60" and "# Mission" not in _arg(st["cmds"][0], "-p")
+    assert "mission" not in {r["name"] for r in board.db.execute("PRAGMA table_info(runs)")}  # not even the column
+    log = run.paths.run_log(res.run_id, "p").read_text()
+    assert '"what": "mission"' not in log
+
+
+def test_a_mission_sets_the_task_and_the_budget_and_is_journaled(seg, monkeypatch):
+    monkeypatch.setenv("BH_MISSIONS", "1")
+    board, go = seg
+    res, st = go([{"ctx": [500]}])
+    task = _arg(st["cmds"][0], "-p")
+    assert "# Mission (set by the host)" in task and "Budget: 15 turns for this mission." in task
+    assert _arg(st["cmds"][0], "--max-turns") == "15"  # the mission's budget, not the operator's 60
+    mission = json.loads(board.rows("SELECT mission FROM runs WHERE id=?", res.run_id)[0]["mission"])
+    assert mission["kind"] == "map" and mission["turns"] == 15
+    setup = json.loads(board.rows("SELECT setup_json FROM runs WHERE id=?", res.run_id)[0]["setup_json"])
+    assert setup["BH_MISSIONS"] == "1" and setup["max_turns"] == 60  # the setup keeps the operator's knobs
+    log = [json.loads(x) for x in run.paths.run_log(res.run_id, "p").read_text().splitlines()]
+    assert [x["what"] for x in log if x.get("type") == "bh_decision"][:1] == ["mission"]
+
+
+def test_the_host_extends_a_mission_once(seg, monkeypatch):
+    monkeypatch.setenv("BH_MISSIONS", "1")
+    seen = {"n": 0}
+
+    def new_test(*a, **k):
+        seen["n"] += 1
+        return True
+
+    monkeypatch.setattr(run.missions, "gate_new_test", new_test)
+    board, go = seg
+    full = {"ctx": [500] * 15, "subtype": "error_max_turns"}
+    res, st = go([full, {"ctx": [500] * 7, "subtype": "error_max_turns"}, {"ctx": [500]}])
+    assert len(st["cmds"]) == 2  # one extension, never a second
+    assert _resumes(st["cmds"][1]) == "s1" and _arg(st["cmds"][1], "--max-turns") == "7"
+    assert "remain for the mission" in _arg(st["cmds"][1], "-p")
+    mission = json.loads(board.rows("SELECT mission FROM runs WHERE id=?", res.run_id)[0]["mission"])
+    assert mission["extended"] == 7 and seen["n"] == 1
+    log = [json.loads(x) for x in run.paths.run_log(res.run_id, "p").read_text().splitlines()]
+    assert [x["what"] for x in log if x.get("type") == "bh_decision"].count("extension") == 1
+
+
+def test_no_extension_without_a_signal(seg, monkeypatch):
+    monkeypatch.setenv("BH_MISSIONS", "1")
+    monkeypatch.setattr(run.missions, "gate_new_test", lambda *a, **k: False)
+    _, go = seg
+    res, st = go([{"ctx": [500] * 15, "subtype": "error_max_turns"}, {"ctx": [500]}])
+    assert len(st["cmds"]) == 1 and res.status == "max_turns"

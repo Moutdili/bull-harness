@@ -229,7 +229,8 @@ other identity, no session, benign value) that must expect something different. 
 Only a rendered page proves it (DOM XSS, client route)? Add `"browse": {"xss": "<marker>"}` to the step: replay
 runs bh-browse and matches its summary (attack contains `xss CONFIRMED (marker <marker>)`, control absent `xss CONFIRMED`).
 Show the minimum data that proves the impact (one record), never a dump of other users' data. Then:
-`bh-note finding "<title>" --severity <s> --class <c> --url <u> --proof proof.json --summary "<impact>" --not-proven "<what you did NOT prove>"`
+`bh-note finding "<title>" --severity <s> --class <c> --url <u> --proof proof.json --summary "<impact>" --not-proven "<what you did NOT prove>" --proof-level <level> --cvss "<CVSS:3.1 vector>"`
+`--cvss`: one metric, one step of the proof that shows it; a metric the proof does not show takes its lowest value. `--proof-level`: `bh-note finding --help` lists the levels.
 No HTTP replay can show it (an AI acting for B on content A wrote)? Observation proof: plant a canary from
 `bh-note canary` in B's data only, make it reach A's side, then record it without proof.json:
 `bh-note finding "<title>" --severity <s> --class <c> --url <u> --observation <canary> --victim <identity> --attacker <the other> --control "k/N" --summary "<impact, k/N>" -e <file with the exact prompts and outputs>`
@@ -397,6 +398,18 @@ def _sso_line(scope: Scope) -> str | None:
     )
 
 
+def oob_hosts(scope: Scope) -> list[str]:
+    """The scope's out-of-band listener hosts (support kind `oob`, lot A), [] when it declares none."""
+    try:
+        hosts = scope.support_hosts("oob")
+    except Exception:  # noqa: BLE001 (a scope model without the kind: none)
+        hosts = ()
+    return [str(h).removeprefix("*.") for h in hosts if h]
+
+
+OOB_BLOCKED = "write-needed, oob-needed,"
+
+
 def scope_block(scope: Scope, identities: list[str] | None = None, *, verifier: bool = False) -> str:
     lines = [f"## Program: {scope.platform}/{scope.program}"]
     lines.append("In scope:")
@@ -423,6 +436,11 @@ def scope_block(scope: Scope, identities: list[str] | None = None, *, verifier: 
         )
     if sso := _sso_line(scope):
         lines.append(sso)
+    if not verifier and (oob := oob_hosts(scope)):
+        lines.append(
+            f"Out-of-band: a callback to `https://{oob[0]}/c/<canary>` is observed by the host; one request, nothing "
+            "else in the URL (`<canary>`: from `bh-note canary`)."
+        )
     browser = bool(scope.support_hosts("passthrough"))
     if not verifier and browser:  # behind a third-party human challenge: bh-browser
         lines.append(BROWSER_BLOCK)
@@ -479,7 +497,57 @@ def _arsenal_without(doc: str, missing: set[str]) -> str:
 def build_system_prompt(scope: Scope, identities: list[str] | None = None, *, missing_tools=()) -> str:
     """`missing_tools`: the builtins the sandbox lacks (`bh-zap` or `zap`); their Arsenal lines are left out."""
     missing = {t if t.startswith("bh-") else f"bh-{t}" for t in missing_tools}
-    return _arsenal_without(doctrine(scope.scanners_on), missing) + "\n" + scope_block(scope, identities) + "\n"
+    doc = _arsenal_without(doctrine(scope.scanners_on), missing)
+    if oob_hosts(scope):  # the host observes callbacks here: an out-of-band test is no blocker
+        doc = doc.replace(OOB_BLOCKED, "write-needed,")
+    return doc + "\n" + scope_block(scope, identities) + "\n"
+
+
+MAIL_LINE = "`bh-mail <identity>` reads the mail your test identities received during this segment."
+
+
+def _surface_text(surface) -> str:
+    """An asset key `<origin> METHOD route` as `METHOD <origin><route>`; a label or anything else as it is."""
+    s = _flat(surface or "", 300).replace("`", "'")
+    origin, _, rest = s.partition(" ")
+    method, _, route = rest.partition(" ")
+    if origin.startswith(("http://", "https://")) and method.isupper() and route.startswith("/"):
+        return f"{method} {origin}{route}"
+    return s
+
+
+def mission_block(mission: dict) -> str:
+    """The `# Mission` section of a task (T17): one objective, the skill to load, the budget. Nothing in it says how
+    the segment closes: the host decides that."""
+    kind = mission.get("kind")
+    cls = _flat(mission.get("vuln_class") or "", 60).replace("`", "'")
+    where = _surface_text(mission.get("surface")) if mission.get("surface") else ""
+    if kind == "map":
+        goal = "map the attack surface: every in-scope origin, its routes and their parameters, on the board."
+    elif kind == "test":
+        goal = f"test `{cls}` on `{where}`."
+        if mission.get("pass") == 2:
+            goal += " An earlier run tested this pair and recorded it clean: this pass works it with another method."
+    elif kind == "prove":
+        title = _flat(mission.get("title") or "", 160).replace("`", "'")
+        goal = f"prove the open lead `{title}`" + (f" on `{where}`" if where else "") + (f" ({cls})" if cls else "")
+        goal += " with the proof its class requires, or show by a request that it does not hold."
+    elif kind == "chain":
+        goal = (
+            f"test whether {where.replace('+', ' and ')} chain into an impact larger than each alone; one request "
+            "per link, each with its "
+            "control. The chain gets its own proof.json."
+        )
+    else:
+        goal = "hunt the most promising lead of the board, by your own judgement."
+    lines = ["# Mission (set by the host)", f"Objective: {goal}"]
+    if mission.get("skill"):
+        lines.append(f"Skill: load `{_flat(mission['skill'], 64)}` with the Skill tool before your first request.")
+    if mission.get("turns"):
+        lines.append(f"Budget: {int(mission['turns'])} turns for this mission.")
+    if kind != "free":
+        lines.append("Another lead you meet on the way: one `bh-note intent` for it, then back to the objective.")
+    return "\n".join(lines)
 
 
 def build_task(
@@ -493,9 +561,13 @@ def build_task(
     scanners: bool = True,
     browser: bool = False,
     lineage: str = "",
+    mission: dict | None = None,
+    mail: bool = False,
 ) -> str:
     """The first message of a session. `lineage`: the block of bh.lineage.block (who this agent is, what it
-    inherits), right after the board; everything proper to one agent lives here, never in the system prompt."""
+    inherits), right after the board; everything proper to one agent lives here, never in the system prompt.
+    `mission` (T17, BH_MISSIONS=1): the objective the host drew, before the board; None leaves the task as it was.
+    `mail`: bh-mail runs for this segment (lot H)."""
     if first and scanners:
         head = "First session on this program. Map it with the arsenal first (recon, crawl, content, scan)."
     elif first and browser:  # R4: a scope without scanners, with the persistent browser
@@ -511,6 +583,9 @@ def build_task(
         head = "Continue the hunt from the board below. Do not redo dead ends; finish mapping any origin " + (
             "whose crawl/content/scan is still missing (✗)." if scanners else "whose crawl is still missing (✗)."
         )
+    narrow = mission is not None and mission.get("kind") != "free"
+    if narrow and not first:  # the mission, not the whole board, is this session's work
+        head = "Work the mission below. The board says what is already known: do not redo its dead ends."
     if rotated:  # the session before this one, same segment, was closed on its context size
         head = (
             "The previous session of this segment was rotated on a context threshold. Read the latest HANDOFF "
@@ -524,12 +599,20 @@ def build_task(
         if refused
         else ""
     )
+    then = (
+        "then work the next angle of the mission's objective"
+        if narrow
+        else "then take the next most promising lead (open intents first, then the next unchecked surface of the "
+        "program card)"
+    )
     # The task never ends on how to stop (audit §6): a closing "summary" line primes an early end.
     return (
-        f"{head}\n\n# Board\n{frontier}\n\n"
+        f"{head}\n\n"
+        + (f"{mission_block(mission)}\n\n" if mission is not None else "")
+        + f"# Board\n{frontier}\n\n"
         + (f"# Lineage\n{lineage.strip(chr(10))}\n\n" if lineage.strip() else "")
-        + f"Work autonomously. {budget}A finding is not the end of the segment: record it, then take the next "
-        "most promising lead (open intents first, then the next unchecked surface of the program card). Keep the "
+        + (f"{MAIL_LINE}\n\n" if mail else "")
+        + f"Work autonomously. {budget}A finding is not the end of the segment: record it, {then}. Keep the "
         "HANDOFF fact current as you go; the harness closes the segment when the budget is spent."
         + closed
         + (f"\n\n{cards}" if cards else "")
@@ -596,6 +679,8 @@ HUNTER_FIELD_MAX = {
     "counter": 1000,
     "severity_if": 1000,
     "severity_why": 1000,
+    "cvss": 200,
+    "proof_level": 40,
 }
 PROOF_MAX = 8000
 STEP_NAME_MAX = 80
@@ -697,6 +782,9 @@ def build_verifier_prompt(scope: Scope, finding: dict, replay: dict, evidence: s
         "severity_if": finding.get("severity_if") or "-",
         "severity_why": finding.get("severity_why") or "-",
     }
+    for k in ("cvss", "proof_level"):  # lot C's fields, shown only when the finding holds them
+        if finding.get(k):
+            fields[k] = finding.get(k)
     proof_line = (
         f"observation (canary, victim, attacker): {data(finding.get('observation'), 300)}"
         if obs is not None

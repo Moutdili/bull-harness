@@ -94,9 +94,20 @@ def _public(agent: dict) -> dict:
 
 
 # ------------------------------------------------------------------ start
-def start(board, scope, run_id: int, setup_sha256: str, *, parent_no=None, mode: str | None = None) -> dict | None:
+def start(
+    board,
+    scope,
+    run_id: int,
+    setup_sha256: str,
+    *,
+    parent_no=None,
+    mode: str | None = None,
+    mission: str | None = None,
+) -> dict | None:
     """Tables ensured (store, recall, score), the agent born, its trace opened in its archive dir, its recall server
-    started. Returns the agent, None when it could not be born (the segment runs without a lineage)."""
+    started. Returns the agent, None when it could not be born (the segment runs without a lineage). `mission` (T17):
+    the mission the host drew for this segment, canonical JSON; it enters the agent's birth record (`birth(mission=)`,
+    when birth takes it) and the agent dict (`mission`), which the task block and the archive read."""
     try:  # no lineage package at all: one line, not one per step
         importlib.import_module(PACKAGE)
     except Exception as exc:  # noqa: BLE001
@@ -107,12 +118,14 @@ def start(board, scope, run_id: int, setup_sha256: str, *, parent_no=None, mode:
     try:
         ident = module("identity")
         kwargs: dict = {"setup_sha256": setup_sha256, "parent_no": parent_no}
-        if mode is not None:  # `bh agent relaunch --same-birth|--fresh-legacy`, when birth takes it
-            try:
-                if "mode" in inspect.signature(ident.birth).parameters:
-                    kwargs["mode"] = mode
-            except (TypeError, ValueError):
-                pass
+        try:
+            params = inspect.signature(ident.birth).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if mode is not None and "mode" in params:  # `bh agent relaunch --same-birth|--fresh-legacy`
+            kwargs["mode"] = mode
+        if mission is not None and "mission" in params:
+            kwargs["mission"] = mission
         agent = ident.birth(board, scope, run_id, **kwargs)
     except Exception as exc:  # noqa: BLE001
         skipped("birth", exc)
@@ -121,7 +134,11 @@ def start(board, scope, run_id: int, setup_sha256: str, *, parent_no=None, mode:
         skipped("birth", f"identity.birth returned {type(agent).__name__}, no agent number")
         return None
     agent.setdefault("program", scope.program)
+    if mission is not None:
+        agent["mission"] = mission
     h = _Handles(program=scope.program, no=agent["no"], setup_sha256=setup_sha256)
+    if mission is not None:
+        h.extra["mission"] = mission
     _LIVE[_key(agent, scope.program)] = h
     try:
         d = Path(module("archive").agent_dir(scope.program, agent["no"], agent.get("pseudo")))
@@ -176,8 +193,9 @@ def rotate(board, scope, agent: dict | None, run_id: int) -> dict | None:
         return None
     h = _handles(agent)
     setup = h.setup_sha256 if h is not None else str(agent.get("setup_sha256") or "")
+    mission = h.extra.get("mission") if h is not None else agent.get("mission")
     close(board, scope, agent, run_id, "rotated")
-    return start(board, scope, run_id, setup, parent_no=agent.get("no"))
+    return start(board, scope, run_id, setup, parent_no=agent.get("no"), mission=mission)
 
 
 # ------------------------------------------------------------------ close

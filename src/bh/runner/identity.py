@@ -10,7 +10,7 @@ weights (lot G's `score.weights_sha256()`, None while it does not exist) and the
 Wave W3 adds what the agent is given to work with: `skills` (name and condensate of every skill linked into its HOME),
 `mcp` (its MCP servers, condensates of container/agent/hooks/mcp.json, of the HexStrike registry and of the server
 code; `enabled` False and no server with BH_MCP=0), `tools` (the --tools list) and `pinned` (the skills whose text
-the task carries for this program and model, D34).
+the task carries for this program and model, D34). Wave W4 adds BH_MISSIONS (T17) and the scope's `cost_cap_usd` (T50).
 Two segments set up alike share a condensate; any change to one knob changes it. The document never holds a
 secret: identities are names and roles (never a session, a credential or a recipe), texts are condensates.
 
@@ -223,6 +223,8 @@ def setup(
     pinned: list[str] | None = None,
     tools: str | None = None,
     mcp: dict | None = None,
+    missions: str = "0",
+    cost_cap_usd: float | None = None,
 ) -> tuple[str, dict]:
     """(sha256 of the canonical document, the document). `recall_params`: what the agent is given of its elders
     (counts, windows), numbers and names only; `pseudo_shown` defaults to BH_LINEAGE_PSEUDO. W3: `skills` the skills
@@ -274,5 +276,7 @@ def setup(
         "pinned": sorted(pinned or ()),
         "tools": tools,
         "mcp": mcp_setup() if mcp is None else mcp,
+        "BH_MISSIONS": str(missions),  # W4, T17: "1" when segments run missions
+        "cost_cap_usd": cost_cap_usd,  # W4, T50: the program's cap on hunt + judge cost, None without one
     }
     return sha256(canonical(doc)), doc

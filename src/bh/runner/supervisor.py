@@ -6,7 +6,12 @@ never waits on a human: a program that cannot go on is paused or parked, the oth
 Caps (D25), held in code: a hunt on real programs is one session of RUNS_PER_SESSION runs inside a named phase
 (`bh hunt --phase NAME`), SESSIONS_PER_DAY sessions a day, MAX_RUNS_PER_DAY runs a day (a lone `bh run` included),
 RUNS_PER_PHASE runs a phase. A cap refuses: it never waits, never postpones, and no option or variable raises it.
-`platform: local` programs (scopes/lab, scopes/examples) count in none of them."""
+`platform: local` programs (scopes/lab, scopes/examples) count in none of them.
+
+W4: a program whose last PARK_AFTER segments in a row added neither an anchored fact nor an endpoint the gate saw
+for the first time (read in the tables, never in the count of notes) is parked until the hunt ends (T21). A program
+whose hunt and judge cost reaches the scope's `cost_cap_usd` starts no other segment: it is paused, its state kept,
+and a `pause` decision says so (T50)."""
 
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ PROMPT_FLOOR = 6
 # Resuming re-reads the whole session history every turn: lab runs 5-7 cost $0.13-0.20 for 3-10 turns,
 # fresh sessions from the board + HANDOFF $0.03-0.04 for similar output. Default: always fresh.
 MAX_RESUMES = int(os.environ.get("BH_MAX_RESUMES", "0"))
+PARK_AFTER = 3  # T21 (K): segments in a row with no new anchored fact and no new endpoint seen by the gate
 
 
 class CapReached(SystemExit):
@@ -194,6 +200,67 @@ def status_line(board: Board, now: float) -> str | None:
     )
 
 
+# ------------------------------------------------------------------ what a segment added (T21), what it cost (T50)
+def _has_table(board: Board, name: str) -> bool:
+    return bool(board.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name))
+
+
+def barren(board: Board, program: str, run_id: int) -> bool:
+    """Run `run_id` added no anchored fact (facts.grounded, the host's word) and no endpoint the gate saw for the
+    first time (a `gate` or `seen` test of this run on an endpoint no earlier run had). Notes alone add nothing. A
+    run the board does not hold closed (runs.ended, which every segment writes) is read as nothing known, never as
+    barren."""
+    if not board.rows("SELECT 1 FROM runs WHERE id=? AND program=? AND ended IS NOT NULL", run_id, program):
+        return False
+    if board.rows("SELECT 1 FROM facts WHERE program=? AND run_id=? AND grounded=1 LIMIT 1", program, run_id):
+        return False
+    if not (_has_table(board, "tests") and _has_table(board, "assets")):
+        return True
+    return not board.rows(
+        "SELECT 1 FROM tests t JOIN assets a ON a.id=t.asset_id WHERE a.program=? AND a.kind='endpoint' "
+        "AND t.run_id=? AND t.evidence IN ('gate', 'seen') AND NOT EXISTS (SELECT 1 FROM tests u WHERE "
+        "u.asset_id=t.asset_id AND u.evidence IN ('gate', 'seen') AND u.run_id IS NOT NULL AND u.run_id<?) LIMIT 1",
+        program,
+        run_id,
+        run_id,
+    )
+
+
+def cost_cap(scope) -> float | None:
+    """The scope's `cost_cap_usd` (lot A parses it): a positive number of dollars, else None (no cap)."""
+    v = getattr(scope, "cost_cap_usd", None)
+    return float(v) if isinstance(v, int | float) and not isinstance(v, bool) and v > 0 else None
+
+
+def program_cost(board: Board, program: str) -> float:
+    """What the program cost so far: every run's hunt (runs.cost_usd) and judge (runs.verify_cost), in dollars."""
+    return float(
+        board.rows(
+            "SELECT COALESCE(SUM(COALESCE(cost_usd, 0) + COALESCE(verify_cost, 0)), 0) AS n FROM runs WHERE program=?",
+            program,
+        )[0]["n"]
+    )
+
+
+def cost_capped(board: Board, scope) -> str | None:
+    """Why no segment may start on this program (its cost reached the cap), None while it may."""
+    cap = cost_cap(scope)
+    if cap is None:
+        return None
+    spent = program_cost(board, scope.program)
+    if spent < cap:
+        return None
+    return (
+        f"{scope.program}: cost cap reached (${spent:.2f} of ${cap:.2f}, hunt and judge): paused, its board kept; "
+        "raise `cost_cap_usd` in the scope file to go on"
+    )
+
+
+def _last_run(board: Board, program: str) -> int | None:
+    rows = board.rows("SELECT MAX(id) AS id FROM runs WHERE program=?", program)
+    return rows[0]["id"] if rows and rows[0]["id"] is not None else None
+
+
 # ------------------------------------------------------------------ hunt
 @dataclass
 class ProgState:
@@ -206,6 +273,9 @@ class ProgState:
     resumes: int = 0
     refusals: int = 0  # in this hunt
     parked: bool = False  # never picked again in this hunt
+    barren: int = 0  # T21: segments in a row that added nothing the tables show
+    capped: bool = False  # T50: its cost reached the scope's cap: paused, never picked again in this hunt
+    scope: object = None  # the scope loaded at preflight (cost cap)
 
 
 def quota_wake(res: SegmentResult, now: float) -> float:
@@ -256,8 +326,20 @@ def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
         if (n := len(recent_refusals(board, scope.program, time.time()))) >= REFUSAL_LIMIT:
             print(f"{scope.program}: excluded ({n} model refusals in 7 days: review its [refusal] blockers)")
             continue
-        ready.append(ProgState(f, scope.program, counted(scope)))
+        ready.append(ProgState(f, scope.program, counted(scope), scope=scope))
     return ready
+
+
+def _pause_on_cost(board: Board, p: ProgState) -> bool:
+    """T50: the program's cost reached its cap: paused (state kept), a `pause` decision in its last run. True when
+    it was paused now."""
+    if p.capped or p.scope is None or (why := cost_capped(board, p.scope)) is None:
+        return False
+    p.capped = True
+    if (rid := _last_run(board, p.program)) is not None:
+        note_decision(board, SegmentResult(program=p.program, run_id=rid), "pause")
+    print(why)
+    return True
 
 
 def _after_refusal(p: ProgState, board: Board | None = None, res: SegmentResult | None = None) -> None:
@@ -317,9 +399,11 @@ def hunt(
             print(f"hunt: {done}/{runs} runs done")
             break
         now = time.time()
-        active = [p for p in progs if not p.parked]
+        for q in progs:
+            _pause_on_cost(board, q)
+        active = [p for p in progs if not p.parked and not p.capped]
         if not active:
-            print("every program is parked: stopping")
+            print("every program is parked or paused: stopping")
             break
         ready = [p for p in active if p.cooldown_until <= now]
         if not ready:
@@ -384,6 +468,15 @@ def hunt(
                 print(f"{p.program}: cooldown until {_fmt(p.cooldown_until)} (refusal on a cause already refused)")
             else:
                 _after_refusal(p, board, res)
+            continue
+        p.barren = p.barren + 1 if barren(board, p.program, res.run_id) else 0
+        if p.barren >= PARK_AFTER:  # T21
+            p.parked = True
+            note_decision(board, res, "park")
+            print(
+                f"{p.program}: parked until the end of the hunt ({p.barren} segments in a row without a new anchored "
+                "fact or a new endpoint seen by the gate)"
+            )
             continue
         if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1
