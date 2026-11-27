@@ -321,3 +321,18 @@ def test_system_prompt_is_the_same_for_two_agents(tmp_path, no_honor):
     assert build_task("FRONTIER", first=False, lineage=two) != task
     assert "# Lineage" not in build_task("FRONTIER", first=False)
     assert build_task("FRONTIER", first=False, lineage="") == build_task("FRONTIER", first=False)
+
+
+def test_backfilled_items_read_pre_lineage_not_operator():
+    """Run 70 (lab, 2026-11-27): backfilled runs (agent #0) were shown as the operator's."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE m (label, agent_no, src_kind, created, title, outcome)")
+    db.execute("INSERT INTO m VALUES ('JUDGED', 0, 'finding', 0, 'old finding', NULL)")
+    db.execute("INSERT INTO m VALUES ('NOTE', 0, 'operator', 0, 'imported lead', NULL)")
+    db.execute("INSERT INTO m VALUES ('NOTE', 3, 'fact', 0, 'agent note', NULL)")
+    rows = db.execute("SELECT * FROM m").fetchall()
+    lines = [block._item_line(r, 0.0) for r in rows]
+    assert "pre-lineage" in lines[0] and "operator" in lines[1] and "#0003" in lines[2]

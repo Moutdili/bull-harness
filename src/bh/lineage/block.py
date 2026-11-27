@@ -83,11 +83,19 @@ def _age(created: Any, now: float) -> str:
     return f"{int(s // 86400)}d"
 
 
+def _author(r: sqlite3.Row) -> str:
+    """Agent #0 is the operator for an imported lead, and the runs before the lineage for a backfilled one
+    (store.backfill): saying "operator" there would credit Mio with what earlier runs found."""
+    src = r["src_kind"] if "src_kind" in r.keys() else None  # noqa: SIM118 (sqlite3.Row: `in` reads values)
+    if r["agent_no"] in (0, None) and src not in (None, "operator"):
+        return "pre-lineage"
+    return _label(r["agent_no"])
+
+
 def _item_line(r: sqlite3.Row, now: float) -> str:
     outcome = f" ({_safe(r['outcome'], 20)})" if r["outcome"] else ""
     return (
-        f"- [{_safe(r['label'], 10)}] {_label(r['agent_no'])} {_age(r['created'], now)}: "
-        f"{_safe(r['title'], TITLE_MAX)}{outcome}"
+        f"- [{_safe(r['label'], 10)}] {_author(r)} {_age(r['created'], now)}: {_safe(r['title'], TITLE_MAX)}{outcome}"
     )
 
 
@@ -144,7 +152,7 @@ def _current_items(board, program: str) -> list[sqlite3.Row]:
         return []
     return _rows(
         board,
-        "SELECT id, kind, cell, outcome, label, title, agent_no, created FROM mem_items "
+        "SELECT id, kind, cell, outcome, label, title, agent_no, src_kind, created FROM mem_items "
         "WHERE program=? AND valid_to IS NULL",
         program,
     )
