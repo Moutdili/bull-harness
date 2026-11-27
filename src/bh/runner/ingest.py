@@ -735,6 +735,8 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
                         ts=_ts(e, now),
                     )
             case "identity-missing":
+                if "run" in e and e["run"] is None:
+                    continue  # the gate preflight probes an unknown identity on purpose, before the run is active
                 ident = _s(e.get("identity"), 80)
                 if ident not in missing:
                     missing.add(ident)

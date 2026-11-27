@@ -13,6 +13,7 @@ believed only where another source agrees (see `refusal_confirmed`, `quota_confi
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import importlib
 import inspect
@@ -247,6 +248,20 @@ def parked(program: str) -> dict | None:
     return rec if isinstance(rec, dict) else {"reason": "unreadable marker"}
 
 
+def scope_guard_problems(scope: Scope) -> list[str]:
+    """bh.scope.guards.check (lot W2-H): what this scope breaks of the common guards (no wildcard or suffix of a
+    Microsoft domain on MSRC, a recipient guard declared...); [] when it holds. A guard that raises is a problem
+    (fails closed); without the module, nothing."""
+    try:
+        from bh.scope import guards
+    except ImportError:
+        return []
+    try:
+        return [str(p) for p in guards.check(scope)]
+    except Exception as exc:  # noqa: BLE001
+        return [f"guards check failed: {type(exc).__name__}: {exc}"]
+
+
 def check_automation(scope: Scope) -> None:
     """Unknown program rules = onboarding not done; automation forbidden = never run; parked = never run until the
     operator lifts it. Nobody is asked mid-hunt."""
@@ -263,6 +278,10 @@ def check_automation(scope: Scope) -> None:
             scope.program,
             ["automation_allowed"],
             f"{scope.program}: automation_allowed is false — refusing to run an agent on it",
+        )
+    if problems := scope_guard_problems(scope):  # W2-H's common guards: written, never called until the W4 merge
+        raise ProgramNotReady(
+            scope.program, ["guards"], f"{scope.program}: the scope breaks its guards: {'; '.join(problems)[:600]}"
         )
     if scope.platform == "local":
         return
@@ -730,6 +749,10 @@ def activate_scope(scope_file: Path) -> None:
     tmp = dst.with_suffix(".tmp")
     shutil.copyfile(scope_file, tmp)
     os.replace(tmp, dst)
+    # the recipient allowlist goes with the scope, not only with a segment: an invitation Mio makes by hand in
+    # bh-browser between runs is refused otherwise (2026-11-27, every POST /invite refused: no recipients.json)
+    with contextlib.suppress(Exception):
+        write_recipients(load_scope(scope_file))
 
 
 def relay_budget(max_turns: int) -> int:
@@ -939,6 +962,9 @@ def _requires(skill: dict) -> set[str]:
     return set()
 
 
+PROGRAM_SKILL_PREFIX = "msrc-"  # a program's own skill (its rules, budget, surfaces): linked only where its scope names it
+
+
 def allowed_skills(scope: Scope) -> list[str] | None:
     """The skills a session on this program may load: every one of classes.all_skills() but those that require
     scanners when the program forbids them. None without skills (the cards path)."""
@@ -951,6 +977,8 @@ def allowed_skills(scope: Scope) -> list[str] | None:
             continue
         if "scanners" in _requires(s) and not scope.scanners_on:
             continue
+        if name.startswith(PROGRAM_SKILL_PREFIX) and name not in {str(c) for c in (scope.cards or ())}:
+            continue  # another program's own skill (msrc-copilot on the lab): its rules are not this program's
         out.append(name)
     return sorted(dict.fromkeys(out))
 
@@ -2557,6 +2585,21 @@ def planted_canary_at(program: str) -> float | None:
     return float(v) if isinstance(v, int | float) and not isinstance(v, bool) else None
 
 
+def stage_whitebox(scope: Scope, say=print) -> str | None:
+    """bh.whitebox.stage before the segment (T49): this program's declared and fetched repositories in the mount, the
+    task's line naming them; None without the key or none fetched. A failure is said and the segment runs without."""
+    try:
+        from bh import whitebox
+
+        mounted, missing = whitebox.stage(scope)
+    except Exception as exc:  # noqa: BLE001 - the white box is a help, never a reason to stop a segment
+        say(f"whitebox: skipped ({type(exc).__name__}: {str(exc)[:120]})")
+        return None
+    if missing:
+        say(f"whitebox: declared but not fetched (bh tools fetch): {', '.join(missing)}")
+    return whitebox.task_line(mounted)
+
+
 def start_mail(scope: Scope, run_id: int, say):
     """Lot H: bh.mailserve.MailServer(program, run_id, scope), started for a scope with `mail_from`; None otherwise
     or when it cannot start (the segment runs without bh-mail)."""
@@ -2845,6 +2888,7 @@ def _run_locked(
         mail = start_mail(scope, run_id, say)  # lot H, next to the recall server: bh-mail for this segment
         extra = {**({"mission": mission} if mission is not None else {}), **({"mail": True} if mail else {})}
         block = lineage_hooks.task_block(board, scope, agent)
+        white = stage_whitebox(scope, say)  # lot F (T49): the declared public code, read-only, or nothing
         task = (
             lineage_task(
                 frontier(board, prog, scope, facts=not block),
@@ -2857,6 +2901,7 @@ def _run_locked(
                 **extra,
             )
             + harness
+            + (f"\n\n{white}" if white else "")
             + "".join(f"\n\n{line}" for line in first_lines)
             + operator
         )

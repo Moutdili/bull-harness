@@ -111,6 +111,8 @@ services:
       # D18: the hunter's skills, read-only; each segment links the ones its program allows into the session's
       # fresh session HOME (bh.runner.run.link_skills). The judge mounts none.
       - ../src/bh/skills:/opt/bh/skills:ro,z
+      # T49: the public code a scope declares (`whitebox:`), staged by the runner before each segment, read-only
+      - ../var/whitebox-mount:/opt/bh/whitebox:ro,z
       # pinned nuclei templates, fetched on the host: the gate blocks GitHub
       - ../var/tools/nuclei-templates:/opt/bh/nuclei-templates:ro,z
     networks: [sandbox]

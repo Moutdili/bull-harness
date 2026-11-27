@@ -591,3 +591,17 @@ def test_the_default_fetch_sends_no_cookie_and_no_program_header(monkeypatch):
     assert handlers == [] and set(k.lower() for k in seen["headers"]) == {"user-agent", "accept"}
     with pytest.raises(ValueError):
         rules._fetch("http://www.example.net/rules")
+
+
+def test_a_scope_breaking_its_guards_is_refused_before_any_segment(monkeypatch):
+    """W4 merge: bh.scope.guards.check was tested but called nowhere; run_segment and the hunt's preflight both go
+    through run.check_automation, which now refuses such a scope."""
+    from bh.runner import run
+    from bh.scope import guards
+
+    scope = scope_from_dict({"program": "p", "platform": "local", "in_scope": ["a.test"]})
+    monkeypatch.setattr(guards, "check", lambda s: ["wildcard on a Microsoft domain: *.microsoft.com"])
+    with pytest.raises(run.ProgramNotReady, match="breaks its guards"):
+        run.check_automation(scope)
+    monkeypatch.setattr(guards, "check", lambda s: [])
+    run.check_automation(scope)

@@ -313,3 +313,16 @@ def test_gate_denied_counts_only_the_hunters_refusals(tmp_path, monkeypatch):
     rows = b.rows("SELECT title, summary FROM facts WHERE kind='blocked'")
     assert [r["title"] for r in rows] == ["gate denied 3 requests"]
     assert "out.t x2" in rows[0]["summary"] and "anthropic" not in rows[0]["summary"]
+
+
+def test_the_preflights_unknown_identity_is_not_the_hunters(tmp_path, monkeypatch):
+    """Runs 69 and 74 (lab, 2026-11-27): every segment told the agent "identity 'zz' requested but not configured";
+    'zz' is the gate preflight's probe (run null), never the hunter's."""
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    b = Board(tmp_path / "b.sqlite")
+    ev = tmp_path / "var" / "state" / "events.jsonl"
+    miss = {"kind": "identity-missing", "program": "p"}
+    _write(ev, [{**miss, "identity": "zz", "run": None}, {**miss, "identity": "admin", "run": 6}])
+    ingest.gate_events(b, "p", 6, identities=[])
+    titles = [r["title"] for r in b.rows("SELECT title FROM facts WHERE kind='harness'")]
+    assert titles == ["identity 'admin' requested but not configured"]

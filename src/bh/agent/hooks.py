@@ -55,7 +55,7 @@ BUNDLE_LINE, BUNDLE_MAX_LINES = 2000, 20
 REPEAT_DIR, REPEAT_LINES, REPEAT_MAX = "repeat", 15, 2
 REPEAT_MARK = "[bh-repeat]"
 _REPEAT_EXEMPT = re.compile(
-    r"(?<![\w.-])(bh-web|bh-note|bh-recall|sleep|bh-agent\s+(?:replay|web|note|recall))(?![\w.-])"
+    r"(?<![\w.-])(bh-web|bh-note|bh-recall|bh-mail|sleep|bh-agent\s+(?:replay|web|note|recall|mail))(?![\w.-])"
 )
 # T38: what bounds a curl or a wget in time
 CURL_TIMEOUT, WGET_TIMEOUT = "--max-time 30", "--timeout=30"

@@ -218,8 +218,10 @@ def test_allowed_skills_leave_out_the_scanner_ones(skills):
     assert scan.scanners_on and not no_scan.scanners_on
     on, off = run.allowed_skills(scan), run.allowed_skills(no_scan)
     needs = {s["name"] for s in classes.all_skills() if "scanners" in run._requires(s)}
-    assert needs and set(on) == names
-    assert not needs & set(off) and set(off) == names - needs
+    # another program's own skill (msrc-*) is left out where the scope does not name it in `cards`
+    others = {n for n in names if n.startswith(run.PROGRAM_SKILL_PREFIX) and n not in set(scan.cards or ())}
+    assert needs and set(on) == names - others
+    assert not needs & set(off) and set(off) == names - needs - others
 
 
 def _block(model: str) -> tuple[str, str]:
@@ -598,3 +600,18 @@ def test_ui_tools_view_needs_auth_and_never_stops_anything(tmp_path, monkeypatch
         srv.server_close()
     src = (ROOT / "src" / "bh" / "ui" / "server.py").read_text()
     assert "/api/agent/tools" in src and "kill_agent(" not in src.split('"/api/agent/tools"')[1].split("if path")[0]
+
+
+def test_a_programs_own_skill_is_linked_only_where_its_scope_names_it():
+    """Lab run 72 (2026-11-27): the Juice Shop session listed msrc-copilot and msrc-onedrive."""
+    from bh.scope import scope_from_dict
+
+    lab = scope_from_dict({"program": "lab", "platform": "local", "in_scope": ["a.test"]})
+    cop = scope_from_dict(
+        {"program": "c", "platform": "local", "in_scope": ["b.test"], "cards": ["msrc-copilot", "bh-web-manual"]}
+    )
+    if run.allowed_skills(lab) is None:
+        pytest.skip("skills off")
+    assert not [n for n in run.allowed_skills(lab) if n.startswith("msrc-")]
+    mine = [n for n in run.allowed_skills(cop) if n.startswith("msrc-")]
+    assert mine == ["msrc-copilot"]
