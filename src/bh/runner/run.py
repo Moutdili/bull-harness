@@ -962,7 +962,8 @@ def _requires(skill: dict) -> set[str]:
     return set()
 
 
-PROGRAM_SKILL_PREFIX = "msrc-"  # a program's own skill (its rules, budget, surfaces): linked only where its scope names it
+# a program's own skill (its rules, budget, surfaces): linked only where its scope names it in `cards`
+PROGRAM_SKILL_PREFIX = "msrc-"
 
 
 def allowed_skills(scope: Scope) -> list[str] | None:
