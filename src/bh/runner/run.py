@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -52,8 +53,21 @@ SYSTEM_DIR = "/var/lib/bh-run"
 SYSTEM_FILE = f"{SYSTEM_DIR}/{c.SYSTEM}"
 # Builtins run for minutes (ffuf, nuclei, sqlmap): the Bash tool's 2-minute default would kill them.
 BASH_TIMEOUT_MS = {"BASH_DEFAULT_TIMEOUT_MS": "330000", "BASH_MAX_TIMEOUT_MS": "900000"}
-# Token economy: every turn resends tool schemas + command listings; keep only what the hunt uses.
-AGENT_TOOLS = os.environ.get("BH_TOOLS", "Bash,Read")
+# Token economy: every turn resends tool schemas + command listings; keep only what the hunt uses. `Skill` is the
+# tool that loads a skill (its name in Claude Code 2.1.330, read from the binary). D22: these + the 12 tools of the
+# `bh` server + the 3 of `hexstrike` stay at or under 20, so Claude Code never needs tool search (a beta the relay
+# refuses); ENABLE_TOOL_SEARCH=false says so to Claude Code as well (HUNTER_ENV).
+AGENT_TOOLS = os.environ.get("BH_TOOLS", "Bash,Read,Skill")
+SKILL_TOOL = "Skill"
+MAX_VISIBLE_TOOLS = 20
+# D19/D20: the hunter's MCP servers, two stdio processes of bh-agent inside the sandbox (container/agent/hooks is
+# mounted read-only there). The judge and the verifier get none: `--strict-mcp-config` without `--mcp-config`.
+MCP_CONFIG = "/opt/bh/hooks/mcp.json"
+HUNTER_ENV = {"ENABLE_TOOL_SEARCH": "false"}
+# D18: src/bh/skills, mounted read-only for the agent only; linked into each session's fresh $HOME/.claude/skills
+SANDBOX_SKILLS = "/opt/bh/skills"
+SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+REPEAT_MARK, FAIL_MARK = getattr(c, "REPEAT_MARK", "[bh-repeat]"), getattr(c, "FAIL_MARK", "[bh-fail]")
 # The model ends its turn after one finding. Within a segment the same session is nudged to go on
 # (cheap: the context is still small), at most MAX_LEGS times, while less than EARLY_STOP of the
 # turn budget is used.
@@ -111,6 +125,8 @@ class SegmentResult:
     arsenal_calls: int = 0  # Bash commands running a builtin or an arsenal tool
     manual_calls: int = 0  # Bash commands hand-crafting HTTP
     locked_calls: int = 0  # commands refused by the tool lock
+    repeats: int = 0  # tool calls the hooks refused as a repeat ([bh-repeat])
+    fails: int = 0  # [bh-fail] lines in the tool results
     text: str = ""
     usage: dict = field(default_factory=dict)
     rate_limit: dict = field(default_factory=dict)  # last `rate_limit_info` of the stream: status, resetsAt, windows
@@ -730,21 +746,56 @@ def sandbox_home(session: int | str) -> str:
     return f"/tmp/bh-home-{session}"
 
 
-def clean_sandbox(program: str, home: str) -> None:
+def clean_sandbox(program: str, home: str, skills: list[str] | None = None) -> None:
     """Nothing the agent wrote can configure the next session: no process of the previous one alive, fresh
     HOME (no ~/.claude settings or memory), no CLAUDE.md / CLAUDE.local.md / .claude / .mcp.json anywhere in the
     program's work tree (claude -p would load a project .mcp.json, whose tools the Bash-only hooks never see). And the
     agent reaches only this program's work dir: /work is root's, every other program's dir is closed (root, 700),
-    so notes, endpoints or coverage of program B cannot be written from a segment on program A."""
+    so notes, endpoints or coverage of program B cannot be written from a segment on program A.
+    `skills`: the skills this session may load, linked into the fresh HOME (None: no skill directory at all)."""
     stack.reset_agent_user(home)
     _clean_work(program)
+    if skills is not None:
+        link_skills(home, skills)
 
 
-def clean_leg(program: str, home: str) -> None:
+def clean_leg(program: str, home: str, skills: list[str] | None = None) -> None:
     """Before every leg after the first: the same, except that `home` keeps the session transcripts `--resume`
-    needs. The previous leg's process has exited; the next one is not started yet."""
+    needs. The previous leg's process has exited; the next one is not started yet. The scrub removes the skills
+    directory with everything else of ~/.claude but the transcripts: it is linked again."""
     stack.scrub_agent_user(home)
     _clean_work(program)
+    if skills is not None:
+        link_skills(home, skills)
+
+
+# Run as root once every process of the hunter is dead (reset/scrub just killed them): nothing races these steps.
+# ~/.claude stays the hunter's (Claude Code writes its transcripts there); ~/.claude/skills is root's (755) and holds
+# only links to the read-only mount, one per allowed skill, so the session cannot add a skill to that directory.
+_SKILLS_SCRIPT = rf"""
+h="$1"; shift
+if [ -L "$h" ] || [ ! -d "$h" ]; then echo "no session HOME at $h" >&2; exit 1; fi
+d="$h/.claude"
+if [ -L "$d" ] || {{ [ -e "$d" ] && [ ! -d "$d" ]; }}; then rm -rf -- "$d"; fi
+if [ ! -d "$d" ]; then mkdir -m 700 -- "$d" && chown -h hunter:hunter -- "$d" || exit 1; fi
+rm -rf -- "$d/skills" && mkdir -m 755 -- "$d/skills" || exit 1
+for n in "$@"; do
+  case "$n" in ''|-*|*[!a-z0-9-]*) echo "bad skill name: $n" >&2; exit 1 ;; esac
+  [ -f "{SANDBOX_SKILLS}/$n/SKILL.md" ] || {{ echo "no skill $n under {SANDBOX_SKILLS}" >&2; exit 1; }}
+  ln -s -- "{SANDBOX_SKILLS}/$n" "$d/skills/$n" || exit 1
+done
+"""
+
+
+def link_skills(home: str, skills: list[str]) -> None:
+    """$HOME/.claude/skills of the session: one link per allowed skill (D18). A name that is not a skill name is
+    an error of the harness, raised before anything starts."""
+    bad = [n for n in skills if not SKILL_NAME.fullmatch(n)]
+    if bad:
+        raise SystemExit(f"cannot link skills {bad}: not skill names")
+    r = stack.agent_sh(_SKILLS_SCRIPT, home, *skills, user="root", timeout=60)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot link the skills in {stack.AGENT}: {r.stderr.strip()}")
 
 
 def _clean_work(program: str) -> None:
@@ -864,9 +915,161 @@ def segment_cards(scope: Scope, picked: list[str]) -> str:
     return classes.cards_block(picked, classes.pinned_cards(scope), scanners=scope.scanners_on)
 
 
-def prepare_workdir(board: Board, scope: Scope, scope_file: Path, identities: list[str] | None = None) -> None:
+# ------------------------------------------------------------------ skills (D18, D34)
+def skills_on() -> bool:
+    """The skills of lot C are there (bh.classes.all_skills): the task names skills instead of pinning cards. Before
+    they are merged the runner keeps the cards path."""
+    return all(callable(getattr(classes, f, None)) for f in ("all_skills", "program_skills", "pinned_skills"))
+
+
+def _requires(skill: dict) -> set[str]:
+    req = skill.get("requires")
+    if isinstance(req, str):
+        return {x.strip() for x in req.split(",") if x.strip()}
+    if isinstance(req, (list, tuple)):
+        return {str(x).strip() for x in req}
+    return set()
+
+
+def allowed_skills(scope: Scope) -> list[str] | None:
+    """The skills a session on this program may load: every one of classes.all_skills() but those that require
+    scanners when the program forbids them. None without skills (the cards path)."""
+    if not skills_on():
+        return None
+    out = []
+    for s in classes.all_skills():
+        name = str(s.get("name") or "") if isinstance(s, dict) else ""
+        if not SKILL_NAME.fullmatch(name):
+            continue
+        if "scanners" in _requires(s) and not scope.scanners_on:
+            continue
+        out.append(name)
+    return sorted(dict.fromkeys(out))
+
+
+def task_skills(scope: Scope, model: str | None) -> tuple[list[str], list[str]]:
+    """(program skills, pinned skills) for this program and model, each one an allowed skill. Pinned ones (D34) are
+    given in full in the task; the others are named."""
+    allowed = set(allowed_skills(scope) or ())
+    pinned = [n for n in dict.fromkeys(classes.pinned_skills(scope, model)) if n in allowed]
+    named = [n for n in dict.fromkeys(classes.program_skills(scope, model)) if n in allowed and n not in pinned]
+    return named, pinned
+
+
+def skills_block(scope: Scope, model: str | None) -> str:
+    """The skills part of a task: one line naming the program's skills (load them first), then the text of each
+    pinned skill with its proof standard."""
+    named, pinned = task_skills(scope, model)
+    out = []
+    if named:
+        out.append(
+            f"Skills for this program: {', '.join(named)}. Load them first with the {SKILL_TOOL} tool; the other "
+            "skills of the session are listed by that tool."
+        )
+    for name in pinned:
+        text = classes.skill_text(name).strip()
+        text = text if scope.scanners_on else classes.no_scanner(text)
+        out.append(
+            f"# Pinned skill: {name}\n{text}\n"
+            f"Proof standard (the verifier applies exactly this): {classes.evidence(name)}"
+        )
+    return "\n\n".join(out)
+
+
+def segment_guides(scope: Scope, model: str | None, picked: list[str]) -> str:
+    """What a task carries to guide the method: the skills block (W3), else the cards block."""
+    return skills_block(scope, model) if skills_on() else segment_cards(scope, picked)
+
+
+def guide_names(scope: Scope, model: str | None, picked: list[str]) -> list[str]:
+    """runs.cards: the pinned and named skills of the task (W3), else the pinned and picked cards."""
+    if skills_on():
+        named, pinned = task_skills(scope, model)
+        return [*pinned, *named]
+    return [*classes.pinned_cards(scope), *picked]
+
+
+# ------------------------------------------------------------------ traffic index (T52)
+def write_flows_index(program: str, run_id: int, offset: int = 0) -> int:
+    """BH_DIR/flows.idx.jsonl for bh-flows: one line per gate flow of the run in progress (the Claude API relay and
+    the host's logins left out), URL redacted, the newest INDEX_MAX. Read from the gate's journal past `offset`
+    (its size when the segment started). Returns the number of lines written."""
+    from bh import redact
+    from bh.agent import flows as agent_flows
+
+    rows: list[str] = []
+    for f in c.read_jsonl(paths.flows_log(), offset):
+        if not isinstance(f, dict) or f.get("run") != run_id or f.get("class") in ("relay", "enroll"):
+            continue
+        fid, url = f.get("id"), f.get("url")
+        if not isinstance(fid, str) or not isinstance(url, str):
+            continue
+        status, size = f.get("status"), f.get("len")
+        rec = {
+            "id": fid,
+            "ts": f.get("ts") if isinstance(f.get("ts"), (int, float)) else None,
+            "method": str(f.get("method") or "")[:16],
+            "url": redact.url(url)[:2000],
+            "status": status if isinstance(status, int) and not isinstance(status, bool) else None,
+            "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+            "identity": f.get("identity") if isinstance(f.get("identity"), str) else None,
+        }
+        rows.append(json.dumps(rec, ensure_ascii=False))
+    rows = rows[-agent_flows.INDEX_MAX :]
+    stack.push_file(f"{c.sandbox_dir(program)}/{agent_flows.INDEX}", "".join(r + "\n" for r in rows))
+    return len(rows)
+
+
+def refresh_flows_index(program: str, run_id: int, offset: int, say) -> None:
+    """write_flows_index, never fatal: the hunt does not depend on bh-flows (it says there is no index yet)."""
+    try:
+        write_flows_index(program, run_id, offset)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        say(f"  ⚠ traffic index not written: {type(exc).__name__}: {one_line(str(exc), 160)}")
+
+
+def system_prompt_for(scope: Scope, identities: list[str], missing: list[str] | tuple[str, ...] = ()) -> str:
+    """The hunter's system prompt; `missing`: builtins whose binary the arsenal check did not find (lot G drops their
+    Arsenal line through `missing_tools`)."""
+    if missing and takes(build_system_prompt, "missing_tools"):
+        return build_system_prompt(scope, identities, missing_tools=tuple(missing))
+    return build_system_prompt(scope, identities)
+
+
+def missing_tools(arsenal: dict | None) -> list[str]:
+    miss = arsenal.get("missing") if isinstance(arsenal, dict) else None
+    return sorted(str(x) for x in miss) if isinstance(miss, list) else []
+
+
+def last_missing(board: Board, program: str) -> list[str]:
+    """The builtins the last segment of `program` found missing (runs.preflight's `arsenal`), [] when unknown."""
+    try:
+        rows = board.rows(
+            "SELECT preflight FROM runs WHERE program=? AND preflight IS NOT NULL ORDER BY id DESC LIMIT 1", program
+        )
+        doc = json.loads(rows[0]["preflight"]) if rows else None
+    except (sqlite3.Error, ValueError, TypeError):
+        return []
+    return missing_tools(doc.get("arsenal")) if isinstance(doc, dict) else []
+
+
+def prepare_workdir(
+    board: Board,
+    scope: Scope,
+    scope_file: Path,
+    identities: list[str] | None = None,
+    *,
+    missing: list[str] | None = None,
+) -> dict | None:
     """Push what the segment reads. `identities`: the live ones offered to the agent (BH_IDENTITIES), the only ones
-    the system prompt names."""
+    the system prompt names. `missing` None: check the builtins' binaries first (preflight.arsenal, T46) and return
+    that check; the system prompt leaves out the Arsenal line of a builtin whose binary is missing. A list: the
+    builtins a check of this segment already found missing (a rotation pushes the same system prompt again)."""
+    from bh.runner import preflight as gate_check
+
+    checked = gate_check.arsenal(gate_check.default_exec_in_agent) if missing is None else None
+    if missing is None:
+        missing = missing_tools(checked)
     prog = scope.program
     if identities is None:
         identities = live_identities(board, prog, also=[i["name"] for i in scope.identities], scope=scope)
@@ -883,8 +1086,9 @@ def prepare_workdir(board: Board, scope: Scope, scope_file: Path, identities: li
     )
     stack.push_file(f"{cbh}/{c.MANUAL_TESTED}", json.dumps(sorted(r["key"].split(" ", 1) for r in tested)))
     stack.push_file(f"{cbh}/{c.FACTS}", (stage / c.FACTS).read_text())
-    push_system_prompt(build_system_prompt(scope, identities))
+    push_system_prompt(system_prompt_for(scope, identities, missing))
     stack.push_file(f"{cbh}/{c.SCOPE}", Path(scope_file).read_text())
+    return checked
 
 
 # ------------------------------------------------------------------ one claude process
@@ -903,9 +1107,16 @@ def agent_command(
     identities: list[str] | None = None,
 ) -> list[str]:
     """claude -p inside the agent for this program. `bh_dir`/`extra_env`/`user` let the verifier reuse it with
-    its own work dir, role and Unix user. `identities`: the names offered to the agent (default: every one)."""
+    its own work dir, role and Unix user. `identities`: the names offered to the agent (default: every one).
+
+    The hunter (no `bh_dir`, user `hunter`, no verifier role) gets the skills linked in its HOME (the `Skill` tool, so
+    no `--disable-slash-commands`, which turns every skill off) and the two MCP servers of MCP_CONFIG (none with
+    BH_MCP=0). `--setting-sources user`: no project settings, project skills or nested `.claude/skills` the work tree
+    could hold are read (the flag settings, our hooks, always are). Anyone else, the verifier included, runs as before
+    W3: Bash and Read, no skill, no MCP server."""
     prog = scope.program
     bh = bh_dir or c.sandbox_dir(prog)
+    hunter = is_hunter(bh_dir=bh_dir, user=user, extra_env=extra_env)
     if identities is None:
         identities = sorted({i["name"] for i in scope.identities} | set(paths.identities(prog)))
     env = {
@@ -917,6 +1128,7 @@ def agent_command(
         "BH_IDENTITY_ROLES": identity_roles(scope, identities),  # never a secret: role and tenant labels
         "HOME": sandbox_home(run_id),
         **BASH_TIMEOUT_MS,
+        **(HUNTER_ENV if hunter else {}),
         **(extra_env or {}),
     }
     cmd = [
@@ -945,12 +1157,9 @@ def agent_command(
         str(max_turns),
         "--permission-mode",
         "bypassPermissions",
-        "--tools",
-        AGENT_TOOLS,
-        "--disable-slash-commands",
+        *tool_options(hunter),
         "--settings",
         "/opt/bh/hooks/settings.json",
-        "--strict-mcp-config",  # no --mcp-config: no MCP server at all, whatever the work tree holds
         "--append-system-prompt-file",
         f"{bh_dir}/{c.SYSTEM}" if bh_dir else SYSTEM_FILE,  # the verifier's is pushed by bh.verify
     ]
@@ -959,6 +1168,41 @@ def agent_command(
     if session:
         cmd += ["--resume", session]
     return cmd
+
+
+def is_hunter(*, bh_dir: str | None, user: str, extra_env: dict[str, str] | None) -> bool:
+    """agent_command builds the hunter's session: neither the verifier's work dir, user or role."""
+    return bh_dir is None and user == "hunter" and (extra_env or {}).get("BH_ROLE", "") in ("", "hunter")
+
+
+def hunter_tools() -> str:
+    """AGENT_TOOLS, without `Skill` while there is no skill to load (the cards path)."""
+    names = [t.strip() for t in AGENT_TOOLS.split(",") if t.strip()]
+    return ",".join(t for t in names if t != SKILL_TOOL or skills_on())
+
+
+def judge_tools() -> str:
+    """The verifier's tools: AGENT_TOOLS without `Skill` (Bash, Read)."""
+    return ",".join(t.strip() for t in AGENT_TOOLS.split(",") if t.strip() and t.strip() != SKILL_TOOL)
+
+
+def mcp_on(env=None) -> bool:
+    """BH_MCP=0 takes the hunter's MCP servers away (the setup records it: identity.mcp_setup)."""
+    return identity.mcp_enabled(env)
+
+
+def tool_options(hunter: bool, env=None) -> list[str]:
+    """--tools, skills and MCP options of one claude process (see agent_command)."""
+    if not hunter:
+        # no --mcp-config: no MCP server at all, whatever the work tree holds; no skill, no command
+        return ["--tools", judge_tools(), "--disable-slash-commands", "--strict-mcp-config"]
+    tools = hunter_tools()
+    out = ["--tools", tools, "--setting-sources", "user"]
+    if SKILL_TOOL not in tools.split(","):
+        out.append("--disable-slash-commands")
+    if mcp_on(env):
+        out += ["--mcp-config", MCP_CONFIG]
+    return [*out, "--strict-mcp-config"]
 
 
 _QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
@@ -979,6 +1223,12 @@ def _tool_result_text(block: dict) -> str:
     if isinstance(content, list):
         return "\n".join(t for x in content if isinstance(x, dict) and isinstance(t := x.get("text"), str))
     return content if isinstance(content, str) else ""
+
+
+def fail_lines(text: str) -> int:
+    """[bh-fail] lines of one tool result: a line that starts with the mark (a target page quoting it mid-line is
+    not counted)."""
+    return sum(1 for line in text.splitlines() if line.lstrip().startswith(FAIL_MARK))
 
 
 def _str(v) -> str:
@@ -1093,6 +1343,8 @@ def consume_stream(
                     if locked:
                         res.locked_calls += 1
                         say("  🔒 manual HTTP refused by the tool lock")
+                    res.repeats += REPEAT_MARK in text
+                    res.fails += fail_lines(text)
                     if over and not res.overflow and stop is not None:  # the turn's tool results are back
                         res.overflow = True
                         stop()
@@ -1287,6 +1539,8 @@ def finish(
     board.record_metrics(res.run_id, res.turn_log, res.tool_log)
     board.run_set(res.run_id, blockers=res.new_blockers, **gate_counts(board, res.run_id))
     board.run_set(res.run_id, rotations=res.rotations, max_context=max(res.leg_context, default=None))
+    identity.ensure(board)  # idempotent: the W3 counters' columns
+    board.run_set(res.run_id, repeats=res.repeats, fails=res.fails)
     graph = Graph(board, scope)
     graph.sync(res.run_id)
     for r in board.rows("SELECT id, url FROM findings WHERE run_id=? AND url IS NOT NULL", res.run_id):
@@ -1530,6 +1784,7 @@ def prepare_rotation(
     context: int,
     identities: list[str] | None = None,
     stopper: StopWatcher | None = None,
+    missing: list[str] | None = None,
 ) -> bool:
     """Before a fresh session takes over mid-segment: ingest the notes so far, write the HANDOFF if none was
     ingested since fact id `since`, push the updated frontier to the sandbox. True when the runner wrote it."""
@@ -1551,7 +1806,7 @@ def prepare_rotation(
         )
         board.add_fact(prog, title, summary, kind="handoff", run_id=res.run_id)
     Graph(board, scope).sync(res.run_id)
-    prepare_workdir(board, scope, scope_file, identities)
+    prepare_workdir(board, scope, scope_file, identities, missing=list(missing or ()))
     return wrote
 
 
@@ -1793,9 +2048,12 @@ def setup_doc(
     system_prompt: str,
     cards: list[str],
     shape: dict,
+    skills: list[str] | None = None,
 ) -> tuple[str, dict]:
     """(sha256, document) of a segment's setup (T10), with the W2 knobs: the doctrine opening in force
-    (BH_DOCTRINE_OPENING, `a` by default), BH_LINEAGE_PSEUDO and the score weights' condensate."""
+    (BH_DOCTRINE_OPENING, `a` by default), BH_LINEAGE_PSEUDO and the score weights' condensate. W3: the skills
+    linked into the session (`skills`, None on the cards path), those the task pins for this model, the hunter's
+    --tools and its MCP servers (BH_MCP)."""
     from bh.browser_service import controller
     from bh.runner import supervisor as sv
     from bh.verify import verifier_model
@@ -1819,6 +2077,10 @@ def setup_doc(
         prompt_quantum=sv.PROMPT_QUANTUM,
         prompt_floor=sv.PROMPT_FLOOR,
         doctrine_opening=opening_name(),  # the opening this segment's doctrine is built with (env or `a`)
+        skills=skills,
+        pinned=task_skills(scope, model)[1] if skills is not None else [],
+        tools=hunter_tools(),
+        mcp=identity.mcp_setup(),
     )
     for k, v in lineage_setup().items():
         doc.setdefault(k, v)
@@ -1838,6 +2100,7 @@ def record_setup(
     task: str | None,
     cards: list[str],
     shape: dict,
+    skills: list[str] | None = None,
 ) -> str:
     """runs.setup_sha256 / setup_json, and the segment's system prompt and task under var/runs/ (`task` None: the
     caller writes it once built, run_text(run_id, "task"))."""
@@ -1850,6 +2113,7 @@ def record_setup(
         system_prompt=system_prompt,
         cards=cards,
         shape=shape,
+        skills=skills,
     )
     board.run_set(run_id, setup_sha256=digest, setup_json=identity.canonical(doc))
     paths.runs_dir().mkdir(parents=True, exist_ok=True)
@@ -1862,15 +2126,18 @@ def record_setup(
 def preview_setup(board: Board, scope: Scope, *, model: str, effort: str | None, max_turns: int, minutes: float):
     """(sha256, document) a segment on `scope` would start with now, without starting it (`bh agent relaunch`)."""
     identities = live_identities(board, scope.program, also=[i["name"] for i in scope.identities], scope=scope)
+    skills = allowed_skills(scope)
     return setup_doc(
         scope,
         model=model,
         effort=effort,
         max_turns=max_turns,
         minutes=minutes,
-        system_prompt=build_system_prompt(scope, identities),
-        cards=[*classes.pinned_cards(scope), *pick_cards(board, scope)],
+        # nothing runs in the agent here: the builtins the last segment found missing stand for a new check
+        system_prompt=system_prompt_for(scope, identities, last_missing(board, scope.program)),
+        cards=[] if skills is not None else [*classes.pinned_cards(scope), *pick_cards(board, scope)],
         shape={"scanners": scope.scanners_on, "browser": has_browser(scope)},
+        skills=skills,
     )
 
 
@@ -2269,7 +2536,8 @@ def _run_locked(
         preflight=json.dumps(preflight, sort_keys=True) if preflight is not None else None,
         early_stop=0,
     )
-    clean_sandbox(prog, sandbox_home(run_id))
+    skills = allowed_skills(scope)  # D18: None while lot C's skills are not there (the cards path)
+    clean_sandbox(prog, sandbox_home(run_id), skills)
     # before the prompt is written: a recipe identity without a live session is left out of it
     no_session = refresh_identities(board, scope, run_id, None if quiet else (lambda m: print(m, flush=True)))
     # the live ones only, for BH_IDENTITIES and the system prompt alike
@@ -2279,7 +2547,12 @@ def _run_locked(
         if n not in no_session
     ]
     Graph(board, scope).sync(None)  # whatever the sandbox holds from earlier segments
-    prepare_workdir(board, scope, scope_file, identities)
+    arsenal = prepare_workdir(board, scope, scope_file, identities)
+    missing = missing_tools(arsenal)
+    if isinstance(arsenal, dict):  # T46: the arsenal check is part of what this segment started after
+        board.run_set(run_id, preflight=json.dumps({**(preflight or {}), "arsenal": arsenal}, sort_keys=True))
+        if missing:
+            say(f"  ⚠ arsenal: no binary for {', '.join(missing)}: left out of the system prompt")
     # targets behind a third-party challenge: bh-browser holds a live session, the operator is pushed any challenge
     watcher = None
     prompts: dict[str, int] | None = None
@@ -2301,13 +2574,13 @@ def _run_locked(
         first_lines.append(EARLY_STOP_LINE)
         board.meta_set(early_stop_key(prog), "")
     before = coverage_counts(board, scope)
-    cards = pick_cards(board, scope)
-    pinned = classes.pinned_cards(scope)
+    cards = [] if skills is not None else pick_cards(board, scope)  # W3: skills replace the picked cards
+    guides = guide_names(scope, model, cards)  # runs.cards: the skills (or cards) the task names
     refused = last_refusal(board, prog, run_id)
     operator = f"\n\nOperator instruction for this segment: {extra_task}" if extra_task else ""
     harness = "".join(f"\n\n{line}" for line in bh_lines)
     shape = {"scanners": scope.scanners_on, "browser": has_browser(scope)}
-    system_prompt = build_system_prompt(scope, identities)  # the same for every agent of the segment
+    system_prompt = system_prompt_for(scope, identities, missing)  # the same for every agent of the segment
     digest = record_setup(
         board,
         run_id,
@@ -2318,8 +2591,9 @@ def _run_locked(
         minutes=minutes,
         system_prompt=system_prompt,
         task=None,
-        cards=[*pinned, *cards],
+        cards=[] if skills is not None else guides,
         shape=shape,
+        skills=skills,
     )
     # W2: the agent of this segment is born from the setup; its memory is the `## Lineage` block of its task
     agent = lineage_hooks.start(board, scope, run_id, digest, parent_no=lineage_parent, mode=lineage_mode)
@@ -2332,7 +2606,7 @@ def _run_locked(
                 block,
                 first=first,
                 max_turns=max_turns,
-                cards=segment_cards(scope, cards),
+                cards=segment_guides(scope, model, cards),
                 refused=refused,
                 **shape,
             )
@@ -2348,12 +2622,12 @@ def _run_locked(
         raise
     log_path = paths.run_log(run_id, prog)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    board.run_set(run_id, cards=",".join([*pinned, *cards]) or None)
+    board.run_set(run_id, cards=",".join(guides) or None)
     say(
         f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · "
         f"max {max_turns} turns / {minutes:g} min"
         + (f" · resume {session[:8]}" if session else "")
-        + (f" · cards {', '.join([*pinned, *cards])}" if pinned or cards else "")
+        + (f" · {'skills' if skills is not None else 'cards'} {', '.join(guides)}" if guides else "")
     )
 
     deadline = time.monotonic() + minutes * 60
@@ -2371,7 +2645,8 @@ def _run_locked(
             while res.legs < max_legs and not stopper.triggered:
                 res.legs += 1
                 if res.legs > 1:  # whatever the previous leg planted goes before the next one loads it
-                    clean_leg(prog, sandbox_home(run_id))
+                    clean_leg(prog, sandbox_home(run_id), skills)
+                refresh_flows_index(prog, run_id, flows_at, say)  # T52: bh-flows reads the run's traffic so far
                 calls_before, turns_before, facts_before = res.tool_calls, len(res.turn_log), last_fact_id(board)
                 locked_before = res.locked_calls
                 res.leg_since = facts_before
@@ -2456,7 +2731,7 @@ def _run_locked(
                         board.meta_set(early_stop_key(prog), str(run_id))
                     break
                 waiting = has_browser(scope) and challenge_pending(browser_status())
-                if not cards and (cards := pick_cards(board, scope)):  # the surface exists once mapping is done
+                if skills is None and not cards and (cards := pick_cards(board, scope)):  # mapping is done
                     board.run_set(run_id, cards=",".join(cards))
                     say(f"  ↻ cards {', '.join(cards)}")
                     new_cards = classes.cards_block(
@@ -2475,6 +2750,7 @@ def _run_locked(
                         context=last_ctx,
                         identities=identities,
                         stopper=stopper,
+                        missing=missing,
                     )
                     if stopper.triggered:
                         break
@@ -2492,7 +2768,7 @@ def _run_locked(
                             block,
                             first=False,
                             max_turns=left_turns,
-                            cards=segment_cards(scope, cards),
+                            cards=segment_guides(scope, model, cards),
                             refused=refused,
                             rotated=True,
                             **shape,

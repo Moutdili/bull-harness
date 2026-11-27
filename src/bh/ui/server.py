@@ -601,6 +601,9 @@ class Handler(BaseHTTPRequestHandler):
             return bhost.call({"op": "status"}, timeout=60)
         if path == "/api/metrics":
             return self._metrics(b)
+        if path == "/api/agent/tools":  # read-only: the Stop button (stack.kill_agent) is the only way to stop them
+            up = stack.container_running(stack.AGENT)
+            return {"running": up, "tools": stack.agent_tools() if up else [], "now": time.time()}
         if m := re.fullmatch(r"/api/runs/(\d+)/tools", path):
             return [dict(r) for r in b.rows("SELECT * FROM tool_calls WHERE run_id=? ORDER BY idx", int(m.group(1)))]
         if m := re.fullmatch(r"/api/runs/(\d+|latest)/events", path):

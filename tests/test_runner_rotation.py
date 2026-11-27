@@ -86,7 +86,9 @@ def seg(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "browser_status", lambda call=None: None)
     monkeypatch.setattr(run.identity, "claude_version", lambda: "2.1.330")
     state = {"legs": [], "cmds": [], "limits": [], "cleaned": []}
-    monkeypatch.setattr(run, "clean_leg", lambda prog, home: state["cleaned"].append((len(state["cmds"]), home)))
+    monkeypatch.setattr(
+        run, "clean_leg", lambda prog, home, skills=None: state["cleaned"].append((len(state["cmds"]), home))
+    )
 
     def no_podman(*a, **k):
         raise AssertionError("a test reached podman")

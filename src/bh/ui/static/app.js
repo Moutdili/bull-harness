@@ -123,6 +123,19 @@ function renderEvent(e) {
   return el("div", { class: "ev result" }, el("div", { class: "h" }, `fin · ${e.turns ?? "?"} tours${e.cost ? ` · $${e.cost.toFixed(2)} éq.` : ""}`), e.body);
 }
 
+// ------------------------------------------------------------------ tools in progress (T46): read-only
+const dur = (s) => s == null ? "—" : s < 60 ? `${s} s` : s < 3600 ? `${(s / 60) | 0} min ${s % 60} s` : `${(s / 3600) | 0} h ${((s % 3600) / 60) | 0} min`;
+views.tools = async () => {
+  const d = await api("/api/agent/tools");
+  fill($("#tools"),
+    el("div", { class: "row" }, el("b", {}, "Processus du conteneur agent"), el("span", { class: "muted small" }, "lecture seule · l'arrêt reste le bouton Stop (Programmes)")),
+    !d.running ? el("div", { class: "empty" }, "Le conteneur agent ne tourne pas.")
+      : !d.tools.length ? el("div", { class: "empty" }, "Aucun outil en cours.")
+        : el("table", {}, el("tr", {}, ...["pid", "durée", "outil", "commande", "dernière ligne"].map((h) => el("th", {}, h))),
+          ...d.tools.map((t) => el("tr", {}, el("td", { class: "small" }, t.pid), el("td", { class: "small" }, dur(t.seconds)), el("td", {}, t.name),
+            el("td", { class: "mono small" }, t.cmd), el("td", { class: "mono small muted" }, t.last || "—")))));
+};
+
 // ------------------------------------------------------------------ findings
 views.findings = async () => {
   const f = await api("/api/findings");
@@ -416,4 +429,4 @@ async function refresh() {
 window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (Object.hasOwn(views, t) && t !== current) show(t); });
 const start = (location.hash || "#dash").slice(1);
 show(Object.hasOwn(views, start) ? start : "dash");
-setInterval(() => { if (["dash", "live", "submit", "blockers", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);
+setInterval(() => { if (["dash", "live", "tools", "submit", "blockers", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);

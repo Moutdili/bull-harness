@@ -11,12 +11,16 @@ The suite runs with BH_ESC_JSONL=1: one JSON object per check {"check", "profile
 {"summary": true, "checks": N, "fails": K}. An unreadable line, a check not ok, a missing summary (or one that
 disagrees with the lines) fail the preflight; in profile `lab` only, a missing positive check or witness fails it
 too. A failure cancels: there is no degraded mode. Nothing here is skipped for a real program (BH_PREFLIGHT=0 is
-read for a `platform: local` program only)."""
+read for a `platform: local` program only).
+
+`arsenal()` (T46) is another check, run before every segment: is each builtin's binary in the agent image (and each
+tool ported from the HexStrike registry)? It cancels nothing: a missing builtin leaves the system prompt's Arsenal."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -193,3 +197,82 @@ def require(scope, **kw) -> dict:
     if not res["ok"]:
         raise PreflightFailed(f"preflight failed, hunt cancelled: {res['error']}", res)
     return res
+
+
+# ------------------------------------------------------------------ the arsenal (T46)
+# The binary each builtin of bh.agent.tools runs (and bh-zap's java). One missing: the builtin fails at its first
+# call, so its line leaves the system prompt's Arsenal (prompt.build_system_prompt, `missing_tools`).
+BUILTIN_BINARIES = {
+    "bh-recon": ("subfinder", "httpx-toolkit"),
+    "bh-crawl": ("katana",),
+    "bh-content": ("ffuf",),
+    "bh-scan": ("nuclei",),
+    "bh-params": ("arjun",),
+    "bh-sqli": ("sqlmap",),
+    "bh-xss": ("dalfox",),
+    "bh-zap": ("java",),
+}
+_BINARY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+# One line per binary: `+name` found on the hunter's PATH, `-name` not. The names travel as arguments, never in the
+# script; the shell only answers for them.
+_ARSENAL_SCRIPT = r"""
+for b in "$@"; do
+  if command -v -- "$b" >/dev/null 2>&1; then echo "+$b"; else echo "-$b"; fi
+done
+"""
+
+
+def default_exec_in_agent(binaries: list[str]) -> str:
+    """`command -v` of each binary inside the agent, as the hunter (its PATH)."""
+    r = stack.agent_sh(_ARSENAL_SCRIPT, *binaries, timeout=60)
+    if r.returncode != 0:
+        raise OSError(f"arsenal check failed in {stack.AGENT}: {(r.stderr or '').strip()[:200]}")
+    return r.stdout
+
+
+def hexstrike_binaries() -> dict[str, str] | None:
+    """{tool name: binary} of the tools ported from the HexStrike registry (lot B: bh.agent.hexstrike.registry.TOOLS,
+    entries with `binary` and `ported`); None while that module is not there."""
+    try:
+        from bh.agent.hexstrike import registry  # type: ignore[attr-defined]
+    except ImportError:
+        return None
+    tools = getattr(registry, "TOOLS", None)
+    items = tools.items() if isinstance(tools, dict) else enumerate(tools or ())
+    out: dict[str, str] = {}
+    for key, t in items:
+        get = t.get if isinstance(t, dict) else (lambda k, d=None, t=t: getattr(t, k, d))
+        binary, ported = get("binary"), get("ported")
+        if not ported or not isinstance(binary, str) or not _BINARY_NAME.fullmatch(binary):
+            continue
+        out[str(get("name") or key)] = binary
+    return out
+
+
+def arsenal(exec_in_agent: Callable[[list[str]], str] = default_exec_in_agent) -> dict:
+    """{"ok", "builtins": {builtin: bool}, "binaries": {binary: bool}, "hexstrike": {tool: bool} | None,
+    "missing": [builtin], "error"} for runs.preflight. A builtin is missing when one of its binaries is. Never
+    raises: a check that cannot run says so in `error` and removes nothing from the prompt."""
+    hex_tools = hexstrike_binaries()
+    wanted = sorted({b for bins in BUILTIN_BINARIES.values() for b in bins} | set((hex_tools or {}).values()))
+    out: dict = {"ok": False, "builtins": {}, "binaries": {}, "hexstrike": None, "missing": [], "error": None}
+    try:
+        text = exec_in_agent(wanted)
+    except (OSError, subprocess.SubprocessError, SystemExit) as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        return out
+    seen: dict[str, bool] = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if len(line) > 1 and line[0] in "+-" and line[1:] in wanted:
+            seen[line[1:]] = line[0] == "+"
+    if set(seen) != set(wanted):
+        out["error"] = "no answer for " + ", ".join(sorted(set(wanted) - set(seen)))
+        return out
+    out["binaries"] = seen
+    out["builtins"] = {name: all(seen[b] for b in bins) for name, bins in BUILTIN_BINARIES.items()}
+    out["missing"] = sorted(name for name, ok in out["builtins"].items() if not ok)
+    if hex_tools is not None:
+        out["hexstrike"] = {name: seen[b] for name, b in sorted(hex_tools.items())}
+    out["ok"] = not out["missing"]
+    return out
