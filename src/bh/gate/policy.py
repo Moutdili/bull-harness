@@ -110,6 +110,13 @@ MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a 
 # authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S. Only the ids of the
 # path count (I6): a query or body parameter (telemetry `eventid`, a search filter) is no object read.
 ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 6, 600, 5000  # D26: six distinct ids, the seventh refused
+# T32: the test objects' registry (bh.gate.objects). A PUT, PATCH or DELETE under an identity whose path id the
+# registry does not hold: `observe` journals it (event `object-unknown`, `would_refuse: true`) and lets it through;
+# `enforce` refuses it (OBJECTS_REASON). Mio's decision: `observe` first, `enforce` after a month counted by the
+# orchestrator. Nothing switches this constant by itself; `enforce` is never the default.
+OBJECTS_MODES = ("observe", "enforce")
+OBJECTS_MODE = "observe"
+OBJECTS_REASON = "not one of your test objects"
 # T5: paths no client may reach, whatever the method (bh-browser included): they end our session, change our
 # accounts or spend money. Matched case-insensitively on the request PATH only (never the query string), raw and
 # normalized (%xx decoded, ;params dropped, // collapsed); a scope adds its own (`protected_urls`), never removes one.

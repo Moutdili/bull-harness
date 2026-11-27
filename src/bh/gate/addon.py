@@ -42,9 +42,16 @@ program header ever added), flows class `docs`, never a test.
 
 Canaries (I1, bh.gate.canary): every request URL and body, response body and websocket frame (both ways) is searched
 for `BH-SECRET-<16 hex>` on its whole content (decoded, bounded to canary.SCAN_BYTES) before any truncation; each hit
-is one `events.jsonl` line {"kind": "canary", "token", "where": request-url|request-body|response-body|ws-client|
-ws-server, "host", "url" (redacted), "identity", "client": browser|agent|judge|login|other, "run", "ts"}. Nothing
-around the token is kept. The relay (Claude API traffic) is not searched: the hunter's own context names the token.
+is one `events.jsonl` line {"kind": "canary", "token", "sha256" (canary.digest of the token, T24), "where":
+request-url|request-body|response-body|ws-client|ws-server, "host", "url" (redacted), "identity", "client":
+browser|agent|judge|login|other, "run", "ts"}. Nothing around the token is kept. The relay (Claude API traffic) is
+not searched: the hunter's own context names the token.
+
+Test objects (T32, bh.gate.objects): a 2xx answer to a POST under an identity on a target registers the id it gives
+(Location, or a top-level `id` / `uuid` / `key`; event `object-registered`). A PUT, PATCH or DELETE under an identity
+whose path id the registry does not hold is journaled (`object-unknown`, `would_refuse: true`) and, only when
+policy.OBJECTS_MODE is `enforce` (never the default), refused ("not one of your test objects"). The host's own
+requests (`_from_gate`) are never looked up; a registry error neither registers nor refuses (`objects-error`).
 
 Relay (Claude API, the only holder of the OAuth token): only the agent and judge containers, only the two calls
 Claude Code makes, within the run's budget, and only a body policy.check_relay accepts: client tools only, no
@@ -116,6 +123,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from mitmproxy import ctx, http, tcp, udp
 from mitmproxy.net.http.url import parse_authority, unparse
@@ -123,11 +131,12 @@ from mitmproxy.proxy import mode_specs, server_hooks
 
 from bh import paths, redact
 from bh.accounts.expiry import jwt_exp
-from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER, origin
-from bh.gate import canary, recipients, session
+from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER, IDENTITY_ONLY_METHODS, origin
+from bh.gate import canary, objects, recipients, session
 from bh.gate.policy import (
     DOCS_HEADERS,
     DOCS_USER_AGENT,
+    OBJECTS_REASON,
     SYSTEM_HOSTS,
     Policy,
     Verdict,
@@ -606,7 +615,8 @@ class Gate:
                     paths.EVENTS,
                     {
                         "kind": "canary",
-                        "token": tok,
+                        "token": str(tok),
+                        "sha256": tok.sha256,  # T24: what a host-planted canary is known by
                         "where": where,
                         "host": host,
                         "url": redact.url(url),
@@ -933,10 +943,12 @@ class Gate:
         host_header = parse_authority(req.host_header, check=False)[0] if req.host_header else None
         url, host = self._named(flow)
         override = next((req.headers[h] for h in METHOD_OVERRIDES if h in req.headers), None)
+        method = override.strip().upper() if override else req.method.upper()
+        flow.metadata["bh_method"] = method  # what the server runs (T32 reads it at the answer too)
         v = self.policy.classify_request(
             url,
             host,
-            override.strip().upper() if override else req.method,
+            method,
             host_header=host_header,
             identity=identity,
             body_len=len(req.raw_content or b""),
@@ -953,6 +965,15 @@ class Gate:
         flow.metadata["bh_support"] = v.support
         if not v.allowed:
             self._deny(flow, v, "request")
+            return
+        if (
+            v.klass == "target"
+            and identity
+            and method in IDENTITY_ONLY_METHODS
+            and not _from_gate(flow)
+            and (refused := self._object_check(flow, url, method, identity))
+        ):
+            self._deny(flow, refused, "request")
             return
         bucket = self.policy.bucket(v.klass)
         if bucket is not None:
@@ -990,6 +1011,62 @@ class Gate:
             for k in ("Cookie", "Authorization"):
                 req.headers.pop(k, None)
         # support `auth`: only enrollment reaches it (policy); its own cookies are the login's, left as they are
+
+    # ---- T32: the test objects' registry (bh.gate.objects)
+    def _object_check(self, flow: http.HTTPFlow, url: str, method: str, identity: str) -> Verdict | None:
+        """A write under an identity on a path id the registry does not hold: event `object-unknown` (with
+        `would_refuse: true`, what the orchestrator counts before switching the mode), refused in `enforce` mode only.
+        A path without an id, a known object, or a registry that cannot be read: let through (in doubt, no refusal).
+        The host's own requests (the canary's plant, the probe) never come here."""
+        mode = objects.mode()
+        try:
+            with objects.connect(self.state) as conn:
+                known = objects.known(conn, self.policy.program, url)
+        except Exception as exc:  # noqa: BLE001 - a broken registry never refuses a hunt
+            self._log(paths.EVENTS, {"kind": "objects-error", "where": "lookup", "error": repr(exc)[:200]})
+            return None
+        if known is not False:
+            return None
+        oid = (objects.object_of(url) or ("", ""))[1]
+        self._log(
+            paths.EVENTS,
+            {
+                "kind": "object-unknown",
+                "identity": identity,
+                "method": method,
+                "url": recipients.scrub(redact.url(url)),
+                "route": objects.route_of(urlsplit(url).path),
+                "object_id": oid[: objects.ID_MAX],
+                "mode": mode,
+                "would_refuse": True,
+                "client": "browser" if flow.metadata.get("bh_browser") else client_kind(flow),
+            },
+        )
+        return deny(OBJECTS_REASON, "test-objects") if mode == "enforce" else None
+
+    def _objects_created(self, flow: http.HTTPFlow, url: str) -> None:
+        """A 2xx answer to a POST under an identity, on a target: the identifier it gives joins the registry (event
+        `object-registered` per new row). Observation only: never raises, never decides the flow."""
+        identity, resp = flow.metadata.get("bh_identity"), flow.response
+        if not identity or flow.metadata.get("bh_method", flow.request.method) != "POST" or resp is None:
+            return
+        if not 200 <= resp.status_code < 300:
+            return
+        try:
+            body = canary.decode(resp.raw_content or b"", resp.headers.get("content-encoding"), objects.BODY_SCAN + 1)
+            items = objects.created(
+                url, resp.status_code, resp.headers.get("location"), body, resp.headers.get("content-type")
+            )
+            if not items:
+                return
+            with objects.connect(self.state) as conn:
+                new = objects.record(conn, self.policy.program, identity, items)
+            for route, oid in new:
+                self._log(
+                    paths.EVENTS, {"kind": "object-registered", "identity": identity, "route": route, "object_id": oid}
+                )
+        except Exception as exc:  # noqa: BLE001 - the registry never costs a flow
+            self._log(paths.EVENTS, {"kind": "objects-error", "where": "register", "error": repr(exc)[:200]})
 
     def _identity_file(self, name: str) -> Path | None:
         """The identity's file for the active program, None for an unknown or malformed name."""
@@ -1171,6 +1248,7 @@ class Gate:
         fid = self._record(flow, flow.response.status_code)
         if flow.metadata.get("bh_class") != "target":
             return
+        self._objects_created(flow, self._named(flow)[0])
         resp = flow.response
         url, host = self._named(flow)
         browser = bool(flow.metadata.get("bh_browser"))

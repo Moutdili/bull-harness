@@ -3,6 +3,7 @@ close of a connection (I18). No network, mitmproxy simulated; every address tabl
 
 import asyncio
 import gzip
+import hashlib
 import importlib
 import json
 import os
@@ -32,7 +33,7 @@ SCOPE = {
     "identities": [{"name": "user-a", "origins": ["https://app.example.com/"]}],
     "support": [{"value": "challenges.example.net", "kind": "passthrough"}],
 }
-EVENT_KEYS = {"kind", "token", "where", "host", "url", "identity", "client", "run", "ts", "program"}
+EVENT_KEYS = {"kind", "token", "sha256", "where", "host", "url", "identity", "client", "run", "ts", "program"}
 
 
 @pytest.fixture
@@ -285,6 +286,7 @@ def test_canary_in_the_url(addon, tmp_path):
     (ev,) = _canary(tmp_path)
     assert (ev["token"], ev["where"], ev["host"], ev["client"]) == (TOKEN, "request-url", "app.example.com", "agent")
     assert ev["program"] == "t" and ev["identity"] is None and "hunter2" not in ev["url"]
+    assert ev["sha256"] == hashlib.sha256(TOKEN.encode()).hexdigest()  # T24: the digest of the normalized token
 
 
 def test_canary_in_a_gzip_request_body_from_the_browser(addon, tmp_path):

@@ -260,8 +260,8 @@ def test_failed_login_message_holds_no_secret(env, monkeypatch):
     _gate(monkeypatch, probe_bad, login_401)
     with pytest.raises(en.AccountError) as exc:
         en.refresh(_scope(False), "user-a", board=env)
-    assert str(exc.value) == "login: HTTP 401"
-    assert cred["password"] not in str(exc.value)
+    assert str(exc.value) == "[credentials] login: HTTP 401"  # T51: the cause leads the blocker's text
+    assert exc.value.cause == "credentials" and cred["password"] not in str(exc.value)
 
 
 def test_dead_lab_account_is_signed_up_again_with_the_same_credential(env, monkeypatch):
