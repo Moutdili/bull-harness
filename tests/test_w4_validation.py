@@ -858,7 +858,11 @@ def test_proof_identities_from_steps_and_observation():
 
 
 # ====================================================================== T28: the skill cvss-from-evidence
-SKILL = ROOT / "src" / "bh" / "skills" / "cvss-from-evidence" / "SKILL.md"
+# tests/test_w3_skills.py (not this lot's) closes the list of skill folders: until the merge adds
+# "cvss-from-evidence" there, the skill waits as SKILL.md.pending (inert: all_skills reads */SKILL.md only), then a
+# `git mv` makes it live; the same tests run on either name
+_SKILL_DIR = ROOT / "src" / "bh" / "skills" / "cvss-from-evidence"
+SKILL = _SKILL_DIR / "SKILL.md" if (_SKILL_DIR / "SKILL.md").is_file() else _SKILL_DIR / "SKILL.md.pending"
 ORIGIN = ROOT / ".claude" / "skills" / "cvss-from-evidence" / "SKILL.md"
 
 
@@ -876,7 +880,8 @@ def test_skill_form():
     heads = [h for h in re.findall(r"^## (.+)$", body, re.M)]
     for title in ("When", "Do", "Proof", "Never", "False positives", "Watch"):
         assert any(h == title or h.startswith((f"{title}:", f"{title} ")) for h in heads), title
-    assert {s["name"] for s in classes.all_skills()} >= {"cvss-from-evidence"}
+    live = "cvss-from-evidence" in {s["name"] for s in classes.all_skills()}
+    assert live == (SKILL.name == "SKILL.md")
 
 
 @pytest.mark.skipif(not ORIGIN.is_file(), reason="the repatriated skill lives in the main checkout's .claude")
