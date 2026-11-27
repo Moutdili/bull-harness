@@ -466,3 +466,34 @@ def test_sources_carry_the_attribution():
         head = ast.get_docstring(ast.parse(f.read_text())) or ""
         assert "HexStrike AI" in head and "MIT" in head and "modified" in head.lower(), f
         assert "hexstrike_mcp.py" in head, f
+
+
+def test_a_mapper_run_feeds_the_board_like_bh_crawl(tmp_path, monkeypatch):
+    """Lab, 2026-11-27: `tool_run katana_crawl` through MCP found 76 lines and left the crawl phase at ✗; its summary
+    was raw JSONL. Now its endpoints of the target origin land in ENDPOINTS and the crawl phase is recorded."""
+    import json as _json
+
+    from bh.agent import contract as c
+    from bh.agent.hexstrike import registry as reg
+    from bh.agent.hexstrike import run as hr
+
+    monkeypatch.setenv("BH_DIR", str(tmp_path))
+    out = tmp_path / "stdout.txt"
+    out.write_text(
+        "\n".join(
+            [
+                _json.dumps({"request": {"method": "GET", "endpoint": "http://t.test:3000/api/a/1"}}),
+                _json.dumps({"request": {"method": "POST", "endpoint": "http://t.test:3000/rest/b"}}),
+                _json.dumps({"request": {"method": "GET", "endpoint": "http://other.test/x"}}),
+                "http://t.test:3000/main.js",
+            ]
+        )
+    )
+    tool = reg.TOOLS["katana_crawl"]
+    got = hr.record_map(tool, {"url": "http://t.test:3000/"}, out, ok=True, partial=False, raw=tmp_path)
+    assert got["new"] == 2 and "other.test" not in "\n".join(got["lines"])
+    keys = {e["key"] for e in c.read_jsonl(tmp_path / c.ENDPOINTS)}
+    assert len(keys) == 2
+    cov = c.read_json(tmp_path / c.COVERAGE, {})
+    assert cov["http://t.test:3000"]["crawl"]["status"] == "ok"
+    assert hr.record_map(tool, {"url": "http://t.test:3000/"}, out, ok=True, partial=False, raw=tmp_path)["new"] == 0

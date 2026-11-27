@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import math
+import json
 import os
 import re
 import shlex
@@ -447,6 +448,9 @@ def tool_run(name: object, args: object = None, timeout: object = None) -> dict:
             rc = 127
     ok = rc == 0
     lines, n = summarize(out) if ok or partial else ([], 0)
+    mapped = record_map(tool, values, out, ok=ok, partial=partial, raw=run_dir) if ok or partial else None
+    if mapped is not None and mapped["lines"] is not None:  # raw JSONL requests cost tokens: their endpoints say it
+        lines = mapped["lines"]
     res = {
         "ok": ok,
         "partial": partial,
@@ -461,6 +465,69 @@ def tool_run(name: object, args: object = None, timeout: object = None) -> dict:
     if not ok:
         res["stderr"] = summarize(err, STDERR_LINES)[0][-STDERR_LINES:]
     return res
+
+
+_URL = re.compile(r"https?://[^\s\"'<>\\]+")
+CRAWLERS = frozenset({"katana", "hakrawler", "gospider"})  # binaries whose run is the origin's crawl phase
+PARTIAL = "error: partial (timeout)"  # bh.agent.tools.PARTIAL_STATUS: a cut run is not a done phase
+
+
+def _found(out: Path) -> tuple[list[tuple[str, str]], bool]:
+    """((method, url) of every endpoint a mapper printed, whether it printed JSONL requests): a JSONL request
+    ({"request": {"method", "endpoint"}}), or any http(s) URL in a text line."""
+    found: list[tuple[str, str]] = []
+    structured = False
+    try:
+        text = out.read_text(errors="replace")
+    except OSError:
+        return found, structured
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("{"):
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                doc = None
+            req = doc.get("request") if isinstance(doc, dict) else None
+            if isinstance(req, dict) and isinstance(req.get("endpoint"), str):
+                found.append((str(req.get("method") or "GET").upper(), req["endpoint"]))
+                structured = True
+                continue
+        found += [("GET", u.rstrip(".,;)]")) for u in _URL.findall(line)]
+    return found, structured
+
+
+def record_map(tool: r.Tool, values: dict, out: Path, *, ok: bool, partial: bool, raw: Path) -> dict | None:
+    """What a mapper found goes where bh-crawl's does (lab, 2026-11-27: a katana crawl through MCP left the board's
+    crawl phase at ✗): the target origin's new endpoints in ENDPOINTS, and the crawl phase for a crawler. Returns
+    {"new", "lines"} (endpoint lines for the summary), None for a tool that is no mapper or has no http(s) target."""
+    if tool.klass != "mapper":
+        return None
+    origin = c.origin(str(values.get("url") or ""))
+    if not origin:
+        return None
+    d = c.bh_dir()
+    known = {(e.get("origin"), e.get("key")) for e in c.read_jsonl(d / c.ENDPOINTS)}
+    recs, seen = [], []
+    found, structured = _found(out)
+    for method, url in found:
+        k = c.endpoint_key(url, method)
+        if not k or k[0] != origin or c.STATIC_EXT.search(k[1]):
+            continue
+        seen.append(f"{method} {url}"[:300])
+        if k in known:
+            continue
+        known.add(k)
+        recs.append({"origin": k[0], "key": k[1], "url": url, "params": [], "status": None,
+                     "source": f"hexstrike:{tool.name}"})  # fmt: skip
+    if recs:
+        c.append_jsonl(d / c.ENDPOINTS, *recs)
+    if tool.binary in CRAWLERS:
+        c.record_phase(d, origin, "crawl", status="ok" if ok else PARTIAL, count=len(recs), raw=str(raw))
+    uniq = list(dict.fromkeys(seen))
+    head = f"{len(uniq)} endpoint(s) of {origin}, {len(recs)} new (recorded as bh-crawl's); full output: {raw}"
+    # JSONL requests (katana -jsonl) are long and repetitive: their endpoints replace them; a text output stays as is
+    return {"new": len(recs), "lines": [head, *uniq[: SUMMARY_LINES - 1]] if structured else None}
 
 
 def render_stdin(tool: r.Tool, values: dict, internal: dict[str, str]) -> str:
