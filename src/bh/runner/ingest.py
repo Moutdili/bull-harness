@@ -588,6 +588,16 @@ def _identity_dead(
     out.blockers += 1
 
 
+def _not_the_hunters(e: dict) -> bool:
+    """A refusal the hunter did not cause: another client (bh-browser, the login container, a self-test) or the
+    gate preflight the runner sends from the agent container before the run is active (`run` null). Those are
+    harness noise: reported to the agent as "gate denied N requests", they read as its own mistakes."""
+    client = e.get("client")
+    if client is not None and client not in ("agent", "judge"):
+        return True
+    return client == "agent" and "run" in e and e["run"] is None
+
+
 def gate_events(board: Board, program: str, run_id: int, identities: list[str]) -> GateOutcome:
     """One summary fact for denials, blocker facts for walls (WAF, 401) and missing identities.
 
@@ -609,6 +619,8 @@ def gate_events(board: Board, program: str, run_id: int, identities: list[str]) 
             continue
         match e.get("kind"):
             case "blocked":
+                if _not_the_hunters(e):
+                    continue
                 host = re.sub(r"https?://([^/]+).*", r"\1", e.get("url") or e.get("host") or "?")
                 blocked[host] = blocked.get(host, 0) + 1
             case "waf":

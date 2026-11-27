@@ -289,3 +289,27 @@ def test_a_new_proof_revives_a_needs_proof_finding(tmp_path):
     _write(tmp_path / "notes-3.jsonl", [{**note, "proof": _proof("b")}])
     ingest.notes(b, "p", 3, tmp_path / "notes-3.jsonl")
     assert len(b.rows("SELECT id FROM findings")) == 2
+
+
+def test_gate_denied_counts_only_the_hunters_refusals(tmp_path, monkeypatch):
+    """Run 69 (lab, 2026-11-27): the agent read "gate denied 102 requests" listing api.anthropic.com and
+    web.archive.org, which were the gate preflight and the login container, never its own requests."""
+    monkeypatch.setenv("BH_HOME", str(tmp_path))
+    b = Board(tmp_path / "b.sqlite")
+    ev = tmp_path / "var" / "state" / "events.jsonl"
+    deny = {"kind": "blocked", "program": "p"}
+    _write(
+        ev,
+        [
+            {**deny, "url": "https://api.anthropic.com/x", "client": "agent", "run": None},  # preflight
+            {**deny, "url": "http://10.0.0.1:3000/socket.io/", "client": "login", "run": 6},
+            {**deny, "url": "https://ads.t/x", "client": "browser", "run": 6},
+            {**deny, "url": "https://out.t/a", "client": "agent", "run": 6},
+            {**deny, "url": "https://out.t/b", "client": "judge", "run": 6},
+            {**deny, "url": "https://old.t/x"},  # a line written before the gate named its client
+        ],
+    )
+    ingest.gate_events(b, "p", 6, identities=[])
+    rows = b.rows("SELECT title, summary FROM facts WHERE kind='blocked'")
+    assert [r["title"] for r in rows] == ["gate denied 3 requests"]
+    assert "out.t x2" in rows[0]["summary"] and "anthropic" not in rows[0]["summary"]
