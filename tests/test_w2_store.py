@@ -612,3 +612,15 @@ def test_a_route_without_its_host_takes_the_one_host_of_the_asset_graph(board):
     assert store.ingest_run(board, "p", rid, 4) > 0
     cov = board.db.execute("SELECT ckey FROM mem_items WHERE src_kind='coverage'").fetchone()
     assert cov["ckey"].startswith("h.test|get /api/x/{id}|sqli")  # canonical: default port dropped
+
+
+def test_the_ledger_has_one_schema():
+    """Review of plan R (2026-11-27): store.py and score.py declared the ledger differently."""
+    import re
+
+    from bh.lineage import score
+
+    def cols(sql: str) -> str:
+        return " ".join(re.search(r"CREATE TABLE IF NOT EXISTS ledger \((.*?)\);", sql, re.S).group(1).split())
+
+    assert cols(store.SCHEMA) == cols(score.LEDGER_SCHEMA)

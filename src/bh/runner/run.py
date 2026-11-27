@@ -770,7 +770,10 @@ def set_active_run(run_id: int | None, program: str = "", relay_max: int | None 
         rec = {"run_id": run_id, "program": program}
         if relay_max is not None:
             rec["relay_max"] = relay_max
-        p.write_text(json.dumps(rec))
+        # atomic: the gate re-reads it on its mtime and must never see half a file (review of plan R, 2026-11-27)
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, p)
 
 
 def sandbox_home(session: int | str) -> str:

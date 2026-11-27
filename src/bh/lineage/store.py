@@ -61,9 +61,11 @@ CREATE TABLE IF NOT EXISTS blocks (
   no INTEGER NOT NULL, program TEXT NOT NULL, prev_hash TEXT, block_hash TEXT NOT NULL, body TEXT, ts REAL NOT NULL,
   UNIQUE(program, no)
 );
+-- the ledger's one schema is lot G's (bh.lineage.score, its writer): the two copies said REAL/INTEGER points and
+-- TEXT/INTEGER ref_id, and whichever module created the table first won (review of plan R, 2026-11-27)
 CREATE TABLE IF NOT EXISTS ledger (
-  id INTEGER PRIMARY KEY, program TEXT NOT NULL, agent_no INTEGER, signal TEXT NOT NULL, points REAL,
-  ref_kind TEXT, ref_id TEXT, ts REAL NOT NULL
+  id INTEGER PRIMARY KEY, program TEXT NOT NULL, agent_no INTEGER, signal TEXT NOT NULL, points INTEGER NOT NULL,
+  ref_kind TEXT, ref_id INTEGER, ts REAL
 );
 CREATE INDEX IF NOT EXISTS ledger_prog ON ledger(program, agent_no);
 """
