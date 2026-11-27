@@ -1,0 +1,254 @@
+[
+  {
+    "id": "csrf",
+    "aliases": [
+      "csrf",
+      "xsrf",
+      "cross-site-request-forgery"
+    ],
+    "path_signals": [
+      "^(POST|PUT|PATCH|DELETE) .*/(account|profile|settings|preferences|email|password)"
+    ],
+    "param_signals": [
+      "csrf(_?token)?|xsrf(_?token)?|authenticity_token"
+    ],
+    "evidence": "On an object of one of our identities, a state-changing request sent the way a cross-site page would (no token or a wrong one, a foreign Origin and Referer) succeeds with a cookie session whose SameSite lets it travel cross-site, shown by reading the object back with the marker; control: the same forged request without a session is refused; login, logout and public-form CSRF are not this class.",
+    "skill": "csrf"
+  },
+  {
+    "id": "xxe",
+    "aliases": [
+      "xxe",
+      "xml-external-entity",
+      "xml-external-entities",
+      "xxe-injection"
+    ],
+    "path_signals": [
+      "/(soap|xml|wsdl|rss|feed|sitemap|import)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "xml|wsdl|soap"
+    ],
+    "evidence": "An XML document whose entity the server expands returns the content of one harmless, world-readable file (or the internal-entity marker when files are filtered, the claim then reduced to expansion); control: the same document with the entity declared and not referenced, the content or marker absent; blind cases are oob-needed, never a finding.",
+    "skill": "xxe"
+  },
+  {
+    "id": "websocket-origin",
+    "aliases": [
+      "websocket-origin",
+      "cross-site-websocket-hijacking",
+      "cswsh",
+      "websocket-hijacking"
+    ],
+    "path_signals": [
+      "/(ws|wss|websockets?|socket\\.io|sockjs|signalr|realtime|cable)(/|$| |\\?)"
+    ],
+    "param_signals": [],
+    "evidence": "A websocket handshake carrying the identity's cookie session and a foreign Origin is accepted (101) on a socket that delivers that identity's account data, with SameSite letting the cookie travel cross-site; control: the same handshake without a session is refused or gets no account data.",
+    "skill": "websocket-origin"
+  },
+  {
+    "id": "type-confusion",
+    "aliases": [
+      "type-confusion",
+      "type-juggling",
+      "php-type-juggling"
+    ],
+    "path_signals": [
+      "/(reset|forgot|verify|confirm|invite|unsubscribe|magic-?link)"
+    ],
+    "param_signals": [
+      "email|token|hash|code|invite(_?code)?"
+    ],
+    "evidence": "A field sent with another type (array, null, boolean, number, object) makes the server do what the well-typed value would refuse, readable over HTTP between our two identities (a token issued, an object changed, a session for the wrong identity); control: the same request with the well-typed value is refused; an effect seen only in a mailbox is not proved.",
+    "skill": "type-confusion"
+  },
+  {
+    "id": "web-cache",
+    "aliases": [
+      "web-cache",
+      "web-cache-poisoning",
+      "web-cache-deception",
+      "cache-poisoning",
+      "cache-deception"
+    ],
+    "path_signals": [
+      "/(me|account|profile|settings)(/|$| |\\?)"
+    ],
+    "param_signals": [],
+    "evidence": "Deception: a private page of the attacker identity requested under a unique static-looking URL is then served from the cache, marker included, to a request without a session; poisoning: on a unique, keyed cache buster, a reflected header value is served to a later request that does not send it; control: a sibling URL or buster never requested with the session or header, marker absent.",
+    "skill": "web-cache"
+  },
+  {
+    "id": "saml",
+    "aliases": [
+      "saml",
+      "saml-bypass",
+      "saml-authentication-bypass",
+      "xml-signature-wrapping"
+    ],
+    "path_signals": [
+      "/(saml2?|acs|assertion-?consumer)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "SAMLResponse|SAMLRequest|RelayState"
+    ],
+    "evidence": "A SAMLResponse issued for one of our identities, tampered (NameID changed to our other identity, signature removed, or a wrapped unsigned assertion), is accepted by the in-scope service provider and opens a session as the other identity; control: the same tampering with a broken digest is refused.",
+    "skill": "saml"
+  },
+  {
+    "id": "mass-assignment",
+    "aliases": [
+      "mass-assignment",
+      "auto-binding",
+      "overposting"
+    ],
+    "path_signals": [
+      "^(POST|PUT|PATCH) .*/(me|profile|account|users?|settings|projects?)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "role|is_?admin|verified|plan|permissions?"
+    ],
+    "evidence": "A field the client may not set (role, isAdmin, verified, plan, permissions), added to an update of the identity's own object, is stored and read back, or opens what the raised value grants; control: the same read by our other identity, which sent only the normal update, shows the old value or is refused.",
+    "skill": "mass-assignment"
+  },
+  {
+    "id": "jwt",
+    "aliases": [
+      "jwt",
+      "json-web-token",
+      "jwt-forgery",
+      "jwt-algorithm-confusion"
+    ],
+    "path_signals": [
+      "/(\\.well-known/jwks\\.json|jwks|token|refresh)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "jwt|id_token|access_token"
+    ],
+    "evidence": "A JWT issued to one of our identities and altered (claim changed with the signature kept, alg none, HS256 confusion with the published key, expired, wrong audience) is accepted and acts as our other identity or a role we do not hold; control: the same request with a broken signature is refused; no secret is ever guessed.",
+    "skill": "jwt"
+  },
+  {
+    "id": "oauth-oidc",
+    "aliases": [
+      "oauth",
+      "oauth2",
+      "oidc",
+      "openid-connect",
+      "oauth-misconfiguration"
+    ],
+    "path_signals": [
+      "/(oauth2?|authorize|callback|openid|\\.well-known/openid-configuration)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "redirect_uri|client_id|code_challenge|code_verifier|nonce|response_type"
+    ],
+    "evidence": "On our own login with an in-scope authorization server, a changed redirect_uri (or a missing state, or a missing or wrong PKCE verifier) is accepted and sends the code or token to a place we chose, read in the Location header and never followed; control: the registered value, or a foreign host the server must refuse, gives the registered callback or a refusal; a public client without a secret is not a finding.",
+    "skill": "oauth-oidc"
+  },
+  {
+    "id": "request-smuggling",
+    "aliases": [
+      "request-smuggling",
+      "http-request-smuggling",
+      "http-desync",
+      "desync"
+    ],
+    "path_signals": [],
+    "param_signals": [],
+    "evidence": "Lab only (platform local, or written permission): a request with conflicting Content-Length and Transfer-Encoding framing makes the back end wait to its timeout in three runs, a request that leaves no prefix queued; control: the same request with consistent framing answers at once; anywhere else the class is blocked, never tested.",
+    "skill": "request-smuggling"
+  },
+  {
+    "id": "prototype-pollution",
+    "aliases": [
+      "prototype-pollution",
+      "client-side-prototype-pollution",
+      "server-side-prototype-pollution"
+    ],
+    "path_signals": [],
+    "param_signals": [
+      "__proto__|constructor|prototype"
+    ],
+    "evidence": "A __proto__ or constructor.prototype key carrying a harmless marker key no code reads ends on the prototype: the marker shows in the rendered DOM (client side) or, in the lab only, on another object of our other identity; control: the same request with the marker under a plain key, marker absent; no execution payload; a script sink is proved by the XSS standard.",
+    "skill": "prototype-pollution"
+  },
+  {
+    "id": "ssti",
+    "aliases": [
+      "ssti",
+      "server-side-template-injection",
+      "template-injection"
+    ],
+    "path_signals": [
+      "/(preview|templates?|render|notifications?|reports?)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "template|tpl|preview|subject|layout"
+    ],
+    "evidence": "A template expression in a field of our own account is evaluated by the server: an arithmetic product nobody types by chance comes back computed, confirmed by a second product; control: the same value without the template delimiters comes back literally; nothing past arithmetic is attempted.",
+    "skill": "ssti"
+  },
+  {
+    "id": "subdomain-takeover",
+    "aliases": [
+      "subdomain-takeover",
+      "dangling-dns",
+      "domain-takeover"
+    ],
+    "path_signals": [],
+    "param_signals": [],
+    "evidence": "An in-scope host answers a hosting or storage provider's unclaimed-resource page; control: a working sibling host of the same program on that provider answers its normal page, without the unclaimed message; the finding exists only once the operator has claimed the resource and served a page of ours there.",
+    "skill": "subdomain-takeover"
+  },
+  {
+    "id": "postmessage",
+    "aliases": [
+      "postmessage",
+      "insecure-postmessage",
+      "postmessage-misconfiguration",
+      "cross-window-messaging"
+    ],
+    "path_signals": [
+      "/(embed|widgets?|iframe|popup)(/|$| |\\?)"
+    ],
+    "param_signals": [],
+    "evidence": "A message listener with a missing or weak origin check carries a value we chose into a sink, shown in the rendered DOM (or by the XSS confirmation line) through a page of the target that relays it, the DOM read before and after; control: the same page with a benign value the listener must ignore, marker absent; code reading alone is a candidate, never a finding.",
+    "skill": "postmessage"
+  },
+  {
+    "id": "nosqli",
+    "aliases": [
+      "nosql-injection",
+      "nosqli",
+      "mongodb-injection",
+      "operator-injection"
+    ],
+    "path_signals": [
+      "/(login|signin|search|filter)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "filter|where|selector"
+    ],
+    "evidence": "On the identity's own login, a query operator in place of the password ({\"$ne\": \"\"}) returns the logged-in answer's marker, or on a search an operator widens the result to our other identity's object; control: a wrong password string, or the plain value, gets the refusal or the narrow result; the username stays a plain string; no value is ever extracted character by character.",
+    "skill": "nosql-injection"
+  },
+  {
+    "id": "race-condition",
+    "aliases": [
+      "race-condition",
+      "race-conditions",
+      "toctou",
+      "double-spend"
+    ],
+    "path_signals": [
+      "/(coupons?|vouchers?|redeem|transfer|withdraw|votes?|likes?|gift-?cards?|claim)(/|$| |\\?)"
+    ],
+    "param_signals": [
+      "coupon|voucher|promo(_?code)?"
+    ],
+    "evidence": "Two simultaneous requests of one identity for an action the business allows once (coupon, transfer, single vote) leave a stored state that breaks the rule (used twice, a negative balance), read back; control: the same read for our other identity, which sent the two requests one after the other, shows the rule kept; never more than two requests.",
+    "skill": "race-condition"
+  }
+]
