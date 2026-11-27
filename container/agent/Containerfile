@@ -92,12 +92,12 @@ RUN apt-get update \
 #     (binary xvfb), x11vnc 0.9.17-3, novnc 1:1.6.0-3 (it depends on websockify 0.13.0+dfsg1-2, installed, unused).
 #     Pinned: a rolling repo that moved fails the build here; bump the ARGs after checking pkg.kali.org.
 #     xclip: `bh-web text --clipboard` reads the page's clipboard on the virtual display (`xclip -selection clipboard
-#     -o`). XCLIP_VERSION has no default: the orchestrator fills it at the rebuild from pkg.kali.org/pkg/xclip (an
-#     empty value fails the build, never an unpinned install).
+#     -o`). XCLIP_VERSION: 0.13-4, the kali-rolling candidate read on 2026-11-27 (`apt-cache policy xclip` in the
+#     pinned base); an empty value still fails the build, never an unpinned install.
 ARG XVFB_VERSION=2:21.1.25-2
 ARG X11VNC_VERSION=0.9.17-3
 ARG NOVNC_VERSION=1:1.6.0-3
-ARG XCLIP_VERSION
+ARG XCLIP_VERSION=0.13-4
 RUN { test -n "${XCLIP_VERSION}" || { echo "XCLIP_VERSION is empty: pin it from pkg.kali.org/pkg/xclip" >&2; exit 1; }; } \
  && apt-get update \
  && apt-get install -y --no-install-recommends "xvfb=${XVFB_VERSION}" "x11vnc=${X11VNC_VERSION}" "novnc=${NOVNC_VERSION}" \
