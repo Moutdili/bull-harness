@@ -29,7 +29,10 @@ NAMES = {
     "flows",
 }
 HONEST = {"counter": "B may have shared it", "severity_if": "a read without B's click", "severity_why": "1 click"}
-LAUNCH = "import sys; from bh.agent.main import main; sys.argv = ['bh-agent', 'mcp', 'bh']; main()"
+LAUNCH = (  # -I like the sandbox's bh-agent: the source tree goes on sys.path by hand (it is not installed in bh-audit)
+    f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / 'src')!r}); "
+    "from bh.agent.main import main; sys.argv = ['bh-agent', 'mcp', 'bh']; main()"
+)
 FORBIDDEN = ("bypass", "evade", "stealth", "brute", "exploit", "weaponiz")
 
 
