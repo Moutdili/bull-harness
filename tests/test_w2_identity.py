@@ -317,3 +317,13 @@ def test_no_container_mounts_the_lineage():
             src = (vol if isinstance(vol, str) else vol.get("source", "")).split(":", 1)[0].rstrip("/")
             assert "lineage" not in src, (name, vol)
             assert src not in ("..", "../var", ".", "/"), (name, vol)  # nothing that contains var/lineage
+
+
+def test_the_setup_names_the_harness_commit():
+    """2026-11-27: to relaunch an agent on exactly its code, its setup must name the harness commit."""
+    import re
+
+    from bh.runner import identity as rid
+
+    sha = rid.harness_commit()
+    assert sha is None or re.fullmatch(r"[0-9a-f]{40}(-dirty)?", sha)

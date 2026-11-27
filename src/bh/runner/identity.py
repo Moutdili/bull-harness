@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import subprocess
 import os
 import re
 from pathlib import Path
@@ -198,6 +199,27 @@ def pseudo_shown_setting(env=None) -> str:
     return "0" if str(env.get("BH_LINEAGE_PSEUDO", "1")).strip() == "0" else "1"
 
 
+def harness_commit() -> str | None:
+    """The harness's git commit the segment runs on, `<sha>-dirty` when src/ or container/ hold uncommitted changes:
+    with it an agent can be relaunched on exactly its code (`git worktree add <dir> <sha>`). None outside a checkout."""
+    root = Path(__file__).resolve().parents[3]
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--", "src", "container"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001 - a setup field never stops a segment (and tests stub subprocess)
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return None
+    return f"{sha}-dirty" if dirty else sha
+
+
 def setup(
     scope,
     *,
@@ -255,6 +277,7 @@ def setup(
             key=lambda x: x["name"],
         ),
         "claude_code": claude_version(),
+        "harness_commit": harness_commit(),
         "MAX_RUNS_PER_DAY": int(max_runs_per_day),
         "RUNS_PER_SESSION": int(runs_per_session),
         "SESSIONS_PER_DAY": int(sessions_per_day),

@@ -689,6 +689,20 @@ def cmd_agent(args) -> int:
     return agent_relaunch(args, b, ident)
 
 
+def _run_defaults() -> dict:
+    from bh.runner.run import DEFAULT_MODEL
+
+    return {
+        "model": os.environ.get("BH_MODEL", DEFAULT_MODEL),
+        "effort": os.environ.get("BH_EFFORT"),
+        "max_turns": 60,
+        "minutes": 30.0,
+    }
+
+
+RUN_DEFAULTS = _run_defaults()
+
+
 def agent_relaunch(args, b, ident) -> int:
     """A new segment whose agent's parent is agent n: refused, with the fields that moved, when the setup drifted."""
     from bh.runner import run
@@ -702,6 +716,12 @@ def agent_relaunch(args, b, ident) -> int:
     if rows[0].get("program") not in (None, scope.program):
         print(f"agent {args.n} hunted {rows[0]['program']}, not {scope.program}: --scope", file=sys.stderr)
         return 2
+    # "relaunchable as it was": the knobs come from the agent's own setup unless the operator names them
+    setup_of = getattr(ident, "_setup_of", None)  # lot D's reader; a module without it gives no defaults
+    born = (setup_of(b, rows[0]) if setup_of else None) or {}
+    for knob in ("model", "effort", "max_turns", "minutes"):
+        if getattr(args, knob) == RUN_DEFAULTS.get(knob) and born.get(knob) is not None:
+            setattr(args, knob, born[knob])
     _, doc = run.preview_setup(
         b, scope, model=args.model, effort=args.effort, max_turns=args.max_turns, minutes=args.minutes
     )
@@ -712,6 +732,13 @@ def agent_relaunch(args, b, ident) -> int:
             "--allow-drift to relaunch anyway",
             file=sys.stderr,
         )
+        if (sha := str(born.get("harness_commit") or "")) and "harness_commit" in drift:
+            exact = sha.removesuffix("-dirty")
+            print(
+                f"  its code: git worktree add ../bh-{exact[:8]} {exact}"
+                + (" (it ran with uncommitted changes: not exactly reproducible)" if sha.endswith("-dirty") else ""),
+                file=sys.stderr,
+            )
         return 2
     if drift:
         print(f"setup drift accepted: {', '.join(map(str, drift))}")
@@ -1325,14 +1352,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="stack, last runs, submissions and blockers").set_defaults(func=cmd_status)
 
     def run_opts(sp):
-        from bh.runner.run import DEFAULT_MODEL
-
-        sp.add_argument("--model", default=os.environ.get("BH_MODEL", DEFAULT_MODEL))
-        sp.add_argument(
-            "--effort", default=os.environ.get("BH_EFFORT"), choices=["low", "medium", "high", "xhigh", "max"]
-        )
-        sp.add_argument("--max-turns", type=int, default=60)
-        sp.add_argument("--minutes", type=float, default=30)
+        sp.add_argument("--model", default=RUN_DEFAULTS["model"])
+        sp.add_argument("--effort", default=RUN_DEFAULTS["effort"], choices=["low", "medium", "high", "xhigh", "max"])
+        sp.add_argument("--max-turns", type=int, default=RUN_DEFAULTS["max_turns"])
+        sp.add_argument("--minutes", type=float, default=RUN_DEFAULTS["minutes"])
 
     r = sub.add_parser("run", help="one agent segment on one program")
     r.add_argument("scope")
