@@ -24,8 +24,12 @@
           # --control k/N: the same steps without A's payload, N runs, k canary crossings (N6)
   HONESTY = --counter "<best case against it>" --severity-if "<proof that would change the severity>"
             --severity-why "<why this severity>"   (all three required, never empty)
+            [--proof-level 1|2|3] [--cvss CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N]
+          # --proof-level (T27): 1 signal, 2 partial, 3 impact (default). 1 and 2 are kept as CANDIDATE facts, never
+          # judged. --cvss (T28): the vector only; the host computes the score, the program's own scale wins
   bh-note canary           # prints a fresh BH-SECRET-<16 hex> to plant in the victim's data
-  bh-note verdict F12 confirmed|rejected|inconclusive "reason"     # verifier only
+  bh-note verdict F12 confirmed|rejected|inconclusive "reason" [--cvss <lower vector>] [--proof-level 1|2|3]
+          # verifier only; --cvss and --proof-level can only lower the hunter's
   bh-note blocked auth|account|waf|captcha|...|other "what is blocked" --tried "<what you tried>" \\
           --would-prove "<what would prove it>" [-d detail] [--intent I3] [--host H]
   bh-note show 42          # full summary/evidence of fact 42
@@ -57,6 +61,11 @@ HONESTY = (
     ("severity_if", "--severity-if", "the proof that would change its severity"),
     ("severity_why", "--severity-why", "why this severity"),
 )
+PROOF_LEVELS = (1, 2, 3)  # 1 signal, 2 partial, 3 impact (bh.classes.PROOF_LEVELS)
+# A CVSS 3.1 base vector in the specification's order. Only the form is checked here: the host parses it again and
+# computes the score (bh.cvss), the sandbox never does.
+CVSS_RE = re.compile(r"(CVSS:3\.1/)?AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/C:[HLN]/I:[HLN]/A:[HLN]")
+CVSS_HELP = "a CVSS 3.1 base vector, CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_ in this order"
 # The handoff's rubrics, in this order, all required (`--dead none` when nothing was abandoned). No credentials rubric.
 HANDOFF = ("state", "dead", "next", "files")
 
@@ -190,10 +199,20 @@ def parser() -> argparse.ArgumentParser:
     fi.add_argument("--not-proven", default="")
     for _key, flag, what in HONESTY:
         fi.add_argument(flag, help=f"required: {what}")
+    fi.add_argument(
+        "--proof-level",
+        type=int,
+        choices=PROOF_LEVELS,
+        default=3,
+        help="1 signal, 2 partial (kept as a CANDIDATE fact, never judged), 3 impact (the default)",
+    )
+    fi.add_argument("--cvss", help=f"optional: {CVSS_HELP}; the host computes the score")
     v = sub.add_parser("verdict")
     v.add_argument("finding_id")
     v.add_argument("verdict", choices=["confirmed", "rejected", "inconclusive"])
     v.add_argument("reason")
+    v.add_argument("--cvss", help=f"only to lower the hunter's vector: {CVSS_HELP}")
+    v.add_argument("--proof-level", type=int, choices=PROOF_LEVELS, help="only to lower the hunter's proof level")
     b = sub.add_parser("blocked", help="a lead you cannot finish: recorded and closed, nobody unblocks it")
     b.add_argument("reason", choices=c.BLOCKER_REASONS)
     b.add_argument("title")
@@ -410,7 +429,17 @@ def _observation_finding(a: argparse.Namespace) -> None:
 
 
 def _honesty(a: argparse.Namespace) -> dict:
-    return {key: getattr(a, key) for key, _flag, _what in HONESTY}
+    """The honesty pass, the proof level and, when given, the CVSS vector (T27, T28)."""
+    out = {key: getattr(a, key) for key, _flag, _what in HONESTY}
+    out["proof_level"] = a.proof_level
+    if a.cvss is not None:
+        out["cvss"] = a.cvss.strip()
+    return out
+
+
+def _check_cvss(a: argparse.Namespace) -> None:
+    if a.cvss is not None and not CVSS_RE.fullmatch(a.cvss.strip()):
+        sys.exit(f"{a.op} refused:\n  - --cvss is {CVSS_HELP} (the host computes the score)")
 
 
 def _check_honesty(a: argparse.Namespace) -> None:
@@ -507,6 +536,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit("bh-note verdict is reserved to the independent verifier")
     if a.op != "verdict" and c.is_verifier():
         sys.exit("the verifier only records verdicts")
+    if a.op in ("finding", "verdict"):
+        _check_cvss(a)
     if a.op == "finding":
         _check_honesty(a)
     if a.op == "finding" and a.observation is not None:

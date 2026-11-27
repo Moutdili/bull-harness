@@ -29,6 +29,19 @@ line written by the replay, never by the page: `xss CONFIRMED (marker <marker>) 
 twin control (same route, benign value) expects `{"absent": ["xss CONFIRMED"]}`; the URL, the title and the
 console never reach the body. A `"browse": {}` step (no marker) has the rendered DOM as its body, like any answer.
 
+An open redirect is proved by a real navigation: `"browse": {"final_url": "https://<payload host>/<path>"}` (GET
+only) runs bh-browse on the step's URL and compares where the browser ended (summary.json `final_url` when bh-browse
+writes it, else the chain of HTTP redirects its har.json kept) with that prefix: same origin, path starting with the
+prefix's path. The body is one canonical line, `redirect CONFIRMED (prefix <prefix>)` or `redirect none (prefix
+<prefix>)`; the prefix is on another origin than the step (a payload host of the scope: never a third party).
+
+Timing (a time-based SQL injection, plan T26): `expect` may hold `elapsed_ms_min` (an attack only) and `elapsed_ms_max`,
+whole milliseconds, at most 10 000 each: no recipe waits more than 10 s per request. A proof with a timed attack has
+at least three of them, each with a twin control without the delay whose `elapsed_ms_max` is below the attack's
+`elapsed_ms_min`; a delay written in the payload (sleep, pg_sleep, WAITFOR DELAY) is at most 10 s, BENCHMARK is
+refused (it loads the target). The replay sends them one after the other through the gate, at the program's rate,
+and times each answer.
+
 Fresh marker: when the marker sits as is in the step's URL (or body), the replay swaps it for a marker of its own,
 drawn at random, and runs bh-browse with that one; the line still names the proof's marker, and the step's result
 says `"marker": "fresh"`. A page that merely shows a marker planted beforehand (stored, cached) then shows the old
@@ -52,11 +65,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urljoin, urlsplit
 
 from bh.agent import contract as c
 from bh.agent.browse import xss_confirmed
@@ -64,7 +78,15 @@ from bh.agent.browse import xss_confirmed
 ROLES = ("setup", "attack", "control")
 METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
-EXPECT_KEYS = ("status", "contains", "absent", "regex")
+TIMED_KEYS = ("elapsed_ms_min", "elapsed_ms_max")
+EXPECT_KEYS = ("status", "contains", "absent", "regex", *TIMED_KEYS)
+# the timing recipe (T26); the same numbers as bh.classes.TIMED_MEASURES / MAX_ELAPSED_MS (only bh/agent is in the
+# sandbox, so they are repeated here and a test keeps them equal)
+TIMED_MEASURES, MAX_ELAPSED_MS = 3, 10_000
+MAX_HOPS = 10  # HTTP redirects followed in a browse step's har.json
+_SLEEP = re.compile(r"\b(?:pg_)?sleep\s*\(\s*(\d+(?:\.\d+)?)", re.I)
+_WAITFOR = re.compile(r"waitfor\s+delay\s+'(\d+):(\d+):(\d+(?:\.\d+)?)'", re.I)
+_HEAVY = re.compile(r"\bbenchmark\s*\(|\bgenerate_series\s*\(|\brandomblob\s*\(", re.I)
 MAX_STEPS, TIMEOUT_S, ROUNDS, SNIPPET, MAX_REGEX = 8, 20, 2, 300, 200
 BROWSE_TIMEOUT_S = 90  # one rendered page through the gate (17-40 s measured on the lab)
 REGEX_TIMEOUT_S = 5  # one regex search on one answer (at most 1 MiB), in a child process
@@ -119,10 +141,12 @@ def validate(proof: object) -> list[str]:
             )
         if "browse" in st:
             b = st["browse"]
-            if not isinstance(b, dict) or set(b) - {"xss"}:
-                errors.append(f'{where}: browse is {{}} or {{"xss": "<marker>"}}')
+            if not isinstance(b, dict) or set(b) - {"xss", "final_url"} or len(b) > 1:
+                errors.append(f'{where}: browse is {{}}, {{"xss": "<marker>"}} or {{"final_url": "<prefix>"}}')
             elif "xss" in b and not _MARKER.fullmatch(str(b["xss"])):
                 errors.append(f"{where}: the xss marker is 4-32 characters of [A-Za-z0-9_]")
+            elif "final_url" in b:
+                errors += [f"{where}: {e}" for e in _prefix_problems(b["final_url"], str(st.get("url", "")))]
             if str(st.get("method", "GET")).upper() != "GET":
                 errors.append(f"{where}: a browse step is a GET (a page load)")
         exp = st.get("expect")
@@ -131,8 +155,15 @@ def validate(proof: object) -> list[str]:
         else:
             if any(not str(n) for k in ("contains", "absent") for n in (exp.get(k) or [])) or exp.get("regex") == "":
                 errors.append(f"{where}: empty marker (an empty string matches every answer)")
-            if st.get("role") == "attack" and not (exp.get("contains") or exp.get("absent") or exp.get("regex")):
-                errors.append(f"{where}: an attack must name a body marker (contains, absent or regex), not a status")
+            timed = "elapsed_ms_min" in exp
+            if st.get("role") == "attack" and not (
+                exp.get("contains") or exp.get("absent") or exp.get("regex") or timed
+            ):
+                errors.append(
+                    f"{where}: an attack must name a body marker (contains, absent or regex) or a delay "
+                    "(elapsed_ms_min), not a status"
+                )
+            errors += [f"{where}: {e}" for e in _timing_problems(st, exp)]
             if "regex" in exp:
                 rx = str(exp["regex"])
                 try:
@@ -150,6 +181,7 @@ def validate(proof: object) -> list[str]:
     if "control" not in roles:
         errors.append("at least one step must have role 'control' (the refused or benign twin of the attack)")
     attacks = [st for st in steps if isinstance(st, dict) and st.get("role") == "attack"]
+    errors += _timed_proof_problems(steps, attacks)
     for i, st in enumerate(steps):
         if not isinstance(st, dict) or st.get("role") != "control":
             continue
@@ -161,6 +193,94 @@ def validate(proof: object) -> list[str]:
                 "identity, query or body change)"
             )
     return errors
+
+
+def _ms(value: object) -> int | None:
+    """A timing bound: a whole number of milliseconds, 1 to MAX_ELAPSED_MS; None otherwise."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_ELAPSED_MS:
+        return None
+    return value
+
+
+def _timing_problems(st: dict, exp: dict) -> list[str]:
+    """One step's timing bounds (T26): whole milliseconds up to 10 s, the minimum on an attack only, never on a
+    browse step (a page load times the browser, not the query)."""
+    errors = []
+    for k in TIMED_KEYS:
+        if k in exp and _ms(exp[k]) is None:
+            errors.append(
+                f"{k} is a whole number of milliseconds, 1 to {MAX_ELAPSED_MS} (no recipe waits more than "
+                f"{MAX_ELAPSED_MS // 1000} s per request)"
+            )
+    if "elapsed_ms_min" in exp and st.get("role") != "attack":
+        errors.append("elapsed_ms_min goes on an attack (the delayed request); its control says elapsed_ms_max")
+    if set(exp) & set(TIMED_KEYS) and "browse" in st:
+        errors.append("a browse step is not timed (a page load measures the browser)")
+    if "elapsed_ms_min" in exp:
+        errors += _delay_problems(st)
+    return errors
+
+
+def _delay_problems(st: dict) -> list[str]:
+    """The delay a timed attack writes in its payload: at most MAX_ELAPSED_MS; a heavy query is refused."""
+    body = st.get("body")
+    text = (
+        unquote_plus(str(st.get("url", "")))
+        + "\n"
+        + (json.dumps(body) if isinstance(body, (dict, list)) else str(body or ""))
+    )
+    errors = []
+    if _HEAVY.search(text):
+        errors.append("a heavy query (BENCHMARK, generate_series, randomblob) loads the target: use a sleep")
+    seconds = [float(m.group(1)) for m in _SLEEP.finditer(text)]
+    seconds += [int(h) * 3600 + int(m) * 60 + float(sec) for h, m, sec in _WAITFOR.findall(text)]
+    if any(x * 1000 > MAX_ELAPSED_MS for x in seconds):
+        errors.append(f"the payload waits more than {MAX_ELAPSED_MS // 1000} s")
+    return errors
+
+
+def _timed_proof_problems(steps: list, attacks: list[dict]) -> list[str]:
+    """A timed proof (T26): at least TIMED_MEASURES delayed attacks, each with a twin control without the delay
+    whose elapsed_ms_max is below the attack's elapsed_ms_min."""
+    timed = [a for a in attacks if isinstance(a.get("expect"), dict) and _ms(a["expect"].get("elapsed_ms_min"))]
+    if not timed:
+        return []
+    errors = []
+    if len(timed) < TIMED_MEASURES:
+        errors.append(
+            f"a timed proof has at least {TIMED_MEASURES} delayed attacks (elapsed_ms_min), not {len(timed)}: one slow "
+            "answer is the network"
+        )
+    controls = [
+        s
+        for s in steps
+        if isinstance(s, dict)
+        and s.get("role") == "control"
+        and isinstance(s.get("expect"), dict)
+        and _ms(s["expect"].get("elapsed_ms_max"))
+    ]
+    for a in timed:
+        low = a["expect"]["elapsed_ms_min"]
+        if not any(_twins(a, k) and k["expect"]["elapsed_ms_max"] < low for k in controls):
+            errors.append(
+                "a delayed attack needs a twin control without the delay (same route, no sleep) whose elapsed_ms_max "
+                "is below the attack's elapsed_ms_min"
+            )
+            break
+    return errors
+
+
+def _prefix_problems(prefix: object, step_url: str) -> list[str]:
+    """The prefix of an open-redirect step: an absolute http(s) URL with a path, no query or fragment, on another
+    origin than the step (the payload host the redirect should not reach)."""
+    if not isinstance(prefix, str) or len(prefix) > 500 or any(ch.isspace() for ch in prefix):
+        return ["final_url is an absolute URL prefix (https://<payload host>/<path>)"]
+    parts = urlsplit(prefix)
+    if c.origin(prefix) is None or not parts.path.startswith("/") or parts.query or parts.fragment:
+        return ["final_url is https://<host>/<path>: a path (at least /), no query, no fragment"]
+    if c.origin(prefix) == c.origin(step_url):
+        return ["final_url is on another origin than the step: a redirect inside the site is not open"]
+    return []
 
 
 def _header_problems(headers: object) -> list[str]:
@@ -245,8 +365,15 @@ def _twins(attack: dict, control: dict) -> bool:
     return where(attack) == where(control)
 
 
-def _expect_holds(exp: dict, status: int, body: str) -> tuple[bool, list[str]]:
+def _expect_holds(exp: dict, status: int, body: str, elapsed_ms: int | None = None) -> tuple[bool, list[str]]:
     misses = []
+    for k, slow in (("elapsed_ms_min", True), ("elapsed_ms_max", False)):
+        if k not in exp:
+            continue
+        if elapsed_ms is None:
+            misses.append(f"{k}: the answer was not timed")
+        elif (elapsed_ms < int(exp[k])) if slow else (elapsed_ms > int(exp[k])):
+            misses.append(f"{elapsed_ms} ms, {k} {exp[k]}")
     if "status" in exp and status not in [
         int(s) for s in (exp["status"] if isinstance(exp["status"], list) else [exp["status"]])
     ]:
@@ -286,6 +413,7 @@ def _browse(step: dict) -> tuple[int, str, bool]:
     The text bh-browse prints is never read: it carries the URL, the title and the console."""
     exe = shutil.which("bh-browse") or "/opt/bh/bin/bh-browse"
     url = str(step["url"])
+    prefix = (step.get("browse") or {}).get("final_url")
     marker = (step.get("browse") or {}).get("xss")
     ran = str(marker) if marker else None
     if marker and marker_kind(step) == "fresh":
@@ -306,9 +434,68 @@ def _browse(step: dict) -> tuple[int, str, bool]:
         )
         raw = _browse_raw(Path(env["BH_DIR"]) / c.RAW)
         summary = _read_summary(raw / "summary.json")
+        if prefix:
+            final = summary.get("final_url") if isinstance(summary.get("final_url"), str) else None
+            if final is None:
+                try:
+                    final = har_final(json.loads(_read_text(raw / "har.json") or "null"), url)
+                except ValueError:
+                    final = None
+            return (*redirect_body(summary, str(prefix), final), False)
         dom = "" if marker else _read_text(raw / "dom.html")
     status, body = browse_body(summary, str(marker) if marker else None, dom, c.origin(str(step["url"])), ran)
     return status, body, False
+
+
+def reached(final: str | None, prefix: str) -> bool:
+    """The navigation ended under `prefix`: same origin (contract.origin), path starting with the prefix's path."""
+    if not isinstance(final, str) or c.origin(final) is None or c.origin(final) != c.origin(prefix):
+        return False
+    return urlsplit(final).path.startswith(urlsplit(prefix).path)
+
+
+def redirect_body(summary: dict, prefix: str, final: str | None) -> tuple[int, str]:
+    """(status, canonical line) of an open-redirect step: decided here, the URL itself never reaches the body."""
+    st = summary.get("status")
+    status = st if isinstance(st, int) and not isinstance(st, bool) and 100 <= st <= 599 else 0
+    word = "CONFIRMED" if reached(final, prefix) else "none"
+    return status, f"redirect {word} (prefix {prefix})"
+
+
+def har_final(har: object, start: str) -> str | None:
+    """Where the HTTP redirects starting at `start` led, from bh-browse's har.json: the Location (`redirectURL`) of
+    each answer, followed MAX_HOPS times at most. The last URL is returned even when the browser never loaded it (a
+    host outside the scope, refused). None when `start` is not in the file. Script and meta redirects are not seen
+    here: summary.json's `final_url` covers them when bh-browse writes it."""
+    entries = (har.get("log") or {}).get("entries") if isinstance(har, dict) else None
+    if not isinstance(entries, list):
+        return None
+    by_url: dict[str, str] = {}
+    for e in entries:
+        req = e.get("request") if isinstance(e, dict) else None
+        resp = e.get("response") if isinstance(e, dict) else None
+        if not isinstance(req, dict) or not isinstance(req.get("url"), str):
+            continue
+        loc = resp.get("redirectURL") if isinstance(resp, dict) else None
+        if not loc and isinstance(resp, dict):
+            loc = next(
+                (
+                    h.get("value")
+                    for h in resp.get("headers") or []
+                    if isinstance(h, dict) and str(h.get("name", "")).lower() == "location"
+                ),
+                None,
+            )
+        by_url.setdefault(req["url"].split("#")[0], loc if isinstance(loc, str) else "")
+    url = start.split("#")[0]
+    if url not in by_url:
+        return None
+    for _ in range(MAX_HOPS):
+        loc = by_url.get(url)
+        if not loc:
+            return url
+        url = urljoin(url, loc).split("#")[0]
+    return url
 
 
 def _browse_raw(root: Path) -> Path:
@@ -390,6 +577,15 @@ def _send(step: dict) -> tuple[int, str, bool]:
         return err.code, (err.read(1 << 20) or b"").decode("utf-8", "replace"), _gate_refused(err.headers)
 
 
+def _timed(step: dict) -> tuple[int, str, bool, int | None]:
+    """A step's answer and, for a request (not a page load), the milliseconds it took, read through to the body."""
+    if "browse" in step:
+        return (*_browse(step), None)
+    t0 = time.monotonic()
+    status, body, denied = _send(step)
+    return status, body, denied, int((time.monotonic() - t0) * 1000)
+
+
 def _gate_refused(headers) -> bool:
     return (headers.get(c.GATE_HEADER) or "").lower() == "denied"
 
@@ -404,9 +600,9 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
             if n and (st["role"] == "setup" or str(st.get("method", "GET")).upper() not in SAFE_METHODS):
                 continue  # a write creates state (a booking, an object): replaying it would collide (409), not prove
             try:
-                status, body, denied = _browse(st) if "browse" in st else _send(st)
-                answers.append((st, status, body))
-                ok, misses = _expect_holds(st["expect"], status, body)
+                status, body, denied, elapsed = _timed(st)
+                answers.append((st, status, body, elapsed))
+                ok, misses = _expect_holds(st["expect"], status, body, elapsed)
                 res = {
                     "name": st.get("name", ""),
                     "role": st["role"],
@@ -417,6 +613,8 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
                     "sha1": hashlib.sha1(body.encode()).hexdigest()[:12],
                     "snippet": body[:SNIPPET],
                 }
+                if elapsed is not None and set(st["expect"]) & set(TIMED_KEYS):
+                    res["elapsed_ms"] = elapsed
                 if "browse" in st and (kind := marker_kind(st)):
                     res["marker"] = kind
                 round_.append(res)
@@ -433,10 +631,10 @@ def replay(proof: dict, rounds: int = ROUNDS) -> dict:
         results.append(round_)
         # no differential: a control's answer already satisfies what its attack claims to prove
         for a in (st for st in proof["steps"] if st["role"] == "attack"):
-            for k, status, body in answers:
+            for k, status, body, elapsed in answers:
                 if k["role"] != "control" or not _twins(a, k):
                     continue
-                holds, misses = _expect_holds(a["expect"], status, body)
+                holds, misses = _expect_holds(a["expect"], status, body, elapsed)
                 if holds or REGEX_TIMED_OUT in misses:  # undecided counts against the proof
                     control_disproves = True
     every = [s for r in results for s in r]

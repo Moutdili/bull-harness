@@ -45,6 +45,28 @@ CANARY_PRIVATE = (
     "boundary."
 )
 MAX_CARDS = 3  # per segment: cards are resent every turn
+# T27: how far a proof goes, 1 to 3 (`bh-note finding ... --proof-level`). Only `impact` is a finding the judge sees;
+# `signal` and `partial` are recorded as CANDIDATE facts (bh.runner.ingest). Our ceiling is one read or one record, on
+# our own identities: never a dump, never a takeover.
+PROOF_LEVELS = ("signal", "partial", "impact")
+LEVEL_DEFAULTS = (
+    "an answer differs when the input changes, nothing of value seen yet",
+    "the flaw is reached, but what it gives was not read back, or only on one run, or without a control",
+    "one read or one record that crosses the boundary, on our own identities, reproduced with its twin control",
+)
+RECIPE_DEFAULT = (
+    "One request that shows the impact and its twin control (same route, the identity or the value changed); a read "
+    "before a write, a write only on an object of our own identities, nothing else."
+)
+# T31: what makes two findings of a class one finding (verify.dedupe_key). In doubt, never one.
+#   param      the parameter the proof aims at is part of the finding (XSS: a distinct parameter, a distinct finding)
+#   origin     one finding per origin (information disclosure)
+#   operation  one finding per operation on a resource: method + route family, whatever the parameter
+#   route      the default: route family (method included) + the parameter aimed at
+DEDUPE_RULES = ("param", "origin", "operation", "route")
+# T26: a timed proof (SQLi): at least TIMED_MEASURES delayed attacks and one twin control without the delay, each at
+# most MAX_ELAPSED_MS (bh.agent.proof.validate checks it)
+TIMED_MEASURES, MAX_ELAPSED_MS = 3, 10_000
 
 
 @dataclass(frozen=True)
@@ -61,12 +83,20 @@ class VulnClass:
     # file itself, which the agent may read on any program (audit I8)
     scan: str = ""
     skill: str = ""  # the skill of src/bh/skills that holds its method, when it is not the card's name
+    # T27: what `signal`, `partial` and `impact` (PROOF_LEVELS) mean for this class; () = LEVEL_DEFAULTS
+    levels: tuple[str, ...] = ()
+    recipe: str = ""  # T26: the least intrusive proof, written; "" = RECIPE_DEFAULT
+    dedupe: str = "route"  # T31: one of DEDUPE_RULES
 
     def __post_init__(self) -> None:  # `(r"x")` is a str, not a tuple: accept both
         for name in ("aliases", "path_signals", "param_signals"):
             value = getattr(self, name)
             if isinstance(value, str):
                 object.__setattr__(self, name, (value,))
+        if self.levels and len(self.levels) != len(PROOF_LEVELS):
+            raise ValueError(f"{self.id}: levels are {len(PROOF_LEVELS)} texts ({', '.join(PROOF_LEVELS)})")
+        if self.dedupe not in DEDUPE_RULES:
+            raise ValueError(f"{self.id}: dedupe is one of {', '.join(DEDUPE_RULES)}")
 
     def matches(self, key: str, params: Iterable[str]) -> float:
         """How strongly one endpoint calls for this class: 0, or weight (path) / 1.5 x weight (parameter)."""
@@ -87,6 +117,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         True,
         tool=AUTHZ_TOOL,
         scan=AUTHZ_WRITE,
+        levels=(
+            "A's request naming B's object is not refused (a status, an empty or public answer)",
+            "a field of B's object reaches A, but nothing private, or once only, or without the owner's control",
+            "B's private data read by A, or one of B's objects changed by A and read back, with B's own request and "
+            "a request without a session as controls",
+        ),
+        recipe="Two of our identities: B reads its own object (setup), A reads the same object (attack), no session "
+        "(control). A read first; a write only on B's object of our own, read back once.",
+        dedupe="operation",
     ),
     VulnClass(
         "broken-access-control",
@@ -107,6 +146,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         card=True,
         tool=AUTHZ_TOOL,
         scan=AUTHZ_WRITE,
+        levels=(
+            "a route of a higher role answers a lower one with something else than a refusal",
+            "the lower identity reaches the function, but its effect or the protected data is not shown",
+            "the lower identity reads the protected data, or the action takes effect and is read back, with the "
+            "refused twin as control",
+        ),
+        recipe="The same request as the higher identity (setup), as the lower one (attack), and without a session or "
+        "as an identity without the right (control); an action only on an object of our own identities.",
+        dedupe="operation",
     ),
     VulnClass(
         "auth",
@@ -128,6 +176,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "A token the attacker obtained legitimately is not a bypass.",
         True,
         0.5,
+        levels=(
+            "an altered token or a missing credential gets an answer other than the usual refusal",
+            "the protected route answers, but nothing reserved to the account is shown",
+            "a resource or action reserved to one of our accounts reached without its credential, with the same "
+            "request refused without the bypass",
+        ),
+        recipe="One request with the altered or missing credential (attack) and its twin with the untouched one "
+        "removed (control), on our own accounts only; never a login of another person's account.",
+        dedupe="operation",
     ),
     VulnClass(
         "sqli",
@@ -136,11 +193,22 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         (r"q|query|search|filter|sort|order(by)?|where|category|id|name"),
         "Data extracted through the injection (database version, a table or column name, a row the user cannot "
         "otherwise read), or a boolean pair: a true and a false payload give consistently different answers on "
-        "two runs. A database error tied to the payload is a lead, not a finding. Never time-based.",
+        "two runs. A database error tied to the payload is a lead, not a finding. Time-based only as its recipe "
+        "says: three delayed answers and a twin control without the delay, each request at most 10 s.",
         True,
         scan="`bh-sqli '<url with the parameter>'` (`--data` for a body, `--as user-a` for an authenticated one) "
         "runs Boolean/Error/Union only, never time-based; a point it finds is confirmed by hand with ONE read-only "
         "extraction.",
+        levels=(
+            "a database error tied to the payload",
+            "a true/false or delayed/undelayed differential seen once, or without its control",
+            "one read-only value extracted (the database version), or the differential reproduced on two runs with "
+            "its control; never a table dumped",
+        ),
+        recipe="A boolean pair first (true and false payloads, one request each). Timing only when nothing else "
+        "answers: three requests with a delay of at most 10 s, each expecting elapsed_ms_min, and one twin control "
+        "without the delay expecting elapsed_ms_max, at the program's rate. One read-only value at most.",
+        dedupe="param",
     ),
     VulnClass(
         "nosqli",
@@ -149,6 +217,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         (),
         "Same standard as SQL injection: extracted data or a consistent boolean differential.",
         False,
+        levels=(
+            "an operator in the input changes the answer's error",
+            "an operator changes which documents come back, once or without control",
+            "one value read through the operator on our own account, or a boolean differential on two runs with "
+            "its control",
+        ),
+        recipe="An operator pair on our own account (`$ne` against `$eq` on the same field), one request each; "
+        "nothing extracted character by character.",
+        dedupe="param",
     ),
     VulnClass(
         "xss",
@@ -162,6 +239,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         'same way; in proof.json such a step carries `"browse": {"xss": "<marker>"}`.',
         True,
         scan="`bh-xss '<url?param=x>'` for the reflected cases, before the method by hand.",
+        levels=(
+            "the payload comes back unencoded in the page",
+            "it lands in an executable context, but no execution was seen (CSP, browser, sanitizer)",
+            "it executes in a real browser on the target's origin: `xss CONFIRMED` from a browse step, with a "
+            "benign twin as control",
+        ),
+        recipe='A browse step `"browse": {"xss": "<marker>"}` with a payload that only calls alert(\'<marker>\'), '
+        "and its twin with a benign value; no cookie or token read, nothing sent anywhere.",
+        dedupe="param",
     ),
     VulnClass(
         "ssrf",
@@ -173,6 +259,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "rendered. An internal address is never the proof and never requested (the program forbids it). No "
         'listener declared by the scope: `bh-note blocked oob-needed "<url and parameter>"`.',
         True,
+        levels=(
+            "the server's answer changes with the URL we give",
+            "a request reached a host of ours, but we do not know it came from the target's server",
+            "a request from the target's server received on a listener the scope declares, or an in-scope page the "
+            "server read and returned, with a benign URL as control",
+        ),
+        recipe="One URL on a listener the scope declares (attack) and the same parameter with a benign in-scope URL "
+        "(control); never an internal address, never a third party.",
+        dedupe="param",
     ),
     VulnClass(
         "open-redirect",
@@ -182,6 +277,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "The response sends the browser to an external domain we supplied (Location header, meta refresh or JS). "
         "Control: a benign internal value stays internal. Most programs pay it only when chained (OAuth token leak).",
         True,
+        levels=(
+            "our value appears in a Location header or a script, not followed",
+            "a redirect toward our value, shown by the raw answer only",
+            "a real navigation ends on a payload host of the scope: `redirect CONFIRMED` from a browse step, with an "
+            "internal value as control",
+        ),
+        recipe='A browse step `"browse": {"final_url": "https://<payload host>/<path>"}` on the redirecting URL, and '
+        "its twin with an internal value; the destination is always a payload host of the scope, never a third party.",
+        dedupe="param",
     ),
     VulnClass(
         "file-upload",
@@ -191,6 +295,15 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "An uploaded file is served back in a way that runs (stored XSS through SVG/HTML served inline, server-side "
         "execution) or overwrites something. Storing an arbitrary file alone is not a vulnerability.",
         True,
+        levels=(
+            "a file type the form should refuse is accepted",
+            "the file is served back, but nothing runs or is overwritten",
+            "the file served back runs in the target's origin (a marker of ours), or overwrites one of our own files, "
+            "with a harmless file as control",
+        ),
+        recipe="One small file on our own account with a marker only (an SVG that calls alert('<marker>')), and the "
+        "same upload with a harmless image as control; never a server-side payload.",
+        dedupe="operation",
     ),
     VulnClass(
         "graphql",
@@ -200,6 +313,14 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "Introspection alone is information. Proof is unauthorized data or a mutation reached through GraphQL; the "
         "IDOR and auth standards apply.",
         True,
+        levels=(
+            "introspection or a field suggestion",
+            "an object of another identity named in an error or a partial answer",
+            "unauthorized data or a mutation reached through GraphQL, under the IDOR or auth standard",
+        ),
+        recipe="One query (or one mutation on our own object) as the wrong identity, and the same as the owner or "
+        "without a session; no batching, no alias lists.",
+        dedupe="operation",
     ),
     VulnClass(
         "business-logic",
@@ -211,6 +332,14 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "A rule of the business is broken on our own account (price, quantity, coupon reuse, a step skipped), shown "
         "with the state before and after and a control where the rule holds.",
         True,
+        levels=(
+            "the server accepts a value the interface never sends",
+            "the value is accepted, but the state after was not read back",
+            "a business rule broken on our own account, state read before and after, with a control where it holds",
+        ),
+        recipe="State read, one request that breaks the rule on our own account, state read again; the same request "
+        "with a legal value as control. Never a real payment.",
+        dedupe="operation",
     ),
     VulnClass(
         "info-disclosure",
@@ -221,6 +350,14 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "names, public specs, version banners and by-design data are not disclosure.",
         True,
         scan="Candidates also come from the hits of `bh-content` and `bh-scan`.",
+        levels=(
+            "a file or route answers that should not exist",
+            "it holds names, versions or by-design data, but no secret value",
+            "one actual secret value or another user's personal data read once; never used, never dumped",
+        ),
+        recipe="One GET of the file or route (attack) and the same path without the leaking part (control); the "
+        "secret is shown redacted and never used.",
+        dedupe="origin",
     ),
     VulnClass(
         "path-traversal",
@@ -230,6 +367,14 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "The content of a file outside the served directory comes back (a known marker of a system file). Control: "
         "the same path without the traversal sequence gives different content.",
         True,
+        levels=(
+            "a traversal sequence changes the error",
+            "a file outside the served directory is named or sized, not read",
+            "a known marker of a system file comes back, with the same path without the sequence as control",
+        ),
+        recipe="One read of a harmless system file with a known marker, and its twin without the traversal; never "
+        "a secret file, never a write.",
+        dedupe="param",
     ),
     VulnClass(
         "cors",
@@ -240,6 +385,14 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "Access-Control-Allow-Credentials is true, on an authenticated response that holds sensitive data.",
         True,
         0.1,
+        levels=(
+            "an arbitrary Origin is reflected",
+            "reflected with credentials allowed, on an answer without sensitive data",
+            "a credentialed cross-origin read of our own account's sensitive data, with a benign origin as control",
+        ),
+        recipe="One request with an Origin of a payload host and our session (attack), and its twin with the "
+        "target's own origin (control).",
+        dedupe="operation",
     ),
     VulnClass(
         "prompt-injection",
@@ -262,6 +415,14 @@ _CARD_CLASSES: tuple[VulnClass, ...] = (
         "leaked data, a jailbreak or harmful text, self-impact (attacker = victim) and system prompt extraction "
         "are not findings." + CANARY_PRIVATE,
         True,
+        levels=(
+            "the model follows an instruction from A's content in A's own session",
+            "B's session acts on A's content, but neither the canary nor the action crossed",
+            "the canary planted in B's data seen on A's side by the gate, or the action read back in B's account, in "
+            "k of N runs with the control",
+        ),
+        recipe="A plants one instruction in content it owns; B, our other identity, asks its usual question; the "
+        "canary planted only in B's data. N runs, the same without the instruction as control.",
     ),
 )
 # exclusion-only classes (no card): names programs use in their non-qualifying lists
@@ -274,12 +435,14 @@ _EXCLUSION_CLASSES: tuple[VulnClass, ...] = (
     VulnClass("csrf-logout", ("logout-csrf", "csrf-logout")),
     VulnClass("missing-headers", ("missing-security-headers", "security-headers", "missing-headers")),
     VulnClass("rate-limiting", ("rate-limit", "missing-rate-limit", "no-rate-limit", "rate-limiting")),
-    VulnClass("version-disclosure", ("banner-disclosure", "banner", "version-disclosure")),
+    VulnClass("version-disclosure", ("banner-disclosure", "banner", "version-disclosure"), dedupe="origin"),
     VulnClass("social-engineering", ("phishing", "social-engineering")),
     VulnClass("spam", ("spam", "email-flooding")),
     VulnClass("physical", ("physical",)),
 )
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+# T31 rules of classes that classes_more.json adds (its entries carry no rule): the rest take `route`
+DEDUPE_MORE = {"ssti": "param", "csrf": "operation", "mass-assignment": "operation"}
 
 
 def _strings(entry: dict, key: str, where: str) -> tuple[str, ...]:
@@ -329,6 +492,7 @@ def build_classes(more: Path | None = MORE_CLASSES) -> tuple[VulnClass, ...]:
                     _strings(entry, "param_signals", where),
                     evidence,
                     skill=skill,
+                    dedupe=DEDUPE_MORE.get(cid, "route"),
                 )
             )
     n_card = len(_CARD_CLASSES)
@@ -420,6 +584,38 @@ def evidence(name: str) -> str:
     )
 
 
+def _cls(name: str) -> VulnClass | None:
+    return BY_ID.get(str(name)) or BY_ID.get(canonical(str(name)))
+
+
+def proof_levels(name: str) -> dict[str, str]:
+    """{"signal": ..., "partial": ..., "impact": ...} for the class `name` (T27); the defaults for a class without
+    its own."""
+    cls = _cls(name)
+    return dict(zip(PROOF_LEVELS, (cls.levels if cls and cls.levels else LEVEL_DEFAULTS), strict=True))
+
+
+def level_name(level: object) -> str | None:
+    """1 -> signal, 2 -> partial, 3 -> impact; None for anything else."""
+    try:
+        n = int(str(level))
+    except ValueError:
+        return None
+    return PROOF_LEVELS[n - 1] if 1 <= n <= len(PROOF_LEVELS) else None
+
+
+def recipe(name: str) -> str:
+    """The least intrusive proof of the class `name`, written (T26); RECIPE_DEFAULT for a class without one."""
+    cls = _cls(name)
+    return cls.recipe if cls and cls.recipe else RECIPE_DEFAULT
+
+
+def dedupe_rule(name: str) -> str:
+    """The T31 rule of the class `name` (DEDUPE_RULES); `route` for an unknown class."""
+    cls = _cls(name)
+    return cls.dedupe if cls else "route"
+
+
 def card_text(class_id: str) -> str:
     return (CARDS_DIR / f"{class_id}.md").read_text().strip()
 
@@ -486,7 +682,10 @@ def _card(c: str, scanners: bool = False) -> str:
             "\n"
             + (f"Tool: {cls.tool}\n" if cls.tool else "")
             + (f"Scanner (this program allows them): {cls.scan}\n" if scanners and cls.scan else "")
-            + f"Proof standard (the verifier applies exactly this): {cls.evidence}"
+            + f"Proof standard (the verifier applies exactly this): {cls.evidence}\n"
+            + f"Least intrusive proof: {recipe(c)}\n"
+            + "Proof levels (`--proof-level`): "
+            + "; ".join(f"{n} {name}: {text}" for n, (name, text) in enumerate(proof_levels(c).items(), 1))
         )
     return text if scanners else no_scanner(text)
 

@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bh import assets, paths, redact
+from bh import assets, classes, cvss, paths, redact
 from bh.agent import contract as c
 from bh.agent import proof
 from bh.board import Board
@@ -196,6 +196,59 @@ def _revive(board: Board, program: str, title: str, fields: dict, doc) -> int | 
     return fid
 
 
+def proof_level(value) -> int:
+    """`--proof-level` of a finding note: 1, 2 or 3. Absent (a note of an older bh-note) or unreadable: 3, the normal
+    path to the judge, which may lower it; never a reason to skip a verification."""
+    if isinstance(value, bool):
+        return 3
+    try:
+        n = int(str(value).strip())
+    except ValueError:
+        return 3
+    return n if n in (1, 2, 3) else 3
+
+
+def _cvss(value) -> tuple[str | None, float | None, str | None]:
+    """The hunter's vector (`--cvss`): (normalized vector, score computed here, None), or (None, None, why refused).
+    No vector: (None, None, None)."""
+    if value in (None, ""):
+        return None, None, None
+    try:
+        vector = cvss.normalize(_s(value, 200))
+        return vector, cvss.score(vector), None
+    except ValueError as exc:
+        return None, None, one_line(str(exc), 200)
+
+
+def _candidate(board: Board, program: str, run_id: int, n: dict, level: int) -> tuple[int, int, int]:
+    """A finding note at proof level 1 (signal) or 2 (partial) (T27): a CANDIDATE fact, never a finding, never sent
+    to the judge. It says what the proof reached and what the class calls an impact, so a later session can take it
+    up."""
+    klass = canonical(_s(n.get("vuln_class"), 80) or "unknown")
+    levels = classes.proof_levels(klass)
+    name = classes.level_name(level) or "signal"
+    title = _hunter_title(_line(n.get("title"), 280) or "(untitled)")
+    summary = "\n".join(
+        [
+            f"proof level {level} ({name}) of {klass}: {levels[name]}",
+            f"impact would be: {levels['impact']}",
+            f"hunter's summary: {_line(n.get('summary'), 700)}",
+            f"not proven: {_line(n.get('not_proven'), 400) or '-'}",
+        ]
+    )
+    board.add_fact(
+        program,
+        f"CANDIDATE: {title}",
+        summary,
+        _s(n.get("evidence"), 500),
+        kind="candidate",
+        run_id=run_id,
+        endpoint=c.endpoint_label(n.get("url")),
+        vuln_class=klass,
+    )
+    return 1, 0, 0
+
+
 def _note(
     board: Board, program: str, run_id: int, n: dict, scope: Scope | None, receipts: Receipts | None = None
 ) -> tuple[int, int, int]:
@@ -221,6 +274,10 @@ def _note(
             if m := INTENT_ID.fullmatch(_s(n.get("intent_id"), 20)):
                 return _done(board, program, run_id, int(m.group(1)), n)
         case "finding":
+            level = proof_level(n.get("proof_level"))
+            if level < 3:  # T27: a signal or a partial proof is a lead, not a finding: no judge spent on it
+                return _candidate(board, program, run_id, n, level)
+            vector, score, refused = _cvss(n.get("cvss"))
             fields = {k: n.get(k) for k in FINDING_FIELDS if k not in ("vuln_class", "proof", "observation")}
             fields = {k: _s(v, HONESTY_MAX if k in HONESTY_FIELDS else 20000) for k, v in fields.items()}
             fields["poc"] = redact.text(fields.get("poc", ""))
@@ -234,8 +291,21 @@ def _note(
                 fields["not_proven"] = (fields.get("not_proven", "") + " [observation refused by the host]").strip()
             elif obs is not None and "control" not in obs:  # N6: kept, but the host's verdict stops at inconclusive
                 fields["not_proven"] = (fields.get("not_proven", "") + " [no control k/N without A's payload]").strip()
+            if refused:
+                fields["not_proven"] = (fields.get("not_proven", "") + " [cvss vector refused by the host]").strip()
+                board.add_fact(
+                    program,
+                    "cvss vector refused",
+                    f"{one_line(_s(n.get('title'), 200), 200)!r}: {refused}. The host computes the score from a CVSS "
+                    "3.1 base vector; the finding is kept without one.",
+                    kind="harness",
+                    run_id=run_id,
+                )
             title = _s(n.get("title"), 300)
-            if _revive(board, program, title, fields, doc) is not None:
+            cvss.ensure(board)
+            graded = {"proof_level": level, "cvss_vector": vector, "cvss_score": score}
+            if (revived := _revive(board, program, title, fields, doc)) is not None:
+                board.finding_set(revived, **graded)
                 return 0, 1, 0
             fid = board.add_finding(
                 program,
@@ -246,6 +316,7 @@ def _note(
                 **fields,
                 vuln_class=canonical(_s(n.get("vuln_class"), 80) or "unknown"),
             )
+            board.finding_set(fid, **graded)
             if obs is not None:  # the gate's table as of now, for the board; the verification reads it again
                 board.finding_set(fid, replay=json.dumps({"observation": observation.check(obs, scope)})[:200_000])
             if scope is not None and (excluded := scope.excludes(_s(n.get("vuln_class"), 80))):
