@@ -7,17 +7,26 @@ Each class carries:
   method card worth loading for a segment;
 - evidence: the proof standard. The hunting agent reads it in the card, the verifier applies the same
   text, so "proven" means the same thing on both sides.
-Cards live in src/bh/cards/<card>.md (written for this harness, ≤ 40 lines each).
+Cards live in src/bh/cards/<card>.md (written for this harness, ≤ 40 lines each). Skills (W3, the Skill tool of
+Claude Code) live in src/bh/skills/<name>/SKILL.md: one per card, same name, plus skills of their own; a class's
+skill is `skill_for(class_id)`. src/bh/skills/classes_more.json, when present, adds classes (or completes one) at
+import.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 CARDS_DIR = Path(__file__).parent / "cards"
+SKILLS_DIR = Path(__file__).parent / "skills"
+MORE_CLASSES = SKILLS_DIR / "classes_more.json"  # classes added by the skills (W3-H), merged at import
 # first pass of the access-control classes (idor, broken-access-control): the builtin and the proof it leaves
 AUTHZ_TOOL = (
     "`bh-authz` (after mapping, 2+ identities): every known endpoint as each identity and anonymous; it flags owner "
@@ -51,6 +60,7 @@ class VulnClass:
     # what a program that allows scanners adds (a scanner of contract.SCANNERS or a scanner mode); never in the card
     # file itself, which the agent may read on any program (audit I8)
     scan: str = ""
+    skill: str = ""  # the skill of src/bh/skills that holds its method, when it is not the card's name
 
     def __post_init__(self) -> None:  # `(r"x")` is a str, not a tuple: accept both
         for name in ("aliases", "path_signals", "param_signals"):
@@ -65,7 +75,7 @@ class VulnClass:
         return self.weight if any(re.search(rx, key, re.I) for rx in self.path_signals) else 0.0
 
 
-CLASSES: tuple[VulnClass, ...] = (
+_CARD_CLASSES: tuple[VulnClass, ...] = (
     VulnClass(
         "idor",
         ("bola", "insecure-direct-object-reference", "broken-object-level-authorization", "idor"),
@@ -253,7 +263,9 @@ CLASSES: tuple[VulnClass, ...] = (
         "are not findings." + CANARY_PRIVATE,
         True,
     ),
-    # exclusion-only classes (no card): names programs use in their non-qualifying lists
+)
+# exclusion-only classes (no card): names programs use in their non-qualifying lists
+_EXCLUSION_CLASSES: tuple[VulnClass, ...] = (
     VulnClass("dos", ("denial-of-service", "ddos", "resource-exhaustion", "dos")),
     VulnClass("race-condition", ("race-condition", "race-conditions")),  # excluding it must not drop business-logic
     VulnClass("brute-force", ("bruteforce", "credential-stuffing", "password-spraying", "brute-force")),
@@ -267,8 +279,77 @@ CLASSES: tuple[VulnClass, ...] = (
     VulnClass("spam", ("spam", "email-flooding")),
     VulnClass("physical", ("physical",)),
 )
+_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+
+def _strings(entry: dict, key: str, where: str) -> tuple[str, ...]:
+    value = entry.get(key) or ()
+    if isinstance(value, str):
+        value = (value,)
+    if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{where}: {key!r} is a list of strings")
+    for v in value if key.endswith("signals") else ():
+        re.compile(v)  # a bad regex fails here, at import, not in the middle of a segment
+    return tuple(value)
+
+
+def build_classes(more: Path | None = MORE_CLASSES) -> tuple[VulnClass, ...]:
+    """The card classes, then those of `more` (classes_more.json, a list of {"id", "aliases", "path_signals",
+    "param_signals", "evidence", "skill"}), then the exclusion-only classes. An id already defined is completed, never
+    duplicated: its `skill` is set and its `evidence` filled when it had none (a standard already written stays, its
+    aliases and signals too). No file: the built-in classes as they are. A malformed file raises (an error of the lot
+    that wrote it, said at import)."""
+    base = [*_CARD_CLASSES, *_EXCLUSION_CLASSES]
+    if more is None or not more.is_file():
+        return tuple(base)
+    entries = json.loads(more.read_text())
+    if not isinstance(entries, list):
+        raise ValueError(f"{more.name}: a list of class objects")
+    index = {c.id: i for i, c in enumerate(base)}
+    added: list[VulnClass] = []
+    for n, entry in enumerate(entries):
+        where = f"{more.name}[{n}]"
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not _NAME.fullmatch(entry["id"]):
+            raise ValueError(f'{where}: an object with an "id" made of [a-z0-9-]')
+        cid = entry["id"]
+        evidence, skill = entry.get("evidence") or "", entry.get("skill") or ""
+        if not isinstance(evidence, str) or not isinstance(skill, str) or (skill and not _NAME.fullmatch(skill)):
+            raise ValueError(f'{where}: "evidence" is a string, "skill" a skill name')
+        if cid in index:
+            old = base[index[cid]]
+            base[index[cid]] = dataclasses.replace(old, evidence=old.evidence or evidence, skill=skill or old.skill)
+        elif any(c.id == cid for c in added):
+            raise ValueError(f"{where}: {cid!r} appears twice")
+        else:
+            added.append(
+                VulnClass(
+                    cid,
+                    _strings(entry, "aliases", where),
+                    _strings(entry, "path_signals", where),
+                    _strings(entry, "param_signals", where),
+                    evidence,
+                    skill=skill,
+                )
+            )
+    n_card = len(_CARD_CLASSES)
+    return (*base[:n_card], *added, *base[n_card:])
+
+
+def alias_map(classes: Iterable[VulnClass]) -> dict[str, str]:
+    """Alias -> class id. A built-in alias keeps its class: a class added later never takes a name over ("jwt" stays
+    `auth` even if a `jwt` class is added), and an id is its own alias only when no other class claims it."""
+    out: dict[str, str] = {}
+    classes = list(classes)
+    builtin = {c.id for c in (*_CARD_CLASSES, *_EXCLUSION_CLASSES)}
+    for c in sorted(classes, key=lambda c: c.id not in builtin):  # built-in first, stable within each group
+        for alias in (*c.aliases, c.id):
+            out.setdefault(alias, c.id)
+    return out
+
+
+CLASSES: tuple[VulnClass, ...] = build_classes()
 BY_ID = {c.id: c for c in CLASSES}
-_ALIAS = {alias: c.id for c in CLASSES for alias in (*c.aliases, c.id)}
+_ALIAS = alias_map(CLASSES)
 # names distinctive enough to be found inside a longer phrase ("XSS (stored)", "Denial of Service (DoS) attacks");
 # single words like "session" or "auth" are not ("Missing session timeout" is not every auth bug)
 _DISTINCT = {
@@ -433,3 +514,89 @@ def cards_block(class_ids: list[str], pinned: list[str] | tuple[str, ...] = (), 
 
 def all_cards() -> list[str]:
     return sorted(p.stem for p in CARDS_DIR.glob("*.md"))
+
+
+# ------------------------------------------------------------------ skills (W3): src/bh/skills/<name>/SKILL.md
+SKILL_FILE = "SKILL.md"
+SKILL_REQUIRES = ("scanners",)  # the only value of `requires`: the skill names a scanner (audit I8)
+DESCRIPTION_MAX = 200  # what the agent pays every turn: it says when to load the skill, nothing more
+
+
+def skills_dir() -> Path:
+    return SKILLS_DIR
+
+
+def _skill_path(name: str) -> Path | None:
+    path = SKILLS_DIR / str(name) / SKILL_FILE
+    return path if _NAME.fullmatch(str(name)) and path.is_file() else None
+
+
+def skill_frontmatter(text: str) -> dict:
+    """The YAML between the opening `---` and the next one; {} when the text has none."""
+    m = re.match(r"---\n(.*?)\n---(?:\n|$)", text, re.S)
+    meta = yaml.safe_load(m.group(1)) if m else None
+    return meta if isinstance(meta, dict) else {}
+
+
+def skill_text(name: str) -> str:
+    """The whole SKILL.md of a skill (frontmatter included). An unknown name raises."""
+    path = _skill_path(name)
+    if path is None:
+        raise ValueError(f"skill {name!r}: no {SKILLS_DIR.name}/{name}/{SKILL_FILE}")
+    return path.read_text().strip()
+
+
+def all_skills() -> list[dict]:
+    """Every skill of SKILLS_DIR, sorted by name: {"name", "description", "requires"} (`requires`: None or
+    "scanners")."""
+    out = []
+    for path in sorted(SKILLS_DIR.glob(f"*/{SKILL_FILE}")):
+        meta = skill_frontmatter(path.read_text())
+        requires = meta.get("requires")
+        out.append(
+            {
+                "name": str(meta.get("name") or path.parent.name),
+                "description": str(meta.get("description") or ""),
+                "requires": str(requires) if requires else None,
+            }
+        )
+    return out
+
+
+def skill_for(class_id: str) -> str | None:
+    """The skill that holds a class's method: the class's own `skill`, else its card's name; None when no such skill
+    exists on disk. An exact class id first (a class added by classes_more.json whose id is an older alias, `jwt`),
+    then the canonical name ("BOLA" -> idor)."""
+    cls = BY_ID.get(str(class_id)) or BY_ID.get(canonical(str(class_id)))
+    if cls is None:
+        return None
+    for name in (cls.skill, cls.id if cls.card else ""):
+        if name and _skill_path(name) is not None:
+            return name
+    return None
+
+
+def pinned_skills(scope, model: str | None) -> list[str]:
+    """Skills the scope pins for one model family (`pin_for_models: {<skill>: [<family>, ...]}`, lot D): pinned when
+    the model id without its `claude-` prefix starts with one of the families ("claude-opus-5-5" -> "opus")."""
+    pins = getattr(scope, "pin_for_models", None) or {}
+    family = str(model or "").lower().removeprefix("claude-")
+    if not family:
+        return []
+    out = []
+    for skill, listed in pins.items() if hasattr(pins, "items") else pins:  # a dict, or its (skill, families) pairs
+        families = (listed,) if isinstance(listed, str) else (listed or ())
+        if any(str(f) and family.startswith(str(f).lower()) for f in families):
+            out.append(str(skill))
+    return out
+
+
+def program_skills(scope, model: str | None = None) -> list[str]:
+    """The skills given whole to the hunter on this program: the scope's `cards` (one skill per card, same name),
+    then those pinned for `model`. Each must name a skill of SKILLS_DIR: a bad or missing one is an operator error,
+    raised before the segment starts."""
+    names = [str(n) for n in (getattr(scope, "cards", ()) or ())] + pinned_skills(scope, model)
+    for n in names:
+        if _skill_path(n) is None:
+            raise ValueError(f"scope skill {n!r}: no {SKILLS_DIR.name}/{n}/{SKILL_FILE}")
+    return list(dict.fromkeys(names))
