@@ -179,7 +179,23 @@ def cmd_down(args) -> int:
 
 
 def cmd_tools_fetch(args) -> int:
-    """Host-side downloads the sandbox cannot do (the gate blocks GitHub)."""
+    """Host-side downloads the sandbox cannot do (the gate blocks GitHub). With --repo and --commit: a source tree
+    for the white-box review (bh.whitebox.fetch, lot F)."""
+    repo, commit = getattr(args, "repo", None), getattr(args, "commit", None)
+    if repo or commit:
+        import re as _re
+
+        if not (repo and commit):
+            print("--repo and --commit go together", file=sys.stderr)
+            return 2
+        if not _re.fullmatch(r"https://[^\s/]+/\S+", repo) or not _re.fullmatch(r"[0-9a-f]{7,40}", commit):
+            print("--repo is an https URL, --commit a hexadecimal sha (7 to 40)", file=sys.stderr)
+            return 2
+        whitebox = _need("bh.whitebox", "bh tools fetch --repo")
+        if whitebox is None:
+            return 2
+        print(f"fetched {whitebox.fetch(repo, commit)}")
+        return 0
     dst = paths.tools_dir() / "nuclei-templates"
     if dst.is_dir():
         print(f"{dst} already present (delete it to refetch {NUCLEI_TEMPLATES_TAG})")
@@ -218,7 +234,18 @@ def cmd_status(args) -> int:
         f"to submit: {n_submit} · inconclusive: {n_inc} · needs proof (hunter): {n_proof} (findings)"
         f" · blockers (24 h): {n_block}"
     )
+    _alerts(b)
     return 0
+
+
+def _alerts(b, program: str | None = None) -> list[str]:
+    """L10: a program whose last outcomes are neither accepted nor paid. Said, never acted on."""
+    from bh import stats
+
+    lines = stats.alert_lines(b, program)
+    for line in lines:
+        print(line)
+    return lines
 
 
 # ---------------------------------------------------------------- runs
@@ -346,10 +373,15 @@ def cmd_todo(args) -> int:
         return 0
     # Only submissions: todos of the retired kinds stay in the table as history, never as work.
     rows = b.rows("SELECT * FROM todos WHERE kind='submit' AND status=? ORDER BY id", "done" if args.all else "open")
+    fence = Fence() if args.verbose else None
+    if rows and fence is not None:
+        print(fence.legend())
     for r in rows:
         print(f"T{r['id']:<4} [{r['kind']:14}] {r['program'] or '-':16} {r['title']}")
         if args.verbose and r["detail"]:
             print(f"      {r['detail']}")
+        if fence is not None and r["status"] == "open":
+            _checklist(b, dict(r), fence, indent="      ")
     if not rows:
         print("nothing to submit")
     return 0
@@ -371,6 +403,46 @@ def cmd_blockers(args) -> int:
             print(f"      {r['summary']}")
     if not rows:
         print(f"no blocker in the last {args.since:g} h")
+    return 0
+
+
+def _checklist(b, todo_or_fid, fence, indent: str = "") -> None:
+    """L1: what to check before submitting (bh.stats.checklist); nothing is sent anywhere."""
+    from bh import stats
+
+    fid = todo_or_fid if isinstance(todo_or_fid, int) else stats.submit_fid(todo_or_fid)
+    if fid is None:
+        return
+    try:
+        lines = stats.checklist(b, fid, fence=lambda v: fence(stats._key(v, 120)))
+    except Exception as exc:  # noqa: BLE001 - the list is a help, never a failure of the command
+        print(f"{indent}(checklist unavailable: {type(exc).__name__})")
+        return
+    for line in lines:
+        print(indent + line)
+
+
+def cmd_outcome(args) -> int:
+    """L4: the platform's outcome of a finding, typed by Mio after the triage (bh.stats.set_outcome)."""
+    from bh import stats
+
+    b = _board()
+    try:
+        fid = int(str(args.id).lstrip("Ff"))
+    except ValueError:
+        print(f"bad finding id {args.id!r}", file=sys.stderr)
+        return 2
+    try:
+        out = stats.set_outcome(b, fid, args.outcome, bounty=args.bounty, note=args.note or "")
+    except KeyError:
+        print(f"unknown finding F{fid}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    paid = f" · bounty {out['bounty']:g}" if out["bounty"] else ""
+    print(f"F{fid} ({out['program']}) -> {out['outcome']}{paid} · ledger: {out['ledger']}")
+    _alerts(b, out["program"])
     return 0
 
 
@@ -410,6 +482,16 @@ def cmd_finding(args) -> int:
     ):
         print(f"{k:11}: {r.get(k) if k in host_fields else fence(escape_invisible(str(r.get(k) or '')))}")
     print("poc:\n" + fence(escape_invisible(str(r.get("poc") or ""))))
+    if r.get("outcome"):
+        bounty = f" · bounty {r['bounty']:g}" if r.get("bounty") else ""
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["outcome_ts"])) if r.get("outcome_ts") else "?"
+        print(f"outcome    : {r['outcome']}{bounty} ({when})")
+        if r.get("outcome_note"):
+            print(f"note       : {escape_invisible(str(r['outcome_note']))}")
+    from bh import stats
+
+    if r.get("status") in stats.TO_SUBMIT:
+        _checklist(b, fid, fence)
     return 0
 
 
@@ -702,13 +784,74 @@ def cmd_rules(args) -> int:
 def cmd_stats(args) -> int:
     from bh import stats
 
-    summary = stats.summary(_board(), program=args.program, phase=args.phase, setup=args.setup)
+    b = _board()
+    summary = stats.summary(b, program=args.program, phase=args.phase, setup=args.setup)
     if args.json:
         import json
 
+        summary["alerts"] = stats.alert_lines(b, args.program)
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
         print(stats.table(summary))
+        _alerts(b, args.program)
+    return 0
+
+
+def cmd_objects(args) -> int:
+    """The objects our test accounts created on a program (lot B's table `test_objects`), read-only."""
+    b = _board()
+    if not b.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='test_objects'"):
+        print("no test_objects table yet (lot B): nothing to list")
+        return 0
+    cols = {r["name"] for r in b.db.execute("PRAGMA table_info(test_objects)")}
+    sql = "SELECT * FROM test_objects" + (" WHERE program=?" if "program" in cols else "")
+    rows = b.rows(sql + (" ORDER BY id" if "id" in cols else ""), *([args.program] if "program" in cols else []))
+    fence = Fence()
+    if rows:
+        print(fence.legend())
+    host = {"id", "program", "run_id", "created", "ts", "deleted", "identity"}
+    for r in rows:
+        cells = (
+            f"{k}={v if k in host or v is None else fence(escape_invisible(str(v)[:300]))}" for k, v in dict(r).items()
+        )
+        print("  ".join(cells))
+    if not rows:
+        print(f"no test object for {args.program}")
+    return 0
+
+
+def cmd_audit(args) -> int:
+    """Audit of one run against an oracle (lot H: bh.audit.run_audit, bh.audit.render)."""
+    audit = _need("bh.audit", "bh audit")
+    if audit is None:
+        return 2
+    oracle = Path(args.oracle) if args.oracle else None
+    if oracle is not None and not oracle.is_file():
+        print(f"no such oracle file: {oracle}", file=sys.stderr)
+        return 1
+    try:
+        run_id = int(str(args.run).lstrip("Rr"))
+    except ValueError:
+        print(f"bad run id {args.run!r}", file=sys.stderr)
+        return 2
+    result = audit.run_audit(_board(), run_id, oracle)
+    print(escape_invisible(str(audit.render(result))))
+    return 0
+
+
+def cmd_scope_new(args) -> int:
+    """D32: scopes/msrc/<service>.yaml from a host survey (bh.scope_scaffold). automation_allowed stays false."""
+    from bh import scope_scaffold
+
+    try:
+        dst = scope_scaffold.write(args.service, Path(args.capture), hosts=args.host or None, say=None)
+    except scope_scaffold.ScaffoldError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    print(f"wrote {dst}")
+    for line in scope_scaffold.missing(dst):  # bh.scope.guards.check, and automation still Mio's to allow
+        print(f"  missing: {line}")
+    print("next: read the program rules, then set automation_allowed by hand (it stays false until you do)")
     return 0
 
 
@@ -822,12 +965,14 @@ def _age(seconds: int | None) -> str:
 
 def cmd_accounts(args) -> int:
     """The harness's own test accounts (issue 25). No secret or session value is ever printed."""
-    from bh.accounts import enroll as en
-
     scope = _load_scope_or_exit(args.file)
     declared = [i["name"] for i in scope.identities]
     if unknown := sorted(set(args.names) - set(declared)):
         raise SystemExit(f"ERR {scope.program}: no identity {', '.join(unknown)} in {args.file}")
+    if args.acmd == "check":
+        return accounts_check(scope, args.names or declared)
+    from bh.accounts import enroll as en
+
     board = _board()
     if args.acmd == "ls":
         live = stack.container_running(stack.GATE)
@@ -865,6 +1010,25 @@ def cmd_accounts(args) -> int:
             except en.AccountError as exc:
                 print(f"{n}: FAILED {exc}")
                 rc = 1
+    return rc
+
+
+def accounts_check(scope, names: list[str]) -> int:
+    """T51: why each identity's session is (not) usable, one closed cause per identity (lot B's enroll.diagnose).
+    No segment is started, no login attempted here."""
+    enroll = _need("bh.accounts.enroll", "bh accounts check")
+    diagnose = getattr(enroll, "diagnose", None) if enroll is not None else None
+    if diagnose is None:
+        if enroll is not None:
+            print("bh accounts check: enroll.diagnose is not available yet (lot B); nothing done", file=sys.stderr)
+        return 2
+    rc = 0
+    for n in names:
+        try:
+            cause = str(diagnose(scope, n))
+        except Exception as exc:  # noqa: BLE001 - one identity's failure says nothing of the next
+            cause, rc = f"error ({type(exc).__name__})", 1
+        print(f"{n:<16} {escape_invisible(cause)[:200]}")
     return rc
 
 
@@ -1130,6 +1294,12 @@ def build_parser() -> argparse.ArgumentParser:
     rv = scope.add_parser("revoke", help="revoke an approved endpoint request (the gate drops it at its reload)")
     rv.add_argument("id")
     rv.set_defaults(func=cmd_scope_revoke)
+    nw = scope.add_parser("new", help="a new MSRC service scope from a host survey (never a wildcard)")
+    nw.add_argument("platform", choices=["msrc"])
+    nw.add_argument("service", help="service name, e.g. outlook (writes scopes/msrc/<service>.yaml)")
+    nw.add_argument("--from", dest="capture", required=True, help="host survey (docs/research/21-... format)")
+    nw.add_argument("--host", action="append", help="keep only this surveyed host or prefix (repeatable)")
+    nw.set_defaults(func=cmd_scope_new)
 
     u = sub.add_parser("up", help="start gate + agent containers (+ web UI)")
     u.add_argument("--build", action="store_true")
@@ -1137,9 +1307,12 @@ def build_parser() -> argparse.ArgumentParser:
     u.set_defaults(func=cmd_up)
     sub.add_parser("down", help="stop the stack").set_defaults(func=cmd_down)
     tools = sub.add_parser("tools", help="host-side tool data").add_subparsers(dest="tcmd", required=True)
-    tools.add_parser("fetch", help=f"clone nuclei-templates {NUCLEI_TEMPLATES_TAG} into var/tools").set_defaults(
-        func=cmd_tools_fetch
+    tf = tools.add_parser(
+        "fetch", help=f"clone nuclei-templates {NUCLEI_TEMPLATES_TAG} into var/tools (or a repo for white-box review)"
     )
+    tf.add_argument("--repo", help="https URL of a source repository (bh.whitebox.fetch)")
+    tf.add_argument("--commit", help="the commit to fetch (hexadecimal sha)")
+    tf.set_defaults(func=cmd_tools_fetch)
     ui = sub.add_parser("ui", help="web UI (daemon by default; binds the Tailscale IP)")
     ui.add_argument(
         "action", nargs="?", choices=["rotate-token"], help="rotate-token: a new UI login token (old cookies die)"
@@ -1285,17 +1458,36 @@ def build_parser() -> argparse.ArgumentParser:
     sta.add_argument("--json", action="store_true")
     sta.set_defaults(func=cmd_stats)
 
+    from bh.stats import OUTCOMES
+
+    oc = sub.add_parser("outcome", help="the platform's outcome of a submitted finding, typed after the triage")
+    oc.add_argument("id", help="F<n>")
+    oc.add_argument("outcome", choices=OUTCOMES)
+    oc.add_argument("--bounty", type=float, help="the bounty paid")
+    oc.add_argument("--note", help="your note (shown escaped)")
+    oc.set_defaults(func=cmd_outcome)
+
+    ob = sub.add_parser("objects", help="objects our test accounts created on a program (read-only)")
+    ob.add_argument("program")
+    ob.set_defaults(func=cmd_objects)
+
+    au = sub.add_parser("audit", help="audit one run (bh.audit)")
+    au.add_argument("run", help="run id")
+    au.add_argument("--oracle", help="oracle file")
+    au.set_defaults(func=cmd_audit)
+
     ac = sub.add_parser("accounts", help="the harness's own test accounts: enroll, refresh, ls (no secret shown)")
     acs = ac.add_subparsers(dest="acmd", required=True)
     for name, text in (
         ("enroll", "sign up (if the program allows it and none exists) and log in"),
         ("refresh", "probe the session; log in again (or sign up again) only if it is dead"),
         ("ls", "identities: recipe, credential stored, session age, probe"),
+        ("check", "why each identity's session is (not) usable: one closed cause each, no segment started"),
     ):
         a = acs.add_parser(name, help=text)
         a.add_argument("file", help="scope YAML")
         a.add_argument("names", nargs="*", help="identities (default: every one with an 'enroll' recipe)")
-        if name != "ls":
+        if name not in ("ls", "check"):
             a.add_argument("--force", action="store_true", help="lift the one-login-per-hour limit")
         a.set_defaults(func=cmd_accounts, force=False)
     st = acs.add_parser("set", help="store a test account's credential typed by hand (hidden input, 0600)")

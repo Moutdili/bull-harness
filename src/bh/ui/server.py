@@ -504,6 +504,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/login":
             return self._login()
+        if m := re.fullmatch(r"/api/finding/(\d{1,12})/outcome", u.path):
+            return self._outcome(int(m.group(1)))
         if not self._authed() or self.headers.get("X-BH") != "1":
             return self._send(403, b"forbidden", "text/plain")
         try:
@@ -512,6 +514,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc)}, 400)
         except Exception as exc:  # noqa: BLE001
             return self._json({"error": str(exc)}, 500)
+
+    # -- L4: the platform's outcome, typed by Mio (the same function as `bh outcome`)
+    OUTCOME_FIELDS = frozenset({"outcome", "bounty", "note"})
+
+    def _outcome(self, fid: int) -> None:
+        """POST /api/finding/<id>/outcome {"outcome", "bounty", "note"}: the UI session (401 without it), the
+        `X-BH: 1` header and this very origin (403 otherwise), then bh.stats.set_outcome."""
+        if not self._authed():
+            return self._send(401, b"login required", "text/plain")
+        if self.headers.get("X-BH") != "1" or not self._same_origin():
+            return self._send(403, b"forbidden", "text/plain")
+        from bh import stats
+
+        try:
+            body = self._body()
+            if extra := sorted(set(body) - self.OUTCOME_FIELDS):
+                raise ValueError(f"unknown field(s): {', '.join(map(str, extra))[:120]}")
+            out = stats.set_outcome(Board(), fid, body.get("outcome"), body.get("bounty"), body.get("note") or "")
+        except KeyError as exc:
+            return self._json({"error": f"not found: {exc}"}, 404)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, 400)
+        except Exception as exc:  # noqa: BLE001
+            return self._json({"error": str(exc)}, 500)
+        return self._json(out)
 
     # -- API
     def api_get(self, path: str, q: dict):
@@ -667,6 +694,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _programs(self, b: Board) -> list[dict]:
+        from bh import stats
         from bh.scope import ScopeError, load_scope
 
         out = []
@@ -679,6 +707,7 @@ class Handler(BaseHTTPRequestHandler):
                 out.append({"file": str(f.relative_to(paths.home())), "error": str(exc)})
                 continue
             st = b.rows("SELECT COUNT(*) n, MAX(started) last FROM runs WHERE program=?", s.program)[0]
+            cost = stats.summary(b, program=s.program)  # T50: cost so far, and the cap when the scope has one
             out.append(
                 {
                     "file": str(f.relative_to(paths.home())),
@@ -692,6 +721,13 @@ class Handler(BaseHTTPRequestHandler):
                     "runs": st["n"],
                     "last_run": st["last"],
                     "identities": paths.identities(s.program),
+                    "cost_usd": cost["cost_usd"]["total"],
+                    "cost_cap_usd": getattr(s, "cost_cap_usd", None),
+                    "cost_per_verified": cost["cost_per_verified"],
+                    "cost_per_paid": cost["cost_per_paid"],
+                    "outcomes": cost["outcomes"],
+                    "bounty_total": cost["bounty_total"],
+                    "alerts": stats.alert_lines(b, s.program),
                 }
             )
         return out

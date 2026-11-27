@@ -147,10 +147,14 @@ function findingTable(f) {
       el("td", {}, `F${x.id}`), el("td", {}, sev(x.severity)), el("td", {}, x.title), el("td", {}, x.vuln_class || "—"),
       el("td", {}, x.program), el("td", { class: `st-${x.status}` }, x.status), el("td", { class: "mono small" }, x.url || ""))));
 }
+const OUTCOME_STATUSES = ["verified", "verified-evidence", "submitted"];
+const OUTCOMES = ["accepted", "paid", "duplicate", "informative", "na"];
+const money = (v) => (typeof v === "number" ? `$${v.toFixed(2)}` : (v ?? "—"));
 async function openFinding(id) {
   const f = await api(`/api/findings/${id}`);
   const body = el("div");
   const tabs = { overview: "Vue d'ensemble", verify: "Vérification", poc: "PoC", proof: "Non prouvé", traffic: `Trafic (${f.flows.length})`, triage: "Triage" };
+  if (OUTCOME_STATUSES.includes(f.status)) tabs.outcome = "Issue plateforme";
   const pane = el("div");
   const sub = el("div", { class: "subtabs" }, ...Object.entries(tabs).map(([k, v]) => el("button", { "data-k": k, onclick: () => sel(k) }, v)));
   function sel(k) {
@@ -197,6 +201,20 @@ async function openFinding(id) {
       el("pre", { style: "max-height:70vh" }, f.poc || "(vide)"));
     if (k === "proof") fill(pane, el("p", { class: "muted small" }, "Ce que l'agent déclare NE PAS avoir prouvé. À lire avant toute soumission."), el("pre", {}, f.not_proven || "(rien déclaré)"));
     if (k === "traffic") fill(pane, f.flows.length ? flowTable(f.flows.slice().reverse()) : el("div", { class: "empty" }, "Aucun flux du gate sur cet hôte."));
+    if (k === "outcome") {
+      // L4: what the platform decided, typed by Mio after the triage (the same function as `bh outcome`)
+      const bounty = el("input", { type: "number", min: 0, step: "any", placeholder: "prime (optionnel)", style: "width:160px", value: f.bounty ?? "" });
+      const note = el("input", { placeholder: "note (optionnel)", style: "flex:1", maxlength: 1000, value: f.outcome_note || "" });
+      const act = (o) => el("button", { class: `btn ${o === f.outcome ? "primary" : ""}`, onclick: async () => {
+        try {
+          await api(`/api/finding/${f.id}/outcome`, { outcome: o, bounty: bounty.value === "" ? null : Number(bounty.value), note: note.value });
+          toast(`F${f.id} : issue ${o}`); openFinding(f.id); refresh();
+        } catch (e) { toast(`erreur: ${e.message}`); } } }, o);
+      fill(pane, el("p", { class: "muted small" }, "L'issue donnée par la plateforme après le triage. Elle recalcule le registre de crédit ; le juge ne la voit jamais."),
+        el("dl", {}, el("dt", {}, "Issue"), el("dd", {}, f.outcome || "—"), el("dt", {}, "Prime"), el("dd", {}, f.bounty ?? "—"),
+          el("dt", {}, "Saisie"), el("dd", {}, time(f.outcome_ts)), el("dt", {}, "Note"), el("dd", {}, f.outcome_note || "—")),
+        el("div", { class: "row" }, bounty, note), el("div", { class: "row" }, ...OUTCOMES.map(act)));
+    }
     if (k === "triage") {
       const v = el("input", { placeholder: "verdict / note", style: "flex:1", value: f.verdict || "" });
       const act = (s) => el("button", { class: `btn ${s === "verified" || s === "submitted" ? "primary" : ""}`, onclick: async () => {
@@ -412,6 +430,13 @@ function programCard(p, busy) {
     el("div", { class: "row" }, el("b", {}, `${p.platform}/${p.program}`), el("span", { class: "muted small mono" }, p.file),
       el("span", { class: "badge" }, `${p.rps ?? "∞"} req/s`), el("span", { class: "badge" }, p.automation === false ? "automation interdite" : p.automation ? "automation OK" : "automation ?"),
       el("span", { class: "muted small" }, `${p.runs} runs · dernier ${ago(p.last_run)}`)),
+    el("div", { class: "small" }, el("span", { class: "muted" }, "coût cumulé "), money(p.cost_usd),
+      el("span", { class: "muted" }, " · plafond "), p.cost_cap_usd == null ? "—" : money(p.cost_cap_usd),
+      el("span", { class: "muted" }, " · par finding vérifié "), money(p.cost_per_verified),
+      el("span", { class: "muted" }, " · par finding payé "), money(p.cost_per_paid),
+      el("span", { class: "muted" }, " · issues "), Object.entries(p.outcomes || {}).map(([k, n]) => `${k} ${n}`).join(", ") || "—",
+      el("span", { class: "muted" }, " · primes "), money(p.bounty_total)),
+    ...(p.alerts || []).map((a) => el("div", { class: "small err" }, a)),
     el("div", { class: "small" }, el("span", { class: "muted" }, "in: "), p.in_scope.join(", ")),
     p.out_of_scope.length ? el("div", { class: "small" }, el("span", { class: "muted" }, "out: "), p.out_of_scope.join(", ")) : null,
     el("div", { class: "small muted" }, `en-têtes: ${Object.entries(p.headers).map(([k, v]) => `${k}: ${v}`).join(" · ") || "—"} · identités: ${p.identities.join(", ") || "—"}`),

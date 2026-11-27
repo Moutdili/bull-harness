@@ -9,7 +9,8 @@ profile, behind the gate) and one Playwright client attached over CDP (loopback)
   received (never one of a sign-in host), `text --clipboard` what the page copied (read by xclip in the container).
 - the host's control socket (RUN_DIR, 0700): reached only by `podman exec -i ... host`, JSON on stdin:
   load_session, status, reset, human_done, human_viewing, fill_budget_reset, fill_budget_set, switch_refused,
-  snapshot.
+  snapshot, shot (one PNG of the page for the PoC: refused during a challenge or while the operator has the screen;
+  the agent's door never has it).
 
 The browser is the distribution's Chromium as it ships: no flag that hides automation, no user agent of ours,
 not headless. While a human challenge is on screen, click/fill/press/upload/goto/tabs --select are refused: the agent
@@ -121,6 +122,7 @@ PUMP_S = 0.02  # while a websocket is routed, how often the idle worker lets Pla
 # blocked at the 46th short prompt of the day, measured 2026-11-26); the service's limit itself is read on the page.
 FILL_SEGMENT = 80
 FILL_DAY = 45
+SHOT_MAX = 12_000_000  # bytes of one PNG screenshot (the host's `shot`)
 UPLOAD_SEGMENT = 6  # files set per segment (the Enter that sends one counts as a prompt)
 SWITCH_SEGMENT = 2  # identity switches the agent may ask per segment (each one costs a human challenge)
 DAY_S = 86_400
@@ -196,6 +198,10 @@ class Forbidden(PermissionError):
 
 class Unavailable(RuntimeError):
     pass
+
+
+class ScreenBusy(RuntimeError):
+    """`shot` refused: a human challenge is pending or the operator has the screen."""
 
 
 # ---------------------------------------------------------------- request validation
@@ -357,6 +363,7 @@ SPEC: dict[str, dict[str, tuple[bool, Any]]] = {
     "fill_budget_reset": {},
     "fill_budget_set": {"segment": (True, lambda v: _int(v, "segment", 0, FILL_SEGMENT))},
     "snapshot": {},
+    "shot": {},
     "switch_refused": {
         "identity": (True, lambda v: _name(v, "identity")),
         "reason": (True, lambda v: _str(v, "reason", 1, 200)),
@@ -420,6 +427,7 @@ class Driver(Protocol):
     def ws_rewrite(self, find: str, replace: str, url_contains: str, ttl: int) -> dict[str, Any]: ...
     def cookie_values(self) -> list[str]: ...
     def snapshot(self) -> dict[str, Any]: ...
+    def screenshot(self) -> bytes: ...
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None: ...
     def wipe(self) -> None: ...
 
@@ -500,6 +508,8 @@ class Controller:
             return 403, scrub_obj({"error": "not a target response", "detail": str(exc)}, secrets)
         except Unavailable as exc:
             return 503, scrub_obj({"error": str(exc)}, secrets)
+        except ScreenBusy as exc:
+            return 409, scrub_obj({"error": "screen-busy", "detail": str(exc)}, secrets)
         except Exception as exc:  # noqa: BLE001 (a page error is the agent's information, never a crash)
             first = (str(exc).strip().splitlines() or [""])[0][:200]
             return 502, scrub_obj({"error": f"{op}: {type(exc).__name__}: {first}"}, secrets)
@@ -1154,6 +1164,27 @@ class Controller:
         }
         return {"snapshot": out, "challenge": self._challenge(out), "taken_at": self.clock()}
 
+    def _op_shot(self) -> dict[str, Any]:
+        """One PNG of the page as the screen shows it, for the PoC (host only: `bh.stats.poc_shot`). Refused while a
+        human challenge is pending or the operator has the screen (spectator included); no gesture, nothing
+        injected in the page: the browser's own compositor capture (CDP Page.captureScreenshot)."""
+        if self._screen_open():
+            raise ScreenBusy("the operator has the screen: no screenshot")
+        if self.pending_since is not None or self._observe(self.driver.snapshot())["pending"]:
+            raise ScreenBusy("a human challenge is pending: no screenshot")
+        data = self.driver.screenshot()
+        if not isinstance(data, (bytes, bytearray)) or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise Unavailable("shot: the browser gave no PNG")
+        if len(data) > SHOT_MAX:
+            raise Unavailable(f"shot: over {SHOT_MAX} bytes")
+        url = scrub_url(str(self.driver.snapshot().get("url") or ""), self._all_secrets())
+        return {
+            "png_b64": base64.b64encode(bytes(data)).decode("ascii"),
+            "bytes": len(data),
+            "url": url,
+            "taken_at": self.clock(),
+        }
+
     def _op_switch_refused(self, identity: str, reason: str) -> dict[str, Any]:
         if self.switch_requested == identity:
             self.switch_requested = None
@@ -1659,6 +1690,18 @@ class PlaywrightDriver:
             "tabs": len(pages),
             "tab": pages.index(page) if page in pages else None,
         }
+
+    def screenshot(self) -> bytes:
+        """The visible page through CDP Page.captureScreenshot: the compositor's frame, no script in the page, no
+        scroll, no style injected (Playwright's page.screenshot may inject a caret-hiding style)."""
+        page = self._page()
+        cdp = self._context().new_cdp_session(page)
+        try:
+            out = cdp.send("Page.captureScreenshot", {"format": "png"})
+        finally:
+            with contextlib.suppress(Exception):
+                cdp.detach()
+        return base64.b64decode(out.get("data") or "")
 
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
         self._context().add_cookies(cookies)
