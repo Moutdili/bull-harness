@@ -18,6 +18,7 @@ REQUIRED_PHASES has run on that origin (see hooks.pre_tool_use).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -133,6 +134,26 @@ def names_in(text: str, hosts=(), words=()) -> str | None:
 _DOCS_URL = re.compile(r"[a-z][a-z0-9+.-]{0,20}:/{1,3}\S|(^|[^a-z0-9])www\.[a-z0-9-]|(^|\s)//[a-z0-9]", re.I)
 _DOCS_PATH = re.compile(r"/[^/\s]+/")  # /a/b, a/b/c, /a/: a path of more than one segment
 _DOCS_MAIL = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+", re.I)
+# An IP literal (v4, or v6 with at least two groups around a ::, or 8 groups): a scope written as a CIDR names no host,
+# so the name check cannot see its target (lab 2026-11-27: "10.231.0.10" reached Context7). No docs question needs one.
+_DOCS_IP_TOKEN = re.compile(r"(?<![\w:.])[0-9a-f:.]*[:.][0-9a-f:.]*(?![\w:.])|(?<![\w:.])[0-9.]+(?=:\d)", re.I)
+
+
+def _has_ip(text: str) -> bool:
+    """An IPv4 or IPv6 literal (std::vector, 12:30:45 and versions like 18.2.0 are not addresses)."""
+    for raw in _DOCS_IP_TOKEN.findall(text):
+        tok = raw.strip(".")
+        for cand in (tok, tok.rsplit(":", 1)[0]):  # 1.2.3.4:8080 is an address and a port
+            if cand.count(".") != 3 and cand.count(":") < 2:
+                continue
+            try:
+                ipaddress.ip_address(cand)
+            except ValueError:
+                continue
+            return True
+    return False
+
+
 _DOCS_CANARY = re.compile(r"bh-?secret", re.I)
 
 
@@ -152,6 +173,8 @@ def docs_text_why(text: str, *, hosts=(), words=(), max_len: int = DOCS_QUESTION
         return "docs query: a path of more than one segment"
     if _DOCS_MAIL.search(text):
         return "docs query: an e-mail address"
+    if _has_ip(text):
+        return "docs query: an IP address"
     if any(ord(ch) < 32 for ch in text):
         return "docs query: a control character"
     return None
