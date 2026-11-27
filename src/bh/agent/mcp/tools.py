@@ -476,28 +476,33 @@ def recall_tool(args: dict) -> dict:
 
 
 # ------------------------------------------------------------------ other lots' builtins, loaded at call time
+# docs and flows follow their builtin's command line (bh.agent.docs, bh.agent.flows): `bh-docs <library>
+# "<question>"`, `bh-flows [--grep RE] [--status N] [--method M] [--as ID] [-n N]`
 DOCS = _obj(
     {
-        "query": _str("what you need from the documentation", maxLength=500),
         "library": _str("a library name or id (/owner/repo)", maxLength=500),
+        "query": _str("what you need from the documentation (nothing of the target)", maxLength=500),
     },
-    ("query",),
+    ("library", "query"),
 )
 FLOWS = _obj(
     {
-        "id": _str("one flow of the gate's log, by id", maxLength=100),
-        "last": _int("the N most recent flows", 1, 500),
-        "contains": _str("only the flows whose URL contains this", maxLength=500),
+        "grep": _str("regular expression searched in `METHOD URL`", maxLength=500),
+        "status": _int("HTTP status (e.g. 403)", 100, 599),
+        "method": _str("HTTP method (e.g. POST)", maxLength=10),
+        "as": _str("identity the gate attached (`none`: no identity)", maxLength=80),
+        "n": _int("lines (at most 30)", 1, 30),
     },
 )
 
 
 def _docs_argv(args: dict) -> list[str]:
-    return [args["query"], *(["--library", args["library"]] if "library" in args else [])]
+    return [args["library"], args["query"]]
 
 
 def _flows_argv(args: dict) -> list[str]:
-    return [x for k in ("id", "last", "contains") if k in args for x in (f"--{k}", str(args[k]))]
+    flag = {"grep": "--grep", "status": "--status", "method": "--method", "as": "--as", "n": "-n"}
+    return [x for k, f in flag.items() if k in args for x in (f, str(args[k]))]
 
 
 def _later(name: str, default_argv: Callable[[dict], list[str]]) -> Callable[[dict], dict]:

@@ -1,6 +1,6 @@
 ---
 name: csrf
-description: Use when a state-changing request on your own account works with a cookie session (profile, e-mail, password, settings). Decides whether a cross-site page could send it: the browser judges, not curl.
+description: "Use when a state-changing request on your own account works with a cookie session (profile, e-mail, password, settings). Decides whether a cross-site page could send it: the browser judges, not curl."
 ---
 <!--
 Source: hermes/bug-bounty/csrf-cross-site-request-forgery/SKILL.md; merged from hermes/bug-bounty/csrf-modern and hermes/bug-bounty/bug-bounty-proof-package (its CSRF rule and references/csrf-validation.md). No author or licence stated; the sources point to PortSwigger Web Security Academy (CSRF, bypassing SameSite restrictions) and the OWASP CSRF prevention cheat sheet.

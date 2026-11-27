@@ -495,14 +495,20 @@ def test_browse_xss_not_confirmed_says_no_proof():
 def test_archive_uses_the_cache_when_there(bh, tmp_path, monkeypatch):
     d, bindir = bh
     (d / c.SCOPE).write_text("in_scope: [example.com]\n")
-    store = {}
+    store = {}  # lot D's API: get(program, tool, args, scope_hash) -> raw path; put(..., raw_path, ttl_s)
     cache = types.ModuleType("bh.agent.cache")
-    cache.get = store.get
-    cache.put = store.__setitem__
+    cache.scope_hash = lambda: "sh"
+    cache.get = lambda prog, tool, args, sh: store.get((prog, tool, json.dumps(args), sh))
+    cache.put = lambda prog, tool, args, sh, raw, ttl: store.__setitem__((prog, tool, json.dumps(args), sh), str(raw))
     monkeypatch.setitem(sys.modules, "bh.agent.cache", cache)
+    import bh.agent
+
+    monkeypatch.setattr(bh.agent, "cache", cache, raising=False)  # `from bh.agent import cache` reads this first
     _recorder(bindir, "gau", tmp_path / "gau.args", out="https://example.com/a?x=1")
     lines = t.archive(t.Job("recon", "https://example.com", None, 30), "example.com")
-    assert (tmp_path / "gau.args").exists() and list(store.values()) == [["https://example.com/a?x=1"]]
+    assert (tmp_path / "gau.args").exists() and len(store) == 1
+    assert [k[1] for k in store] == ["recon-archive"]
+    assert Path(next(iter(store.values()))).read_text().strip() == "https://example.com/a?x=1"
     (tmp_path / "gau.args").unlink()
     lines = t.archive(t.Job("recon", "https://example.com", None, 30), "example.com")
     assert not (tmp_path / "gau.args").exists() and "(cached)" in lines[0] and "1 in scope" in lines[0]

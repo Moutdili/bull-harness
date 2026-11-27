@@ -77,9 +77,9 @@ flowchart LR
 | `src/bh/runner/` | One segment (`run.py`), board ingestion (`ingest.py`), doctrine (`prompt.py`), supervisor |
 | `src/bh/verify.py` | Two-stage verifier, deduplication, triager PoC |
 | `src/bh/classes.py`, `src/bh/cards/` | Vulnerability classes (aliases, signals, proof standard) and 24 method cards |
-| `src/bh/skills/` | Skills (W3): one method per class or surface, `<name>/SKILL.md`, loaded by the agent on demand in place of pinned cards |
-| `src/bh/agent/mcp/` | Sandbox MCP server `bh` (W3): the builtins as 12 typed tools over stdio, started by `bh-agent mcp bh` |
-| `src/bh/agent/hexstrike/` | Sandbox MCP server `hexstrike` (W3): HexStrike's tool table behind three meta-tools, no shell, started by `bh-agent mcp hexstrike` |
+| `src/bh/skills/` | Skills: one method per class or surface, `<name>/SKILL.md`, loaded by the agent on demand in place of pinned cards |
+| `src/bh/agent/mcp/` | Sandbox MCP server `bh`: the builtins as 12 typed tools over stdio, started by `bh-agent mcp bh` |
+| `src/bh/agent/hexstrike/` | Sandbox MCP server `hexstrike`: HexStrike's tool table behind three meta-tools, no shell, started by `bh-agent mcp hexstrike` |
 | `src/bh/lineage/` | Lineage (host side): numbered agents, the memory they hand on in `board.sqlite`, `bh-recall` search |
 | `src/bh/assets.py` | Asset graph (hosts, origins, endpoints, coverage, tests) built from the sandbox and the gate |
 | `src/bh/redact.py` | The single definition of "sensitive" (credential headers and keys, personal data, JWTs) |

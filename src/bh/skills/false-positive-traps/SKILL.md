@@ -1,6 +1,6 @@
 ---
 name: false-positive-traps
-description: Use when about to record a finding or a CANDIDATE, and when judging one: the traps that make a claim false (parameter not needed, by design, SPA fallback, public keys, seed data, WAF answers).
+description: "Use when about to record a finding or a CANDIDATE, and when judging one: the traps that make a claim false (parameter not needed, by design, SPA fallback, public keys, seed data, WAF answers)."
 ---
 <!--
 Source: hermes/review-cavaliers/SKILL.md; merged from hermes/review-nemesis, review-ombre, review-kairos, review-chaos, hermes/bug-bounty/llm-hallucination-bug-bounty, hermes/arsenal-cavaliers and hermes/bug-bounty/infomaniak-pentest/references/by-design-verification.md (no author or licence stated).

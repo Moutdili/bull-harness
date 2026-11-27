@@ -387,10 +387,18 @@ def test_request_all_is_get_only(monkeypatch, bh_dir):
     assert _call("request_all", {"url": "https://t.test/x", "method": "POST"})["isError"]
 
 
-def test_later_lots_not_available():
-    for name, args in (("docs", {"query": "react hooks"}), ("flows", {"last": 5})):
-        res = _call(name, args)
-        assert res["isError"] and "not available" in _text(res)
+def test_docs_and_flows_follow_their_builtins_command_line(monkeypatch):
+    """W3 merge: the MCP tools named --library/--id/--last/--contains, flags bh-docs and bh-flows do not take."""
+    from bh.agent import docs, flows
+
+    got = {}
+    monkeypatch.setattr(docs, "main", lambda argv: got.setdefault("docs", argv))
+    monkeypatch.setattr(flows, "main", lambda argv: got.setdefault("flows", argv))
+    _call("docs", {"library": "/vercel/next.js", "query": "middleware matcher"})
+    _call("flows", {"status": 403, "method": "POST", "n": 5})
+    assert got["docs"] == ["/vercel/next.js", "middleware matcher"]
+    assert got["flows"] == ["--status", "403", "--method", "POST", "-n", "5"]
+    assert flows.parse(got["flows"]).status == 403
 
 
 def test_recall_maps(monkeypatch, bh_dir):

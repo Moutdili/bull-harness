@@ -697,6 +697,7 @@ SCANNERS = (
     "x8",
     "paramspider",
     "crlfuzz",
+    "bh-fuzz",  # several probes on one parameter (T43): a scanner for the tool lock, the verifier and program rules
 )
 _BUILTIN_SCANS = "|".join(t.removeprefix("bh-") for t in SCANNERS if t.startswith("bh-"))
 

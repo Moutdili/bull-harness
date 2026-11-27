@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bh import classes
 from bh.agent import contract
@@ -91,11 +92,10 @@ def _split(name: str) -> tuple[dict[str, str], list[str]]:
     lines = (SKILLS / name / "SKILL.md").read_text().splitlines()
     assert lines[0] == "---", name
     end = lines.index("---", 1)
-    meta = {}
-    for line in lines[1:end]:
-        key, _, value = line.partition(":")
-        meta[key.strip()] = value.strip()
-    return meta, lines[end + 1 :]
+    # real YAML, as Claude Code reads it: an unquoted ": " in a description is invalid there (W3 merge: csrf, xxe)
+    meta = yaml.safe_load("\n".join(lines[1:end])) or {}
+    assert isinstance(meta, dict), name
+    return {k: str(v) for k, v in meta.items()}, lines[end + 1 :]
 
 
 def _text(name: str) -> str:

@@ -1,6 +1,6 @@
 ---
 name: xxe
-description: Use when the server parses XML you control: XML or SOAP bodies, SVG, DOCX or XLSX uploads, or a JSON endpoint that also accepts `application/xml`. Entity expansion, proved with a marker.
+description: "Use when the server parses XML you control: XML or SOAP bodies, SVG, DOCX or XLSX uploads, or a JSON endpoint that also accepts `application/xml`. Entity expansion, proved with a marker."
 ---
 <!--
 Source: hermes/bug-bounty/xxe-injection/SKILL.md (no author or licence stated).

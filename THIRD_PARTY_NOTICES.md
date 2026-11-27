@@ -4,7 +4,7 @@ bull-harness reuses code, text or ideas from the projects below. Each section na
 URL as the project's own `LICENSE` or README gives it (otherwise « à compléter par l'orchestrateur »), and the table of what
 we took. The code tables are filled by the lot that copies the code (wave W3); a project with an empty table has given us
 nothing yet. Rows marked « W3 » name files that lots A to H of wave W3 add: they were written from those lots' commits
-and file headers, before the merge, and are « à préciser à la fusion » (paths, line ranges, removals).
+and file headers, and were checked at the merge (2026-11-27): every path exists, and each file's header names its origin.
 
 Obligation (Apache-2.0 §4, and good practice for every MIT source): each file we take from another project keeps that
 project's copyright and licence notice, carries a prominent line saying that we modified it and what changed (« Modified
@@ -78,7 +78,7 @@ SOFTWARE.
   notice that we modified it** (for instance a header line « Modified from Strix (Apache-2.0) by bull-harness:
   <what changed> »), and is listed below.
 
-All rows are W3 (lots C and H), « à préciser à la fusion ». Each file names its Strix origin, the copyright line and
+All rows are W3 (lots C and H), checked at the merge. Each file names its Strix origin, the copyright line and
 the licence in its header, and lists what it removed; the summary below is ours.
 
 | fichier chez nous | fichier d'origine | modifications |
@@ -126,16 +126,16 @@ four Strix skills, none copied, so it has no row.
 | `.claude/skills/compose-podman-parity/SKILL.md` | hermes/devops/compose-ci-parity/SKILL.md (author: Hermes Agent, licence: MIT). | translated; examples of another project's toolchain removed; kept as is otherwise. Our stack is rootless Podman with podman-compose, and the compose file must stay compatible with docker compose. |
 | `.claude/skills/podman-disk-reclaim/SKILL.md` | hermes/devops/disk-space-reclamation/SKILL.md (author: Hermes, licence: MIT). | translated; paths of another machine removed; its helper script was not repatriated; the "In this repository" lines are ours. |
 | `.claude/skills/claude-p-headless/SKILL.md` | hermes/.archive/claude-code/SKILL.md (author: Hermes Agent + Teknium, licence: MIT); merged from hermes/devops/claude-code-handoff (Hermes Agent, MIT). | translated in part; interactive tmux driving, dialog handling, permission-bypass recipes, local documentation paths of another project and installation steps removed. |
-| `src/bh/skills/report-writing/SKILL.md` (W3, lot C, à préciser à la fusion) | `../inputs/skills-audit/skills/report-writing/SKILL.md`, itself from hermes/creative/bug-bounty-report-triptyque (author: Hermes Agent, licence: MIT), merged there with Hermes sources with no licence stated; merged here with two Strix files (above). | merged and condensed; Strix's tools mapped to ours; nothing removed beyond the audit skill's own removals (the "anti-AI score" goal, cookie-stealing examples, report templates holding tokens). |
-| `src/bh/skills/wordpress-rest/SKILL.md` (W3, lot H, à préciser à la fusion) | hermes/.archive/wordpress-security-audit/SKILL.md; merged from hermes/security/bug-bounty-workflow-automation/references/wordpress-api-recon.md and section titles of hermes/security/bug-bounty-hacking (Hermes Agent, MIT) (the other two: no author or licence stated). | translated; DNS lookups, GitHub searches, login pages, 100-record reads and real target names removed; minimal-read and stop rules are ours. |
+| `src/bh/skills/report-writing/SKILL.md` (W3, lot C) | `../inputs/skills-audit/skills/report-writing/SKILL.md`, itself from hermes/creative/bug-bounty-report-triptyque (author: Hermes Agent, licence: MIT), merged there with Hermes sources with no licence stated; merged here with two Strix files (above). | merged and condensed; Strix's tools mapped to ours; nothing removed beyond the audit skill's own removals (the "anti-AI score" goal, cookie-stealing examples, report templates holding tokens). |
+| `src/bh/skills/wordpress-rest/SKILL.md` (W3, lot H) | hermes/.archive/wordpress-security-audit/SKILL.md; merged from hermes/security/bug-bounty-workflow-automation/references/wordpress-api-recon.md and section titles of hermes/security/bug-bounty-hacking (Hermes Agent, MIT) (the other two: no author or licence stated). | translated; DNS lookups, GitHub searches, login pages, 100-record reads and real target names removed; minimal-read and stop rules are ours. |
 | `.claude/skills/token-cost-of-commands/SKILL.md` | hermes/token-efficient-agent-commands/SKILL.md (author: Hermes Agent, licence: MIT). | translated; token counts measured on other models' tokenizers removed (they do not transfer); the non-ASCII one-character names and the Hermes plugin steps removed; the audit argument and the "In this repository" section are ours. Its probe script and reference were not repatriated. |
 
 ## obra/superpowers
 
 - Licence: MIT, as the `Source:` lines state (Hermes Agent adapted these sources from obra/superpowers). No
   repository URL is given in these files.
-- Wave W3: no skill of the sandbox (`src/bh/skills/`) comes from it, as far as the headers of lots C and H say
-  (à préciser à la fusion).
+- Wave W3: no skill of the sandbox (`src/bh/skills/`) comes from it, as the headers of lots C and H say
+  (checked at the merge: no skill names it).
 
 | skill chez nous | source | modifications |
 |---|---|---|
@@ -147,8 +147,8 @@ four Strix skills, none copied, so it has no row.
 
 - Licence: MIT, © 2025 Lex Christopherson, as the `Source:` line states (references `context-budget-discipline.md`
   and `gates-taxonomy.md`, adapted by Hermes Agent). No repository URL is given in these files.
-- Wave W3: no skill of the sandbox (`src/bh/skills/`) comes from it, as far as the headers of lots C and H say
-  (à préciser à la fusion).
+- Wave W3: no skill of the sandbox (`src/bh/skills/`) comes from it, as the headers of lots C and H say
+  (checked at the merge: no skill names it).
 
 | skill chez nous | source | modifications |
 |---|---|---|

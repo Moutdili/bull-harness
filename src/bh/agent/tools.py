@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -628,9 +629,18 @@ def archive(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, timeout: in
         *(["--subs"] if subs else []),
         domain,
     ]
-    key = f"gau|{domain}|{'subs' if subs else 'host'}|{','.join(ARCHIVE_PROVIDERS)}|{max_urls}"
-    cached = _cache("get", key)
-    if isinstance(cached, list) and all(isinstance(u, str) for u in cached):
+    # bh.agent.cache (lot D): get(program, tool, args, scope_hash) -> raw path; put(..., raw_path, ttl_s)
+    prog = os.environ.get("BH_PROGRAM") or c.bh_dir().parent.name
+    key = [domain, "subs" if subs else "host", ",".join(ARCHIVE_PROVIDERS), max_urls]
+    shash = _cache("scope_hash") or ""
+    hit = _cache("get", prog, "recon-archive", key, shash)
+    cached = None
+    if isinstance(hit, str):
+        try:
+            cached = [u for u in Path(hit).read_text(errors="replace").splitlines() if u.strip()]
+        except OSError:
+            cached = None
+    if cached is not None:
         urls, rc, timed_out, capped = cached[:max_urls], 0, False, len(cached) >= max_urls
         (job.raw / "gau.txt").write_text("".join(u + "\n" for u in urls))
         (job.raw / "gau.err").write_text("")
@@ -638,7 +648,7 @@ def archive(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, timeout: in
     else:
         urls, rc, timed_out, capped = _stream(job, cmd, "gau.txt", max_urls, min(timeout, job.timeout))
         if rc == 0 and not timed_out:
-            _cache("put", key, urls)
+            _cache("put", prog, "recon-archive", key, shash, job.raw / "gau.txt", 24 * 3600)
         from_cache = ""
     err_text = (job.raw / "gau.err").read_text(errors="replace") if (job.raw / "gau.err").is_file() else ""
     failed = bool(rc) and not timed_out
