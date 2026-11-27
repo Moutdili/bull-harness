@@ -243,7 +243,9 @@ def test_output_stays_within_25_lines(env, monkeypatch, capsys):
     s, out = run(monkeypatch, App(), [*urls, "--max", "40", "--write-own"], capsys)
     assert len([r for r in s["rows"] if r["kind"]]) == 40
     lines = out.strip().splitlines()
-    assert len(lines) <= az.MAX_LINES and "more candidates in summary.json" in out and lines[-1].startswith("raw: ")
+    assert len(lines) <= az.MAX_LINES and "more candidates in summary.json" in out and lines[-3].startswith("raw: ")
+    assert lines[-2] == "1 routes in, 1 tested, missing: none"  # one route, 40 query strings
+    assert lines[-1].startswith("next: read ")
 
 
 def test_401_guard_stops_an_identity_before_the_gate_marks_its_session_dead(env, monkeypatch):

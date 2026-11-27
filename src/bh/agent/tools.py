@@ -14,11 +14,18 @@ output under raw/, prints at most ~30 lines, and records what it covered:
 
 Common options: --as <identity> (authenticated, header injected by the gate),
 --timeout <s>. The tool lock (hooks.py) opens an origin once crawl, content and scan ran.
+
+Every summary ends with `next: <one action>`, written by the harness (T39). A failure prints
+`[bh-fail] <class>: <action>` (bh.agent.fail, T36) and writes no endpoint, no lead and no tested route; a tool killed
+at its time budget keeps what it found (`partial: true`), its routes are not marked tested and its phase is not done
+(T37). bh-content and bh-sqli read the technology bh-recon (httpx) and bh-crawl (katana) recorded for the origin: the
+extensions to try, the DBMS to test (T44); none known, the defaults.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import shlex
@@ -33,6 +40,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from bh.agent import contract as c
+from bh.agent import fail
 
 NUCLEI_TEMPLATES = Path("/opt/bh/nuclei-templates")
 WORDLISTS = Path("/usr/share/seclists/Discovery/Web-Content")
@@ -59,6 +67,32 @@ _JS_PATH = re.compile(
     re.I,
 )
 _NOT_ENDPOINT = re.compile(r"^//|^/[^/]{0,1}$|\s|\.\.|^/(assets|static|fonts|images?|img|media|node_modules)/", re.I)
+# contract.phase_done counts every status but those that start with "error": a partial run is not a done phase
+PARTIAL_STATUS = "error: partial (timeout)"
+# T44: technology (as httpx / katana name it, matched as a word) -> what to try. Observed values only: an extension
+# for the framework the origin runs, a DBMS only when a database itself was named.
+TECH_EXT = (
+    ("php", ".php"),
+    ("asp.net", ".aspx"),
+    ("iis", ".aspx"),
+    ("coldfusion", ".cfm"),
+    ("tomcat", ".jsp"),
+    ("jsp", ".jsp"),
+    ("java", ".jsp"),
+    ("jboss", ".jsp"),
+    ("perl", ".pl"),
+)
+TECH_EXT_MAX = 2  # each extension multiplies the wordlist's requests
+TECH_DBMS = (
+    ("mysql", "MySQL"),
+    ("mariadb", "MySQL"),
+    ("postgresql", "PostgreSQL"),
+    ("microsoft sql server", "Microsoft SQL Server"),
+    ("mssql", "Microsoft SQL Server"),
+    ("oracle database", "Oracle"),
+    ("sqlite", "SQLite"),
+)
+TECH_READ_LINES = 300  # katana.jsonl lines read per file for its response headers
 
 
 @dataclass
@@ -70,11 +104,14 @@ class Job:
     origin: str = ""
     raw: Path = field(default_factory=Path)
     lines: list[str] = field(default_factory=list)
+    rc: int = 0  # the first non-zero exit of its tools
+    timed_out: bool = False
+    fail: str | None = None  # the class of the first failure (bh.agent.fail)
 
     def __post_init__(self) -> None:
         o = c.origin(self.url)
         if o is None:
-            sys.exit(f"bh-{self.phase}: need an http(s) URL, got {self.url!r}")
+            sys.exit(fail.line("bad-argument", f"bh-{self.phase} needs an http(s) URL, got {self.url[:200]!r}"))
         self.origin = o
         slug = re.sub(r"[^A-Za-z0-9.-]+", "_", urlsplit(self.url).netloc + urlsplit(self.url).path)[:60]
         self.raw = c.bh_dir() / c.RAW / f"{self.phase}-{slug}-{int(time.time())}"
@@ -97,9 +134,26 @@ class Job:
                 ).returncode
                 return rc, False
             except subprocess.TimeoutExpired:
-                return 124, True
+                rc, to = 124, True
             except FileNotFoundError:
-                return 127, False
+                rc, to = 127, False
+        self.note(rc, to, name)
+        return rc, to
+
+    def note(self, rc: int, timed_out: bool, tool: str | None = None) -> None:
+        """Keep the first failure of the job's tools: its exit, its class (from that tool's stderr)."""
+        self.timed_out = self.timed_out or timed_out
+        if rc and not self.rc:
+            self.rc = rc
+        if (rc or timed_out) and self.fail is None:
+            err = self.raw / f"{tool}.err" if tool else None
+            text = err.read_text(errors="replace")[-4000:] if err is not None and err.is_file() else self.last_error()
+            self.fail = fail.classify(rc, text, timed_out)
+
+    @property
+    def state(self) -> str:
+        """ok, partial (killed at its time budget: what it found is kept, not counted) or error."""
+        return "partial" if self.timed_out else "error" if self.rc else "ok"
 
     def last_error(self) -> str:
         for err in sorted(self.raw.glob("*.err")):
@@ -108,17 +162,53 @@ class Job:
                 return lines[-1][:300]
         return ""
 
-    def finish(self, count: int, rc: int, timed_out: bool, headline: str) -> None:
-        status = "partial (timeout)" if timed_out else ("ok" if rc == 0 else f"error rc={rc}")
-        c.record_phase(c.bh_dir(), self.origin, self.phase, status=status, count=count, raw=str(self.raw))
+    def finish(
+        self,
+        count: int,
+        rc: int,
+        timed_out: bool,
+        headline: str,
+        next_step: str = "",
+        coverage: str = "",
+        tail: str = "",
+    ) -> None:
+        """The summary: headline, at most SUMMARY_LINES lines, raw, the failure line, `coverage` (a builtin's
+        `N routes in, N tested, missing: ...`) and last `next: <one action>` (then `; <tail>` when given)."""
+        self.note(rc, timed_out)
+        state = self.state
+        status = {"ok": "ok", "partial": "partial (timeout)", "error": f"error rc={self.rc}"}[state]
+        recorded = PARTIAL_STATUS if state == "partial" else status
+        c.record_phase(c.bh_dir(), self.origin, self.phase, status=recorded, count=count, raw=str(self.raw))
         print(f"bh-{self.phase} {self.url}: {headline} [{status}]")
-        if status.startswith("error") and (why := self.last_error()):
+        if state == "partial":
+            print("partial: true (killed at its time budget: what it found so far is below; not counted as done)")
+        if state == "error" and (why := self.last_error()):
             print(f"  stderr: {why}")
         for line in self.lines[:SUMMARY_LINES]:
             print("  " + line)
         if len(self.lines) > SUMMARY_LINES:
             print(f"  ... {len(self.lines) - SUMMARY_LINES} more")
         print(f"raw: {self.raw}/")
+        if state != "ok":
+            print(fail.line(self.fail or "parse"))
+        if coverage:
+            print(coverage)
+        step = self.fail_next() if state != "ok" else (next_step or "bh-note frontier")
+        print(f"next: {step}" + (f"; {tail}" if tail else ""))
+
+    def fail_next(self) -> str:
+        """The one action after a failure, by class: never a retry of a rate limit."""
+        k = self.fail or "parse"
+        return {
+            "timeout": f"bh-{self.phase} on a narrower target (one path), or with --timeout {self.timeout * 2}",
+            "rate": "bh-note frontier: another lead; this one later",
+            "missing-tool": "this step by hand with single requests (curl --max-time 30, q)",
+            "bad-argument": f"bh-{self.phase} --help",
+            "unreachable": f"curl -sS --max-time 10 -o /dev/null -w '%{{http_code}}' {self.origin}/",
+            "auth": f"bh-{self.phase} {self.url} as another identity (--as) or none",
+            "parse": f"ls -la {self.raw}/ and grep the tool's files there",
+            "gate-denied": "bh-note frontier: another route in scope",
+        }[k]
 
 
 def _safe_technique(value: str) -> str:
@@ -139,7 +229,10 @@ def _flag_pairs(flag: str, values: list[str]) -> list[str]:
 
 
 def _add_endpoints(job: Job, items: list[tuple[str, str, list[str], int | None]], source: str) -> int:
-    """items: (method, url, params, status). Dedup on (origin, key); returns the number of new endpoints."""
+    """items: (method, url, params, status). Dedup on (origin, key); returns the number of new endpoints. A failed
+    tool writes none (a partial one keeps what it observed)."""
+    if job.state == "error":
+        return 0
     d = c.bh_dir()
     known = {(e.get("origin"), e.get("key")) for e in c.read_jsonl(d / c.ENDPOINTS)}
     recs = []
@@ -160,6 +253,125 @@ def _add_endpoints(job: Job, items: list[tuple[str, str, list[str], int | None]]
     if recs:
         c.append_jsonl(d / c.ENDPOINTS, *recs)
     return len(recs)
+
+
+def _touched(job: Job, urls: list[str], via: str, method: str = "GET") -> None:
+    """A route counts as tested only when the tool ran to the end."""
+    if job.state == "ok":
+        c.record_touched(c.bh_dir(), urls, via=via, method=method)
+
+
+def next_phase(origin: str, running: str = "") -> str | None:
+    """`bh-<phase> <origin>` for the first required phase not done on the origin (the `running` one aside: it is
+    recorded once its summary is printed), None when all are."""
+    missing = [p for p in c.missing_phases(c.bh_dir(), origin) if p != running]
+    return f"bh-{missing[0]} {origin}" if missing else None
+
+
+def route_coverage(origin: str, limit: int = 3) -> tuple[int, int, list[str]]:
+    """(routes known on the origin, routes tested, the first untested ones): endpoints.jsonl against touched.jsonl,
+    by route family, as the frontier counts them."""
+    d = c.bh_dir()
+    keys = list(
+        dict.fromkeys(
+            e.get("key", "")
+            for e in c.read_jsonl(d / c.ENDPOINTS)
+            if e.get("origin") == origin and e.get("key") and not c.STATIC_EXT.search(e.get("key", ""))
+        )
+    )
+    tested = {c.family(t.get("key", "")) for t in c.read_jsonl(d / c.TOUCHED) if t.get("origin") == origin}
+    missing = [k for k in keys if c.family(k) not in tested]
+    return len(keys), len(keys) - len(missing), missing
+
+
+def coverage_line(n_in: int, n_tested: int, missing: list[str], limit: int = 3) -> str:
+    shown = ", ".join(missing[:limit]) + (f" (+{len(missing) - limit})" if len(missing) > limit else "")
+    return f"{n_in} routes in, {n_tested} tested, missing: {shown or 'none'}"
+
+
+# ------------------------------------------------------------------ technology (T44)
+def _word_in(name: str, text: str) -> bool:
+    return re.search(rf"(?<![\w.]){re.escape(name)}(?!\w)", text, re.I) is not None
+
+
+def _head_jsonl(path: Path, n: int) -> list[dict]:
+    out = []
+    try:
+        with open(path, errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= n:
+                    break
+                try:
+                    doc = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(doc, dict):
+                    out.append(doc)
+    except OSError:
+        pass
+    return out
+
+
+def known_tech(origin: str) -> list[str]:
+    """The technology names already recorded for `origin`: httpx's `tech` and `webserver` (bh-recon), katana's
+    `technologies` and its Server / X-Powered-By headers (bh-crawl). Newest runs first, at most 5 of each."""
+    raw = c.bh_dir() / c.RAW
+
+    def newest(pattern: str) -> list[Path]:
+        try:
+            return sorted(raw.glob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)[:5]
+        except OSError:
+            return []
+
+    names: list[str] = []
+    for f in newest("recon-*/httpx.jsonl"):
+        for h in _head_jsonl(f, TECH_READ_LINES):
+            if origin in (c.origin(str(h.get("url", ""))), c.origin(str(h.get("final_url", "")))):
+                names += [str(x) for x in h.get("tech") or [] if isinstance(x, str)]
+                names += [str(h["webserver"])] if isinstance(h.get("webserver"), str) else []
+    for f in newest("crawl-*/katana.jsonl"):
+        for r in _head_jsonl(f, TECH_READ_LINES):
+            req, resp = r.get("request") or {}, r.get("response") or {}
+            if not isinstance(req, dict) or not isinstance(resp, dict):
+                continue
+            if c.origin(str(req.get("endpoint", ""))) != origin:
+                continue
+            names += [str(x) for x in resp.get("technologies") or [] if isinstance(x, str)]
+            headers = resp.get("headers") if isinstance(resp.get("headers"), dict) else {}
+            for k, v in headers.items():
+                if str(k).lower().replace("-", "_") in ("server", "x_powered_by") and isinstance(v, str):
+                    names.append(v)
+    return list(dict.fromkeys(n[:80] for n in names if n))
+
+
+def tech_extensions(tech: list[str]) -> list[tuple[str, str]]:
+    """(our name, extension) for the technology seen, at most TECH_EXT_MAX extensions."""
+    out: dict[str, str] = {}
+    for name, ext in TECH_EXT:
+        if ext not in out and any(_word_in(name, t) for t in tech):
+            out[ext] = name
+    return [(name, ext) for ext, name in list(out.items())[:TECH_EXT_MAX]]
+
+
+def tech_dbms(tech: list[str]) -> tuple[str, str] | None:
+    """(our name, sqlmap --dbms value) when a database was named, else None."""
+    for name, dbms in TECH_DBMS:
+        if any(_word_in(name, t) for t in tech):
+            return name, dbms
+    return None
+
+
+# ------------------------------------------------------------------ passive cache (lot D, optional)
+def _cache(op: str, *args):
+    """bh.agent.cache.get / put when the module is there; absent or failing: no cache."""
+    try:
+        from bh.agent import cache  # optional (lot D)
+    except ImportError:
+        return None
+    try:
+        return getattr(cache, op)(*args)
+    except Exception:  # noqa: BLE001 - a cache is a help, never a reason to fail the step
+        return None
 
 
 # ------------------------------------------------------------------ archive (bh-recon)
@@ -416,20 +628,38 @@ def archive(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, timeout: in
         *(["--subs"] if subs else []),
         domain,
     ]
-    urls, rc, timed_out, capped = _stream(job, cmd, "gau.txt", max_urls, min(timeout, job.timeout))
+    key = f"gau|{domain}|{'subs' if subs else 'host'}|{','.join(ARCHIVE_PROVIDERS)}|{max_urls}"
+    cached = _cache("get", key)
+    if isinstance(cached, list) and all(isinstance(u, str) for u in cached):
+        urls, rc, timed_out, capped = cached[:max_urls], 0, False, len(cached) >= max_urls
+        (job.raw / "gau.txt").write_text("".join(u + "\n" for u in urls))
+        (job.raw / "gau.err").write_text("")
+        from_cache = " (cached)"
+    else:
+        urls, rc, timed_out, capped = _stream(job, cmd, "gau.txt", max_urls, min(timeout, job.timeout))
+        if rc == 0 and not timed_out:
+            _cache("put", key, urls)
+        from_cache = ""
+    err_text = (job.raw / "gau.err").read_text(errors="replace") if (job.raw / "gau.err").is_file() else ""
+    failed = bool(rc) and not timed_out
     kept = sorted({u for u in urls if in_scope(u, rules, domain)})
     (job.raw / "archive-inscope.txt").write_text("".join(u + "\n" for u in kept))
-    fams, new, per_origin = _add_archive_endpoints(kept)
+    fams, new, per_origin = (0, 0, {}) if failed else _add_archive_endpoints(kept)
     for o, n in per_origin.items():
-        c.record_phase(c.bh_dir(), o, "archive", status="ok", count=n, raw=str(job.raw))
+        status = PARTIAL_STATUS if timed_out else "ok"
+        c.record_phase(c.bh_dir(), o, "archive", status=status, count=n, raw=str(job.raw))
     state = " (cut at --max-urls)" if capped else " (timeout, partial)" if timed_out else f" (rc={rc})" if rc else ""
     lines = [
-        f"archive: {len(urls)} URLs from {'+'.join(ARCHIVE_PROVIDERS)} for {'*.' if subs else ''}{domain}{state}, "
-        f"{len(kept)} in scope, {fams} route families, {new} new endpoints (source archive)"
+        f"archive: {len(urls)} URLs from {'+'.join(ARCHIVE_PROVIDERS)} for {'*.' if subs else ''}{domain}"
+        f"{state}{from_cache}, {len(kept)} in scope, {fams} route families, {new} new endpoints (source archive)"
     ]
-    err = [x for x in (job.raw / "gau.err").read_text(errors="replace").splitlines() if x.strip()]
+    err = [x for x in err_text.splitlines() if x.strip()]
     if not urls and err:
         lines.append(f"archive: gau stderr: {err[-1][:200]}")
+    if failed or timed_out:
+        lines.append("archive " + fail.line(fail.classify(rc, err_text[-4000:], timed_out)))
+    if failed:
+        return lines
     patterns = gf_patterns()
     if not patterns:
         lines.append(f"archive: gf patterns missing at {GF_DIR}, no classification")
@@ -483,13 +713,24 @@ def recon(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, use_archive: 
     live = c.read_jsonl(job.raw / "httpx.jsonl")
     if use_archive:
         job.lines += archive(job, target, max_urls)
+    origins = []
     for h in sorted(live, key=lambda x: (x.get("status_code", 0), x.get("url", ""))):
         tech = ",".join(h.get("tech") or [])[:60]
         job.lines.append(f"{h.get('status_code')} {h.get('url')}  {(h.get('title') or '')[:50]}  {tech}")
         if o := c.origin(h.get("url", "")):
-            c.record_phase(c.bh_dir(), o, "recon", status="ok", count=1, raw=str(job.raw))
+            origins.append(o)
+            if job.state == "ok":
+                c.record_phase(c.bh_dir(), o, "recon", status="ok", count=1, raw=str(job.raw))
     n_names = len(hosts.read_text().split())
-    job.finish(len(live), rc or rc_s, to, f"{n_names} names, {len(live)} live HTTP services")
+    todo = [o for o in dict.fromkeys(origins) if next_phase(o, "recon")]
+    job.finish(
+        len(live),
+        rc or rc_s,
+        to,
+        f"{n_names} names, {len(live)} live HTTP services",
+        (next_phase(todo[0], "recon") if todo else None)
+        or ("bh-note frontier" if origins else "bh-recon another name of the scope"),
+    )
 
 
 def js_paths(text: str) -> list[tuple[str, str]]:
@@ -554,23 +795,33 @@ def crawl(job: Job) -> None:
     for f in resp_dir.rglob("*.txt") if resp_dir.is_dir() else []:
         if f.name != "index.txt":
             js += [(m, job.origin + p, c.query_params(p), None) for m, p in js_paths(f.read_text(errors="replace"))]
+    job.note(rc, to)
     new = _add_endpoints(job, items, "crawl") + _add_endpoints(job, js, "js")
     eps = [e for e in c.read_jsonl(c.bh_dir() / c.ENDPOINTS) if e.get("origin") == job.origin]
     for e in sorted(eps, key=lambda e: (not e.get("params"), e["key"]))[:SUMMARY_LINES]:
         params = f" ?{','.join(e['params'])}" if e.get("params") else ""
         job.lines.append(f"{e['key']}{params}")
+    n_in, n_tested, missing = route_coverage(job.origin)
+    after = next_phase(job.origin, "crawl")
     job.finish(
         new,
         rc,
         to,
         f"{len(items)} URLs crawled, {len(js)} paths quoted in JS/HTML, {new} new endpoints "
         f"({len(eps)} known on this origin)",
+        after or (f"one hand-made request on {missing[0]}, then bh-note cover" if missing else "bh-note frontier"),
+        coverage_line(n_in, n_tested, missing),
     )
 
 
 def content(job: Job, wordlist: str | None) -> None:
     wl = Path(wordlist) if wordlist else WORDLISTS / ("common.txt" if c.rps() >= 10 else "quickhits.txt")
     base = job.url.rstrip("/")
+    exts = tech_extensions(known_tech(job.origin))
+    if exts:
+        job.lines.append(
+            "profile: " + ", ".join(f"{n} -> {e}" for n, e in exts) + " (technology bh-recon / bh-crawl recorded)"
+        )
     rc, to = job.exec(
         [
             "ffuf",
@@ -595,22 +846,33 @@ def content(job: Job, wordlist: str | None) -> None:
             str(job.raw / "ffuf.json"),
             "-s",
             "-noninteractive",
+            *(["-e", ",".join(e for _, e in exts)] if exts else []),
             *_flag_pairs("-H", job.headers()),
         ]
     )
     results = (c.read_json(job.raw / "ffuf.json", {}) or {}).get("results") or []
     items = [("GET", r.get("url", ""), [], r.get("status")) for r in results]
+    job.note(rc, to)
     new = _add_endpoints(job, items, "content")
     for r in sorted(results, key=lambda r: (r.get("status", 0), r.get("url", "")))[:SUMMARY_LINES]:
         job.lines.append(f"{r.get('status')} {r.get('length', '?'):>7}B  {urlsplit(r.get('url', '')).path}")
-    job.finish(len(results), rc, to, f"{len(results)} paths found with {wl.name}, {new} new endpoints")
+    job.finish(
+        len(results),
+        rc,
+        to,
+        f"{len(results)} paths found with {wl.name}, {new} new endpoints",
+        next_phase(job.origin, "content") or "bh-note frontier",
+    )
 
 
 def scan(job: Job, deep: bool) -> None:
     """Pass 1: templates matching the detected tech (-as). Pass 2: generic misconfigurations
     (high+), or with --deep exposures + misconfigurations (medium+, ~4.7k requests)."""
     if not NUCLEI_TEMPLATES.is_dir():
-        sys.exit(f"bh-scan: nuclei templates missing at {NUCLEI_TEMPLATES} (mount var/tools/nuclei-templates)")
+        sys.exit(
+            fail.line("missing-tool", f"nuclei templates missing at {NUCLEI_TEMPLATES}: test by hand (curl, q)")
+            + "\nnext: bh-content or a hand-made request on the origin"
+        )
     common = [
         "-u",
         job.url,
@@ -660,6 +922,9 @@ def scan(job: Job, deep: bool) -> None:
         rc1 or rc2,
         to1 or to2,
         f"{len(hits)} template matches{' (deep)' if deep else ''}; triage them, info hits are rarely findings",
+        "reproduce the most severe match above by hand, one request (curl --max-time 30)"
+        if hits
+        else next_phase(job.origin, "scan") or "bh-note frontier",
     )
 
 
@@ -686,9 +951,15 @@ def params(job: Job) -> None:
     for u, ps in found.items():
         job.lines.append(f"{u}  params: {', '.join(ps)}")
     _add_endpoints(job, [("GET", u, ps, None) for u, ps in found.items()], "params")
-    c.record_touched(c.bh_dir(), [job.url], via="params")
+    _touched(job, [job.url], via="params")
     n = sum(len(p) for p in found.values())
-    job.finish(n, rc, to, f"{n} hidden parameters")
+    job.finish(
+        n,
+        rc,
+        to,
+        f"{n} hidden parameters",
+        f"bh-fuzz {shlex.quote(job.url)} -p <one parameter above>" if n else "bh-note frontier",
+    )
 
 
 def sqli(job: Job, data: str | None, param: str | None, level: int, technique: str) -> None:
@@ -728,6 +999,9 @@ def sqli(job: Job, data: str | None, param: str | None, level: int, technique: s
     ]
     cmd += (["--data", data] if data else []) + (["-p", param] if param else [])
     cmd += ["--headers", "\n".join(job.headers())] if job.identity else []
+    if profile := tech_dbms(known_tech(job.origin)):
+        cmd += ["--dbms", profile[1]]
+        job.lines.append(f"profile: {profile[0]} -> --dbms {profile[1]} (technology bh-recon / bh-crawl recorded)")
     rc, to = job.exec(cmd, stdout="sqlmap.log")
     log = (job.raw / "sqlmap.log").read_text(errors="replace") if (job.raw / "sqlmap.log").exists() else ""
     points = re.findall(r"Parameter: (.+?) \((\w+)\)\s*\n((?:\s+(?:Type|Title|Payload): .*\n)+)", log)
@@ -742,8 +1016,18 @@ def sqli(job: Job, data: str | None, param: str | None, level: int, technique: s
             for x in log.splitlines()
             if re.search(r"(not injectable|does not seem|WAF|CRITICAL|might be injectable)", x)
         ][-6:]
-    c.record_touched(c.bh_dir(), [job.url], via="sqli", method="POST" if data else "GET")
-    job.finish(len(points), rc, to, f"{len(points)} injection point(s)")
+    method = "POST" if data else "GET"
+    _touched(job, [job.url], via="sqli", method=method)
+    route = f"{method} {c.path_key(urlsplit(job.url).path)}"
+    job.finish(
+        len(points),
+        rc,
+        to,
+        f"{len(points)} injection point(s)",
+        "write proof.json (attack + control), then bh-note finding --class sqli --proof proof.json"
+        if points
+        else f'bh-note cover "{route}" sqli clean -e {job.raw}/sqlmap.log',
+    )
 
 
 def xss(job: Job) -> None:
@@ -787,8 +1071,16 @@ def xss(job: Job) -> None:
             f"[{p.get('type', '?')}] param={p.get('param')} "
             f"{(p.get('data') or p.get('poc') or p.get('payload') or '')[:150]}"
         )
-    c.record_touched(c.bh_dir(), [job.url], via="xss")
-    job.finish(len(pocs), rc, to, f"{len(pocs)} XSS PoC(s) (V = verified in DOM, R = reflected)")
+    _touched(job, [job.url], via="xss")
+    job.finish(
+        len(pocs),
+        rc,
+        to,
+        f"{len(pocs)} XSS PoC(s) (V = verified in DOM, R = reflected)",
+        "confirm one PoC in a page: bh-browse '<PoC URL>' --xss <MARKER> (a dialog or window.__bhxss)"
+        if pocs
+        else f'bh-note cover "GET {c.path_key(urlsplit(job.url).path)}" xss clean -e {job.raw}/dalfox.json',
+    )
 
 
 # ------------------------------------------------------------------ CLI

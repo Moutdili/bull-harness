@@ -276,7 +276,7 @@ def test_summary_is_bounded_and_says_what_matters():
     assert len(lines) <= b.SUMMARY_LINES and all(len(x) <= b.LINE_CHARS for x in lines)
     assert lines[0].startswith('bh-browse http://h:3000/ as=alice: 200, title "OWASP Juice Shop"')
     assert "xss CONFIRMED (marker bhX1) origin=http://h:3000" in text and "cdnjs.cloudflare.com ×6" in text
-    assert lines[-1] == "raw: /work/.bh/raw/browse-x/"
+    assert lines[-2] == "raw: /work/.bh/raw/browse-x/" and lines[-1].startswith("next: write proof.json")
     small = "\n".join(b.render(_fake(dialogs=[], steps=[], forms=[], xhr=[])))
     assert "not confirmed" in small and "CONFIRMED" not in small.replace("not confirmed", "")
     assert 'heading "Welcome"' in small and 'textbox "Email" = alice@x' in small and "1049 tokens" in small

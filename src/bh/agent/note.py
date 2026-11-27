@@ -69,8 +69,49 @@ def _one_line(v: str) -> str:
     return " ".join(v.split())
 
 
+def _action_of(parser: argparse.ArgumentParser, name: str) -> argparse.Action | None:
+    """The action argparse names `name` in its errors: `--a/-b`, an option string, a dest or a metavar."""
+    parts = set(name.split("/"))
+    for act in parser._actions:  # argparse keeps them there
+        if parts & set(act.option_strings) or name in (act.dest, act.metavar):
+            return act
+    return None
+
+
+def _valid(act: argparse.Action | None) -> str:
+    if act is None:
+        return ""
+    if act.choices:
+        return "valid: " + "|".join(str(x) for x in act.choices)
+    return act.help.removeprefix("required: ") if act.help else ""
+
+
+def field_errors(parser: argparse.ArgumentParser, message: str) -> list[str]:
+    """argparse's one error, as one line per faulty field with the values that are valid."""
+    if m := re.match(r"argument (\S+): invalid choice: (.+?) \(choose from .*\)$", message, re.S):
+        act = _action_of(parser, m.group(1))
+        return [f"{m.group(1)}: {m.group(2)[:60]} is not valid; {_valid(act)}"]
+    if m := re.match(r"the following arguments are required: (.+)$", message, re.S):
+        out = []
+        for name in m.group(1).split(", "):
+            why = _valid(_action_of(parser, name))
+            out.append(f"{name} is required" + (f" ({why})" if why else ""))
+        return out
+    if m := re.match(r"argument (\S+): (.+)$", message, re.S):
+        why = _valid(_action_of(parser, m.group(1)))
+        return [f"{m.group(1)}: {m.group(2)}" + (f" ({why})" if why else "")]
+    return [message]
+
+
+class _Parser(argparse.ArgumentParser):
+    """A refusal is one line per faulty field, with the valid values, never argparse's usage block."""
+
+    def error(self, message: str):  # type: ignore[override]
+        self.exit(2, f"{self.prog} refused:\n  - " + "\n  - ".join(field_errors(self, message)) + "\n")
+
+
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="bh-note")
+    p = _Parser(prog="bh-note")
     sub = p.add_subparsers(dest="op", required=True)
     f = sub.add_parser("fact")
     f.add_argument("title")
