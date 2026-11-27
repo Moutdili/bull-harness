@@ -46,6 +46,9 @@ from bh.agent import fail
 NUCLEI_TEMPLATES = Path("/opt/bh/nuclei-templates")
 WORDLISTS = Path("/usr/share/seclists/Discovery/Web-Content")
 # Never run: noisy, destructive or brute-force templates, and OOB templates (no interactsh through the gate).
+# T42: a login form on an origin's home page (after redirects): a password input. httpx -er puts the matches in
+# `extracts`; bh-recon writes `login_form` in endpoints.jsonl, the host believes it where the gate saw the origin.
+LOGIN_FORM_RE = r"""<input[^>]{0,200}type=["']?password"""
 NUCLEI_EXCLUDE_TAGS = "dos,fuzz,intrusive,bruteforce,brute-force,default-login,osint,oast,headless"
 SUMMARY_LINES = 25
 # Archive step of bh-recon (gau 2.2.4). Only the providers the gate lets through as passive sources (contract
@@ -311,6 +314,13 @@ def _head_jsonl(path: Path, n: int) -> list[dict]:
     except OSError:
         pass
     return out
+
+
+def login_form_seen(h: dict) -> bool:
+    """httpx said the page (after redirects) holds a password field: its `extracts` for LOGIN_FORM_RE are not empty."""
+    ex = h.get("extracts") if isinstance(h, dict) else None
+    values = ex.values() if isinstance(ex, dict) else ex if isinstance(ex, list) else ()
+    return any(bool(v) for v in values if isinstance(v, (str, list)))
 
 
 def known_tech(origin: str) -> list[str]:
@@ -716,6 +726,8 @@ def recon(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, use_archive: 
             "-web-server",
             "-follow-redirects",
             "-no-color",
+            "-er",
+            LOGIN_FORM_RE,
             *_flag_pairs("-H", job.headers()),
         ],
         stdout="httpx.jsonl",
@@ -723,14 +735,25 @@ def recon(job: Job, target: str, max_urls: int = ARCHIVE_MAX_URLS, use_archive: 
     live = c.read_jsonl(job.raw / "httpx.jsonl")
     if use_archive:
         job.lines += archive(job, target, max_urls)
-    origins = []
+    origins, homes = [], []
     for h in sorted(live, key=lambda x: (x.get("status_code", 0), x.get("url", ""))):
         tech = ",".join(h.get("tech") or [])[:60]
-        job.lines.append(f"{h.get('status_code')} {h.get('url')}  {(h.get('title') or '')[:50]}  {tech}")
+        login = login_form_seen(h)
+        job.lines.append(
+            f"{h.get('status_code')} {h.get('url')}  {(h.get('title') or '')[:50]}  {tech}"
+            + ("  [login]" if login else "")
+        )
         if o := c.origin(h.get("url", "")):
             origins.append(o)
             if job.state == "ok":
                 c.record_phase(c.bh_dir(), o, "recon", status="ok", count=1, raw=str(job.raw))
+                status = h.get("status_code") if isinstance(h.get("status_code"), int) else None
+                homes.append(
+                    {"origin": o, "key": "GET /", "url": o, "params": [], "status": status, "source": "recon",
+                     "login_form": login}
+                )  # fmt: skip
+    if homes:  # T42: the host scores an origin with a login form only if the gate saw traffic to it
+        c.append_jsonl(c.bh_dir() / c.ENDPOINTS, *homes)
     n_names = len(hosts.read_text().split())
     todo = [o for o in dict.fromkeys(origins) if next_phase(o, "recon")]
     job.finish(

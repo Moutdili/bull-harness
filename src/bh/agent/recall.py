@@ -7,6 +7,7 @@
   bh-recall --chain [n]                              the last n blocks of the lineage
   bh-recall --full <id>                              one item in full
   bh-recall --history <key>                          the items a cell replaced
+  bh-recall --techniques "<idea>"                    technique cards the host drew from verified findings elsewhere
 
 The sandbox has no database: this writes a request file in BH_DIR/recall/req/, the host answers in
 BH_DIR/recall/res/ (bh.lineage.serve), and the answer is printed. No answer within WAIT_S seconds: it says so and
@@ -29,6 +30,7 @@ from bh.agent import contract as c
 WAIT_S = 8.0
 POLL_S = 0.1
 UNAVAILABLE = "recall UNAVAILABLE (test anyway; pass --recall none)"
+MODES = ("map", "cell", "run", "chain", "full", "history", "techniques")
 LIMITS = {"query": 500, "url": 2000, "class": 100, "arg": 500}  # the host checks them again
 
 
@@ -89,10 +91,13 @@ def parse(args: list[str]) -> dict:
     g.add_argument("--chain", nargs="?", const="", metavar="N", help="last N blocks of the lineage")
     g.add_argument("--full", metavar="ID", help="one item in full")
     g.add_argument("--history", metavar="KEY", help="replaced items of a cell")
+    g.add_argument("--techniques", metavar="IDEA", help="technique cards (methods, no program names) for an idea")
     a = p.parse_args(args)
-    mode = next((m for m in ("map", "cell", "run", "chain", "full", "history") if getattr(a, m) is not None), "search")
+    mode = next((m for m in MODES if getattr(a, m) is not None), "search")
     if mode == "search" and not (a.idea or "").strip():
-        p.error("give the idea to search, or one of --map --cell --run --chain --full --history")
+        p.error("give the idea to search, or one of --map --cell --run --chain --full --history --techniques")
+    if mode == "techniques" and not a.techniques.strip():
+        p.error("--techniques needs the idea, in a few words")
     if mode != "search" and (a.idea or a.url or a.vuln_class or a.k is not None):
         p.error(f"--{mode} takes no idea, --url, --class or --k")
     if a.k is not None and not 1 <= a.k <= 20:

@@ -54,7 +54,10 @@ STALE_TTL_S: dict[str, float] = {
     "dead-end:external": 30 * DAY,
 }
 VERDICTS = ("EXACT-SETTLED", "EXACT-OPEN", "STALE", "CANDIDATES", "NEW", "UNAVAILABLE")
-MODES = ("map", "cell", "run", "chain", "full", "history")
+MODES = ("map", "cell", "run", "chain", "full", "history", "techniques")
+# T18: the technique cards (bh.lineage.techniques), the only partition a program reads that is not its own
+TECHNIQUES = "*techniques*"
+TECHNIQUE_LINES = 8
 UNAVAILABLE_LINE = "recall UNAVAILABLE (test anyway; pass --recall none)"
 RECEIPT_RE = re.compile(r"R-[0-9a-f]{8}")
 # Host-written sentences, one per verdict. They inform: none of them forbids a test.
@@ -388,6 +391,8 @@ def search(
     k = max(1, min(int(k or 10), K_MAX))
     db = None
     try:
+        if program == TECHNIQUES:  # never a program (bh.lineage.techniques): its cards are read with `techniques`
+            raise Unavailable(program)
         db = _db(board)
         _need(db, "mem_items", "mem_fts", "mem_receipts")
         cell = cell_of(url, vuln_class)
@@ -474,13 +479,40 @@ def navigate(board: Any, program: str, mode: str, arg: str | None = None) -> str
         "chain": _chain,
         "full": _full,
         "history": _history,
+        "techniques": _techniques,
     }.get(mode)
     if fn is None:
         return "recall ERROR: unknown mode"
+    if program == TECHNIQUES:  # the partition is read through `techniques` only, never as a program
+        return UNAVAILABLE_LINE
     try:
         return fn(_db(board), program, (arg or "").strip(), time.time())
     except (Unavailable, sqlite3.Error, ValueError, TypeError, KeyError):
         return UNAVAILABLE_LINE
+
+
+def _techniques(db: sqlite3.Connection, program: str, arg: str, now: float) -> str:
+    """T18: full-text search of the technique cards, the TECHNIQUES partition only (never the caller's program nor
+    another one): the best card in full, then the titles of the next ones, TECHNIQUE_LINES data lines at most. Host-
+    derived, redacted and checked cards (bh.lineage.techniques); still data inside the tag, never an instruction."""
+    _need(db, "mem_items", "mem_fts")
+    if not arg:
+        return "recall ERROR: --techniques needs an idea"
+    hits = [r for r in fts(db, TECHNIQUES, arg, TECHNIQUE_LINES) if r.get("kind") == "technique"]
+    if not hits:
+        return "techniques · 0 cards for this idea (cards come from verified findings of other programs)."
+    top, data = hits[0], []
+    data.append((f"#{top['id']} ×{top.get('seen') or 1} · ", _clean(top.get("title"), 160)))
+    for ln in str(top.get("summary") or "").splitlines():
+        if ln.strip() and len(data) < TECHNIQUE_LINES:
+            data.append(("  ", _clean(ln, 180)))
+    for r in hits[1:]:
+        if len(data) >= TECHNIQUE_LINES:
+            break
+        data.append((f"#{r['id']} ×{r.get('seen') or 1} · ", _clean(r.get("title"), 160)))
+    head = [f"techniques · {len(hits)} card(s), best first · from verified findings, hosts and values templated"]
+    tail = ["a card is a method, not a lead on this program: prove it here with your own proof.json"]
+    return _frame(head, data, tail, max_lines=TECHNIQUE_LINES + 4, budget=BUDGET_TOKENS)
 
 
 def _int_arg(arg: str, default: int | None = None) -> int | None:
