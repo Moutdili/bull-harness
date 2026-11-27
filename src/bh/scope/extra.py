@@ -54,6 +54,8 @@ def entry_problem(scope: Scope, rule: Rule) -> str | None:
         return "an administration host"
     if rule.host in scope.payload_hosts:
         return "a payload host"
+    if scope.oob is not None and patterns_overlap(rule.host, scope.oob.host):
+        return "the out-of-band listener"
     for s in scope.support:
         if patterns_overlap(rule.host, support_pattern(s.rule)):
             return f"a support host ({s.kind})"

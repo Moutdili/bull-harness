@@ -18,23 +18,37 @@ schemes, third-party callback services. -->
    fetches it: the content of that page read and returned or rendered by the server is the proof; error messages
    that name the fetch are a lead.
 2. Redirect-based variants only through in-scope redirectors, toward an in-scope page.
-3. A listener declared by the scope: aim the parameter at it once and read what it received.
+3. Blind (nothing read back): look at the scope block of your task.
+   - It shows a `support (oob): <oob host>` line: `bh-note canary`, then aim the parameter once at
+     `https://<oob host>/c/<canary>`, exactly that: one call, never any other data in the URL (no path of the
+     target, no query, no name or value read from it). Send that request as one identity, the one you will name
+     `--victim`; the other identity never sends the canary. The host reads the listener, you cannot: the gate
+     refuses that host to every client of the sandbox, and such a refusal proves nothing.
+   - No `support (oob)` line: there is no out-of-band listener; `bh-note blocked oob-needed` (Proof below).
 4. Record the sink either way: `bh-note cover "<METHOD /route>" ssrf clean|suspect -e <raw body path>`.
 
 ## Proof
-A request received on a host of ours that the scope declares as a listener, or step 1: the content of an
-in-scope page the server read and returned or rendered. proof.json for step 1: attack = the parameter set to the
-in-scope page, expecting a marker only that page holds; twin control = the same request with the parameter set to
-another in-scope page without the marker, expecting it `absent`. No listener declared by the scope and nothing
-rendered back: `bh-note blocked oob-needed "<url and parameter>" --tried "<...>" --would-prove "<...>"`.
+Either the content of an in-scope page the server read and returned or rendered (step 1), or a request
+received on a host of ours that the scope declares as a listener (step 3: the host reads it). proof.json for
+step 1: attack = the parameter set to the in-scope page, expecting a marker only that page holds; twin control =
+the same request with the parameter set to another in-scope page without the marker, expecting it `absent`.
 `bh-note finding "<title>" --severity <s> --class ssrf --url <url> --proof proof.json --summary "<...>"
 --not-proven "<...>" --counter "<...>" --severity-if "<...>" --severity-why "<...>"`.
+Step 3, when the scope block shows a `support (oob)` host: control = the same request with the parameter set to an
+in-scope page instead of the callback, N runs (no callback, 0/N); then `bh-note finding "<title>" --severity <s>
+--class ssrf --url <url> --observation <canary> --victim <the identity that sent it> --attacker <the other>
+--control 0/N --summary "<the parameter, the one call, UTC time>" -e <file with the exact request>`. The host
+decides from what its listener received, never from what you say.
+No `support (oob)` host in the scope block and nothing rendered back: `bh-note blocked oob-needed "<url and
+parameter>" --tried "<...>" --would-prove "<...>"`.
 
 ## Never
 - Aim the server at a loopback, link-local, cloud metadata or internal address or name, in any spelling (decimal,
   hex, IPv6, a DNS name that resolves to one, a redirect to one): the program forbids it and it proves nothing here.
 - Scan internal ranges, hit third-party hosts through the target.
 - Use a scheme other than `https` or `http`.
+- Put anything but the canary in a callback URL, call it more than once per sink, or aim a callback at any host
+  but the scope's `support (oob)` one (never a public collaborator or a third-party catcher).
 
 ## False positives
 - Your own client fetched it, not the server: a row in `bh-web net` or `bh-browse` output is the browser's request.

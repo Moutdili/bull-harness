@@ -31,17 +31,28 @@ dropped, marked "(Strix)". modified (bull-harness W3-H): class standard now in c
    `<r xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="file:///etc/hostname" parse="text"/></r>`.
 5. Office and SVG files: unzip, add the entity to the inner XML, zip again with harmless content; upload as
    user-a only.
-6. Nothing comes back (blind): the proof needs a receiver of ours.
-   `bh-note blocked oob-needed "<route>: blind XML entity"`.
+6. Nothing comes back (blind): the proof needs a receiver of ours. Look at the scope block of your task.
+   - It shows a `support (oob): <oob host>` line: `bh-note canary`, then one external entity, referenced once,
+     whose only URL is `https://<oob host>/c/<canary>`:
+     `<!DOCTYPE r [<!ENTITY bho SYSTEM "https://<oob host>/c/<canary>">]><r>&bho;</r>`. One call, never any other
+     data in the URL (no file, no parameter entity that reads one, no value of the target). Send it as one
+     identity, the one you will name `--victim`; the other never sends the canary. Proof below.
+   - No `support (oob)` line: `bh-note blocked oob-needed "<route>: blind XML entity"`.
 
 ## Proof
 proof.json: `attack` = the request of step 3 (or step 1 when step 3 is filtered, with the claim reduced to
 "entities are expanded"), expecting the file's content or the marker; `control` = the same document with the
 entity declared and not referenced, expecting it absent. `--not-proven`: which files were not read.
+Blind, with the scope's `support (oob)` host (step 6): control = the same document with the entity declared and
+not referenced, N runs (0/N); then `bh-note finding "<title>" --severity <s> --class xxe --url <url>
+--observation <canary> --victim <the identity that sent it> --attacker <the other> --control 0/N --summary
+"<route, the one call, UTC time>" -e <file with the exact document>`. The host decides from what its listener
+received; you never see it (the gate refuses that host to the sandbox).
 
 ## Never
 - Nested or repeated entities (expansion bomb): denial of service.
-- `http://` entities toward internal addresses, metadata endpoints or any host outside the scope.
+- `http://` entities toward internal addresses, metadata endpoints or any host outside the scope; the one
+  exception is the callback of step 6, `https://<oob host>/c/<canary>` and nothing else in it.
 - Keys, configuration files, source code, or any second file once the first read proved it.
 - A file that makes the server run something: stop, `bh-note blocked server-exec "<where, no content>"`.
 
@@ -56,4 +67,5 @@ entity declared and not referenced, expecting it absent. `--not-proven`: which f
 
 ## Watch
 - An anomaly on one payload: one variant that keeps the syntax, then two close controls at most.
-- A parser that accepts DTDs but returns nothing is a fact worth recording for when a receiver exists.
+- A parser that accepts DTDs but returns nothing is a fact worth recording for when a receiver exists (a
+  scope block without a `support (oob)` line).

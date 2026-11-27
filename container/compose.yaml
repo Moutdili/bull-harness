@@ -2,6 +2,7 @@
 #   sandbox : internal network, NO route out. agent + judge + login + browser + gate.
 #   egress  : normal network. gate only.
 #   lab     : internal network for local practice targets (profile "lab"). gate only.
+#   oob     : the out-of-band listener alone (profile "oob"), its port published on the host's 127.0.0.1 only.
 # The gate is therefore the only path from the agent (and the judge, and the login browser) to anything.
 # The lineage's memory and archives (var/lineage) and the lab's sources (lab/) stay on the host: no container
 # mounts them (tests/test_w2_runner.py reads this file).
@@ -35,6 +36,8 @@ networks:
     ipam:
       config:
         - subnet: 10.231.0.0/24
+  # the out-of-band listener alone (profile `oob`); not internal, so the host can publish its port on 127.0.0.1
+  oob: {}
 
 volumes:
   browser-profile: {}
@@ -233,6 +236,34 @@ services:
       - ../src/bh/browser_service:/opt/bh/lib/bh/browser_service:ro,z
     networks: [sandbox]
     command: [python3, -I, -c, "import sys;sys.path.insert(0,'/opt/bh/lib');from bh.browser_service.__main__ import main;main(sys.argv[1:])", serve]
+    restart: unless-stopped
+
+  # Out-of-band listener (src/bh/oob/listener.py, T23): what a target's server sends to `https://<name>/c/<canary>`,
+  # kept as one line {ts, proto, token, src}. Profile `oob`: no command of the harness starts it; the orchestrator
+  # does, opens Tailscale Funnel toward the host's 127.0.0.1:${BH_OOB_PORT:-8792} at the start of a run and resets it
+  # after. Its own network (never `sandbox`: no client of the sandbox may reach it, the gate opens nothing for it), its
+  # port published on the host's loopback only, one volume: the journal's directory, read by bh.runner.observation
+  # through the scope's `support` entry of kind `oob` (`journal: <this home>/var/oob/oob.jsonl`).
+  oob:
+    build:
+      context: ../src
+      dockerfile: ../container/oob/Containerfile
+    image: localhost/bh-oob:dev
+    container_name: bh-oob
+    profiles: [oob]
+    user: "10001:10001"
+    # the host's user is the container's 10001: the journal it writes stays the host user's, readable by the host
+    userns_mode: "keep-id:uid=10001,gid=10001"
+    read_only: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    pids_limit: 64
+    mem_limit: 128m
+    ports:
+      - "127.0.0.1:${BH_OOB_PORT:-8792}:8792"
+    volumes:
+      - ../var/oob:/journal:Z
+    networks: [oob]
     restart: unless-stopped
 
   # Local practice target: `podman-compose -f container/compose.yaml --profile lab up -d juiceshop`
