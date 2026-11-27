@@ -78,7 +78,7 @@ SOFTWARE.
   notice that we modified it** (for instance a header line « Modified from Strix (Apache-2.0) by bull-harness:
   <what changed> »), and is listed below.
 
-All rows are W3 (lots C and H), checked at the merge. Each file names its Strix origin, the copyright line and
+The rows marked W3 (lots C and H) were checked at the merge of W3; the rows marked W4 name files of lot G, in the same commit. Each file names its Strix origin, the copyright line and
 the licence in its header, and lists what it removed; the summary below is ours.
 
 | fichier chez nous | fichier d'origine | modifications |
@@ -102,9 +102,15 @@ the licence in its header, and lists what it removed; the summary below is ours.
 | `src/bh/skills/xxe/SKILL.md` | `strix/skills/vulnerabilities/xxe.md` ("False Positives" only) | four lines reworded, network access dropped, marked "(Strix)". |
 | `src/bh/skills/graphql/SKILL.md` | `strix/skills/protocols/graphql.md` | condensed and rewritten for two identities of ours, merged with our card `src/bh/cards/graphql.md`. Removed: alias enumeration of ids, array batching to pass limits, fragment bombs and other complexity tests, filter evasion, transport and timing tricks, persisted-query hash guessing. |
 | `src/bh/skills/report-writing/SKILL.md` | `strix/skills/analysis/counterevidence.md`, `strix/skills/analysis/severity_calibration.md` | merged and condensed with the audit's report-writing skill (Hermes, below); Strix's tools mapped to ours. Removed: static-only findings without a replay, CVSS vector mechanics, severity examples aimed at internal services. |
+| `src/bh/skills/agent-actions/SKILL.md` (W4, lot G) | `strix/skills/vulnerabilities/agentic_system_security.md`, `strix/skills/vulnerabilities/llm_prompt_injection.md` ("Tool / Function-Call Abuse", "Validation", "False Positives"), `strix/skills/technologies/llm_applications.md` ("LLM03:2026 Excessive Agency") | rewritten into our form for two identities of ours: one line of effective authority per action, proof by the state change read back over HTTP or a canary the gate saw, twin control without the instruction; delivery and canary left to our skills prompt-injection and ai-connectors. Removed: shadow-agent discovery on hosts and in logs, the source's inspector and regression tools, supply-chain and package-name tests, tool-argument fuzzing, replay, retry and parallel bursts, approval races, cloud and credential sinks, "Summary". |
+| `src/bh/skills/entra/SKILL.md` (W4, lot G) | `strix/skills/protocols/oauth.md` ("Scope and Token Issues", "OpenID Connect Specific", "Validation", "False Positives"), `strix/skills/cloud/azure.md` (identity parts only) | rewritten on the target's side only: what the target's API does with the token of each of our identities (account, grant, revocation); the login hosts stay support hosts. Removed: redirect_uri matrices, client enumeration, dynamic registration, device-code polling, Referer harvesting, account linking from an attacker's provider, every Azure resource, role, conditional access, storage, key vault and managed identity test, the source's command-line and audit tools, directory inventory, "Tooling", "Pro Tips", "Summary". |
 
 `src/bh/skills/multi-tenant/SKILL.md` (W3, lot H) is our own text: its ideas were checked against the tenant sections of
 four Strix skills, none copied, so it has no row.
+`src/bh/skills/graph/SKILL.md` and `src/bh/skills/power-platform/SKILL.md` (W4, lot G) are our own text, written from
+our host surveys (`docs/research/`); `graph` takes one idea of `strix/skills/cloud/azure.md` (delegated versus
+application permissions), no text, so neither has a row. `src/bh/cvss.py` (W4, lot C) gets its row once the
+orchestrator confirms that it reuses Strix's code.
 
 ## Hermes Agent
 

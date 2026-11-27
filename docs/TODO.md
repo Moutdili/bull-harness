@@ -1,10 +1,19 @@
-> Plan en vigueur : v4.2, `out/roadmap-v4.md` (chemin à confirmer par l'orchestrateur) ; ce TODO le précède.
+> Plan en vigueur : v4.2 (`roadmap-v4.md`, tenu par l'orchestrateur hors du dépôt) ; vagues fusionnées : W1, W2, W3 (base `b160269`, suite verte) ; W4 en cours, 8 lots. Ce TODO précède le plan : ses phases restent l'historique, le plan fait foi.
 # bull-harness — TODO maître
 
 Décisions figées (2026-11-22, plan Ultra depuis le 2026-11-24) : CVP **Defense** (individuel) · Podman rootless · YWH + Intigriti d'abord · objectif court terme : **premiers CVE** (divulgation coordonnée) → dossier Red Team plus tard.
 
 Légende propriétaire : **C** = Claude (en direct, parties critiques) · **H** = Hermes (swarm) · **M** = Mio (humain).
 Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie que si le critère passe en sortie d'outil réelle.
+
+## Vagues du plan v4.2 (état au 2026-11-27)
+
+| Vague | État | Ce qu'elle a livré (résumé ; détail : `docs/architecture.md`, « Blocs livrés en W1 à W3 ») |
+|---|---|---|
+| W1 | fusionnée | doctrine (A), notes et contrôle d'observation (B), vérificateur (C), gate : URL protégées, hôtes de charge, garde d'énumération à 6 ids (D), bh-browser (E), runner : auto-test du gate, setup haché, plafonds, budget de prompts (F), hooks sur `mcp__.*` (G), docs (H) |
+| W2 | fusionnée | jambes typées (A), mémoire (B), rappel `bh-recall` (C), agents et chaînes de hash (D), ouverture et bloc `## Lineage` (E), lignée branchée au runner et `bh stats` (F), registre de crédit (G), scope MSRC étape 1 : garde de destinataires, règles du programme, OneDrive (H) |
+| W3 | fusionnée | serveur MCP `bh` (A), `hexstrike` (B), cartes devenues skills (C), sources docs et passives (D), sorties et hooks (E), skills et MCP dans la session du chasseur (F), doctrine et docs (G), skills de classes (H) |
+| W4 | en cours | hors bande, preuve entre comptes, validation, missions, rapports, banc et boîte mail, scope MSRC étape 2, skills Microsoft, schémas |
 
 ## État au 2026-11-25 (vérifié par tests ; le live reste à faire, issue 27)
 

@@ -158,9 +158,11 @@ def test_doc18_describes_the_spectator_screen():
     assert "human_watching" in text
 
 
-def test_diagrams_say_they_are_outdated():
-    first = (ROOT / "docs" / "diagrams.md").read_text().splitlines()[0]
-    assert first == "Outdated since 2026-11-26: see docs/architecture.md; redrawn in wave W4."
+def test_diagrams_are_redrawn():
+    """W1 marked them outdated; W4 (lot G) redrew them: the mark is gone (their checks: tests/test_w4_docs.py)."""
+    text = (ROOT / "docs" / "diagrams.md").read_text()
+    assert text.splitlines()[0] == "# Schémas d'architecture"
+    assert "Outdated since" not in text
 
 
 def test_todo_points_to_the_plan():
