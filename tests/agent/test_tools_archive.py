@@ -239,3 +239,25 @@ def test_recon_cli_no_archive(bh, tmp_path, capsys):
     t.main("recon", ["example.com", "--no-archive", "--timeout", "30"])
     assert "archive:" not in capsys.readouterr().out
     assert not (tmp_path / "a.txt").exists()
+
+
+# ------------------------------------------------------------------ T42: bh-recon notes a login form per live origin
+def test_recon_notes_the_login_form_of_each_live_origin(bh, tmp_path):
+    d, bindir = bh
+    rows = "\n".join(
+        json.dumps(r)
+        for r in (
+            {"url": "https://app.example.com", "status_code": 200, "title": "Sign in",
+             "extracts": {t.LOGIN_FORM_RE: ['<input id="pw" type="password']}},
+            {"url": "https://www.example.com", "status_code": 200, "title": "Home", "extracts": {}},
+        )
+    )  # fmt: skip
+    _exe(bindir / "httpx-toolkit", f'printf "%s\\n" "$@" > {tmp_path / "httpx-args"}\ncat <<"EOF"\n{rows}\nEOF\n')
+    t.recon(_job(), "https://app.example.com", use_archive=False)
+    assert t.LOGIN_FORM_RE in (tmp_path / "httpx-args").read_text().splitlines()  # httpx -er <regex>
+    homes = {e["origin"]: e for e in c.read_jsonl(d / c.ENDPOINTS) if "login_form" in e}
+    assert homes["https://app.example.com:443"]["login_form"] is True
+    assert homes["https://www.example.com:443"]["login_form"] is False
+    assert homes["https://app.example.com:443"]["key"] == "GET /"
+    assert t.login_form_seen({"extracts": ["x"]}) and not t.login_form_seen({"extracts": {"r": []}})
+    assert not t.login_form_seen({}) and not t.login_form_seen({"extracts": "a string, not a list"})
