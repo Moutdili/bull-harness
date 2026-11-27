@@ -346,6 +346,7 @@ def test_bh_js_is_a_command_and_a_link():
 
 def test_xclip_is_pinned_in_the_image_and_checked():
     cf = (ROOT / "container/agent/Containerfile").read_text()
-    assert re.search(r"^ARG XCLIP_VERSION$", cf, re.M)
+    # pinned to an exact version (2026-11-27: 0.13-4), never an unpinned install
+    assert re.search(r"^ARG XCLIP_VERSION=\d[\w.:~+-]*$", cf, re.M)
     assert '"xclip=${XCLIP_VERSION}"' in cf and "command -v Xvfb x11vnc chromium xclip" in cf
     assert "command -v xclip" in (ROOT / "container/agent/check.sh").read_text()
