@@ -60,5 +60,8 @@ classes_more.json.
 
 ## Watch
 - Note the time and the cache lifetime; ask in the finding for the entry to be purged if it is long.
-- Password-reset links built from `X-Forwarded-Host` are the same root cause seen in a mail: the sandbox
-  cannot read mail, record it as a lead for the operator.
+- Password-reset links built from `X-Forwarded-Host` are the same root cause seen in a mail: ask a reset for
+  your own identity with the header set, then `bh-mail <identity>` shows whether the link names your payload
+  host (a link outside the scope prints as `[link: <host>]`). Supporting data only: the finding keeps its
+  proof.json or its observation. `mail UNAVAILABLE` → `bh-note blocked other "<what to read in which mailbox>"`,
+  as before.

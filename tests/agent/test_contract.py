@@ -117,3 +117,25 @@ def test_docs_text_why():
     assert c.docs_text_why("ftp://x") == "docs query: a URL"
     assert c.docs_text_why("me@x.org") == "docs query: an e-mail address"
     assert c.docs_text_why("a\x00b") == "docs query: a control character"
+
+
+# ------------------------------------------------------------------ W4-H: bh-mail is a note
+def test_bh_mail_is_a_note_neither_locked_nor_manual_nor_a_scanner(tmp_path, monkeypatch):
+    from bh.agent import hooks
+
+    monkeypatch.setenv("BH_DIR", str(tmp_path))  # no phase has run: any manual HTTP would be locked
+    monkeypatch.setenv("BH_SCANNERS", "0")
+    for cmd in (
+        "bh-mail user-b",
+        "bh-mail user-a --since-min 30",
+        "/opt/bh/bin/bh-mail user-b",
+        "bh-agent mail user-b",
+    ):
+        assert not c.uses_manual_http(cmd), cmd
+        assert not c.runs_scanner(cmd) and not c.runs_mapper(cmd) and not c.uses_arsenal(cmd), cmd
+        assert hooks.lock_decision(cmd) is None and hooks.rules_decision(cmd) is None, cmd
+    assert "bh-mail" in c.HOST_SERVED_TOOLS and "bh-recall" in c.HOST_SERVED_TOOLS
+    # what runs beside it, or inside a substitution, is judged as itself
+    assert c.uses_manual_http("bh-mail user-b ; curl http://t.test/a")
+    assert hooks.lock_decision('bh-mail "$(curl -s http://t.test/a)"') is not None
+    assert c.runs_scanner("bh-mail user-b && nuclei -u http://t.test")

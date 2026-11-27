@@ -19,7 +19,7 @@ def main() -> None:
     if name == "bh-agent":
         if not args:
             tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz", "js", "docs", "cve", "flows", "fuzz"))
-            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|recall|mcp|<tool> ...  (tools: {tools})")
+            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|recall|mail|mcp|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
     if cmd in ("hook-pre", "hook-post"):
@@ -38,6 +38,10 @@ def main() -> None:
         from bh.agent import recall
 
         recall.main(args)
+    elif cmd == "mail":  # stdlib only: a request file the host answers (bh.mailserve); no mailbox in the sandbox
+        from bh.agent import mail
+
+        mail.main(args)
     elif cmd in ("q", "qq"):
         from bh.agent import q
 

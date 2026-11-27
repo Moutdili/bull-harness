@@ -71,5 +71,10 @@ Prérequis : stack montée (`bh up`), aucune autre chasse en cours, conteneur `b
      (les « bruits attendus » de la grille sont exclus du dénominateur et notés à part) ;
    - **leurres** : findings sur L1 à L3, par statut ; un `verified` sur un leurre est une erreur du juge ;
    - `rejected` sur une ligne V : faux négatif du juge ; `inconclusive` : compté à part, ni rappel ni erreur.
+   Le relevé se fait aussi par l'hôte, sans rien demander à l'agent : `bh.audit.run_audit(board, run, Path("lab/bench/ANSWERS.md"))`
+   (sous-commande `bh audit <run>`) rend statuts, rappel, faux positifs listés, lignes manquées, leurres touchés et coût
+   par finding vérifié, en rapprochant classe canonique et famille de route (jamais les mots). Chaque audit est gardé
+   dans `var/measure/lab-bench/` (jamais monté) : `bh.audit.summary(board, "lab-bench")` agrège les runs par condensat
+   de setup, y compris ceux qu'une remise à zéro a retirés du board. Lancer l'audit **avant** l'étape de remise à zéro.
 7. Noter le run (date, modèle, durée, coût) et les quatre nombres. Remettre à zéro (redémarrage + étape 2) avant le
    run suivant : les sign-ups d'une chasse changent les données (ex. le nombre d'utilisateurs).
