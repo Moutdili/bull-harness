@@ -45,6 +45,7 @@ from bh.scope import Scope
 from bh.text import INVISIBLE, escape_invisible, one_line
 
 VERIFIER_TURNS, VERIFIER_MINUTES = 8, 5
+VERDICT_MAX = 600  # characters of the judge's verdict paragraph kept by the host (T39): the code bounds it
 # The judge is never the hunter's model (correlated errors, audit I10). BH_VERIFIER_MODEL names it; empty, it is Opus,
 # or Mythos when the hunter is Opus. A BH_VERIFIER_MODEL of the hunter's family is replaced the same way.
 JUDGE_DEFAULT, JUDGE_FOR_OPUS = "opus", "claude-mythos-5-2"
@@ -213,7 +214,14 @@ def stage_b(
     ]
     if not verdicts:
         return "inconclusive", "the verifier recorded no verdict" + (" (timeout)" if timed_out else "")
-    return verdicts[-1]["verdict"], str(verdicts[-1].get("reason", ""))[:2000]
+    return verdicts[-1]["verdict"], verdict_paragraph(verdicts[-1].get("reason", ""))
+
+
+def verdict_paragraph(reason: object) -> str:
+    """The judge's reason as one paragraph of at most VERDICT_MAX characters (whitespace folded, an ellipsis when
+    cut): the bound is the code's, whatever the judge wrote."""
+    text = " ".join(str(reason or "").split())
+    return text if len(text) <= VERDICT_MAX else text[: VERDICT_MAX - 1] + "…"
 
 
 def decide(replay: dict, verdict: str, reason: str) -> tuple[str, str]:

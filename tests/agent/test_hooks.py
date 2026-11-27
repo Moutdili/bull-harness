@@ -13,10 +13,10 @@ def test_lock_until_phases_ran(tmp_path, monkeypatch):
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and reason.startswith(c.LOCK_MARK)
     assert "bh-crawl http://10.0.0.5:3000" in reason and "bh-scan http://10.0.0.5:3000" in reason
     assert hooks.pre_tool_use(_ev("bh-crawl http://10.0.0.5:3000")) is None  # builtins always pass
-    assert hooks.pre_tool_use(_ev("curl -s https://web.archive.org/cdx?url=x")) is None  # passive source
+    assert hooks.pre_tool_use(_ev("curl -s -m 10 https://web.archive.org/cdx?url=x")) is None  # passive source
     for p in c.REQUIRED_PHASES:
         c.record_phase(tmp_path, "http://10.0.0.5:3000", p, status="ok", count=0, raw="")
-    assert hooks.pre_tool_use(_ev("curl -s http://10.0.0.5:3000/api/Users")) is None
+    assert hooks.pre_tool_use(_ev("curl -s --max-time 10 http://10.0.0.5:3000/api/Users")) is None
     touched = c.read_jsonl(tmp_path / c.TOUCHED)
     assert touched[-1]["key"] == "GET /api/Users"
     log = c.read_jsonl(tmp_path / c.COMMANDS)
@@ -45,7 +45,7 @@ def test_program_that_forbids_scanners(tmp_path, monkeypatch):
     assert hooks.pre_tool_use(_ev("bh-crawl http://h")) is None
     assert c.required_phases() == ("crawl",)
     c.record_phase(tmp_path, "http://h:80", "crawl", status="ok", count=1, raw="")
-    assert hooks.pre_tool_use(_ev("curl -s http://h/api")) is None  # crawl alone unlocks the origin
+    assert hooks.pre_tool_use(_ev("curl -sm 10 http://h/api")) is None  # crawl alone unlocks the origin
 
 
 def test_builtin_refuses_when_scanners_are_forbidden(monkeypatch, capsys):

@@ -22,6 +22,9 @@ Gate: sequential requests, refusals (`X-BH-Gate: denied`) counted and shown, nev
 under one identity on GUARD_401 routes stop that identity (the gate reads 401s on 3 routes as a dead session).
 Output: at most 25 lines; requests and answers per identity in raw/authz-*/exchanges.jsonl, a proof.json for the
 best candidate (format of bh.agent.proof, validated), coverage phase `authz`, tested endpoints in touched.jsonl.
+The summary ends with `N routes in, N tested, missing: ...` (the routes given or known, against the rows tested) and
+`next: <one action>`; a run where the owner got no usable answer at all (gate refusals, rate limit, unreachable, 401
+everywhere) prints `[bh-fail] <class>: <action>` and marks nothing tested.
 Classification: a mapper; with --write-own a scanner (refused where the program forbids scanners). The verifier
 may not run it.
 """
@@ -43,6 +46,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from bh.agent import contract as c
+from bh.agent import fail
 
 MAX_LINES = 25
 DEFAULT_MAX = 30
@@ -640,11 +644,41 @@ def main(argv: list[str]) -> None:
         eps = known_endpoints(a.source, a.methods)
         if not eps:
             sys.exit("bh-authz: no known endpoint yet: map first (bh-crawl, bh-content) or give URLs")
+    routes_in = list(eps)
     eps = eps[: max(1, a.max)]
-    run(eps, owner, others, with_anon=with_anon, write_own=a.write_own, limit=max(1, a.max))
+    run(eps, owner, others, with_anon=with_anon, write_own=a.write_own, limit=max(1, a.max), routes_in=routes_in)
 
 
-def run(eps: list[Endpoint], owner: str, others: list[str], *, with_anon: bool, write_own: bool, limit: int) -> dict:
+def _route(ep: Endpoint) -> str:
+    return f"{ep.method} {c.path_key(_path(ep.url))}"
+
+
+def failure(rows: list[Row], owner: str) -> str | None:
+    """The fail class when the owner got no usable answer on any row; None when at least one answer came back."""
+    answers = [r.answers.get(owner) for r in rows]
+    if not answers or any(
+        x is not None and x.status > 0 and not x.denied and x.status not in (401, 429) for x in answers
+    ):
+        return None
+    if any(x is not None and x.denied for x in answers):
+        return "gate-denied"
+    if any(x is not None and x.status == 429 for x in answers):
+        return "rate"
+    if any(x is not None and x.status == 401 for x in answers):
+        return "auth"
+    return "unreachable"
+
+
+def run(
+    eps: list[Endpoint],
+    owner: str,
+    others: list[str],
+    *,
+    with_anon: bool,
+    write_own: bool,
+    limit: int,
+    routes_in: list[Endpoint] | None = None,
+) -> dict:
     d = c.bh_dir()
     first = urlsplit(eps[0].url)
     raw = d / c.RAW / f"authz-{re.sub(r'[^A-Za-z0-9.-]+', '_', first.netloc + first.path)[:50]}-{int(time.time())}"
@@ -745,12 +779,25 @@ def run(eps: list[Endpoint], owner: str, others: list[str], *, with_anon: bool, 
         "requests": client.sent,
         "proof": str(proof_path) if proof_path else None,
     }
+    klass = failure(rows, owner)
+    summary["fail"] = klass
     c.write_json(raw / "summary.json", summary)
     for origin in dict.fromkeys(c.origin(r.ep.url) for r in rows):
         n = sum(1 for r in cands if c.origin(r.ep.url) == origin)
-        c.record_phase(d, str(origin), "authz", status="ok", count=n, raw=str(raw))
-    c.record_touched(d, [r.ep.url for r in rows if r.ep.method == "GET"], via="authz")
-    c.record_touched(d, [w.url for w, _ in writes if w.method], via="authz", method="PATCH")
+        status = f"error: {klass}" if klass else "ok"
+        c.record_phase(d, str(origin), "authz", status=status, count=n, raw=str(raw))
+    if not klass:  # a failed run tested nothing
+        c.record_touched(d, [r.ep.url for r in rows if r.ep.method == "GET"], via="authz")
+        c.record_touched(d, [w.url for w, _ in writes if w.method], via="authz", method="PATCH")
+    given = list(dict.fromkeys(_route(e) for e in (routes_in or eps)))
+    done = {_route(r.ep) for r in rows} if not klass else set()
+    missing = [k for k in given if k not in done]
+    end = [
+        *([fail.line(klass)] if klass else []),
+        f"{len(given)} routes in, {len(given) - len(missing)} tested, missing: "
+        + (", ".join(missing[:3]) + (f" (+{len(missing) - 3})" if len(missing) > 3 else "") if missing else "none"),
+        f"next: {next_step(klass, proof_path, cands, missing, owner, others)}",
+    ]
     lines = report(
         rows,
         writes,
@@ -763,8 +810,27 @@ def run(eps: list[Endpoint], owner: str, others: list[str], *, with_anon: bool, 
         proof_path=proof_path,
         proof_of=proof_of,
     )
-    print("\n".join(lines[:MAX_LINES]))
+    print("\n".join([*lines[: MAX_LINES - len(end)], *end]))
     return summary
+
+
+def next_step(klass, proof_path, cands, missing, owner, others) -> str:
+    """One action, the harness's words."""
+    if klass:
+        return {
+            "gate-denied": "bh-note frontier: another route in scope",
+            "rate": "bh-note frontier: another lead; this one later (the gate sets the pace)",
+            "auth": f"bh-authz --owner {others[0]} (the session of {owner} is refused)"
+            if others
+            else "bh-note frontier",
+        }.get(klass, "curl -sS --max-time 10 -o /dev/null -w '%{http_code}' on one of the routes")
+    if proof_path:
+        return f"read {proof_path}, then bh-note finding --class idor|broken-access-control --proof {proof_path}"
+    if cands:
+        return "write the proof of the first candidate by hand: the attack, and a control without the owner's marker"
+    if missing:
+        return "bh-authz --max 60 for the routes left out above"
+    return "bh-note frontier"
 
 
 def _cell(who: str, ans: Answer | None, owner_digest: str) -> str:
@@ -815,15 +881,12 @@ def report(rows, writes, client, *, owner, others, with_anon, uniq, me_path, pro
         foot.append(f"  stopped {', '.join(stopped)}: 401 on {GUARD_401} routes (the gate would mark the session dead)")
     if proof_path:
         foot.append(f"proof ({proof_of}): {proof_path}")
-        foot.append(
-            f'  read it, then: bh-note finding "<title>" --class idor|broken-access-control --proof {proof_path}'
-        )
     elif proof_of:
         foot.append(f"proof: {proof_of}")
     elif cands:
         foot.append("proof: none built (no control without the marker): write it by hand")
     foot.append(f"raw: {client.raw}/ (exchanges.jsonl, summary.json)")
-    room = MAX_LINES - len(head) - len(wlines) - len(foot)
+    room = MAX_LINES - 3 - len(head) - len(wlines) - len(foot)  # 3: the coverage, failure and next lines
     if len(body) > room:
         body = [*body[: max(0, room - 1)], f"  ... {len(body) - max(0, room - 1)} more candidates in summary.json"]
     return [*head, *body, *wlines, *foot][:MAX_LINES]

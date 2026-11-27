@@ -218,7 +218,8 @@ def test_recon_summary_bounded(bh, tmp_path, capsys):
     out = capsys.readouterr().out.splitlines()
     summary = [x for x in out if x.startswith("  ") and not x.startswith("  ...")]
     assert len(summary) <= t.SUMMARY_LINES
-    assert len(out) <= t.SUMMARY_LINES + 3  # headline, "... N more", raw
+    assert len(out) <= t.SUMMARY_LINES + 4  # headline, "... N more", raw, next
+    assert out[-1].startswith("next: ")
     assert summary[0].startswith("  archive: 12 URLs") and summary[1].startswith("  gf (")
 
 

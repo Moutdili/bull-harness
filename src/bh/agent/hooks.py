@@ -1,12 +1,18 @@
 """Claude Code hooks for the agent (registered in container/agent/hooks/settings.json).
 
-PreToolUse(Bash):  log the command; enforce the program rules and the tool lock; record tested endpoints.
+PreToolUse(Bash):  log the command; enforce the program rules and the tool lock; record tested endpoints. The third
+  identical command of a session is refused with the answer it already got (T33, `[bh-repeat]`); a curl or a wget
+  without a time limit is refused with the form to run instead (T38).
 PreToolUse(mcp__*): the same rules for an MCP tool, classified by bh.agent.mcp_policy: an unknown tool is refused,
   a scanner is refused when the program forbids scanners, a `request` tool is under the tool lock on the origins of
-  its URLs, the verifier gets no MCP tool at all. Every call is logged in commands.jsonl (tool, klass, decision).
-PostToolUse(Bash): long outputs go to raw/, the model sees head + tail + the path. Exception: a single
+  its URLs, a HexStrike tool the registry refuses (`refused`, `no-route`) is refused with the registry's reason, the
+  verifier gets no MCP tool at all. Every call is logged in commands.jsonl (tool, klass, decision).
+PostToolUse(Bash): an output is recognised before it is cut (T37): a binary one (a NUL, or text that was not UTF-8)
+  shows 16 bytes in hex and the path; a minified bundle (few lines, a line over BUNDLE_LINE characters) its type,
+  size and path; else a long output goes to raw/ and the model sees head + tail + the path. Exception: a single
   `bh-web text|frames|outline` or `bh-web net --body <i>` (already bounded by bh-browser; a chat's answer sits at the
-  end and must not be elided) is shown whole up to EXEMPT_CHARS. Then the turn budget (budget_line).
+  end and must not be elided) is shown whole up to EXEMPT_CHARS. Then the turn budget (budget_line). The first
+  REPEAT_LINES lines of every output are kept under repeat/ for T33.
 PostToolUse(mcp__*): no rewrite (the shape of an MCP result is the server's); an output over MAX_CHARS is logged in
   trunc.jsonl.
 
@@ -32,7 +38,7 @@ import time
 from pathlib import Path
 
 from bh.agent import contract as c
-from bh.agent import mcp_policy
+from bh.agent import fail, mcp_policy
 
 MAX_LINES = int(os.environ.get("BH_TRUNC_LINES", "80"))
 MAX_CHARS = int(os.environ.get("BH_TRUNC_CHARS", "8000"))
@@ -41,6 +47,18 @@ HEAD, TAIL = 30, 12
 EXEMPT_CHARS = int(os.environ.get("BH_TRUNC_EXEMPT_CHARS", "24000"))
 EXEMPT_WEB = ("text", "frames", "outline")
 _OPERATORS = ";&|()<>\n"
+# T37: a minified bundle is at most BUNDLE_MAX_LINES lines with one over BUNDLE_LINE characters
+BUNDLE_LINE, BUNDLE_MAX_LINES = 2000, 20
+# T33: per normalized command and session, the first REPEAT_LINES lines of its output; the 3rd identical call is refused
+REPEAT_DIR, REPEAT_LINES, REPEAT_MAX = "repeat", 15, 2
+REPEAT_MARK = "[bh-repeat]"
+_REPEAT_EXEMPT = re.compile(
+    r"(?<![\w.-])(bh-web|bh-note|bh-recall|sleep|bh-agent\s+(?:replay|web|note|recall))(?![\w.-])"
+)
+# T38: what bounds a curl or a wget in time
+CURL_TIMEOUT, WGET_TIMEOUT = "--max-time 30", "--timeout=30"
+_CURL_ARG_SHORT = set("AbcCdDeEFhHKmoPQrtTuUwxXyYz")  # curl short options that take a value
+_WRAPPERS = {"sudo", "env", "command", "exec", "nice", "nohup", "time", "xargs", "stdbuf", "ionice", "builtin"}
 
 SCANNER_DENIAL = (
     f"{c.RULES_MARK} this program forbids automated scanners. Use bh-recon / bh-crawl and "
@@ -104,7 +122,7 @@ def lock_decision(cmd: str) -> str | None:
     return lock_for(c.urls_in(cmd))
 
 
-def mcp_decision(name: str, klass: str, urls: list[str]) -> str | None:
+def mcp_decision(name: str, klass: str, urls: list[str], tool_input: object = None) -> str | None:
     """Denial message for an MCP tool of class `klass` (mcp_policy.classify), None to let it run."""
     if c.is_verifier():
         return (
@@ -113,6 +131,12 @@ def mcp_decision(name: str, klass: str, urls: list[str]) -> str | None:
         )
     if klass == "unknown":
         return f"{c.RULES_MARK} unknown MCP tool {name[:120]}: only tools the harness has classified may run."
+    if klass in ("refused", "no-route"):
+        tool = mcp_policy._hexstrike_name(tool_input) or "?"
+        why = mcp_policy.hexstrike_reason(tool_input) or (
+            "it has no route through the gate" if klass == "no-route" else "the harness does not run it"
+        )
+        return f"{c.RULES_MARK} HexStrike tool {tool[:60]} refused ({klass}): {why}"
     if klass == "scanner" and not c.scanners_allowed():
         return SCANNER_DENIAL
     if klass == "request":
@@ -134,7 +158,7 @@ def _mcp_pre(ev: dict, name: str) -> dict | None:
     """Unlike the rest of the hooks, a failure here refuses: an MCP tool runs only once it is classified and logged."""
     try:
         klass, urls = mcp_policy.classify(name, ev.get("tool_input"))
-        denial = mcp_decision(name, klass, urls)
+        denial = mcp_decision(name, klass, urls, ev.get("tool_input"))
         d = c.bh_dir()
         c.append_jsonl(
             d / c.COMMANDS,
@@ -161,7 +185,12 @@ def pre_tool_use(ev: dict) -> dict | None:
     cmd = (ev.get("tool_input") or {}).get("command") or ""
     if name != "Bash" or not cmd:
         return None
-    denial = rules_decision(cmd) or (None if c.is_verifier() else lock_decision(cmd))
+    denial = (
+        rules_decision(cmd)
+        or _safe(repeat_decision, cmd, ev.get("session_id"))
+        or (None if c.is_verifier() else lock_decision(cmd))
+        or _safe(timeout_decision, cmd)
+    )
     d = c.bh_dir()
     c.append_jsonl(
         d / c.COMMANDS,
@@ -178,6 +207,149 @@ def pre_tool_use(ev: dict) -> dict | None:
     if c.uses_manual_http(cmd):
         c.record_touched(d, c.urls_in(cmd), via="manual")
     return None
+
+
+def _safe(fn, *args):
+    """A help (repeat, timeout) never stalls the hunt: on an unexpected error it lets the command run."""
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - fail open, but say so
+        print(f"bh hook error ({fn.__name__}): {exc}", file=sys.stderr)
+        return None
+
+
+# ------------------------------------------------------------------ T33: the same command again
+def normalize(cmd: str) -> str:
+    return " ".join(cmd.split())
+
+
+def repeat_exempt(cmd: str) -> bool:
+    """Commands whose answer changes by design: a replay, the browser, the board, the lineage, a wait."""
+    return bool(_REPEAT_EXEMPT.search(cmd))
+
+
+def _repeat_path(session: object, cmd: str) -> Path:
+    key = hashlib.sha1(f"{session or '-'}\0{normalize(cmd)}".encode(errors="replace")).hexdigest()[:20]
+    return c.bh_dir() / REPEAT_DIR / f"{key}.json"
+
+
+def repeat_decision(cmd: str, session: object) -> str | None:
+    """The third identical call (spaces normalised) of a session is refused with what the command answered."""
+    if not normalize(cmd) or repeat_exempt(cmd):
+        return None
+    doc = c.read_json(_repeat_path(session, cmd), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("n"), int) or doc["n"] < REPEAT_MAX:
+        return None
+    head = [str(x)[:300] for x in (doc.get("head") or [])][:REPEAT_LINES]
+    return "\n".join(
+        [
+            f"{REPEAT_MARK} this exact command already ran twice; its answer will not change:",
+            *(head or ["(no output)"]),
+            f"raw: {doc.get('raw') or '-'}",
+        ]
+    )
+
+
+def repeat_record(cmd: str, session: object, stdout: str, stderr: str) -> None:
+    """After a run: one more call of this command, its first lines, and its whole output in repeat/<key>.log."""
+    if not normalize(cmd) or repeat_exempt(cmd):
+        return
+    path = _repeat_path(session, cmd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = c.read_json(path, None)
+    n = doc.get("n") if isinstance(doc, dict) and isinstance(doc.get("n"), int) else 0
+    log = path.with_suffix(".log")
+    log.write_text(stdout + (f"\n--- stderr ---\n{stderr}" if stderr else ""), errors="backslashreplace")
+    lines = (stdout or stderr).splitlines()[:REPEAT_LINES]
+    c.write_json(path, {"cmd": normalize(cmd)[:2000], "n": n + 1, "head": [x[:300] for x in lines], "raw": str(log)})
+
+
+# ------------------------------------------------------------------ T38: curl / wget without a time limit
+def _words(cmd: str) -> list[str] | None:
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=_OPERATORS)
+    lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _curl_bounded(args: list[str]) -> bool:
+    skip = False
+    for w in args:
+        if skip:
+            skip = False
+            continue
+        if w == "--max-time" or w.startswith("--max-time="):
+            return True
+        if w.startswith("--") or not w.startswith("-") or w == "-":
+            continue
+        for i, ch in enumerate(w[1:]):
+            if ch == "m":
+                return True
+            if ch in _CURL_ARG_SHORT:
+                skip = i == len(w) - 2  # the value is the next word
+                break
+    return False
+
+
+def _wget_bounded(args: list[str]) -> bool:
+    return any(
+        re.match(r"--(read-)?timeout(=|$)", w) or (re.match(r"-[A-Za-z]*T", w) and not w.startswith("--")) for w in args
+    )
+
+
+def unbounded_clients(cmd: str) -> list[str]:
+    """The curl / wget calls of `cmd` (at a command position) with no time limit of their own and no `timeout`
+    wrapper. A command that does not parse is left alone."""
+    words = _words(cmd)
+    if words is None:
+        return []
+    found, i, start, wrapped = [], 0, True, False
+    while i < len(words):
+        w = words[i]
+        if w and set(w) <= set(_OPERATORS):
+            start, wrapped = True, False
+        elif start:
+            base = os.path.basename(w)
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) or w.startswith("-") or base in _WRAPPERS:
+                pass
+            elif base == "timeout":
+                wrapped = True
+                i += 1
+                while i < len(words) and words[i].startswith("-"):
+                    i += 1  # its options; the next word is the duration
+            elif base in ("curl", "wget"):
+                j = i + 1
+                while j < len(words) and not (words[j] and set(words[j]) <= set(_OPERATORS)):
+                    j += 1
+                bounded = _curl_bounded(words[i + 1 : j]) if base == "curl" else _wget_bounded(words[i + 1 : j])
+                if not (bounded or wrapped):
+                    found.append(base)
+                start, i = False, j
+                continue
+            else:
+                start = False
+        i += 1
+    return found
+
+
+def timeout_decision(cmd: str) -> str | None:
+    """A curl or a wget without a time limit can hold the turn until Claude Code kills it: refused with the form to
+    run. Nothing else is touched."""
+    clients = unbounded_clients(cmd)
+    if not clients:
+        return None
+    flags = {"curl": CURL_TIMEOUT, "wget": WGET_TIMEOUT}
+    if "\n" in cmd or len(cmd) > 600:
+        form = " and ".join(f"`{x} {flags[x]} ...`" for x in dict.fromkeys(clients))
+    else:
+        form = cmd
+        for name in dict.fromkeys(clients):
+            form = re.sub(rf"(?<![\w./-]){name}(?![\w.-])", f"{name} {flags[name]}", form)
+        form = f"`{form}`"
+    what = " and ".join(dict.fromkeys(clients))
+    return fail.line("bad-argument", f"{what} without a time limit can hold the turn; run instead: {form}")
 
 
 # ------------------------------------------------------------------ PostToolUse
@@ -219,14 +391,64 @@ def exempt(cmd: str) -> bool:
     return op in EXEMPT_WEB or (op == "net" and any(w == "--body" or w.startswith("--body=") for w in rest))
 
 
-def _shrink(text: str, label: str, tool_id: str) -> tuple[str, dict | None]:
-    lines = text.splitlines()
-    if len(lines) <= MAX_LINES and len(text) <= MAX_CHARS:
-        return text, None
+def is_binary(text: str) -> bool:
+    """A NUL byte, or text that was not UTF-8 (Claude Code hands it over with U+FFFD in place of the bad bytes): at
+    least 1 % of its characters, so one broken character in a page does not hide the page."""
+    bad = text.count("\ufffd")
+    return "\x00" in text or (bad > 0 and bad * 100 >= len(text))
+
+
+def bundle_type(text: str) -> str:
+    """A rough type for a minified output, from its first characters: html, json, css or js."""
+    head = text.lstrip()[:2000]
+    if head[:1] == "<":
+        return "html"
+    if head[:1] in "[{":
+        try:
+            json.loads(text)
+            return "json"
+        except ValueError:
+            pass
+    if re.search(r"function\b|=>|\bvar\b|\bconst\b|\blet\b|\breturn\b", head):
+        return "js"
+    if re.search(r"[.#@][\w-]+[^{}]*\{[^{}]*:[^{}]*\}", head):
+        return "css"
+    return "text"
+
+
+def is_bundle(lines: list[str]) -> bool:
+    return 0 < len(lines) <= BUNDLE_MAX_LINES and max(len(x) for x in lines) > BUNDLE_LINE
+
+
+def _raw_path(text: str, label: str, tool_id: str) -> Path:
     raw = c.bh_dir() / c.RAW
     raw.mkdir(parents=True, exist_ok=True)
     path = raw / f"{int(time.time())}-{hashlib.sha1(tool_id.encode()).hexdigest()[:8]}-{label}.log"
-    path.write_text(text)
+    path.write_text(text, errors="backslashreplace")
+    return path
+
+
+def _shrink(text: str, label: str, tool_id: str) -> tuple[str, dict | None]:
+    lines = text.splitlines()
+    if text and is_binary(text):
+        path = _raw_path(text, label, tool_id)
+        first = text.encode("utf-8", "backslashreplace")[:16].hex(" ")
+        note = (
+            f"[bh] binary {label} ({len(text)} chars), first 16 bytes: {first}. Full {label}: {path} "
+            "(read it with xxd, file or strings, never cat it)"
+        )
+        return note, {"label": label, "lines": len(lines), "path": str(path), "kind": "binary"}
+    if is_bundle(lines):
+        path = _raw_path(text, label, tool_id)
+        note = (
+            f"[bh] minified {bundle_type(text)} {label}: {len(lines)} lines, {len(text)} chars, longest line "
+            f"{max(len(x) for x in lines)}. Full {label}: {path}. bh-crawl on its origin extracts the endpoints it "
+            "names; grep the raw for a path, never cat it"
+        )
+        return note, {"label": label, "lines": len(lines), "path": str(path), "kind": "bundle"}
+    if len(lines) <= MAX_LINES and len(text) <= MAX_CHARS:
+        return text, None
+    path = _raw_path(text, label, tool_id)
     head = [line[:400] for line in lines[:HEAD]]
     tail = [line[:400] for line in lines[-TAIL:]] if len(lines) > HEAD + TAIL else []
     elided = [f"... [{len(lines) - len(head) - len(tail)} lines elided] ..."] if tail else []
@@ -348,6 +570,8 @@ def post_tool_use(ev: dict) -> dict | None:
     else:
         out, s1 = _shrink(stdout, "stdout", tid)
     err, s2 = _shrink(resp.get("stderr") or "", "stderr", tid)
+    if isinstance(cmd, str):
+        _safe(repeat_record, cmd, ev.get("session_id"), stdout, resp.get("stderr") or "")
     budget = _safe_budget_line()
     if not (s1 or s2 or budget):
         return None

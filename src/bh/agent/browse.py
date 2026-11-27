@@ -28,6 +28,12 @@ a script run on another origin, then a navigation or a history rewrite back to t
 a submit or a key press on a javascript: URL is not made: the hunter's own script proves nothing. The line is
 `xss CONFIRMED (marker <M>) origin=<origin>`.
 
+Inventory (T48): after the load and after each step (fill, click, submit, key press), the page's forms (action,
+method, field names), the keys of localStorage and sessionStorage and the console errors (tagged with the step) are
+read again and merged; the summary names them, never a value (STORAGE_JS reads keys only, FORMS_JS names only).
+The summary ends with `next: <one action>`; a failure adds `[bh-fail] <class>: <action>` and writes no endpoint; an
+--xss marker not confirmed says `[bh] no proof.json on this test`.
+
 Classification: a mapper. `--xss` on a single page is an observation, not a scan (Mio's decision, audit I14): it
 runs on a program that forbids scanners. `--xss` with `--routes` carries the marker across the pages it walks: a
 scanner, refused when the program forbids scanners.
@@ -53,6 +59,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from bh.agent import contract as c
+from bh.agent import fail
 import contextlib
 
 SUMMARY_LINES = 25
@@ -114,6 +121,14 @@ FORMS_JS = """() => {
   if (loose.length) out.push({id: '(no form)', method: '', action: '', fields: loose});
   return out;
 }"""
+
+# Keys only: a value of the page's storage is never read (tokens live there).
+STORAGE_JS = """() => {
+  const keys = (name) => { try { const s = window[name]; return s ? Object.keys(s) : []; } catch (e) { return []; } };
+  return {local: keys('localStorage'), session: keys('sessionStorage')};
+}"""
+CONSOLE_SHOWN = 5
+STORAGE_SHOWN = 12
 
 
 # ------------------------------------------------------------------ arguments
@@ -446,8 +461,10 @@ class Result:
     sentinel: str | None = None
     sentinel_origin: str | None = None  # origin of the frame that held the sentinel
     origin: str = ""  # the page's own origin (contract.origin of the URL asked): the only one an XSS confirms on
-    console_errors: list[str] = field(default_factory=list)
+    console_errors: list[str] = field(default_factory=list)  # "[<step>] <first line>"
     forms: list[dict] = field(default_factory=list)
+    local_keys: list[str] = field(default_factory=list)  # names only, never a value
+    session_keys: list[str] = field(default_factory=list)
     routes: list[str] = field(default_factory=list)
     new_keys: list[str] = field(default_factory=list)
     a11y: list[str] = field(default_factory=list)
@@ -513,10 +530,26 @@ def render(r: Result) -> list[str]:
     elif r.marker and not confirmed:
         body.append(f"xss: marker {r.marker} not seen (no dialog, no window.{SENTINEL}): not confirmed")
     if r.console_errors:
-        body.append(f"console: {len(r.console_errors)} errors ({r.console_errors[0][:120]})")
+        shown = " · ".join(e[:90] for e in r.console_errors[:CONSOLE_SHOWN])
+        extra = len(r.console_errors) - CONSOLE_SHOWN
+        more = f" (+{extra} in raw console.log)" if extra > 0 else ""
+        body.append(f"console errors: {len(r.console_errors)}: {shown}{more}")
+    if r.local_keys or r.session_keys:
+        body.append(
+            "storage keys: "
+            + " · ".join(
+                f"{name} {', '.join(k[:40] for k in keys[:STORAGE_SHOWN])}"
+                + (f" (+{len(keys) - STORAGE_SHOWN})" if len(keys) > STORAGE_SHOWN else "")
+                for name, keys in (("localStorage", r.local_keys), ("sessionStorage", r.session_keys))
+                if keys
+            )
+        )
     for f in r.forms[:3]:
-        target = f" → {f.get('method') or 'GET'} {_short(f['action'])}" if f.get("action") else ""
-        body.append(f"form {f.get('id') or '?'}: ({', '.join(f.get('fields', [])[:8])}){target}")
+        action = _short(f["action"]) if f.get("action") else "(this page)"
+        body.append(
+            f"form {f.get('id') or '?'}: {f.get('method') or 'GET'} {action} fields: "
+            f"{', '.join(f.get('fields', [])[:8]) or '-'}"
+        )
     if len(r.forms) > 3:
         body.append(f"forms: +{len(r.forms) - 3} in raw dom.html")
     routes = [k.split(" ", 1)[1] for k in r.new_keys if "#" in k]
@@ -532,11 +565,53 @@ def render(r: Result) -> list[str]:
     if r.shot:
         path, w, h = r.shot
         body.append(f"shot: {path} {w}x{h} ≈ {image_tokens(w, h)} tokens (Read it only if needed)")
-    budget = SUMMARY_LINES - 2  # headline + raw line
+    klass = failure_class(r)
+    end = [f"raw: {r.raw}/"]
+    if klass:
+        end.append(fail.line(klass))
+    elif r.marker and not confirmed:
+        end.append(fail.NO_PROOF)
+    end.append(f"next: {next_step(r, klass, confirmed)}")
+    budget = SUMMARY_LINES - 1 - len(end)  # headline + the closing lines
     if len(body) > budget:
         body = [*body[: budget - 1], f"... {len(body) - budget + 1} more lines in raw"]
     lines = [head[:LINE_CHARS], *("  " + b[: LINE_CHARS - 2] for b in body)]
-    return [*lines, f"raw: {r.raw}/"]
+    return [*lines, *(x[:LINE_CHARS] for x in end)]
+
+
+def failure_class(r: Result) -> str | None:
+    """The fail class of a run that did not end well, None when it did."""
+    if r.state == "ok":
+        return None
+    if r.state.startswith("partial"):
+        return "timeout"
+    if r.state == "error rc=127":
+        return "missing-tool"
+    if r.state.startswith("error step"):
+        return "bad-argument"
+    return fail.classify(1, r.error, False)
+
+
+def next_step(r: Result, klass: str | None, confirmed: bool) -> str:
+    """One action, the harness's words: never a quote of the page."""
+    if klass:
+        return {
+            "timeout": "bh-browse the same page with a larger --timeout, or without --routes",
+            "missing-tool": "bh-web, the persistent browser, for this page",
+            "bad-argument": "bh-browse the page alone, read its a11y lines for the right selector, then the step",
+        }.get(klass, "bh-note frontier")
+    if confirmed:
+        return (
+            "write proof.json with this bh-browse step (attack) and the same page without the marker (control), then "
+            "bh-note finding --class xss --proof proof.json"
+        )
+    if r.marker:
+        return "grep the marker in dom.html (raw/) to see where it landed, then fit the payload to that context"
+    if any("#" in k for k in r.new_keys):
+        return "bh-browse the first new route above (a client-side route only shows rendered)"
+    if r.forms:
+        return "submit the first form above with your own values (--fill CSS=VALUE --submit CSS)"
+    return "bh-note frontier"
 
 
 def summary(r: Result) -> dict:
@@ -792,16 +867,25 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             r.xhr.append((req.method, resp.url, resp.status))
 
     console: list[str] = []
+    stage = ["load"]  # the page action the console errors follow (load, step <i>, routes)
 
     def on_console(msg) -> None:
         line = f"{msg.type}: {msg.text}"
-        console.append(line)
+        console.append(f"[{stage[0]}] {line}")
         if msg.type == "error" and "ERR_BLOCKED_BY_CLIENT" not in msg.text:  # our own local blocks
-            r.console_errors.append(msg.text.splitlines()[0] if msg.text else "error")
+            r.console_errors.append(f"[{stage[0]}] " + (msg.text.splitlines()[0] if msg.text else "error"))
 
     def on_pageerror(exc) -> None:
-        console.append(f"pageerror: {exc}")
-        r.console_errors.append(f"pageerror: {str(exc).splitlines()[0] if str(exc) else exc}")
+        console.append(f"[{stage[0]}] pageerror: {exc}")
+        r.console_errors.append(f"[{stage[0]}] pageerror: {str(exc).splitlines()[0] if str(exc) else exc}")
+
+    def inventory() -> None:
+        """Forms and storage keys of the page as it is now, merged with what earlier states showed."""
+        try:
+            forms = page.evaluate(FORMS_JS)
+        except PwError:
+            forms = []
+        merge_inventory(r, forms if isinstance(forms, list) else [], _storage(page, PwError))
 
     dialog_events: list[dict] = []  # Page.javascriptDialogOpening (CDP): the URL of the frame that raised each
 
@@ -865,8 +949,10 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 page.wait_for_selector(a.wait_for, timeout=left_ms())
             else:
                 settle(15)
+            inventory()
 
             for i, (kind, value) in enumerate(a.steps, 1):
+                stage[0] = f"step {i}"
                 try:
                     if kind == "fill":
                         page.fill(value[0], value[1], timeout=left_ms(20))
@@ -883,6 +969,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                     else:
                         page.click(value, timeout=left_ms(20))
                         settle(15 if kind == "submit" else 3)
+                    inventory()
                 except PwError as exc:
                     sel = value[0] if kind == "fill" else value
                     r.steps.append(f"{i} --{kind} {sel} failed: {str(exc).splitlines()[0][:120]}")
@@ -896,6 +983,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             links = _links(page, PwError)
             seen_urls.append(("GET", page.url, r.status))
             if a.routes:
+                stage[0] = "routes"
                 seen_urls += _explore(page, links, host=host, deadline=deadline, err=PwError, settle=settle)
                 if a.xss and not xss_confirmed(a.xss, [], r.sentinel, r.origin, r.sentinel_origin):
                     r.sentinel, r.sentinel_origin = pick_sentinel(_sentinels(page, PwError), a.xss, r.origin)
@@ -910,10 +998,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 r.a11y = a11y_summary(aria)
             except PwError as exc:
                 (raw / "aria.yml").write_text(f"# aria snapshot failed: {exc}\n")
-            try:
-                r.forms = page.evaluate(FORMS_JS)
-            except PwError:
-                r.forms = []
+            inventory()
             if a.shot:
                 shot = raw / "shot.png"
                 if a.clip:
@@ -947,7 +1032,39 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
     items = endpoint_items(seen_urls, origin_)
     form_fields = {f["action"].split("#")[0]: f.get("fields") or [] for f in r.forms if f.get("action")}
     items = [(k, u, p + form_fields.get(u, []), s) for k, u, p, s in items]
-    r.new_keys = add_endpoints(c.bh_dir(), origin_, items)
+    # a failed run writes no endpoint (T36); a partial one keeps what it observed
+    r.new_keys = [] if r.state.startswith("error") else add_endpoints(c.bh_dir(), origin_, items)
+
+
+def _storage(page, err) -> dict:
+    try:
+        doc = page.evaluate(STORAGE_JS)
+    except err:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def merge_inventory(r: Result, forms: list, storage: dict) -> None:
+    """Add the forms (by action, method and field names) and storage keys not seen yet. Names only."""
+    seen = {(f.get("action"), f.get("method"), tuple(f.get("fields") or [])) for f in r.forms}
+    for f in forms:
+        if not isinstance(f, dict):
+            continue
+        rec = {
+            "id": str(f.get("id") or "")[:60],
+            "method": str(f.get("method") or "")[:10],
+            "action": str(f.get("action") or "")[:500],
+            "fields": [str(x)[:60] for x in (f.get("fields") or []) if isinstance(x, str)][:40],
+        }
+        key = (rec["action"], rec["method"], tuple(rec["fields"]))
+        if key not in seen:
+            seen.add(key)
+            r.forms.append(rec)
+    for attr, name in (("local_keys", "local"), ("session_keys", "session")):
+        have = getattr(r, attr)
+        for k in storage.get(name) or []:
+            if isinstance(k, str) and k not in have:
+                have.append(k[:200])
 
 
 def count_when_open(ws, r: Result) -> None:
@@ -1042,7 +1159,11 @@ def main(argv: list[str] | None = None) -> None:
     r = Result(url=a.url, identity=a.identity, raw=str(job.raw))
 
     def hard_stop(_sig, _frm) -> None:  # the sync API can hang past its own timeouts: never past the budget
-        print(f"bh-browse {a.url}: killed after {a.timeout + 30} s [error rc=124]\nraw: {job.raw}/", flush=True)
+        print(
+            f"bh-browse {a.url}: killed after {a.timeout + 30} s [error rc=124]\nraw: {job.raw}/\n"
+            f"{fail.line('timeout')}\nnext: {next_step(r, 'timeout', False)}",
+            flush=True,
+        )
         os._exit(124)
 
     signal.signal(signal.SIGALRM, hard_stop)
@@ -1051,9 +1172,10 @@ def main(argv: list[str] | None = None) -> None:
     signal.alarm(0)
     with open(job.raw / "summary.json", "w") as fh:  # what a proof replay reads (bh.agent.proof._browse)
         json.dump(summary(r), fh)
-    if a.xss:
+    if a.xss and r.state == "ok":  # a route counts as tested only when the run ended well
         c.record_touched(c.bh_dir(), [a.url], via="browse-xss")
-    c.record_phase(c.bh_dir(), job.origin, "browse", status=r.state, count=len(r.new_keys), raw=str(job.raw))
+    status = "error: partial (timeout)" if r.state.startswith("partial") else r.state  # never counted as done
+    c.record_phase(c.bh_dir(), job.origin, "browse", status=status, count=len(r.new_keys), raw=str(job.raw))
     print("\n".join(render(r)))
     if r.state.startswith("error"):
         sys.exit(1)
