@@ -18,8 +18,8 @@ def main() -> None:
     args = sys.argv[1:]
     if name == "bh-agent":
         if not args:
-            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz", "js"))
-            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|recall|<tool> ...  (tools: {tools})")
+            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz", "js", "docs", "cve", "flows", "fuzz"))
+            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|recall|mcp|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
     if cmd in ("hook-pre", "hook-post"):
@@ -62,6 +62,26 @@ def main() -> None:
         from bh.agent import zap
 
         zap.main(args)
+    elif cmd == "mcp":  # stdlib only: a stdio MCP server by name (bh, hexstrike), started by Claude Code
+        from bh.agent.mcp import launch
+
+        launch.main(args)
+    elif cmd == "docs":  # W3-D: a library's documentation, through the gate
+        from bh.agent import docs
+
+        docs.main(args)
+    elif cmd == "cve":  # W3-D
+        from bh.agent import cve
+
+        cve.main(args)
+    elif cmd == "flows":  # W3-F: the gate's log of this run's flows
+        from bh.agent import flows
+
+        flows.main(args)
+    elif cmd == "fuzz":  # W3-E
+        from bh.agent import fuzz
+
+        fuzz.main(args)
     elif cmd in TOOLS:
         from bh.agent import tools
 
