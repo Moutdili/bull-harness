@@ -32,20 +32,25 @@ flowchart LR
   style POL stroke-width:4px
 ```
 
-More diagrams are in [`docs/diagrams.md`](docs/diagrams.md): one segment step by step, the gate's
-decision for one request, the life of a finding, the path from YesWeHack rules to enforcement, and
-the module map.
+Five diagrams are in [`docs/diagrams.md`](docs/diagrams.md), each with the lines of code it was drawn
+from: who talks to whom at runtime, one segment step by step, the gate's decision for one request,
+the life of a finding, and the lineage with its memory.
 
 ## What keeps the agent honest
 
 | Concern | Where it is enforced | How |
 |---|---|---|
 | Scope | gate | `bh.scope.check()` on the hostname the client asked for. The pinned IP is mapped back to the name it was vetted for, and the Host header is checked too. Out-of-scope requests get a `403 X-BH-Gate`. |
-| Network escape | containers | The agent sits on an internal network. It has no DNS and no route out except the gate. Raw TCP and websockets are refused. |
+| Network escape | containers | The agent sits on an internal network. It has no DNS and no route out except the gate. Raw TCP is refused; websockets only where the scope enables them, to targets, bounded and logged. |
 | Writes | gate | PUT, PATCH and DELETE (method overrides included) go through only as one of *your* identities, and that identity's file must exist. |
-| Program rules | gate + host | Rate limit with backoff on 429, 503 and WAF answers. Enumeration is capped: more than 6 distinct ids in the path of one normalized route in 10 min are refused. Bodies are capped at 1 MiB. Where a program forbids scanners, 25 not-found answers in 5 min pause the origin. |
-| Credentials and quota | gate | The Claude OAuth token exists only in the gate. The relay serves only the agent container, only the calls Claude Code makes, only while a run is active, and at most a request budget per segment. Identity sessions are injected by the gate. Logs and PoCs are redacted by `bh.redact`. |
-| Unknown rules | runner | A real program runs only once a human has set `automation_allowed` and `scanners_allowed` in its scope file. |
+| Program rules | gate + host | Rate limit with backoff on 429, 503 and WAF answers. Enumeration is capped (`policy.ID_LIMIT`): more than 6 distinct ids in the path of one normalized route in 10 min are refused. Bodies are capped at 1 MiB. Where a program forbids scanners, 25 not-found answers in 5 min pause the origin. |
+| Credentials and quota | gate | The Claude OAuth token exists only in the gate. The relay serves only the agent, judge and audit containers, only the calls Claude Code makes, only while a run is active, and at most a request budget per segment. Identity sessions are injected by the gate. Logs and PoCs are redacted by `bh.redact`. |
+| Account-changing paths | gate | Sign-out, password, account deletion and payment paths (plus the scope's `protected_urls`) are refused to every client, the persistent browser included. |
+| Recipients | gate | On a route the scope guards (an invitation, a send), every e-mail address must be one of the program's identities, checked against digests only; otherwise `recipient not ours`. |
+| Payload hosts | gate | The data-free hosts a scope lists (`payload_hosts`) take GET, HEAD and OPTIONS without a body, nothing of ours attached, every request logged. |
+| Gate self-test | runner | Before the first segment, the escape suite runs from the agent container against the live gate; one failed check cancels the hunt. |
+| Unknown rules | runner | A real program runs only once a human has set `automation_allowed` and `scanners_allowed` in its scope file, and only while its rule pages were read in the last 7 days with no unacknowledged change (`bh rules`). |
+| Run caps | runner | On a real program: a named phase, sessions of 11 runs, 3 sessions and 33 runs a day, 33 runs a phase. A cap refuses; it never waits and no option raises it. |
 | Method | sandbox hooks (an aid) | Hand-made HTTP to an origin is refused until the mapping tools have run on it. One tool table serves the scanner ban and the metrics. The hooks see `Bash` and every `mcp__*` tool, classified the same way: an unclassified MCP tool is refused, and the judge gets none. |
 | False positives | host verifier | Stage A replays the structured `proof.json` twice through the gate. The control must be the attack's twin, and an answer to it that satisfies the attack disproves the proof. Stage B runs a fresh Opus judge as its own Unix user, with a clean HOME, after every hunter process has been killed. Its verdict counts only with a nonce given to that process alone. `verified` requires both stages. |
 | Isolation between runs | runner | Each session starts with no process, HOME or CLAUDE.md from the previous one. A segment reaches only its own program's work directory. |
@@ -71,23 +76,29 @@ flowchart LR
 
 | Path | Role |
 |---|---|
-| `src/bh/scope/` | Scope schema v1, the single decision function `check()`, and the YesWeHack importer |
-| `src/bh/gate/` | mitmproxy addon and policy (system, passive, target or deny) |
+| `src/bh/scope/` | Scope schema v1, the single decision function `check()`, approved prefixes, and the YesWeHack importer |
+| `src/bh/gate/` | mitmproxy addon and policy (system, target, support, passive, docs, payload or deny), the Claude API relay, canaries, the recipient guard, identity sessions |
 | `src/bh/agent/` | Code that runs **inside** the sandbox (stdlib only): file contract, tool table, builtins, hooks, `bh-note`, proof replay |
-| `src/bh/runner/` | One segment (`run.py`), board ingestion (`ingest.py`), doctrine (`prompt.py`), supervisor |
-| `src/bh/verify.py` | Two-stage verifier, deduplication, triager PoC |
+| `src/bh/runner/` | One segment (`run.py`), board ingestion (`ingest.py`), doctrine (`prompt.py`), supervisor and run caps (`supervisor.py`), gate self-test (`preflight.py`), hashed setup (`identity.py`), observation proofs (`observation.py`) |
+| `src/bh/verify.py` | Two-stage verifier, deduplication, observation proofs, triager PoC |
 | `src/bh/classes.py`, `src/bh/cards/` | Vulnerability classes (aliases, signals, proof standard) and 24 method cards |
 | `src/bh/skills/` | Skills: one method per class or surface, `<name>/SKILL.md`, loaded by the agent on demand in place of pinned cards |
 | `src/bh/agent/mcp/` | Sandbox MCP server `bh`: the builtins as 12 typed tools over stdio, started by `bh-agent mcp bh` |
 | `src/bh/agent/hexstrike/` | Sandbox MCP server `hexstrike`: HexStrike's tool table behind three meta-tools, no shell, started by `bh-agent mcp hexstrike` |
 | `src/bh/lineage/` | Lineage (host side): numbered agents, the memory they hand on in `board.sqlite`, `bh-recall` search |
+| `src/bh/accounts/` | Our test accounts: sign-up and login recipes run through the gate, sessions, TOTP, mail reading |
+| `src/bh/browser_service/` | The persistent browser (compose service `browser`) and its narrow API; the operator passes challenges there |
+| `src/bh/rules.py` | Program rule pages read, dated and compared (`bh rules check`, `ack`, `diff`) |
+| `src/bh/stats.py` | `bh stats`: runs, cost, findings by status and cost per verified finding, by phase and setup |
 | `src/bh/assets.py` | Asset graph (hosts, origins, endpoints, coverage, tests) built from the sandbox and the gate |
 | `src/bh/redact.py` | The single definition of "sensitive" (credential headers and keys, personal data, JWTs) |
+| `src/bh/retention.py` | Retention of gate flow files and logs (`bh prune`) |
 | `src/bh/board/`, `src/bh/ui/` | SQLite board, and the web UI (stdlib server, CSP, HMAC session) |
+| `src/bh/tokens/` | Token-cost measurements (miner, calibration), kept as a watch |
 | `src/bh/paths.py`, `stack.py`, `text.py` | Filesystem layout, podman operations, text helpers |
 | `container/` | Compose file, agent and gate images, hook settings, `bh-agent` entry point (`python3 -I`) |
-| `scopes/` | One YAML file per program (`scopes/lab/juiceshop.yaml` is the training lab) |
-| `tests/` | Unit tests, and `tests/escape/escape_check.sh` (29 checks against the live gate) |
+| `scopes/` | One YAML file per program (`scopes/lab/juiceshop.yaml` is the training lab, `scopes/msrc/` the Microsoft programs) |
+| `tests/` | Unit tests, and `tests/escape/escape_check.sh` (the escape suite against the live gate, profiles `lab`, `msrc` and `host`) |
 
 ## First start
 
@@ -117,11 +128,22 @@ The import never widens a scope:
 
 You then set `automation_allowed` and `scanners_allowed`; the runner refuses while either is null. The full checklist is in [`docs/premiere-cible-ywh.md`](docs/premiere-cible-ywh.md).
 
+## Microsoft programs (MSRC)
+
+Written by hand from a survey of the hosts seen live (`docs/research/`), one file per service, with our two personal
+test accounts and no tenant:
+- `scopes/msrc/copilot.yaml`: Microsoft Copilot (consumer);
+- `scopes/msrc/onedrive.yaml`: OneDrive personal (Microsoft 365 bounty).
+
+Each one is hunted inside a phase (`bh hunt scopes/msrc/<file> --phase <name>`), after `bh rules check` has read its
+rule pages. Its program skill (`src/bh/skills/msrc-<service>/`) gives the surfaces in order and the proof MSRC wants.
+
 ## Running
 
 ```sh
 uv run bh run scopes/lab/juiceshop.yaml --effort medium --minutes 30 --max-turns 50   # one segment
-uv run bh hunt scopes/x.yaml scopes/y.yaml --hours 4 --effort medium                  # supervisor
+uv run bh hunt scopes/x.yaml scopes/y.yaml --phase p1 --hours 4 --effort medium      # supervisor: one session
+uv run bh rules check scopes/x.yaml       # read the program's rule pages (a real program needs them fresh)
 uv run bh verify scopes/x.yaml F12        # re-verify one finding (judge: BH_VERIFIER_MODEL, default opus)
 uv run bh status · bh todo · bh finding [ID] · bh board frontier <program>
 uv run bh board reset <program> --yes    # labs only: backup, forget the program, wipe its /work
@@ -135,8 +157,8 @@ the agent inside the container.
 ## Tests
 
 ```sh
-uv run pytest                                                                  # unit tests
-podman exec -i --user hunter bh-agent bash -s < tests/escape/escape_check.sh   # live escape suite (29 checks)
+uv run pytest -q                                                               # unit tests
+podman exec -i --user hunter bh-agent bash -s < tests/escape/escape_check.sh   # live escape suite (profile lab)
 uvx ruff@0.14.0 check src tests
 ```
 
@@ -145,4 +167,5 @@ request refused for the wrong reason counts as a failure.
 
 ## Status
 
-The two hostile reviews of 2026-11-24 are fixed and tested, open items included (see [`docs/TODO.md`](docs/TODO.md)). Known limits are in [`docs/architecture.md`](docs/architecture.md).
+Waves W1 to W3 of plan v4.2 are merged and tested (see [`docs/TODO.md`](docs/TODO.md)); the live measures are listed
+there. Known limits are in [`docs/architecture.md`](docs/architecture.md).
