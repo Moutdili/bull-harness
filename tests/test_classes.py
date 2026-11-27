@@ -1,3 +1,7 @@
+import re
+
+import pytest
+
 from bh import classes
 from bh.scope import canonical_vuln
 
@@ -85,3 +89,126 @@ def test_access_control_cards_point_at_bh_authz_and_its_proof():
     assert "Tool: `bh-authz`" in classes.cards_block(["idor"])
     assert classes.canonical("Broken Access Control") == "broken-access-control"
     assert classes.canonical("BOLA") == "idor" and classes.canonical("privilege-escalation") == "auth"
+
+
+# ------------------------------------------------------------------ W3-C: skills, pins, classes_more.json
+def _scope(**kw):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(**kw)
+
+
+def test_skill_for_each_card_class_and_none_without_one():
+    for cls in classes.CLASSES:
+        if cls.card:
+            assert classes.skill_for(cls.id) == cls.id, cls.id
+    assert classes.skill_for("BOLA") == "idor" and classes.skill_for("Broken Access Control") == "broken-access-control"
+    assert classes.skill_for("dos") is None and classes.skill_for("no such class") is None
+    assert classes.skills_dir() == classes.SKILLS_DIR and classes.skills_dir().name == "skills"
+
+
+def test_skill_text_and_all_skills():
+    text = classes.skill_text("idor")
+    assert text.startswith("---\nname: idor\n") and "## Proof" in text
+    for bad in ("../cards", "idor/../idor", "no-such-skill", ""):
+        with pytest.raises(ValueError):
+            classes.skill_text(bad)
+    listed = {s["name"]: s for s in classes.all_skills()}
+    assert set(classes.all_cards()) <= set(listed)
+    assert all(set(s) == {"name", "description", "requires"} for s in listed.values())
+    assert listed["scanner-playbook"]["requires"] == "scanners" and listed["idor"]["requires"] is None
+
+
+def test_pinned_skills_follow_the_model_family():
+    s = _scope(cards=(), pin_for_models={"prompt-injection": ["opus", "mythos"]})
+    assert classes.pinned_skills(s, "claude-sonnet-5-5") == []
+    assert classes.pinned_skills(s, "claude-opus-5-5") == ["prompt-injection"]
+    assert classes.pinned_skills(s, "claude-mythos-1") == ["prompt-injection"]
+    assert classes.pinned_skills(s, "opus") == ["prompt-injection"]  # an alias without the prefix
+    assert classes.pinned_skills(s, None) == [] and classes.pinned_skills(s, "") == []
+    assert classes.pinned_skills(_scope(cards=()), "claude-opus-5-5") == []  # no pin_for_models (before lot D)
+    frozen = _scope(pin_for_models=(("prompt-injection", ("opus", "mythos")),))  # a frozen scope may hold pairs
+    assert classes.pinned_skills(frozen, "claude-mythos-1") == ["prompt-injection"]
+    assert classes.pinned_skills(_scope(pin_for_models={"prompt-injection": "opus"}), "claude-opus-5-5") == [
+        "prompt-injection"
+    ]
+    assert classes.pinned_skills(_scope(pin_for_models={"prompt-injection": "opus"}), "claude-o3") == []
+
+
+def test_program_skills_are_the_scope_cards_then_the_pins():
+    s = _scope(cards=("msrc-copilot", "bh-web-manual"), pin_for_models={"prompt-injection": ["opus", "mythos"]})
+    assert classes.program_skills(s) == ["msrc-copilot", "bh-web-manual"]
+    assert classes.program_skills(s, "claude-sonnet-5-5") == ["msrc-copilot", "bh-web-manual"]
+    assert classes.program_skills(s, "claude-opus-5-5") == ["msrc-copilot", "bh-web-manual", "prompt-injection"]
+    s2 = _scope(cards=("prompt-injection",), pin_for_models={"prompt-injection": ["mythos"]})
+    assert classes.program_skills(s2, "claude-mythos-1") == ["prompt-injection"]  # never twice
+    for bad in (("../../etc/passwd",), ("msrc-nowhere",)):
+        with pytest.raises(ValueError):
+            classes.program_skills(_scope(cards=bad))
+    with pytest.raises(ValueError):
+        classes.program_skills(_scope(cards=(), pin_for_models={"nope": ["opus"]}), "claude-opus-5-5")
+
+
+def test_classes_more_json_completes_and_adds(tmp_path, monkeypatch):
+    import json
+
+    more = tmp_path / "classes_more.json"
+    more.write_text(
+        json.dumps(
+            [
+                {"id": "nosqli", "aliases": ["nosql"], "evidence": "new text", "skill": "nosql-injection"},
+                {"id": "race-condition", "evidence": "Two requests at once break a rule.", "skill": "race-condition"},
+                {
+                    "id": "jwt",
+                    "aliases": ["jwt", "json-web-token"],
+                    "path_signals": [r"/\.well-known/jwks"],
+                    "evidence": "A forged token is accepted.",
+                    "skill": "jwt",
+                },
+                {"id": "csrf", "aliases": ["csrf", "cross-site-request-forgery", "logout-csrf"], "skill": "csrf"},
+            ]
+        )
+    )
+    built = classes.build_classes(more)
+    ids = [c.id for c in built]
+    assert len(ids) == len(set(ids)) == len(classes.build_classes(None)) + 2
+    by_id = {c.id: c for c in built}
+    first_exclusion = ids.index("dos")
+    assert ids.index("prompt-injection") < ids.index("jwt") < ids.index("csrf") < first_exclusion  # card, more, excl
+    nosqli = by_id["nosqli"]
+    assert nosqli.skill == "nosql-injection" and nosqli.evidence == classes.BY_ID["nosqli"].evidence  # kept
+    assert nosqli.aliases == classes.BY_ID["nosqli"].aliases
+    race = by_id["race-condition"]
+    assert race.evidence == "Two requests at once break a rule." and race.skill == "race-condition"
+    assert ids.index("race-condition") > first_exclusion  # completed in place, not moved
+    aliases = classes.alias_map(built)
+    assert aliases["jwt"] == "auth" and aliases["json-web-token"] == "jwt"  # a built-in alias keeps its class
+    assert aliases["logout-csrf"] == "csrf-logout" and aliases["cross-site-request-forgery"] == "csrf"
+    assert classes.exclusion("Logout CSRF") == "csrf-logout"
+    assert classes.build_classes(tmp_path / "absent.json") == classes.build_classes(None)
+    # skill_for: the exact id first, then the alias; only a skill present on disk
+    skills = tmp_path / "skills"
+    (skills / "jwt").mkdir(parents=True)
+    (skills / "jwt" / "SKILL.md").write_text("---\nname: jwt\ndescription: Use when x.\n---\n")
+    monkeypatch.setattr(classes, "SKILLS_DIR", skills)
+    monkeypatch.setattr(classes, "BY_ID", by_id)
+    assert classes.skill_for("jwt") == "jwt" and classes.skill_for("csrf") is None  # no csrf folder here
+    for bad in ({"aliases": []}, {"id": "Bad Id"}, {"id": "x", "skill": "../y"}, {"id": "x", "aliases": [1]},
+                {"id": "x", "path_signals": ["("]}):  # fmt: skip
+        more.write_text(json.dumps([bad]))
+        with pytest.raises((ValueError, re.error)):
+            classes.build_classes(more)
+    more.write_text(json.dumps([{"id": "x"}, {"id": "x"}]))
+    with pytest.raises(ValueError):
+        classes.build_classes(more)
+
+
+def test_the_installed_classes_keep_their_ids_and_aliases():
+    builtin = classes.build_classes(None)
+    for c in builtin:
+        assert classes.canonical(c.id) == c.id, c.id
+        for a in c.aliases:
+            assert classes.canonical(a) == c.id, a
+    assert classes.exclusion("Logout CSRF") == "csrf-logout"
+    # the card path still works until lot F switches
+    assert classes.pinned_cards(_scope(cards=("idor",))) == ["idor"] and classes.card_text("idor").startswith("## ")
