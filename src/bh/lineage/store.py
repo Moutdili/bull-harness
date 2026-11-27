@@ -395,6 +395,28 @@ def _endpoint(value: object) -> tuple[str, str, str]:
     return "", "", ""
 
 
+def _route_hosts(board: Board, program: str) -> dict[str, set[str]]:
+    """route (key.split(...)["route"]) -> the hosts the program's asset graph holds it on."""
+    out: dict[str, set[str]] = {}
+    if not _columns(board, "assets"):
+        return out
+    for r in board.db.execute("SELECT key FROM assets WHERE program=? AND kind='endpoint'", (program,)).fetchall():
+        h, m, p = _endpoint(r["key"])
+        if h:
+            out.setdefault(key.split(key.canonical("", m, p, ""))["route"], set()).add(h)
+    return out
+
+
+def _host_for(hosts: dict[str, set[str]], h: str, m: str, p: str) -> str:
+    """`h`, or when a note named a route without its host (`bh-note cover "GET /p"`), the one host the asset graph
+    holds that route on: otherwise the same endpoint splits into two cells and a settled one reads open (lab, agent
+    #0004 against #0003, 2026-11-27). Several hosts, or none: left empty."""
+    if h or not (m or p):
+        return h
+    found = hosts.get(key.split(key.canonical("", m, p, ""))["route"], set())
+    return next(iter(found)) if len(found) == 1 else h
+
+
 def _identities(value: object) -> list[str]:
     """A JSON list or a comma-separated string, as the board may hold them."""
     if isinstance(value, str) and value.strip().startswith("["):
@@ -434,6 +456,7 @@ def _proof_steps(proof: object) -> list[dict]:
 def _gate_seen(board: Board, program: str, run_id: int) -> set[str]:
     """Endpoints (key.endpoint) whose coverage the gate saw in this run (coverage_class.gate_seen = 1)."""
     out = set()
+    hosts = _route_hosts(board, program)
     for r in _read(
         board,
         "coverage_class",
@@ -444,7 +467,7 @@ def _gate_seen(board: Board, program: str, run_id: int) -> set[str]:
         need=("program", "run_id", "gate_seen", "endpoint"),
     ):
         h, m, p = _endpoint(r["endpoint"])
-        out.add(key.endpoint(key.canonical(h, m, p, "")))
+        out.add(key.endpoint(key.canonical(_host_for(hosts, h, m, p), m, p, "")))
     return out
 
 
@@ -452,6 +475,7 @@ def _run_items(board: Board, program: str, run_id: int, agent_no: int) -> list[d
     """The items of one run, from the board's tables (never from raw output, a target page or the stream)."""
     base = {"program": program, "run_id": run_id, "agent_no": agent_no}
     out: list[dict] = []
+    hosts = _route_hosts(board, program)
     # hand-made requests the gate saw (bh.assets tests, evidence 'gate'): what was tested, by whom the gate says
     tested = (
         board.db.execute(
@@ -489,7 +513,7 @@ def _run_items(board: Board, program: str, run_id: int, agent_no: int) -> list[d
         need=("program", "run_id"),
     ):
         h, m, p = _endpoint(r["endpoint"])
-        ck = key.canonical(h, m, p, str(r["vuln_class"] or ""))
+        ck = key.canonical(_host_for(hosts, h, m, p), m, p, str(r["vuln_class"] or ""))
         f, outcome = key.split(ck), _outcome(r["outcome"])
         out.append(
             base
@@ -561,6 +585,7 @@ def _run_items(board: Board, program: str, run_id: int, agent_no: int) -> list[d
         h, m, p = _endpoint(r["endpoint"])
         if not h and r["kind"] == "blocker" and str(r["evidence"] or "").startswith("host:"):
             h = str(r["evidence"])[5:]
+        h = _host_for(hosts, h, m, p)
         ck = key.canonical(h, m, p, str(r["vuln_class"] or ""), str(r["technique"] or ""), _identities(r["identities"]))
         anchored = _flag(r["grounded"]) and bool(m or p) and key.endpoint(ck) in seen
         why = f"why: {r['why']}\n" if r["why"] else ""
@@ -699,7 +724,9 @@ def ingest_run(board: Board, program: str, run_id: int, agent_no: int) -> int:
     for item in [*_run_items(board, program, run_id, agent_no), _summary(board, program, runs[0], agent_no)]:
         row = _prepare(item)
         src = f"{row['src_kind']}:{row['src_id']}"
-        if done.get(src) == row["text_hash"]:
+        # the cell is part of what was ingested: a source whose cell changed (a host filled in) supersedes its item
+        print_ = f"{row['ckey']}|{row['text_hash']}"
+        if done.get(src) == print_:
             continue
         prior = board.db.execute(
             "SELECT id FROM mem_items WHERE program=? AND src_kind=? AND src_id=? AND run_id=? AND valid_to IS NULL "
@@ -710,7 +737,7 @@ def ingest_run(board: Board, program: str, run_id: int, agent_no: int) -> int:
             _supersede_row(board, int(prior["id"]), row)
         else:
             _put_row(board, row)
-        done[src] = row["text_hash"]
+        done[src] = print_
         n += 1
     board.db.commit()
     board.meta_set(done_key, json.dumps(done, sort_keys=True))

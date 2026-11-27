@@ -529,3 +529,11 @@ def test_server_never_raises_on_a_broken_board(tmp_path, work):
     srv.poll()
     assert (work / "res" / "k1.txt").read_text().strip() == recall.UNAVAILABLE_LINE
     assert isinstance(sqlite3.sqlite_version, str)
+
+
+def test_map_leaves_out_items_without_a_cell(board):
+    """Lab, 2026-11-27: 43 run summaries and handoffs (no host, route nor class) headed the map as one cell `||`."""
+    put(board, "a real cell")
+    put(board, "a run summary", cell="||", kind="run-summary")
+    out = recall.navigate(board, P, "map")
+    assert "1 cell(s)" in out and "· ||" not in out

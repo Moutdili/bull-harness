@@ -592,3 +592,23 @@ def test_backfill_skips_runs_an_agent_owns(board):
     board.db.execute("INSERT INTO agents(no, program, run_id) VALUES (1, 'p', ?)", (rid,))
     board.db.commit()
     assert store.backfill(board, "p") == 0 and _count(board) == 0
+
+
+def test_a_route_without_its_host_takes_the_one_host_of_the_asset_graph(board):
+    """Lab, 2026-11-27: agent #0004's `bh-note cover "GET /rest/products/search"` (no host) opened a second cell beside
+    the one agent #0003 had settled, and read open. The host comes from the asset graph when it holds one only."""
+    from bh import assets
+
+    _lot_a(board)
+    assets.ensure(board)
+    board.db.execute(
+        "INSERT INTO assets(program, kind, key, first_seen, last_seen) "
+        "VALUES ('p', 'endpoint', 'http://h.test:80 GET /api/x/{id}', 0, 0)"
+    )
+    rid = board.run_start("p", "m")
+    board.run_end(rid, status="done")
+    board.db.execute("INSERT INTO coverage_class VALUES ('p', 'GET /api/x/5', 'sqli', 'suspect', 'e', ?, 0, 1)", (rid,))
+    board.db.commit()
+    assert store.ingest_run(board, "p", rid, 4) > 0
+    cov = board.db.execute("SELECT ckey FROM mem_items WHERE src_kind='coverage'").fetchone()
+    assert cov["ckey"].startswith("h.test|get /api/x/{id}|sqli")  # canonical: default port dropped

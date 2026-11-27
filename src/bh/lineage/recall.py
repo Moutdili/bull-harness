@@ -527,6 +527,8 @@ def _map(db: sqlite3.Connection, program: str, arg: str, now: float) -> str:
     prefix = arg.lower()
     cells: dict[str, list[dict]] = {}
     for r in _rows(db, "SELECT * FROM mem_items WHERE program=? AND valid_to IS NULL", program):
+        if not str(r.get("cell") or "").strip(SEP + " "):
+            continue  # no host, route nor class (run summaries, handoffs): not a cell of the surface (--run, --chain)
         route = str(r.get("cell") or "").split(SEP)
         path = route[1].split(" ", 1)[-1] if len(route) > 1 else ""
         if prefix and not (
