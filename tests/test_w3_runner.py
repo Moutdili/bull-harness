@@ -615,3 +615,12 @@ def test_a_programs_own_skill_is_linked_only_where_its_scope_names_it():
     assert not [n for n in run.allowed_skills(lab) if n.startswith("msrc-")]
     mine = [n for n in run.allowed_skills(cop) if n.startswith("msrc-")]
     assert mine == ["msrc-copilot"]
+
+
+def test_claude_codes_bundled_skills_are_off():
+    """Lab run 72 (2026-11-27): the hunter's session listed deep-research, update-config, verify, debug... beside ours.
+    The flag settings turn them off (code.claude.com/docs/en/skills.md, `disableBundledSkills`)."""
+    import json
+
+    doc = json.loads((ROOT / "container/agent/hooks/settings.json").read_text())
+    assert doc["disableBundledSkills"] is True and doc["hooks"]
