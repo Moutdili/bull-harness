@@ -1,0 +1,21 @@
+# bh-oob: the out-of-band listener (src/bh/oob/listener.py, T23). Stdlib Python only; the image holds the listener and
+# the one module it imports (bh.agent.contract, for CANARY_RE), nothing else of the harness. Build context: src/
+#   podman build -t localhost/bh-oob:dev -f container/oob/Containerfile src
+# Base: the gate's pinned image, used for its Python only (mitmproxy itself never runs here, its entrypoint is
+# dropped). Runs as an unprivileged user; writes only to /journal (the host's var/oob, its single volume).
+# Tailscale Funnel, opened and reset by the orchestrator on the host, publishes the host's 127.0.0.1 port: no
+# Tailscale command, key or name lives in this image.
+FROM docker.io/mitmproxy/mitmproxy@sha256:e2f810b6e618258dd4980716da143c4a8de0edcb3243264baea398e2185bbbfb
+COPY bh/__init__.py /opt/bh/lib/bh/__init__.py
+COPY bh/agent/__init__.py bh/agent/contract.py /opt/bh/lib/bh/agent/
+COPY bh/oob/__init__.py bh/oob/listener.py /opt/bh/lib/bh/oob/
+RUN groupadd --system --gid 10001 bhoob \
+ && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin bhoob \
+ && mkdir -p /journal && chown 10001:10001 /journal && chmod -R a-w /opt/bh/lib
+ENV PYTHONDONTWRITEBYTECODE=1
+USER 10001:10001
+EXPOSE 8792
+ENTRYPOINT []
+# Inside its own network namespace the listener binds every address of the container: the host publishes the port on
+# its own 127.0.0.1 only (compose service `oob`), so nothing but the host (and Funnel, through it) reaches it.
+CMD ["python3", "-I", "-c", "import sys;sys.path.insert(0,'/opt/bh/lib');from bh.oob.listener import main;main(sys.argv[1:])", "--host", "0.0.0.0", "--port", "8792", "--journal", "/journal/oob.jsonl"]
