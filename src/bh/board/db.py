@@ -612,7 +612,9 @@ class Board:
         if retry:
             out.append("## blocked, retry: `bh-web state` (a human challenge the operator may have passed)")
             out += [f"- {r['id']} {r['title']}" for r in reversed(retry)]
-        return "\n".join(out) if out else "(board empty: first session on this program)"
+        if out:
+            return "\n".join(out)
+        return "(board empty: first session on this program)" if facts else "(no open intents, candidates or blockers)"
 
     def export_facts(self, program: str, path: Path) -> None:
         """Read-only snapshot for the agent (bh-note show)."""

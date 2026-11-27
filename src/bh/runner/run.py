@@ -37,7 +37,7 @@ from bh.assets import Graph
 from bh.agent import contract as c
 from bh.board import Board
 from bh.runner import identity, ingest, lineage_hooks
-from bh.runner.prompt import build_system_prompt, build_task
+from bh.runner.prompt import build_system_prompt, build_task, opening_name
 from bh.scope import Scope, load_scope
 from bh.text import one_line
 
@@ -1818,6 +1818,7 @@ def setup_doc(
         fill_day=controller.FILL_DAY,
         prompt_quantum=sv.PROMPT_QUANTUM,
         prompt_floor=sv.PROMPT_FLOOR,
+        doctrine_opening=opening_name(),  # the opening this segment's doctrine is built with (env or `a`)
     )
     for k, v in lineage_setup().items():
         doc.setdefault(k, v)

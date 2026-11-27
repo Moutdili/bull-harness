@@ -6,7 +6,7 @@ fill and prompt budgets, BH_PREFLIGHT) into a canonical JSON document (sorted ke
 Wave W2 (D9) adds what makes an agent relaunchable as it was: the hook layer (`hooks_sha256`: the agent's
 hooks/settings.json and bh.agent.mcp_policy), the gate policy (`policy_sha256`), the doctrine opening, the naming
 rule (`pseudo_rule` = bh.lineage.names.TABLES_SHA256) and whether the pseudo is shown (BH_LINEAGE_PSEUDO), the score
-weights (lot G's `score.weights_sha256()`, empty while it does not exist) and the recall parameters.
+weights (lot G's `score.weights_sha256()`, None while it does not exist) and the recall parameters.
 Two segments set up alike share a condensate; any change to one knob changes it. The document never holds a
 secret: identities are names and roles (never a session, a credential or a recipe), texts are condensates.
 
@@ -35,6 +35,7 @@ COLUMNS = (
     ("session", "TEXT"),  # D25: `<local date>-<n>` of the hunt session, NULL for a lone `bh run`
     ("friction", "TEXT"),  # D35: {"challenges_extra", "browser_429"} of a bh-browser segment
     ("quota", "TEXT"),  # R44: {"identity", "allot", "sent", "remaining_pct", "spent"} of a bh-browser segment
+    ("decisions", "INTEGER"),  # T20: bh_decision events of the run (rotation, nudge, budget tier, WAF pause, stop)
 )
 
 
@@ -115,8 +116,8 @@ def policy_sha256() -> str:
     return file_sha256(POLICY_FILE) or ""
 
 
-def score_weights_sha256() -> str:
-    """Lot G's score weights condensate; "" while that module is not there (or cannot answer)."""
+def score_weights_sha256() -> str | None:
+    """Lot G's score weights condensate; None while that module is not there (or cannot answer)."""
     for mod in ("bh.lineage.score", "bh.score"):
         try:
             module = importlib.import_module(mod)
@@ -125,8 +126,8 @@ def score_weights_sha256() -> str:
         try:
             return str(module.weights_sha256())
         except Exception:  # noqa: BLE001 (an absent or broken score never stops a segment from starting)
-            return ""
-    return ""
+            return None
+    return None
 
 
 def pseudo_shown_setting(env=None) -> str:
@@ -159,7 +160,12 @@ def setup(
 ) -> tuple[str, dict]:
     """(sha256 of the canonical document, the document). `recall_params`: what the agent is given of its elders
     (counts, windows), numbers and names only; `pseudo_shown` defaults to BH_LINEAGE_PSEUDO."""
-    from bh.lineage import names
+    try:  # the lineage is optional to a run (lineage_hooks): without it the setup still hashes
+        from bh.lineage import names
+
+        pseudo_rule = names.TABLES_SHA256
+    except ImportError:
+        pseudo_rule = None
 
     doc = {
         "model": model,
@@ -191,7 +197,7 @@ def setup(
         "hooks_sha256": hooks_sha256(),
         "policy_sha256": policy_sha256(),
         "doctrine_opening": str(doctrine_opening),
-        "pseudo_rule": names.TABLES_SHA256,
+        "pseudo_rule": pseudo_rule,
         "pseudo_shown": pseudo_shown_setting() if pseudo_shown is None else str(pseudo_shown),
         "score_weights_sha256": score_weights_sha256(),
         "recall_params": redact.data(dict(recall_params or {})),

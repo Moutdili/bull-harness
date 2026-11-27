@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import bh
 from bh import paths, stats
 from bh.board import Board
 from bh.cli import main
@@ -202,7 +203,7 @@ def test_a_missing_module_breaks_nothing(lin, tmp_path, monkeypatch):
 def test_no_lineage_package_at_all_is_one_line(tmp_path, monkeypatch):
     lines: list[str] = []
     monkeypatch.setattr(lineage_hooks, "say", lines.append)
-    monkeypatch.setitem(sys.modules, "bh.lineage", None)
+    _no_lineage(monkeypatch)
     assert lineage_hooks.start(Board(tmp_path / "b.sqlite"), _scope(), 1, "s") is None
     assert len(lines) == 1 and lines[0].startswith("lineage: start skipped (")
     assert lineage_hooks.task_block(None, _scope(), None) == "" and lineage_hooks.event(None, {}) is None
@@ -341,7 +342,7 @@ def test_segment_births_rotates_and_closes_its_agents(lin, seg):
 
 def test_without_lineage_the_task_and_frontier_are_unchanged(seg, monkeypatch):
     _board, go, st = seg
-    monkeypatch.setitem(sys.modules, "bh.lineage", None)
+    _no_lineage(monkeypatch)
     res, tasks = go([{"ctx": [500], "notes": []}])
     assert "## Lineage" not in tasks[0] and all(st["frontier"])
     assert res.agent is None and res.status == "ok"
@@ -356,7 +357,8 @@ def test_close_runs_in_the_exception_branch(lin, seg):
 
 def test_decisions_are_journaled_and_traced(lin, seg):
     board, go, st = seg
-    board.db.execute("ALTER TABLE runs ADD COLUMN decisions INTEGER")  # identity.ensure's line (lot D)
+    if "decisions" not in {r[1] for r in board.db.execute("PRAGMA table_info(runs)")}:
+        board.db.execute("ALTER TABLE runs ADD COLUMN decisions INTEGER")  # identity.ensure's line (lot D)
     st["outcome"] = ingest.GateOutcome(waf_hosts={"secret-host.a.test"})
     res, _ = go([{"ctx": [500, 800, 900], "locked": 1}, {"ctx": [900, 1100]}, {"ctx": [900, 2100], "overflow": True}])
     whats = [e["what"] for e in _decisions(res)]
@@ -470,7 +472,7 @@ def test_setup_records_opening_pseudo_and_weights(lin, monkeypatch):
 
 def test_setup_without_score_module_still_hashes(monkeypatch):
     monkeypatch.setattr(identity, "claude_version", lambda: "2.1.330")
-    monkeypatch.setitem(sys.modules, "bh.lineage", None)
+    _no_lineage(monkeypatch)
     _, doc = _doc()
     assert doc["score_weights_sha256"] is None and doc["BH_DOCTRINE_OPENING"]
 
@@ -489,14 +491,23 @@ def test_compose_mounts_neither_lineage_nor_lab():
             )
 
 
+def _no_lineage(monkeypatch):
+    """The lineage package absent: its submodules too, since an earlier test may have imported them for real
+    (importlib looks up `bh.lineage.<x>` in sys.modules before it looks at the parent)."""
+    for name in [n for n in sys.modules if n == "bh.lineage" or n.startswith("bh.lineage.")]:
+        monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.setitem(sys.modules, "bh.lineage", None)
+
+
 # ------------------------------------------------------------------ program rules (lot H)
 def _rules(monkeypatch, fresh):
     m = types.ModuleType("bh.rules")
-    m.fresh = fresh
+    m.fresh = lambda program, now=None, **_kw: fresh(program, now)
     m.ack = lambda program: None
     m.diff = lambda program: "- old\n+ new"
     m.check = lambda scope, fetch=None: {"program": scope.program, "ok": True}
     monkeypatch.setitem(sys.modules, "bh.rules", m)
+    monkeypatch.setattr(bh, "rules", m, raising=False)  # `from bh import rules` reads the package attribute first
     return m
 
 
@@ -521,7 +532,7 @@ def test_preflight_sets_aside_stale_rules(tmp_path, monkeypatch, capsys):
     board = Board(tmp_path / "b.sqlite")
     seen = []
 
-    def fresh(program, now=None):
+    def fresh(program, now=None, **_kw):
         seen.append(program)
         return (False, "changed since the last ack") if program == "stale" else (True, "")
 
@@ -534,12 +545,13 @@ def test_preflight_sets_aside_stale_rules(tmp_path, monkeypatch, capsys):
 
 def test_preflight_without_rules_module_changes_nothing(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "bh.rules", None)
+    monkeypatch.delattr(bh, "rules", raising=False)
     board = Board(tmp_path / "b.sqlite")
     assert [p.program for p in supervisor.preflight(board, [_scope_file(tmp_path)])] == ["real"]
 
 
 def test_a_rules_check_that_raises_sets_the_program_aside(tmp_path, monkeypatch):
-    def fresh(program, now=None):
+    def fresh(program, now=None, **_kw):
         raise OSError("rules store unreadable")
 
     _rules(monkeypatch, fresh)
@@ -698,7 +710,7 @@ def home(tmp_path, monkeypatch):
     ],
 )
 def test_lineage_commands_say_when_the_module_is_missing(home, monkeypatch, capsys, argv):
-    monkeypatch.setitem(sys.modules, "bh.lineage", None)
+    _no_lineage(monkeypatch)
     monkeypatch.setattr("bh.cli.stack.wipe_program", lambda p: pytest.fail("reset ran"))
     assert main(argv) == 2
     err = capsys.readouterr().err
@@ -708,6 +720,7 @@ def test_lineage_commands_say_when_the_module_is_missing(home, monkeypatch, caps
 @pytest.mark.parametrize("argv", [["rules", "check", "x.yaml"], ["rules", "ack", "p"], ["rules", "diff", "p"]])
 def test_rules_commands_say_when_the_module_is_missing(home, monkeypatch, capsys, argv):
     monkeypatch.setitem(sys.modules, "bh.rules", None)
+    monkeypatch.delattr(bh, "rules", raising=False)
     assert main(argv) == 2 and "bh.rules is not available" in capsys.readouterr().err
 
 

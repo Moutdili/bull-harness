@@ -689,12 +689,14 @@ def mark_intents(board: Any, program: str, run_id: int | None) -> dict:
         if "recall" not in cols:
             return out
         sel = ", ".join(
-            x if x in cols else f"NULL AS {x}" for x in ("id", "created", "recall", "endpoint", "vuln_class")
+            x if x in cols else f"NULL AS {x}" for x in ("id", "created", "recall", "endpoint", "vuln_class", "kind")
         )
         intents = _rows(db, f"SELECT {sel} FROM intents WHERE program=? AND run_id IS ?", program, run_id)
         have_receipts = bool(_columns(db, "mem_receipts"))
         cited: dict[str, dict] = {}
         for it in intents:
+            if "kind" in cols and it["kind"] not in ("test", "prove"):
+                continue  # only a test or a proof owes a receipt (T15): mapping and untyped intents are not counted
             ok = False
             rec = receipt_row(board, program, it["recall"]) if have_receipts else None
             if rec is not None:

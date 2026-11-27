@@ -232,7 +232,7 @@ def rules_fresh(scope) -> tuple[bool, str]:
     except ImportError:
         return True, ""
     try:
-        ok, why = rules.fresh(scope.program)
+        ok, why = rules.fresh(scope.program, scope=scope)
     except Exception as exc:  # noqa: BLE001
         return False, f"program rules check failed: {type(exc).__name__}: {exc}"
     return bool(ok), str(why or "")

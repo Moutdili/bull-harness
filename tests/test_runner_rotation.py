@@ -177,7 +177,9 @@ def test_rotation_above_the_threshold_starts_a_fresh_session(seg):
     assert _resumes(st["cmds"][1]) is None  # fresh session, not --resume
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
     assert "rotated on a context threshold" in task
-    assert "HANDOFF: api mapped" in task  # the frontier was rebuilt from the notes ingested at rotation
+    # the HANDOFF ingested at rotation reaches the new agent through its Lineage block (the frontier drops facts)
+    assert "# Lineage" in task and "handoff #0001 | next: /api/orders" in task
+    assert "first session on this program" not in task
     # the agent wrote its HANDOFF: the runner did not add one at the rotation (only at the close, T22: the last leg
     # wrote none)
     assert [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")] == [
@@ -208,7 +210,8 @@ def test_runner_writes_the_handoff_when_missing(seg):
     assert "Dead ends (do not redo): sqli on /search: WAF blocks" in rows[0]["summary"]
     assert "Last command: bh-crawl https://a.test/1-1" in rows[0]["summary"]
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
-    assert "HANDOFF (runner)" in task
+    # the runner's HANDOFF reaches the new agent through its Lineage block (the frontier drops facts since W2)
+    assert "handoff #0001 |" in task and "Open intents: I1 test IDOR" in task
 
 
 def test_overflow_at_twice_the_threshold_cuts_the_leg_then_rotates(seg):

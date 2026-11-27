@@ -29,7 +29,8 @@ def b(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_HOME", str(tmp_path))
     board = Board(tmp_path / "board.db")
     board.db.executescript(LINEAGE)
-    board.db.execute("ALTER TABLE intents ADD COLUMN basis TEXT")
+    if "basis" not in {r[1] for r in board.db.execute("PRAGMA table_info(intents)")}:  # lot A's column
+        board.db.execute("ALTER TABLE intents ADD COLUMN basis TEXT")
     board.db.commit()
     return board
 
@@ -378,7 +379,8 @@ def test_honor_roll_informative_line_when_the_column_exists(b):
     rid = agent(b, 1)
     fid = finding(b, rid, "verified")
     assert len(score.honor_roll(b, P)) == 1
-    b.db.execute("ALTER TABLE findings ADD COLUMN outcome TEXT")
+    if "outcome" not in {r[1] for r in b.db.execute("PRAGMA table_info(findings)")}:
+        b.db.execute("ALTER TABLE findings ADD COLUMN outcome TEXT")
     b.db.execute("UPDATE findings SET outcome='informative' WHERE id=?", (fid,))
     b.db.commit()
     lines = score.honor_roll(b, P)

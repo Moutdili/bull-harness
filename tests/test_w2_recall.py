@@ -245,15 +245,18 @@ def test_predecessor_text_stays_inside_the_tag(board):
 # ------------------------------------------------------------------ receipts, intents.verified, misses
 def _intents(b: Board, *, recall_col=True):
     if recall_col:
+        have = {r[1] for r in b.db.execute("PRAGMA table_info(intents)")}  # lot A ships them since W2
         for col in ("recall", "endpoint", "vuln_class", "kind"):
-            b.db.execute(f"ALTER TABLE intents ADD COLUMN {col} TEXT")
+            if col not in have:
+                b.db.execute(f"ALTER TABLE intents ADD COLUMN {col} TEXT")
     b.db.commit()
 
 
 def _intent(b: Board, run_id, rec, endpoint="GET /api/Users/{id}", vc="idor", created=None) -> int:
     cur = b.db.execute(
-        "INSERT INTO intents(program, run_id, title, created, recall, endpoint, vuln_class) VALUES (?,?,?,?,?,?,?)",
-        (P, run_id, "t", created or time.time(), rec, endpoint, vc),
+        "INSERT INTO intents(program, run_id, title, created, recall, endpoint, vuln_class, kind) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (P, run_id, "t", created or time.time(), rec, endpoint, vc, "test"),  # a test owes a receipt (T15)
     )
     b.db.commit()
     return int(cur.lastrowid)

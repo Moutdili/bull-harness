@@ -234,11 +234,13 @@ LOT_A_FACTS = (
 
 
 def _lot_a(b):
+    have = {r[1] for r in b.db.execute("PRAGMA table_info(facts)")}  # lot A ships some of them since W2
     for col in LOT_A_FACTS:
-        b.db.execute(f"ALTER TABLE facts ADD COLUMN {col}")
+        if col.split()[0] not in have:
+            b.db.execute(f"ALTER TABLE facts ADD COLUMN {col}")
     b.db.execute(
-        "CREATE TABLE coverage_class (program TEXT, endpoint TEXT, vuln_class TEXT, outcome TEXT, evidence TEXT, "
-        "run_id INTEGER, ts REAL, gate_seen INTEGER)"
+        "CREATE TABLE IF NOT EXISTS coverage_class (program TEXT, endpoint TEXT, vuln_class TEXT, outcome TEXT, "
+        "evidence TEXT, run_id INTEGER, ts REAL, gate_seen INTEGER)"
     )
 
 
@@ -562,7 +564,8 @@ def test_lineage_imports_no_network_module():
                 names = [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom):
                 names = [node.module or ""] if node.level == 0 else []
-            bad += [f"{f.name}: {n}" for n in names if n.split(".")[0] in NETWORK]
+            # urllib.parse only splits strings: no socket behind it
+            bad += [f"{f.name}: {n}" for n in names if n.split(".")[0] in NETWORK and n != "urllib.parse"]
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "__import__":
                 bad.append(f"{f.name}: __import__")
     assert bad == []
