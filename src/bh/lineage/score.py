@@ -11,6 +11,10 @@ by the host" true. It never enters a prompt as a number attached to a running ag
 A missing table or column is zero signal, never an error: the tables come from other lots (agents, mem_items,
 mem_receipts, coverage_class, intents.basis) and older boards lack them.
 
+Outcomes (W4): the platform's verdict Mio types after the triage (findings.outcome) is a signal like the others, its
+points in WEIGHTS (outcome_*): paid is credited on top of the verified credit, informative and n/a take the verified
+credit back. Retroactive: bh.stats.set_outcome computes the ledger again. The judge never sees an outcome.
+
 Weights: WEIGHTS are the defaults Mio chose; var/state/score-weights.json (host file) may override them, known signals
 and integers in [-1000, 1000] only. Caps (CAPS) are counts of occurrences, not points, and are not tunable.
 """
@@ -50,7 +54,22 @@ WEIGHTS: dict[str, int] = {
     "handoff_missing": -5,
     "legacy_contradicted": -15,  # a ruled-out lead or a dead end on a cell where a finding was then verified
     "gate_denied": -5,  # each gate refusal after the first
+    # The platform's outcome, typed by Mio after the triage (findings.outcome, bh.stats.set_outcome): retroactive.
+    "outcome_paid": 300,  # on top of finding_verified
+    "outcome_accepted": 0,
+    "outcome_duplicate": 0,  # the verified credit stays
+    "outcome_informative": -40,  # and the verified credit is withdrawn; `na` counts as informative
 }
+# outcome -> its signal; the outcomes of WITHDRAWN take the finding's verified credit back. No number here: the points
+# are WEIGHTS' (and the host file's).
+OUTCOME_SIGNALS: dict[str, str] = {
+    "paid": "outcome_paid",
+    "accepted": "outcome_accepted",
+    "duplicate": "outcome_duplicate",
+    "informative": "outcome_informative",
+    "na": "outcome_informative",
+}
+WITHDRAWN = frozenset({"informative", "na"})
 # Occurrences counted at most, per agent (per item for legacy_consulted). gate_denied: 5 x -5 = -25 at the defaults.
 CAPS: dict[str, int] = {
     "ruled_out_anchored": 5,
@@ -233,10 +252,14 @@ def entries(board: Board, program: str, weights: dict[str, int] | None = None) -
     if {"proof", "observation"} <= fcols:
         refused_sql += " OR (status IN ('new','verifying') AND proof IS NULL AND observation IS NULL)"
     best: dict[tuple, tuple[int, sqlite3.Row]] = {}  # (class, cell) -> (rank, finding): one credit per class and cell
+    outcome_sql = "NULL AS outcome, NULL AS outcome_ts"
+    if "outcome" in fcols:
+        when = "outcome_ts, " if "outcome_ts" in fcols else ""
+        outcome_sql = f"outcome, COALESCE({when}updated, created) AS outcome_ts"
     for f in _rows(
         board,
         f"SELECT id, run_id, status, vuln_class, url, created, COALESCE(updated, created) AS ts, "
-        f"({refused_sql}) AS refused FROM findings WHERE program=? ORDER BY id",
+        f"({refused_sql}) AS refused, {outcome_sql} FROM findings WHERE program=? ORDER BY id",
         program,
     ):
         agent = run_agent.get(f["run_id"])
@@ -245,6 +268,11 @@ def entries(board: Board, program: str, weights: dict[str, int] | None = None) -
             verified_cells.append((cell, f["vuln_class"], f["id"], f["ts"]))
         if agent is None:
             continue
+        signal = OUTCOME_SIGNALS.get(f["outcome"]) if f["status"] in VERIFIED else None
+        if signal is not None:
+            out.append(Entry(agent, signal, w[signal], "finding", f["id"], f["outcome_ts"]))
+            if f["outcome"] in WITHDRAWN:
+                continue  # verified by the harness, closed without value by the program: no verified credit
         if f["refused"]:
             out.append(Entry(agent, "finding_refused", w["finding_refused"], "finding", f["id"], f["ts"]))
         elif f["status"] == "rejected":
@@ -477,18 +505,21 @@ def honor_roll(board: Board, program: str) -> list[str]:
                 f"read by {reads[iid]} later agent(s)."
             )
     if "outcome" in _cols(board, "findings"):
+        closed = sorted(WITHDRAWN)
         inf = _rows(
             board,
-            f"SELECT id, vuln_class, url FROM findings WHERE program=? AND outcome='informative' AND status IN "
-            f"({','.join('?' * len(VERIFIED))}) ORDER BY id DESC LIMIT 1",
+            f"SELECT id, vuln_class, url, outcome FROM findings WHERE program=? AND outcome IN "
+            f"({','.join('?' * len(closed))}) AND status IN ({','.join('?' * len(VERIFIED))}) ORDER BY id DESC LIMIT 1",
             program,
+            *closed,
             *VERIFIED,
         )
         if inf:
             f = inf[0]
             lines.append(
                 f"F{f['id']} {_safe(f['vuln_class'], 40)} on {_shown(cell_of_url(f['url']))}: verified by the harness, "
-                "then closed informative by the program."
+                f"then closed {'informative' if f['outcome'] == 'informative' else 'not applicable'} by the program: "
+                "do not report this shape again."
             )
     return lines[:3]
 

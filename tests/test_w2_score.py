@@ -384,7 +384,9 @@ def test_honor_roll_informative_line_when_the_column_exists(b):
     b.db.execute("UPDATE findings SET outcome='informative' WHERE id=?", (fid,))
     b.db.commit()
     lines = score.honor_roll(b, P)
-    assert len(lines) == 2 and lines[1].startswith(f"F{fid} idor") and "informative" in lines[1]
+    # W4: informative takes the verified credit back, so the "best verified" line goes and the shape stays
+    assert len(lines) == 1 and lines[0].startswith(f"F{fid} idor") and "informative" in lines[0]
+    assert "do not report this shape again" in lines[0]
 
 
 def test_honor_roll_keys_are_sanitised(b):

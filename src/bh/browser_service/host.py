@@ -248,6 +248,22 @@ def save_snapshot(path=None, call_=None) -> dict[str, Any]:
     return {"ok": True, "file": str(f), "challenge": out["challenge"]}
 
 
+def shot(dest, call_=None) -> dict[str, Any]:
+    """One PNG of bh-browser's page (controller op `shot`, host only), written 0600 to `dest`. The controller
+    refuses it while a human challenge is pending or the operator has the screen. The image stays on the host:
+    never mounted in a container, never given to the judge or the agent (bh.stats.poc_shot)."""
+    from bh.stats import write_png
+
+    out = (call_ or call)({"op": "shot"})
+    if out.get("code") != 200:
+        return {"ok": False, "error": f"{out.get('error', 'no reply')} {out.get('detail', '')}".strip()}
+    try:
+        n = write_png(Path(dest), out.get("png_b64") or "")
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    return {"ok": True, "file": str(dest), "bytes": n}
+
+
 def view_url(host: str | None = None, port: int = 7340) -> str:
     from bh.ui.server import default_host
 
