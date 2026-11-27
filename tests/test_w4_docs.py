@@ -15,7 +15,7 @@ DIAGRAMS = ROOT / "docs" / "diagrams.md"
 COMPOSE = ROOT / "container" / "compose.yaml"
 # Services the other lots of W4 add to container/compose.yaml (lot A: the out-of-band listener). The orchestrator
 # empties this list once W4 is merged: from then on every service drawn must be one of compose.yaml.
-W4_PENDING = ("oob",)
+W4_PENDING: tuple[str, ...] = ()  # emptied at the W4 merge: `oob` is a compose service now
 
 _PATH = re.compile(r"((?:src/bh|container|tests|docs)/[\w./-]*[\w/])(?::(\d+)(?:-(\d+))?)?")
 _LINE_REF = re.compile(r"`:(\d+)(?:-(\d+))?`")

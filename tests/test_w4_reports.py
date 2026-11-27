@@ -313,10 +313,7 @@ def test_checklist_text(board, monkeypatch):
     assert "(e) program rules: last read never" in text and "bh rules check" in text
     assert '(f) Copilot: the report says "the test ran on copilot.com"' in text
     assert "nothing below is sent anywhere" in lines[0]
-    # without lot C's key: verify.duplicate_of, program by program
-    monkeypatch.delattr(verify, "dedupe_key")
-    text = "\n".join(stats.checklist(board, fid))
-    assert "(a) internal duplicates (verify.duplicate_of" in text and f"F{other}" in text
+    # (the fallback "without lot C's key" is gone: since the W4 merge verify.duplicate_of reads dedupe_key itself)
     stats.set_outcome(board, sent, "duplicate")
     text = "\n".join(stats.checklist(board, fid))
     assert f"F{sent} (msrc-copilot, duplicate)" in text and "Two open reports" not in text

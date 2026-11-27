@@ -54,7 +54,7 @@ flowchart LR
   GATE -->|"egress, jeton posé"| ANT(["api.anthropic.com"])
   GATE -->|"lab"| JUICE
   TGT -. "rappel du serveur cible, W4" .-> FUN(["Tailscale Funnel, W4"])
-  FUN -.-> OOB["oob · écouteur hors bande, W4<br/>lié à la boucle locale de l'hôte"]:::ctr
+  FUN -.-> OOB["oob · écouteur hors bande, W4<br/>réseau oob, seul ; port lié à la boucle locale de l'hôte"]:::ctr
   OOB -. "journal lu par l'hôte, W4" .-> HRUN
   class OOB,FUN w4
   classDef ctr stroke-width:2px

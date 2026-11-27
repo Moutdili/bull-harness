@@ -24,6 +24,8 @@ LOT_H = {
     "subdomain-takeover", "postmessage", "function-level-authz", "multi-tenant", "nextjs", "firebase", "auth0",
     "supabase", "proof-package", "false-positive-traps", "csrf", "type-confusion", "nosql-injection", "xxe",
     "web-cache", "saml", "websocket-origin", "graphql-schema-from-errors", "wordpress-rest", "api-surface-mapping",
+    # wave W4: G (Microsoft services), F (white box), C (severity)
+    "agent-actions", "entra", "graph", "power-platform", "whitebox", "cvss-from-evidence",
 }  # fmt: skip
 PROGRAM_CARDS = (
     "msrc-copilot", "msrc-onedrive", "bh-web-manual", "ai-connectors", "ai-conversation-isolation", "ai-file-upload",
