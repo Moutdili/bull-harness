@@ -1,0 +1,29 @@
+{
+ "synthetic": true,
+ "about": "A segment that maps, anchors a fact in a gate flow, opens and closes an intent and records one finding with a replayable proof; a finding of a class the program excludes is rejected by the harness; the gate denied one request of the hunter.",
+ "program": "replay-lab",
+ "run_id": 1,
+ "model": "claude-replay",
+ "identities": [
+  "user-a",
+  "user-b"
+ ],
+ "scope": {
+  "program": "replay-lab",
+  "platform": "local",
+  "in_scope": [
+   "app.replay.test"
+  ],
+  "forbidden_vulns": [
+   "dos"
+  ],
+  "identities": [
+   {
+    "name": "user-a"
+   },
+   {
+    "name": "user-b"
+   }
+  ]
+ }
+}

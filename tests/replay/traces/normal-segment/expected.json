@@ -1,0 +1,58 @@
+{
+ "board": {
+  "findings": [
+   {
+    "title": "IDOR: any session reads a private booking",
+    "status": "new",
+    "verdict": null,
+    "severity": "medium",
+    "vuln_class": "idor",
+    "url": "http://app.replay.test/api/v1/bookings/bk_0a1b2c3d4e5f",
+    "not_proven": "",
+    "has_proof": 1
+   },
+   {
+    "title": "slow answers under load",
+    "status": "rejected",
+    "verdict": "excluded by program policy (forbidden_vulns: dos)",
+    "severity": "low",
+    "vuln_class": "dos",
+    "url": "http://app.replay.test/api/v1/rooms",
+    "not_proven": "no proof",
+    "has_proof": 0
+   }
+  ],
+  "facts": [
+   {
+    "kind": "fact",
+    "title": "schedule lists private refs",
+    "grounded": 1
+   },
+   {
+    "kind": "handoff",
+    "title": "HANDOFF: one idor recorded",
+    "grounded": 0
+   },
+   {
+    "kind": "blocked",
+    "title": "gate denied 1 requests",
+    "grounded": 0
+   }
+  ],
+  "intents": [
+   {
+    "title": "read another user's booking by ref",
+    "status": "closed",
+    "kind": "map"
+   }
+  ],
+  "runs": [
+   {
+    "id": 1,
+    "status": "ok",
+    "turns": 7,
+    "cost_usd": 0.4213
+   }
+  ]
+ }
+}

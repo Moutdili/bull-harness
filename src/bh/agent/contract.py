@@ -85,6 +85,9 @@ GENERIC_LABELS = frozenset(
 # Commands that only read a third-party documentation or advisory source (never a target): neither locked by the
 # tool lock nor counted as manual HTTP (uses_manual_http).
 PASSIVE_TOOLS = ("bh-docs", "bh-cve", "/opt/bh/bin/bh-docs", "/opt/bh/bin/bh-cve")
+# Commands the host answers from a request file in BH_DIR (bh-recall: the lineage; bh-mail: our identities' mail): no
+# request leaves the sandbox, like a note. Neither locked, nor manual HTTP, nor a scanner: their arguments are text.
+HOST_SERVED_TOOLS = ("bh-recall", "bh-mail", "/opt/bh/bin/bh-recall", "/opt/bh/bin/bh-mail")
 
 
 def is_docs(host: str) -> bool:
@@ -913,7 +916,8 @@ def uses_arsenal(cmd: str) -> bool:
 
 def uses_manual_http(cmd: str) -> bool:
     """A command that hand-crafts HTTP to a URL. bh-docs and bh-cve (PASSIVE_TOOLS) read third-party sources through
-    the gate's own classes: their calls are left out (a substitution inside one still counts)."""
-    if any(t in cmd for t in PASSIVE_TOOLS):
-        cmd = without_commands(cmd, PASSIVE_TOOLS)
+    the gate's own classes, bh-recall and bh-mail (HOST_SERVED_TOOLS) are answered by the host: their calls are left
+    out (a substitution inside one still counts)."""
+    if any(t in cmd for t in (*PASSIVE_TOOLS, *HOST_SERVED_TOOLS)):
+        cmd = without_commands(cmd, (*PASSIVE_TOOLS, *HOST_SERVED_TOOLS))
     return bool(_MANUAL.search(cmd)) and bool(urls_in(cmd))

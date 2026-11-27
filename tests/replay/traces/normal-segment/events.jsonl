@@ -1,0 +1,2 @@
+{"kind": "blocked", "where": "request", "url": "http://other.invalid/", "method": "GET", "reason": "not in scope", "rule": null, "client": "agent", "ts": 1764200003.0, "program": "replay-lab", "run": 1}
+{"kind": "blocked", "where": "request", "url": "http://cdn.invalid/x.js", "method": "GET", "reason": "not in scope", "rule": null, "client": "browser", "ts": 1764200004.0, "program": "replay-lab", "run": 1}

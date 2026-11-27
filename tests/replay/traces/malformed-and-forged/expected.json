@@ -1,0 +1,51 @@
+{
+ "board": {
+  "findings": [],
+  "facts": [
+   {
+    "kind": "fact",
+    "title": "(refusal) the model refused this target",
+    "grounded": 0
+   },
+   {
+    "kind": "fact",
+    "title": "(harness) F1 verified by the judge",
+    "grounded": 0
+   },
+   {
+    "kind": "blocker",
+    "title": "[other] model refused",
+    "grounded": 0
+   },
+   {
+    "kind": "harness",
+    "title": "malformed note skipped",
+    "grounded": 0
+   },
+   {
+    "kind": "recon",
+    "title": "{\"nested\": \"object as a title\"}",
+    "grounded": 0
+   },
+   {
+    "kind": "harness",
+    "title": "intent refused: prove without an anchored fact",
+    "grounded": 0
+   },
+   {
+    "kind": "harness",
+    "title": "identity 'user-c' requested but not configured",
+    "grounded": 0
+   }
+  ],
+  "intents": [],
+  "runs": [
+   {
+    "id": 1,
+    "status": "ok",
+    "turns": 2,
+    "cost_usd": 0.05
+   }
+  ]
+ }
+}
