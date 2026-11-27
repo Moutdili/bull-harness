@@ -81,10 +81,14 @@ def seg(tmp_path, monkeypatch):
     scope_file = tmp_path / "p.yaml"
     scope_file.write_text("program: p\n")
     monkeypatch.setattr(run, "CONTEXT_ROTATE_TOKENS", LIMIT)
-    for name in ("activate_scope", "clean_sandbox", "prepare_workdir", "set_active_run"):
+    for name in ("activate_scope", "clean_sandbox", "prepare_workdir", "set_active_run", "push_budget"):
         monkeypatch.setattr(run, name, lambda *a, **k: None)
+    monkeypatch.setattr(run, "browser_status", lambda call=None: None)
+    monkeypatch.setattr(run.identity, "claude_version", lambda: "2.1.330")
     state = {"legs": [], "cmds": [], "limits": [], "cleaned": []}
-    monkeypatch.setattr(run, "clean_leg", lambda prog, home: state["cleaned"].append((len(state["cmds"]), home)))
+    monkeypatch.setattr(
+        run, "clean_leg", lambda prog, home, skills=None: state["cleaned"].append((len(state["cmds"]), home))
+    )
 
     def no_podman(*a, **k):
         raise AssertionError("a test reached podman")
@@ -125,7 +129,8 @@ def seg(tmp_path, monkeypatch):
             return None, False
         sid = f"s{len(state['cmds'])}"
         res.session_id = sid
-        return {"subtype": "success", "num_turns": len(spec["ctx"]), "session_id": sid, "result": "done"}, False
+        sub = spec.get("subtype", "success")
+        return {"subtype": sub, "num_turns": len(spec["ctx"]), "session_id": sid, "result": "done"}, False
 
     monkeypatch.setattr(run, "run_leg", fake_leg)
 
@@ -162,7 +167,9 @@ def test_no_rotation_under_the_threshold(seg):
     assert st["limits"] == [2 * LIMIT, 2 * LIMIT]
     # M5: the sandbox is scrubbed before the 2nd leg (after the 1st exited), in the segment's HOME
     assert st["cleaned"] == [(1, run.sandbox_home(res.run_id))]
-    assert not board.rows("SELECT 1 FROM facts WHERE kind='handoff'")
+    # no rotation HANDOFF; the segment closed without one of the agent's: the runner's closing one (T22)
+    titles = [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")]
+    assert titles == ["HANDOFF (runner): segment closed (ok)"]
 
 
 def test_rotation_above_the_threshold_starts_a_fresh_session(seg):
@@ -173,9 +180,15 @@ def test_rotation_above_the_threshold_starts_a_fresh_session(seg):
     assert _resumes(st["cmds"][1]) is None  # fresh session, not --resume
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
     assert "rotated on a context threshold" in task
-    assert "HANDOFF: api mapped" in task  # the frontier was rebuilt from the notes ingested at rotation
-    # the agent wrote its HANDOFF: the runner did not add one
-    assert [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")] == ["HANDOFF: api mapped"]
+    # the HANDOFF ingested at rotation reaches the new agent through its Lineage block (the frontier drops facts)
+    assert "# Lineage" in task and "handoff #0001 | next: /api/orders" in task
+    assert "first session on this program" not in task
+    # the agent wrote its HANDOFF: the runner did not add one at the rotation (only at the close, T22: the last leg
+    # wrote none)
+    assert [r["title"] for r in board.rows("SELECT title FROM facts WHERE kind='handoff'")] == [
+        "HANDOFF: api mapped",
+        "HANDOFF (runner): segment closed (ok)",
+    ]
     assert res.new_facts == 1  # counted once, though ingested mid-segment
     log = [json.loads(x) for x in run.paths.run_log(res.run_id, "p").read_text().splitlines()]
     legs = [x for x in log if x.get("type") == "bh_leg"]
@@ -190,7 +203,9 @@ def test_runner_writes_the_handoff_when_missing(seg):
     ]
     res, st = go([{"ctx": [900, 1100], "notes": notes}, {"ctx": [750]}])
     assert res.rotations == 1
-    rows = board.rows("SELECT title, summary, run_id FROM facts WHERE kind='handoff'")
+    rows = board.rows(
+        "SELECT title, summary, run_id FROM facts WHERE kind='handoff' AND title LIKE '%context rotation%'"
+    )
     assert len(rows) == 1
     assert rows[0]["title"] == "HANDOFF (runner): context rotation at 1100 tokens"
     assert rows[0]["run_id"] == res.run_id
@@ -198,7 +213,8 @@ def test_runner_writes_the_handoff_when_missing(seg):
     assert "Dead ends (do not redo): sqli on /search: WAF blocks" in rows[0]["summary"]
     assert "Last command: bh-crawl https://a.test/1-1" in rows[0]["summary"]
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
-    assert "HANDOFF (runner)" in task
+    # the runner's HANDOFF reaches the new agent through its Lineage block (the frontier drops facts since W2)
+    assert "handoff #0001 |" in task and "Open intents: I1 test IDOR" in task
 
 
 def test_overflow_at_twice_the_threshold_cuts_the_leg_then_rotates(seg):
@@ -248,3 +264,62 @@ def test_pending_challenge_opens_the_next_leg(seg, monkeypatch):
     _res, st = go([{"ctx": [500, 600], "notes": [{"op": "intent", "title": "send prompt 3"}]}, {"ctx": [500]}])
     task = st["cmds"][1][st["cmds"][1].index("-p") + 1]
     assert task.startswith("A human challenge was pending: `bh-web state` first, then resume")
+
+
+# ------------------------------------------------------------------ T17: a segment on a mission (BH_MISSIONS=1)
+def _arg(cmd: list[str], flag: str) -> str:
+    return cmd[cmd.index(flag) + 1]
+
+
+def test_without_missions_the_segment_has_none(seg, monkeypatch):
+    monkeypatch.delenv("BH_MISSIONS", raising=False)
+    board, go = seg
+    res, st = go([{"ctx": [500]}])
+    assert _arg(st["cmds"][0], "--max-turns") == "60" and "# Mission" not in _arg(st["cmds"][0], "-p")
+    assert "mission" not in {r["name"] for r in board.db.execute("PRAGMA table_info(runs)")}  # not even the column
+    log = run.paths.run_log(res.run_id, "p").read_text()
+    assert '"what": "mission"' not in log
+
+
+def test_a_mission_sets_the_task_and_the_budget_and_is_journaled(seg, monkeypatch):
+    monkeypatch.setenv("BH_MISSIONS", "1")
+    board, go = seg
+    res, st = go([{"ctx": [500]}])
+    task = _arg(st["cmds"][0], "-p")
+    assert "# Mission (set by the host)" in task and "Budget: 15 turns for this mission." in task
+    assert _arg(st["cmds"][0], "--max-turns") == "15"  # the mission's budget, not the operator's 60
+    mission = json.loads(board.rows("SELECT mission FROM runs WHERE id=?", res.run_id)[0]["mission"])
+    assert mission["kind"] == "map" and mission["turns"] == 15
+    setup = json.loads(board.rows("SELECT setup_json FROM runs WHERE id=?", res.run_id)[0]["setup_json"])
+    assert setup["BH_MISSIONS"] == "1" and setup["max_turns"] == 60  # the setup keeps the operator's knobs
+    log = [json.loads(x) for x in run.paths.run_log(res.run_id, "p").read_text().splitlines()]
+    assert [x["what"] for x in log if x.get("type") == "bh_decision"][:1] == ["mission"]
+
+
+def test_the_host_extends_a_mission_once(seg, monkeypatch):
+    monkeypatch.setenv("BH_MISSIONS", "1")
+    seen = {"n": 0}
+
+    def new_test(*a, **k):
+        seen["n"] += 1
+        return True
+
+    monkeypatch.setattr(run.missions, "gate_new_test", new_test)
+    board, go = seg
+    full = {"ctx": [500] * 15, "subtype": "error_max_turns"}
+    res, st = go([full, {"ctx": [500] * 7, "subtype": "error_max_turns"}, {"ctx": [500]}])
+    assert len(st["cmds"]) == 2  # one extension, never a second
+    assert _resumes(st["cmds"][1]) == "s1" and _arg(st["cmds"][1], "--max-turns") == "7"
+    assert "remain for the mission" in _arg(st["cmds"][1], "-p")
+    mission = json.loads(board.rows("SELECT mission FROM runs WHERE id=?", res.run_id)[0]["mission"])
+    assert mission["extended"] == 7 and seen["n"] == 1
+    log = [json.loads(x) for x in run.paths.run_log(res.run_id, "p").read_text().splitlines()]
+    assert [x["what"] for x in log if x.get("type") == "bh_decision"].count("extension") == 1
+
+
+def test_no_extension_without_a_signal(seg, monkeypatch):
+    monkeypatch.setenv("BH_MISSIONS", "1")
+    monkeypatch.setattr(run.missions, "gate_new_test", lambda *a, **k: False)
+    _, go = seg
+    res, st = go([{"ctx": [500] * 15, "subtype": "error_max_turns"}, {"ctx": [500]}])
+    assert len(st["cmds"]) == 1 and res.status == "max_turns"

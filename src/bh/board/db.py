@@ -17,7 +17,17 @@ from pathlib import Path
 from typing import Any
 
 from bh import paths
-from bh.agent.contract import BLOCKER_REASONS, BLOCKER_TTL_S, CHALLENGE_BLOCKER_TTL_S, CHALLENGE_REASONS
+from bh.agent.contract import (
+    BLOCKER_REASONS,
+    BLOCKER_TTL_S,
+    CHALLENGE_BLOCKER_TTL_S,
+    CHALLENGE_REASONS,
+    CRITERION_MAX,
+    CRITERION_SHOWN,
+    INTENT_OUTCOMES,
+    REACHED,
+    SCOPE_REQUEST_STATUS,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -51,6 +61,11 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   run_id INTEGER NOT NULL, idx INTEGER NOT NULL, ts REAL, tool TEXT, kind TEXT, cmd TEXT, ms INTEGER,
   locked INTEGER, PRIMARY KEY(run_id, idx)
 );
+-- D40: an https prefix the agent asked for; the host's judge decides (pending, approved, refused, revoked)
+CREATE TABLE IF NOT EXISTS scope_requests (
+  id INTEGER PRIMARY KEY, run_id INTEGER, program TEXT NOT NULL, prefix TEXT NOT NULL, why TEXT,
+  status TEXT NOT NULL DEFAULT 'pending', reason TEXT, decided_by TEXT, ts REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS facts_prog ON facts(program, id);
 CREATE INDEX IF NOT EXISTS findings_prog ON findings(program, status);
 CREATE INDEX IF NOT EXISTS todos_status ON todos(status);
@@ -78,9 +93,39 @@ MIGRATIONS = (
     # observation proof (audit I1): {"token": "BH-SECRET-<16 hex>", "victim": ..., "attacker": ...}; the verdict
     # comes from the gate's journal, read by the host (bh.runner.observation), never from the hunter
     ("findings", "observation", "TEXT"),
+    # honesty pass of the hunter (T1): the best case against the finding, the proof that would change its severity,
+    # why this severity. Sandbox text, bounded at ingestion (HONESTY_MAX)
+    ("findings", "counter", "TEXT"),
+    ("findings", "severity_if", "TEXT"),
+    ("findings", "severity_why", "TEXT"),
+    # exit criteria written before the test (T8), and which one `bh-note done --reached` says was met
+    ("intents", "success", "TEXT"),
+    ("intents", "abandon", "TEXT"),
+    ("intents", "reached", "TEXT"),  # success | abandon | NULL (no criteria, or a done without --reached)
+    # W2-A, typed legs. grounded: 1 only when the host found the quote in a response body the gate kept for the run
+    # (T12); never set from the agent's text. The other columns are the agent's words, typed and bounded.
+    ("facts", "grounded", "INTEGER NOT NULL DEFAULT 0"),
+    ("facts", "quote", "TEXT"),  # one line, QUOTE_MAX characters, redacted
+    ("facts", "flow", "TEXT"),  # the gate flow the quote was found in (or the one the note named)
+    ("facts", "why", "TEXT"),  # dead-end: DEAD_END_WHY; think: the reason
+    ("facts", "endpoint", "TEXT"),  # "METHOD route" (contract.endpoint_label)
+    ("facts", "vuln_class", "TEXT"),  # classes.canonical
+    ("facts", "outcome", "TEXT"),  # INTENT_OUTCOMES, on a fact the host derived from an intent's closure
+    ("facts", "technique", "TEXT"),
+    ("facts", "identities", "TEXT"),  # comma-separated identity names
+    ("intents", "kind", "TEXT"),  # INTENT_KINDS, NULL for an untyped intent
+    ("intents", "basis", "TEXT"),  # F<n>
+    ("intents", "after", "TEXT"),  # I<n>
+    ("intents", "recall", "TEXT"),  # R-<id> | none, as written (lot C checks the receipt)
+    ("intents", "endpoint", "TEXT"),
+    ("intents", "vuln_class", "TEXT"),
+    ("intents", "outcome", "TEXT"),  # INTENT_OUTCOMES (base column, typed since W2: the free text moved to result)
+    ("intents", "result", "TEXT"),  # the hunter's free-text outcome of `bh-note done`
 )
+FACT_TYPED = ("grounded", "quote", "flow", "why", "endpoint", "vuln_class", "outcome", "technique", "identities")
+INTENT_TYPED = ("kind", "basis", "after", "recall", "endpoint", "vuln_class")
 # Rows deleted by reset_program. Runs are archived instead: their ids (and log files) are never reused.
-PROGRAM_TABLES = ("facts", "intents", "findings", "todos")
+PROGRAM_TABLES = ("facts", "intents", "findings", "todos", "scope_requests")
 
 # The only human step left: submitting a verified finding. Anything that blocks the hunt is a blocker fact.
 TODO_KINDS = {"submit"}
@@ -109,7 +154,41 @@ FINDING_FIELDS = (
     "not_proven",
     "proof",
     "observation",
+    "counter",
+    "severity_if",
+    "severity_why",
 )
+HONESTY_FIELDS = ("counter", "severity_if", "severity_why")
+HONESTY_MAX = 1000  # stored length of each honesty field
+
+
+def _flat(text: str | None, n: int) -> str:
+    """Hunter text on one frontier line: whitespace runs (newlines too) become one space, the separator `·` of the
+    intent line becomes `-` (a title never fakes a criterion), cut at n characters."""
+    s = " ".join((text or "").replace("·", "-").split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _intent_line(r: sqlite3.Row) -> str:
+    """`- I<n> (<kind>) <title> · after: I<m> · success: <...> · abandon: <...>`: an open intent on its own line,
+    bounded. bh-note done reads this shape (bh.agent.contract.intent_has_criteria) to ask for --reached."""
+    kind = f"({r['kind']}) " if r["kind"] else ""
+    after = f" · after: {r['after']}" if r["after"] else ""
+    crit = "".join(f" · {k}: {_flat(r[k], CRITERION_SHOWN)}" for k in REACHED if r[k])
+    return f"- I{r['id']} {kind}{_flat(r['title'], 300)}{after}{crit}"
+
+
+def _fact_label(r: sqlite3.Row) -> str:
+    """The kind of a frontier fact line: a dead end shows its cause (T13), an anchored fact says so (T12)."""
+    if r["kind"] == "dead-end" and r["why"]:
+        return f"dead-end: {r['why']}"
+    return f"{r['kind']}, anchored" if r["grounded"] else r["kind"]
+
+
+def _typed_value(k: str, v: Any) -> Any:
+    if k == "grounded":
+        return 1 if v is True or v == 1 else 0
+    return None if v is None or v == "" else str(v)[: 500 if k != "quote" else 400]
 
 
 class Board:
@@ -132,6 +211,15 @@ class Board:
                 (time.time(), *sorted(TODO_KINDS)),
             )
             self.meta_set("todos-v2", str(time.time()))
+        if not self.meta_get("intents-outcome-v2"):
+            # intents.outcome held the hunter's free text; since W2 it holds a typed INTENT_OUTCOMES value and the
+            # text lives in `result`. Old rows move once.
+            self.db.execute(
+                "UPDATE intents SET result=outcome, outcome=NULL WHERE outcome IS NOT NULL AND outcome NOT IN "
+                f"({', '.join('?' * len(INTENT_OUTCOMES))})",
+                INTENT_OUTCOMES,
+            )
+            self.meta_set("intents-outcome-v2", str(time.time()))
         self.db.commit()
 
     # ---- meta (cursors, flags)
@@ -179,6 +267,8 @@ class Board:
             for t in ("coverage", "tests", "asset_links"):
                 self.db.execute(f"DELETE FROM {t} WHERE asset_id IN ({ids})", (program,))
             out["assets"] = self.db.execute("DELETE FROM assets WHERE program=?", (program,)).rowcount
+        if self.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coverage_class'"):
+            out["coverage_class"] = self.db.execute("DELETE FROM coverage_class WHERE program=?", (program,)).rowcount
         archived = f"{program}~{time.strftime('%Y%m%d-%H%M%S')}"
         out["runs (archived)"] = self.db.execute(
             "UPDATE runs SET program=? WHERE program=?", (archived, program)
@@ -265,10 +355,15 @@ class Board:
         *,
         kind: str = "fact",
         run_id: int | None = None,
+        **typed: Any,
     ) -> int:
+        """`typed`: the FACT_TYPED columns (W2-A). `grounded` is the host's word: the ingestion sets it, nothing the
+        agent wrote does."""
+        extra = {k: _typed_value(k, v) for k, v in typed.items() if k in FACT_TYPED}
+        cols = ["program", "run_id", "kind", "title", "summary", "evidence", "created", *extra]
         cur = self.db.execute(
-            "INSERT INTO facts(program, run_id, kind, title, summary, evidence, created) VALUES (?,?,?,?,?,?,?)",
-            (program, run_id, kind, title[:300], summary[:2000], evidence[:500], time.time()),
+            f"INSERT INTO facts({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+            (program, run_id, kind, title[:300], summary[:2000], evidence[:500], time.time(), *extra.values()),
         )
         self.db.commit()
         return int(cur.lastrowid)
@@ -282,6 +377,7 @@ class Board:
         *,
         run_id: int | None = None,
         host: str | None = None,
+        **typed: Any,
     ) -> int:
         """A lead the agent cannot finish without a human: recorded, never waited on.
         Fact kind 'blocker', title "[reason] title"; the host (if any) is kept as evidence "host:<name>"."""
@@ -294,20 +390,105 @@ class Board:
             f"host:{host}" if host else "",
             kind="blocker",
             run_id=run_id,
+            **typed,
         )
 
-    def add_intent(self, program: str, title: str, run_id: int | None = None) -> int:
+    def add_intent(
+        self,
+        program: str,
+        title: str,
+        run_id: int | None = None,
+        *,
+        success: str | None = None,
+        abandon: str | None = None,
+        **typed: Any,
+    ) -> int:
+        """An intent, with the exit criteria the hunter wrote before the test (T8), if any: empty means none.
+        `typed`: the INTENT_TYPED columns (kind, basis, after, recall, endpoint, vuln_class)."""
+        extra = {k: _typed_value(k, v) for k, v in typed.items() if k in INTENT_TYPED}
+        cols = ["program", "run_id", "title", "created", "success", "abandon", *extra]
         cur = self.db.execute(
-            "INSERT INTO intents(program, run_id, title, created) VALUES (?,?,?,?)",
-            (program, run_id, title[:300], time.time()),
+            f"INSERT INTO intents({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+            (
+                program,
+                run_id,
+                title[:300],
+                time.time(),
+                (success or "")[:CRITERION_MAX] or None,
+                (abandon or "")[:CRITERION_MAX] or None,
+                *extra.values(),
+            ),
         )
         self.db.commit()
         return int(cur.lastrowid)
 
-    def close_intent(self, intent_id: int, outcome: str) -> None:
+    def close_intent(
+        self, intent_id: int, outcome: str, reached: str | None = None, *, closure: str | None = None
+    ) -> None:
+        """`outcome`: the hunter's text (column `result`); `closure`: the typed INTENT_OUTCOMES value (column
+        `outcome`), NULL when the note gave none."""
         self.db.execute(
-            "UPDATE intents SET status='closed', closed=?, outcome=? WHERE id=?",
-            (time.time(), outcome[:500], intent_id),
+            "UPDATE intents SET status='closed', closed=?, result=?, reached=?, outcome=? WHERE id=?",
+            (
+                time.time(),
+                outcome[:500],
+                reached if reached in REACHED else None,
+                closure if closure in INTENT_OUTCOMES else None,
+                intent_id,
+            ),
+        )
+        self.db.commit()
+
+    def intent_order(self, program: str) -> list[int]:
+        """The order of open intents the hunter last gave (`bh-note reorder`), ids only."""
+        try:
+            ids = json.loads(self.meta_get(f"intent-order:{program}", "[]"))
+        except ValueError:
+            return []
+        return [i for i in ids if isinstance(i, int) and not isinstance(i, bool)] if isinstance(ids, list) else []
+
+    def set_intent_order(self, program: str, ids: list[int]) -> None:
+        self.meta_set(f"intent-order:{program}", json.dumps(list(dict.fromkeys(ids))[:200]))
+
+    def threat_model(self, program: str) -> sqlite3.Row | None:
+        """The active threat model (T16): the latest one. Older ones stay, with their dates."""
+        rows = self.rows(
+            "SELECT id, title, summary, created, grounded FROM facts WHERE program=? AND kind='threat-model' "
+            "ORDER BY id DESC LIMIT 1",
+            program,
+        )
+        return rows[0] if rows else None
+
+    # ---- scope requests (D40): written at ingestion, decided by the host's judge or the operator
+    def add_scope_request(self, program: str, prefix: str, why: str, run_id: int | None = None) -> int | None:
+        """A pending request; None when the same prefix is already pending or approved for the program."""
+        if self.rows(
+            "SELECT 1 FROM scope_requests WHERE program=? AND prefix=? AND status IN ('pending', 'approved')",
+            program,
+            prefix,
+        ):
+            return None
+        cur = self.db.execute(
+            "INSERT INTO scope_requests(run_id, program, prefix, why, status, ts) VALUES (?,?,?,?, 'pending', ?)",
+            (run_id, program, prefix[:500], why[:1000], time.time()),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def scope_requests(self, program: str | None = None, status: str | None = None) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM scope_requests WHERE 1=1", []
+        if program is not None:
+            sql, args = sql + " AND program=?", [*args, program]
+        if status is not None:
+            sql, args = sql + " AND status=?", [*args, status]
+        return self.rows(sql + " ORDER BY id", *args)
+
+    def decide_scope_request(self, request_id: int, status: str, reason: str, decided_by: str) -> None:
+        if status not in SCOPE_REQUEST_STATUS:
+            raise ValueError(f"bad scope request status {status}")
+        self.db.execute(
+            "UPDATE scope_requests SET status=?, reason=?, decided_by=? WHERE id=?",  # ts stays the request's
+            (status, reason[:1000], decided_by[:80], request_id),
         )
         self.db.commit()
 
@@ -365,20 +546,27 @@ class Board:
     def rows(self, sql: str, *args: Any) -> list[sqlite3.Row]:
         return list(self.db.execute(sql, args))
 
-    def frontier(self, program: str, max_facts: int = 25, *, passthrough: bool = False) -> str:
+    def frontier(self, program: str, max_facts: int = 25, *, passthrough: bool = False, facts: bool = True) -> str:
         """Compact context for the agent: titles only, newest first. Target <= ~40 lines.
         `passthrough`: the scope has a host behind a human challenge that the operator passes in bh-web. A captcha or
-        challenge blocker is then a wait, not a wall: shown CHALLENGE_BLOCKER_TTL_S only, under "retry"."""
+        challenge blocker is then a wait, not a wall: shown CHALLENGE_BLOCKER_TTL_S only, under "retry".
+        `facts=False`: no section of latest facts (the inheritance block of the prompt takes its place)."""
         # Bookkeeping facts repeat every segment (one HANDOFF, one "gate denied" per run): only the latest
-        # of each kind is worth resending; every other fact stays, newest first. Blockers have their own section.
-        facts = self.rows(
-            "SELECT id, kind, title FROM facts WHERE program=? AND kind != 'blocker' AND "
-            "(kind NOT IN ('handoff', 'blocked') OR id IN "
-            "(SELECT MAX(id) FROM facts WHERE program=? AND kind IN ('handoff', 'blocked') GROUP BY kind)) "
-            "ORDER BY id DESC LIMIT ?",
-            program,
-            program,
-            max_facts,
+        # of each kind is worth resending; every other fact stays, newest first. Blockers have their own section, the
+        # threat model too (the latest is the active one); `think` lines are the lineage's journal, not the frontier.
+        latest = (
+            self.rows(
+                "SELECT id, kind, title, why, grounded FROM facts WHERE program=? AND kind NOT IN "
+                "('blocker', 'think', 'threat-model') AND "
+                "(kind NOT IN ('handoff', 'blocked') OR id IN "
+                "(SELECT MAX(id) FROM facts WHERE program=? AND kind IN ('handoff', 'blocked') GROUP BY kind)) "
+                "ORDER BY id DESC LIMIT ?",
+                program,
+                program,
+                max_facts,
+            )
+            if facts
+            else []
         )
         # Past the TTL a blocker is dropped from view: the wall may be gone, the lead is worth a new look.
         now = time.time()
@@ -395,31 +583,48 @@ class Board:
             waiting = {r["id"] for r in retry}
             blockers = [r for r in blockers if r["id"] not in waiting]
             retry = [r for r in retry if r["created"] >= now - CHALLENGE_BLOCKER_TTL_S]
-        intents = self.rows("SELECT id, title FROM intents WHERE program=? AND status='open' ORDER BY id", program)
+        intents = self.rows(
+            "SELECT id, title, success, abandon, kind, after FROM intents WHERE program=? AND status='open' "
+            "ORDER BY id",
+            program,
+        )
+        rank = {iid: i for i, iid in enumerate(self.intent_order(program))}  # bh-note reorder; the rest by id
+        intents.sort(key=lambda r: (rank.get(r["id"], len(rank)), r["id"]))
         findings = self.rows("SELECT id, status, severity, title FROM findings WHERE program=? ORDER BY id", program)
+        model = self.threat_model(program)
         out: list[str] = []
         if findings:
             out.append("## findings")
             out += [f"- F{r['id']} [{r['status']}/{r['severity'] or '?'}] {r['title']}" for r in findings]
         if intents:
             out.append("## open intents")
-            out += [f"- I{r['id']} {r['title']}" for r in intents]
-        if facts:
-            out.append(f"## facts (latest {len(facts)}; details: bh-note show <id>)")
-            out += [f"- {r['id']} ({r['kind']}) {r['title']}" for r in reversed(facts)]
+            out += [_intent_line(r) for r in intents]
+        if model is not None:
+            day = time.strftime("%Y-%m-%d", time.localtime(model["created"]))
+            out.append(f"## threat model ({model['id']}, {day}): {_flat(model['title'], 200)}")
+            out += [f"- {_flat(ln, 300)}" for ln in (model["summary"] or "").splitlines() if ln.strip()]
+        if latest:
+            out.append(f"## facts (latest {len(latest)}; details: bh-note show <id>)")
+            out += [f"- {r['id']} ({_fact_label(r)}) {r['title']}" for r in reversed(latest)]
         if blockers:
             out.append("## blocked (do not retry)")
             out += [f"- {r['id']} {r['title']}" for r in reversed(blockers)]
         if retry:
             out.append("## blocked, retry: `bh-web state` (a human challenge the operator may have passed)")
             out += [f"- {r['id']} {r['title']}" for r in reversed(retry)]
-        return "\n".join(out) if out else "(board empty: first session on this program)"
+        if out:
+            return "\n".join(out)
+        return "(board empty: first session on this program)" if facts else "(no open intents, candidates or blockers)"
 
     def export_facts(self, program: str, path: Path) -> None:
         """Read-only snapshot for the agent (bh-note show)."""
         data = {
             r["id"]: dict(r)
-            for r in self.rows("SELECT id, kind, title, summary, evidence FROM facts WHERE program=?", program)
+            for r in self.rows(
+                "SELECT id, kind, title, summary, evidence, grounded, quote, flow, why, endpoint, vuln_class, outcome, "
+                "technique, identities FROM facts WHERE program=?",
+                program,
+            )
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False))

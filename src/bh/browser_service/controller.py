@@ -4,14 +4,21 @@ One process owns the display (Xvfb), the screen server (x11vnc, loopback), the C
 profile, behind the gate) and one Playwright client attached over CDP (loopback). Two doors lead to it:
 
 - the agent's API, HTTP on the sandbox network, `POST /op` with `Authorization: Bearer $BH_BROWSER_TOKEN`:
-  goto, fill, click, press, text, wait, state, outline, attr, net, tabs, upload, frames, switch. Never cookies,
-  storage, raw CDP, script evaluation or screenshots.
+  goto, fill, click, press, text, wait, state, outline, attr, net, tabs, upload, frames, switch, ws_rewrite. Never
+  cookies, storage, raw CDP, script evaluation or screenshots. `net --body` reads a target's response already
+  received (never one of a sign-in host), `text --clipboard` what the page copied (read by xclip in the container).
 - the host's control socket (RUN_DIR, 0700): reached only by `podman exec -i ... host`, JSON on stdin:
-  load_session, status, reset, human_done, human_viewing, fill_budget_reset, switch_refused, snapshot.
+  load_session, status, reset, human_done, human_viewing, fill_budget_reset, fill_budget_set, switch_refused,
+  snapshot, shot (one PNG of the page for the PoC: refused during a challenge or while the operator has the screen;
+  the agent's door never has it).
 
 The browser is the distribution's Chromium as it ships: no flag that hides automation, no user agent of ours,
-not headless. While a human challenge is on screen, click/fill/press/upload are refused: the agent never touches
-it. While the operator has the screen open, the agent may only read (state, text, frames).
+not headless. While a human challenge is on screen, click/fill/press/upload/goto/tabs --select are refused: the agent
+never touches it. While the operator has the screen open, the agent may only read (state, text, frames).
+
+Budgets (FILLS_FILE, kept by a reset): prompts per segment (set by the host) and per identity and day of the host's
+clock (FILL_DAY), files and switches per segment, and the service's own daily limit as the page shows it: once seen,
+no prompt under that identity before the time the page names. Nothing here ever tries to get past it.
 
 One account per profile: the profile holds a marker {program, identity} (PROFILE_ROOT/bh-identity.json), written
 by load_session and removed by reset; load_session refuses another identity until a reset. The marker is what
@@ -23,6 +30,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import hashlib
 import hmac
 import json
 import mimetypes
@@ -59,7 +67,29 @@ from bh.browser_service import (
     VIEWING_OPS,
     VNC_PORT,
 )
-from bh.browser_service.detect import challenge, frame_text, scrub, scrub_obj, scrub_url
+from bh.browser_service.detect import (
+    BODY_MAX as NET_BODY_MAX,
+)
+from bh.browser_service.detect import (
+    CLIPBOARD_MAX,
+    REWRITE_FIND,
+    REWRITE_REPLACE_MAX,
+    body_kind,
+    body_text,
+    challenge,
+    clipboard_text,
+    frame_text,
+    rewrite_client_frame,
+    scrub,
+    scrub_obj,
+    scrub_url,
+    tail,
+    target_host,
+    under_target,
+)
+from bh.browser_service.detect import (
+    quota as read_quota,
+)
 
 CHROMIUM = "/usr/bin/chromium"
 TEXT_MAX = 8000  # head of the page text, the default of `text`
@@ -79,11 +109,23 @@ BODY_MAX = UPLOAD_B64_MAX + 16_384  # agent request (an upload is the largest)
 CTL_MAX = 1_000_000  # host request (a session's cookies)
 MAX_COOKIES = 300
 NET_KEEP, NET_LAST = 500, 200  # requests kept, at most returned by one `net`
+NET_BODIES = 200  # responses whose body `net --body` may still read (the last non-refused lines)
+CLIP_TIMEOUT_S = 2  # `text --clipboard`: xclip's answer
+CLIP_READ_MAX = 1_000_000
+TARGETS_MAX = 200
 FRAMES_KEEP, FRAMES_LAST = 300, 200  # websocket frames kept, at most returned by one `frames`
-# Prompts are bounded in number, not only in size (MSRC: never a flood of prompts). Per segment (the host resets it
-# at prepare) and per identity and UTC day (persisted in the profile volume, a reset does not clear it).
+REWRITE_TTL_DEFAULT, REWRITE_TTL_MAX = 180, 600  # seconds a ws-rewrite rule stays armed
+PUMP_S = 0.02  # while a websocket is routed, how often the idle worker lets Playwright forward its frames
+# Prompts are bounded in number, not only in size (MSRC: never a flood of prompts). Per segment (the host sets it at
+# prepare: the run's share, FILL_SEGMENT at most) and per identity and day of the host's local clock (persisted in the
+# profile volume, a reset does not clear it). FILL_DAY: under the service's own daily limit (Copilot, free account:
+# blocked at the 46th short prompt of the day, measured 2026-11-26); the service's limit itself is read on the page.
 FILL_SEGMENT = 80
-FILL_DAY = 200
+FILL_DAY = 45
+SHOT_MAX = 12_000_000  # bytes of one PNG screenshot (the host's `shot`)
+UPLOAD_SEGMENT = 6  # files set per segment (the Enter that sends one counts as a prompt)
+SWITCH_SEGMENT = 2  # identity switches the agent may ask per segment (each one costs a human challenge)
+DAY_S = 86_400
 VIEWING_TTL_S = 600  # the UI re-asserts "the operator is looking" while its screen is open
 COOKIE_SECRET_MIN = 8  # live cookie values at least this long are scrubbed from every reply
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
@@ -112,11 +154,12 @@ KEYS = frozenset(
 )
 HUMAN_NEEDED = (
     "a human challenge is on screen: the agent must not touch it. The operator is asked to solve it "
-    "(bh browser view); poll state() until challenge.pending is false, or record the blocker and move on"
+    "(bh browser view); run `bh-web wait-human` (it returns once the challenge is gone and the screen handed back). "
+    'If it times out: `bh-note intent "resume <what you were doing> after the challenge"`, then work another surface'
 )
 HUMAN_VIEWING = (
-    "the operator has the screen open: only state, text and frames are accepted until he closes it; "
-    "poll state() until human_viewing is false"
+    'the operator has the screen open: only state, text and frames are accepted until he clicks "J\'ai fini" '
+    "(then he only watches) or closes it; run `bh-web wait-human`, it returns once the screen is handed back"
 )
 SWITCH_NOTE = (
     "the host wipes the profile and loads this identity within a few seconds (only a live identity of this program); "
@@ -137,7 +180,28 @@ class Conflict(RuntimeError):
 
 
 class BudgetSpent(RuntimeError):
+    """A budget is spent (429): `error` names it (fill-budget, upload-budget, switch-budget)."""
+
+    def __init__(self, detail: str, error: str = "fill-budget", **extra: Any) -> None:
+        super().__init__(detail)
+        self.error = error
+        self.extra = extra
+
+
+class NotFound(LookupError):
     pass
+
+
+class Forbidden(PermissionError):
+    pass
+
+
+class Unavailable(RuntimeError):
+    pass
+
+
+class ScreenBusy(RuntimeError):
+    """`shot` refused: a human challenge is pending or the operator has the screen."""
 
 
 # ---------------------------------------------------------------- request validation
@@ -237,6 +301,16 @@ def _cookies(v: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _targets(v: Any) -> list[str]:
+    if (
+        not isinstance(v, list)
+        or len(v) > TARGETS_MAX
+        or not all(isinstance(u, str) and len(u) <= 300 and re.match(r"https?://[^/\s]", u, re.I) for u in v)
+    ):
+        raise Refused(f"targets: a list of at most {TARGETS_MAX} http(s) URL prefixes")
+    return v
+
+
 def _secrets(v: Any) -> list[str]:
     if not isinstance(v, list) or len(v) > 1000 or not all(isinstance(s, str) and len(s) <= 8192 for s in v):
         raise Refused("secrets: a list of strings")
@@ -249,28 +323,47 @@ SPEC: dict[str, dict[str, tuple[bool, Any]]] = {
     "fill": {"css": (True, _css), "text": (True, lambda v: _str(v, "text", 0, FILL_MAX))},
     "click": {"css": (True, _css)},
     "press": {"key": (True, _key)},
-    "text": {"css": (False, _css), "tail": (False, lambda v: _int(v, "tail", 1, TAIL_MAX))},
+    "text": {
+        "css": (False, _css),
+        "tail": (False, lambda v: _int(v, "tail", 1, TAIL_MAX)),
+        "clipboard": (False, lambda v: _bool(v, "clipboard")),
+    },
     "wait": {"css": (False, _css), "ms": (False, None)},
     "state": {},
     "outline": {"css": (False, _css)},
     "attr": {"css": (True, _css), "name": (True, _attr)},
-    "net": {"last": (False, lambda v: _int(v, "last", 1, NET_LAST)), "denied": (False, lambda v: _bool(v, "denied"))},
+    "net": {
+        "last": (False, lambda v: _int(v, "last", 1, NET_LAST)),
+        "denied": (False, lambda v: _bool(v, "denied")),
+        "body": (False, lambda v: _int(v, "body", 0, 2**31)),
+    },
     "tabs": {"select": (False, lambda v: _int(v, "select", 0, 50))},
     "upload": {"css": (True, _css), "name": (True, _file_name), "content_b64": (True, _content)},
     "frames": {"last": (False, lambda v: _int(v, "last", 1, FRAMES_LAST))},
     "switch": {"identity": (True, lambda v: _name(v, "identity"))},
+    "ws_rewrite": {
+        "find": (True, lambda v: _str(v, "find", *REWRITE_FIND)),
+        "replace": (True, lambda v: _str(v, "replace", 0, REWRITE_REPLACE_MAX)),
+        "url_contains": (False, lambda v: _str(v, "url_contains", 1, 120)),
+        "ttl": (False, lambda v: _int(v, "ttl", 10, REWRITE_TTL_MAX)),
+    },
     "load_session": {
         "program": (True, lambda v: _name(v, "program")),
         "identity": (True, lambda v: _name(v, "identity")),
         "cookies": (True, _cookies),
         "secrets": (False, _secrets),
+        "passthrough": (False, lambda v: _bool(v, "passthrough")),
+        "targets": (False, _targets),
+        "tz_offset_min": (False, lambda v: _int(v, "tz_offset_min", -900, 900)),
     },
     "status": {},
     "reset": {"force": (False, lambda v: _bool(v, "force"))},
     "human_done": {},
     "human_viewing": {"on": (True, lambda v: _bool(v, "on"))},
     "fill_budget_reset": {},
+    "fill_budget_set": {"segment": (True, lambda v: _int(v, "segment", 0, FILL_SEGMENT))},
     "snapshot": {},
+    "shot": {},
     "switch_refused": {
         "identity": (True, lambda v: _name(v, "identity")),
         "reason": (True, lambda v: _str(v, "reason", 1, 200)),
@@ -298,6 +391,10 @@ def validate(ops: frozenset[str], req: Any) -> tuple[str, dict[str, Any]]:
                 raise Refused(f"{op}: missing {field}")
             continue
         args[field] = check(req[field]) if check else req[field]
+    if op == "text" and args.get("clipboard") and ("css" in args or "tail" in args):
+        raise Refused("text: --clipboard goes alone (no --css, no --tail)")
+    if op == "net" and "body" in args and ("last" in args or "denied" in args):
+        raise Refused("net: --body goes alone (no --last, no --denied)")
     if op == "wait":
         if ("css" in args) == ("ms" in args):
             raise Refused("wait: exactly one of css or ms")
@@ -323,9 +420,14 @@ class Driver(Protocol):
     def tabs(self) -> dict[str, Any]: ...
     def select_tab(self, index: int) -> None: ...
     def net(self) -> list[dict[str, Any]]: ...
+    def net_response(self, i: int) -> dict[str, Any] | None: ...
+    def net_body(self, i: int) -> bytes | None: ...
+    def clipboard(self) -> str | None: ...
     def frames(self) -> list[dict[str, Any]]: ...
+    def ws_rewrite(self, find: str, replace: str, url_contains: str, ttl: int) -> dict[str, Any]: ...
     def cookie_values(self) -> list[str]: ...
     def snapshot(self) -> dict[str, Any]: ...
+    def screenshot(self) -> bytes: ...
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None: ...
     def wipe(self) -> None: ...
 
@@ -342,8 +444,12 @@ class Controller:
     """Requests in, replies out. Every reply is scrubbed of the loaded session's values, of the cookies the
     browser holds now, and of JWTs; no reply ever carries a cookie, a storage value or a header.
 
-    `store`: the directory of the identity marker and the fill budget (PROFILE_ROOT in the container). None keeps
-    both in memory (tests)."""
+    `store`: the directory of the identity marker and the budgets (PROFILE_ROOT in the container). None keeps both
+    in memory (tests).
+
+    The controller knows no scope: what it needs of one comes with load_session (`passthrough`: the scope has a
+    third-party challenge host; `targets`: the URL prefixes of its targets; `tz_offset_min`: the host's local clock).
+    Without them it takes the closed default (passthrough true, no target, UTC)."""
 
     def __init__(
         self,
@@ -357,14 +463,24 @@ class Controller:
         self.clock = clock
         self.store = store
         self.fill_segment, self.fill_day = fill_segment, fill_day
+        self.boot = clock()
         self.secrets: set[str] = set()
         self.cookies_loaded = 0
+        self.passthrough = True  # fail closed: a label at the end of the page is a challenge
+        self.targets: list[str] = []  # nothing is a target: `net --body` reads nothing
+        self.tz_offset_min: int | None = None  # None: the last one persisted, else UTC
+        self.counters = {"challenges": 0, "sessions": 0}
         self.human_done: float | None = None
         self.pending_since: float | None = None
         self.cleared_at: float | None = None  # when the last challenge went away (the agent resumes after it)
         self.switch_requested: str | None = None
         self.switch_error: str | None = None
         self.viewing_until: float | None = None
+        # "J'ai fini" with no challenge left: the open screen turns spectator (view-only in the UI) and the agent
+        # goes on under the operator's eyes. A new challenge, a reset or the last screen closing ends it.
+        self.watching = False
+        self.upload_armed = False  # a file was set: the Enter that sends it counts as a prompt
+        self.live_quota: dict[str, Any] = {"spent": False, "label": None, "until": None, "remaining_pct": None}
         self._mem: dict[str, Any] = {}  # marker and fills when there is no store
 
     def handle(self, ops: frozenset[str], req: Any) -> tuple[int, dict[str, Any]]:
@@ -373,7 +489,8 @@ class Controller:
         except Refused as exc:
             return 400, {"error": str(exc)}
         secrets = self._all_secrets()
-        if op not in HOST_OPS and op not in VIEWING_OPS and self._viewing():
+        reads_only = op in VIEWING_OPS and not args.get("clipboard")
+        if op not in HOST_OPS and not reads_only and self._viewing():
             out = {"error": "human-viewing", "detail": HUMAN_VIEWING, "state": self._state_dict()}
             return 409, scrub_obj(out, secrets)
         try:
@@ -384,7 +501,15 @@ class Controller:
         except Conflict as exc:
             return 409, scrub_obj({"error": "profile-holds-another-identity", "detail": str(exc)}, secrets)
         except BudgetSpent as exc:
-            return 429, scrub_obj({"error": "fill-budget", "detail": str(exc)}, secrets)
+            return 429, scrub_obj({"error": exc.error, "detail": str(exc), **exc.extra}, secrets)
+        except NotFound as exc:
+            return 404, scrub_obj({"error": "not-found", "detail": str(exc)}, secrets)
+        except Forbidden as exc:
+            return 403, scrub_obj({"error": "not a target response", "detail": str(exc)}, secrets)
+        except Unavailable as exc:
+            return 503, scrub_obj({"error": str(exc)}, secrets)
+        except ScreenBusy as exc:
+            return 409, scrub_obj({"error": "screen-busy", "detail": str(exc)}, secrets)
         except Exception as exc:  # noqa: BLE001 (a page error is the agent's information, never a crash)
             first = (str(exc).strip().splitlines() or [""])[0][:200]
             return 502, scrub_obj({"error": f"{op}: {type(exc).__name__}: {first}"}, secrets)
@@ -412,7 +537,7 @@ class Controller:
             if obj is None:
                 self._mem.pop(name, None)
             else:
-                self._mem[name] = obj
+                self._mem[name] = json.loads(json.dumps(obj))  # a copy, like a file
             return
         if obj is None:
             with contextlib.suppress(FileNotFoundError):
@@ -444,43 +569,124 @@ class Controller:
             live = list(getattr(self.driver, "cookie_values", lambda: [])())
         return self.secrets | {v for v in live if isinstance(v, str) and len(v) >= COOKIE_SECRET_MIN}
 
-    # -- fill budget
+    # -- budgets and the service's limit (FILLS_FILE)
+    def _raw_fills(self) -> dict[str, Any]:
+        f = self._read(FILLS_FILE)
+        return f if isinstance(f, dict) and not f.get("corrupt") else {}
+
+    def _tz(self) -> int:
+        """Minutes east of UTC of the host's local clock: given by the last load_session, persisted; else 0."""
+        if self.tz_offset_min is not None:
+            return self.tz_offset_min
+        tz = self._raw_fills().get("tz")
+        return tz if isinstance(tz, int) and not isinstance(tz, bool) and -900 <= tz <= 900 else 0
+
     def _day(self) -> str:
-        return time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
+        """The day of the host's local clock (the service's counter resets at the account's midnight, assumed to be
+        the host's: a mismatch is measured, see _note_quota)."""
+        return time.strftime("%Y-%m-%d", time.gmtime(self.clock() + 60 * self._tz()))
 
     def _fills(self) -> dict[str, Any]:
-        f = self._read(FILLS_FILE)
-        if not isinstance(f, dict) or f.get("corrupt"):
-            f = {}
-        seg = f.get("segment") if isinstance(f.get("segment"), int) else 0
-        day = self._day()
-        days = {
-            k: v
-            for k, v in (f.get("days") or {}).items()
-            if isinstance(v, dict) and v.get("day") == day and isinstance(v.get("n"), int)
+        f = self._raw_fills()
+
+        def count(k: str) -> int:
+            v = f.get(k)
+            return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+        day, now = self._day(), self.clock()
+        budget = f.get("segment_budget")
+        if isinstance(budget, bool) or not isinstance(budget, int) or not 0 <= budget <= self.fill_segment:
+            budget = self.fill_segment
+
+        def recs(k: str, ok) -> dict[str, Any]:
+            src = f.get(k)
+            return {n: v for n, v in (src.items() if isinstance(src, dict) else []) if isinstance(v, dict) and ok(v)}
+
+        out = {
+            "segment": count("segment"),
+            "segment_budget": budget,
+            "uploads": count("uploads"),
+            "switches": count("switches"),
+            "days": recs("days", lambda v: v.get("day") == day and isinstance(v.get("n"), int)),
+            "banner": recs("banner", lambda v: v.get("day") == day and isinstance(v.get("pct"), int)),
+            # a mark is kept two days after it lapsed: a block right after it is a clock mismatch
+            "quota": recs(
+                "quota",
+                lambda v: isinstance(v.get("clear_at"), (int, float)) and v["clear_at"] > now - 2 * DAY_S,
+            ),
         }
-        return {"segment": seg, "days": days}
+        if isinstance(f.get("tz"), int):
+            out["tz"] = f["tz"]
+        return out
+
+    def _known(self) -> set[str]:
+        """Every identity FILLS_FILE knows (any day), and the marker's."""
+        f = self._raw_fills()
+        names = {n for k in ("days", "banner", "quota") if isinstance(f.get(k), dict) for n in f[k]}
+        m = self.marker()
+        if m:
+            names.add(m["identity"])
+        return {n for n in names if isinstance(n, str) and NAME_RE.fullmatch(n) and n not in ("-", "?")}
 
     def _who(self) -> str:
         m = self.marker()
         return m["identity"] if m else "-"
 
+    def _mark(self, f: dict[str, Any], who: str) -> dict[str, Any] | None:
+        """The service-limit mark of `who` while it holds (until its clear_at), else None."""
+        rec = f["quota"].get(who)
+        return rec if rec and rec["clear_at"] > self.clock() else None
+
+    def _quota_of(self, f: dict[str, Any], who: str) -> dict[str, Any]:
+        """{"sent", "left", "remaining_pct", "spent", "until", "clock_mismatch"} of one identity today."""
+        sent = (f["days"].get(who) or {}).get("n", 0)
+        pct = (f["banner"].get(who) or {}).get("pct")
+        mark = self._mark(f, who)
+        left = self.fill_day - sent
+        if pct is not None:
+            left = min(left, self.fill_day * pct // 100)
+        rec = f["quota"].get(who) or {}
+        return {
+            "sent": sent,
+            "left": 0 if mark else max(0, left),
+            "remaining_pct": pct,
+            "spent": mark is not None,
+            "until": mark.get("until") if mark else None,
+            "clock_mismatch": bool(rec.get("clock_mismatch")),
+        }
+
     def _fills_left(self) -> dict[str, int]:
         f = self._fills()
-        used = (f["days"].get(self._who()) or {}).get("n", 0)
-        return {"segment_left": max(0, self.fill_segment - f["segment"]), "day_left": max(0, self.fill_day - used)}
+        return {
+            "segment_left": max(0, f["segment_budget"] - f["segment"]),
+            "day_left": self._quota_of(f, self._who())["left"],
+            "uploads_left": max(0, UPLOAD_SEGMENT - f["uploads"]),
+            "switches_left": max(0, SWITCH_SEGMENT - f["switches"]),
+        }
 
     def _check_fill(self) -> None:
-        left = self._fills_left()
-        if left["segment_left"] <= 0:
+        f = self._fills()
+        who = self._who()
+        mark = self._mark(f, who)
+        if mark:
+            when = mark.get("until") or "its reset"
             raise BudgetSpent(
-                f"{self.fill_segment} prompts typed this segment: the budget is spent. Read what you have "
-                "(bh-web text --tail, bh-web frames) and work another surface; the next segment gets a new budget"
+                f"service daily limit reached as {who}: no more prompt under this identity before {when}. "
+                "Work an HTTP surface; the other identity costs a `bh-web switch` (and a human challenge)",
+                until=mark.get("until"),
+                clear_at=mark.get("clear_at"),
             )
-        if left["day_left"] <= 0:
+        if f["segment"] >= f["segment_budget"]:
             raise BudgetSpent(
-                f"{self.fill_day} prompts typed today as {self._who()}: the daily budget is spent (UTC day). "
-                "Never flood the service: work an HTTP surface or another identity"
+                f"{f['segment']} prompts typed this segment, its budget is {f['segment_budget']}: spent. Read what "
+                "you have (bh-web text --tail, bh-web frames) and work another surface"
+            )
+        q = self._quota_of(f, who)
+        if q["left"] <= 0:
+            seen = f" (the service says {q['remaining_pct']}% left)" if q["remaining_pct"] is not None else ""
+            raise BudgetSpent(
+                f"{q['sent']} prompts typed today as {who}{seen}: the daily budget of this identity is spent. "
+                "Never flood the service: work an HTTP surface, or another identity (bh-web switch)"
             )
 
     def _spend_fill(self) -> None:
@@ -488,22 +694,124 @@ class Controller:
         who = self._who()
         f["segment"] += 1
         f["days"][who] = {"day": self._day(), "n": (f["days"].get(who) or {}).get("n", 0) + 1}
+        rec = f["quota"].get(who)
+        if rec and rec["clear_at"] <= self.clock():
+            rec["fills_after"] = int(rec.get("fills_after") or 0) + 1
         self._write(FILLS_FILE, f)
+
+    def _clear_at(self, until: str | None, seen: float) -> float:
+        """The next `until` ("12:00 AM") on the host's local clock after `seen`; 24 h after it when unreadable."""
+        m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(?:([AaPp])\.?[Mm]\.?)?", (until or "").strip())
+        if not m:
+            return seen + DAY_S
+        h, mi, ap = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower()
+        if ap:
+            if not 1 <= h <= 12:
+                return seen + DAY_S
+            h = h % 12 + (12 if ap == "p" else 0)
+        if not (0 <= h <= 23 and 0 <= mi <= 59):
+            return seen + DAY_S
+        off = 60 * self._tz()
+        local = seen + off
+        at = local - local % DAY_S + 3600 * h + 60 * mi
+        if at <= local:
+            at += DAY_S
+        return at - off
+
+    def _note_quota(self, snap: dict[str, Any]) -> None:
+        """The service's limit as the page says it (detect.quota, the tail of the text), kept per identity.
+
+        A `day` label marks the identity spent until the next `until` of the host's clock (24 h when unreadable).
+        After that the mark lapses; if the service still blocks (the label again, on a page that changed since),
+        the mark comes back with clock_mismatch (soon after: the account's midnight is not the host's) and a
+        `quota-clock-mismatch` line goes to stderr. Nothing here tries to get past the limit."""
+        q = read_quota(snap)
+        self.live_quota = q
+        who = self._who()
+        if who in ("-", "?") or not (q["spent"] or q["remaining_pct"] is not None):
+            return
+        f, now, changed = self._fills(), self.clock(), False
+        if q["remaining_pct"] is not None and (f["banner"].get(who) or {}).get("pct") != q["remaining_pct"]:
+            f["banner"][who] = {"pct": q["remaining_pct"], "t": now, "day": self._day()}
+            changed = True
+        if q["spent"]:
+            sig = hashlib.sha256(tail(snap).encode("utf-8", "replace")).hexdigest()[:16]
+            rec = f["quota"].get(who)
+            if rec is not None and rec["clear_at"] > now:
+                if rec.get("sig") != sig:
+                    rec["sig"], changed = sig, True
+            elif rec is None or rec.get("sig") != sig:  # never seen, or seen again on a page that changed
+                fills_after = int(rec.get("fills_after") or 0) if rec else 0
+                mismatch = rec is not None and fills_after <= 2
+                f["quota"][who] = {
+                    "seen_at": now,
+                    "until": q["until"],
+                    "clear_at": self._clear_at(q["until"], now),
+                    "label": q["label"],
+                    "sig": sig,
+                    "clock_mismatch": mismatch,
+                    "fills_after": 0,
+                }
+                changed = True
+                print(
+                    f"bh-browser: service daily limit seen as {who} (until {q['until'] or '?'})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if mismatch:
+                    print(
+                        f"bh-browser: quota-clock-mismatch {who}: still blocked after the mark lapsed "
+                        f"(clear_at {rec['clear_at']:.0f}, tz_offset_min {self._tz()}, {fills_after} prompt(s) after)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        if changed:
+            self._write(FILLS_FILE, f)
+
+    def _quota_state(self) -> dict[str, Any]:
+        f = self._fills()
+        who = self._who()
+        mark = self._mark(f, who)
+        live = self.live_quota
+        return {
+            "spent": mark is not None,
+            "label": mark.get("label") if mark else live.get("label"),
+            "until": mark.get("until") if mark else live.get("until"),
+            "remaining_pct": (f["banner"].get(who) or {}).get("pct"),
+        }
 
     # -- helpers
     def _viewing(self) -> bool:
+        """The operator has the screen in hand: the agent only reads. A spectator screen does not count."""
+        return not self.watching and self._screen_open()
+
+    def _screen_open(self) -> bool:
         return self.viewing_until is not None and self.clock() < self.viewing_until
 
-    def _state_dict(self) -> dict[str, Any]:
-        snap = self.driver.snapshot()
-        ch = challenge(snap)
+    def _challenge(self, snap: dict[str, Any]) -> dict[str, Any]:
+        return challenge(snap, passthrough=self.passthrough)
+
+    def _observe(self, snap: dict[str, Any]) -> dict[str, Any]:
+        """One snapshot read: the challenge (its start and end), the service's limit. Returns the challenge."""
+        ch = self._challenge(snap)
         if ch["pending"]:
             if self.pending_since is None:
                 self.pending_since = self.clock()
+                self.counters["challenges"] += 1
+                self.watching = False  # a new challenge: the screen is the operator's again
                 print(f"bh-browser: human challenge on screen ({ch['reason']})", file=sys.stderr, flush=True)
         elif self.pending_since is not None:
             self.pending_since, self.cleared_at = None, self.clock()
             print("bh-browser: the human challenge is gone", file=sys.stderr, flush=True)
+        try:
+            self._note_quota(snap)
+        except Exception as exc:  # noqa: BLE001 - never lose the challenge verdict to the bookkeeping
+            print(f"bh-browser: quota bookkeeping failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        return ch
+
+    def _state_dict(self) -> dict[str, Any]:
+        snap = self.driver.snapshot()
+        ch = self._observe(snap)
         m = self.marker()
         secrets = self._all_secrets()
         out = {
@@ -512,18 +820,20 @@ class Controller:
             "challenge": {**ch, "since": self.pending_since, "cleared_at": self.cleared_at},
             "human_done_at": self.human_done,
             "human_viewing": self._viewing(),
+            "human_watching": self.watching and self._screen_open(),
             "identity": m["identity"] if m else None,
             "program": m["program"] if m else None,
             "switch_requested": self.switch_requested,
             "switch_error": self.switch_error,
             "fills": self._fills_left(),
+            "quota": self._quota_state(),
         }
         if isinstance(snap.get("tabs"), int):
             out["tabs"] = {"count": snap["tabs"], "current": snap.get("tab")}
         return out
 
     def _guard(self) -> None:
-        if challenge(self.driver.snapshot())["pending"]:
+        if self._observe(self.driver.snapshot())["pending"]:
             raise HumanNeeded(HUMAN_NEEDED)
 
     # -- agent ops
@@ -539,6 +849,7 @@ class Controller:
         self._check_fill()
         self.driver.fill(css, text)
         self._spend_fill()
+        self.upload_armed = False  # the prompt that goes with a file is counted here
         return {"ok": True, "fills": self._fills_left()}
 
     def _op_click(self, css: str) -> dict[str, Any]:
@@ -548,7 +859,13 @@ class Controller:
 
     def _op_press(self, key: str) -> dict[str, Any]:
         self._guard()
+        sends_upload = key == "Enter" and self.upload_armed
+        if sends_upload:
+            self._check_fill()  # the Enter that sends a file is a prompt
         self.driver.press(key)
+        if sends_upload:
+            self._spend_fill()
+            self.upload_armed = False
         return self._state_dict()
 
     def _op_wait(self, css: str | None = None, ms: int | None = None) -> dict[str, Any]:
@@ -558,11 +875,30 @@ class Controller:
             self.driver.wait_ms(int(ms or 0))
         return self._state_dict()
 
-    def _op_text(self, css: str | None = None, tail: int | None = None) -> dict[str, Any]:
+    def _op_text(self, css: str | None = None, tail: int | None = None, clipboard: bool = False) -> dict[str, Any]:
+        if clipboard:
+            return self._clipboard()
         t = scrub(self.driver.text(css), self._all_secrets())
         if tail is not None:
             return {"text": t[-tail:], "truncated": len(t) > tail, "length": len(t), "from": "tail"}
         return {"text": t[:TEXT_MAX], "truncated": len(t) > TEXT_MAX, "length": len(t)}
+
+    def _clipboard(self) -> dict[str, Any]:
+        """What the page copied (a share link): read in the container (xclip, the controller's display), never
+        through the page; redacted, then scrubbed of the session's values. Refused during a challenge (and, by
+        handle(), while the operator has the screen). Nothing crosses to the operator's machine (x11vnc keeps
+        -noclipboard -nosetclipboard)."""
+        self._guard()
+        raw = self.driver.clipboard()
+        if raw is None:
+            raise Unavailable("clipboard unavailable")
+        t = clipboard_text(raw, self._all_secrets())
+        return {
+            "text": t[:CLIPBOARD_MAX],
+            "truncated": len(t) > CLIPBOARD_MAX,
+            "length": len(t),
+            "from": "clipboard",
+        }
 
     def _op_outline(self, css: str | None = None) -> dict[str, Any]:
         t = self.driver.outline(css)
@@ -576,20 +912,60 @@ class Controller:
             "truncated": v is not None and len(v) > ATTR_MAX,
         }
 
-    def _op_net(self, last: int = 50, denied: bool = False) -> dict[str, Any]:
+    def _op_net(self, last: int = 50, denied: bool = False, body: int | None = None) -> dict[str, Any]:
+        if body is not None:
+            return self._net_body(body)
         secrets = self._all_secrets()
-        rows = [r for r in self.driver.net() if r.get("denied") or not denied][-last:]
+
+        def kept(r: dict[str, Any]) -> bool:
+            # a gate refusal, or a request that failed towards a host that is not a target's (the gate refuses the
+            # tunnel: no response to carry its header)
+            if r.get("denied"):
+                return True
+            return bool(r.get("failure")) and not target_host(str(r.get("url") or ""), self.targets)
+
+        rows = [r for r in self.driver.net() if not denied or kept(r)][-last:]
         out = []
         for r in rows:
             row = {
-                k: r.get(k) for k in ("t", "method", "status", "denied", "reason", "failure") if r.get(k) is not None
+                k: r.get(k)
+                for k in ("i", "t", "method", "status", "denied", "reason", "failure")
+                if r.get(k) is not None
             }
             row["url"] = scrub_url(str(r.get("url") or ""), secrets)
             out.append(row)
         return {"requests": out, "count": len(out)}
 
+    def _net_body(self, i: int) -> dict[str, Any]:
+        """The body of response `i` of `net`, read only (nothing is sent nor replayed): a target's response only
+        (URL under a target prefix, never a sign-in host), JSON with token keys and credentials replaced, any other
+        text redacted, the session's values scrubbed, at most NET_BODY_MAX characters."""
+        info = self.driver.net_response(i)
+        if info is None:
+            raise NotFound(f"no response {i} kept (the last {NET_BODIES} not refused by the gate are)")
+        url = str(info.get("url") or "")
+        if not under_target(url, self.targets):
+            raise Forbidden("this response is not a target's (or the scope names no target): its body is not read")
+        secrets = self._all_secrets()
+        ctype = str(info.get("type") or "")
+        head = {"i": i, "url": scrub_url(url, secrets), "status": info.get("status")}
+        data = self.driver.net_body(i)
+        if data is None:
+            return {**head, "unavailable": True}
+        if body_kind(ctype) == "binary":
+            return {**head, "binary": True, "type": ctype[:100], "bytes": len(data)}
+        t = body_text(data, ctype, secrets)
+        return {
+            **head,
+            "type": ctype[:100],
+            "body": t[:NET_BODY_MAX],
+            "truncated": len(t) > NET_BODY_MAX,
+            "length": len(t),
+        }
+
     def _op_tabs(self, select: int | None = None) -> dict[str, Any]:
         if select is not None:
+            self._guard()  # N8: changing the driven tab under a challenge is acting on it
             self.driver.select_tab(select)
         t = self.driver.tabs()
         secrets = self._all_secrets()
@@ -603,9 +979,19 @@ class Controller:
 
     def _op_upload(self, css: str, name: str, content_b64: bytes) -> dict[str, Any]:
         self._guard()
+        f = self._fills()
+        if f["uploads"] >= UPLOAD_SEGMENT:
+            raise BudgetSpent(
+                f"{f['uploads']} files set this segment (at most {UPLOAD_SEGMENT}): the upload budget is spent",
+                error="upload-budget",
+            )
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         self.driver.upload(css, name, mime, content_b64)
-        return {"ok": True, "name": name, "bytes": len(content_b64), "mime": mime}
+        f = self._fills()
+        f["uploads"] += 1
+        self._write(FILLS_FILE, f)
+        self.upload_armed = True
+        return {"ok": True, "name": name, "bytes": len(content_b64), "mime": mime, "fills": self._fills_left()}
 
     def _op_frames(self, last: int = 30) -> dict[str, Any]:
         secrets = self._all_secrets()
@@ -620,10 +1006,35 @@ class Controller:
             )
         return {"frames": out, "count": len(out)}
 
+    def _op_ws_rewrite(
+        self, find: str, replace: str, url_contains: str = "/Chathub/", ttl: int = REWRITE_TTL_DEFAULT
+    ) -> dict[str, Any]:
+        """Arm ONE rewrite of the next client frame (sent by the page) that contains `find`, on a websocket opened
+        after this call whose URL contains `url_contains`. One occurrence, then disarmed; a frame carrying a challenge
+        answer is never touched (detect.rewrite_client_frame). Logged in `frames` (dir "rewrite") and on stderr."""
+        print(
+            f"bh-browser: ws-rewrite armed ({len(find)} -> {len(replace)} chars, "
+            f"url contains {url_contains!r}, {ttl} s)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"ok": True, **self.driver.ws_rewrite(find, replace, url_contains, ttl)}
+
     def _op_switch(self, identity: str) -> dict[str, Any]:
         m = self.marker()
         if m and m["identity"] == identity:
             return {"ok": True, "identity": identity, "note": "already the identity of the browser"}
+        if self.switch_requested == identity:
+            return {"ok": True, "switch_requested": identity, "note": SWITCH_NOTE}
+        f = self._fills()
+        if f["switches"] >= SWITCH_SEGMENT:
+            raise BudgetSpent(
+                f"{f['switches']} switches asked this segment (at most {SWITCH_SEGMENT}, each one a new human "
+                "challenge): stay with this identity",
+                error="switch-budget",
+            )
+        f["switches"] += 1
+        self._write(FILLS_FILE, f)
         self.switch_requested, self.switch_error = identity, None
         print(f"bh-browser: the agent asks to switch to {identity}", file=sys.stderr, flush=True)
         return {"ok": True, "switch_requested": identity, "note": SWITCH_NOTE}
@@ -633,7 +1044,15 @@ class Controller:
 
     # -- host ops
     def _op_load_session(
-        self, program: str, identity: str, cookies: list[dict[str, Any]], secrets: list[str] | None = None
+        self,
+        program: str,
+        identity: str,
+        cookies: list[dict[str, Any]],
+        *,
+        secrets: list[str] | None = None,
+        passthrough: bool | None = None,
+        targets: list[str] | None = None,
+        tz_offset_min: int | None = None,
     ) -> dict[str, Any]:
         m = self.marker()
         if m is not None and (m["program"], m["identity"]) != (program, identity):
@@ -645,45 +1064,84 @@ class Controller:
         self.secrets |= {c["value"] for c in cookies} | set(secrets or [])
         self._write(MARKER_FILE, {"program": program, "identity": identity, "loaded_at": self.clock()})
         self.cookies_loaded = len(cookies)
+        self.counters["sessions"] += 1
+        self.passthrough = True if passthrough is None else passthrough  # absent: fail closed
+        self.targets = list(targets or [])
+        if tz_offset_min is not None:
+            self.tz_offset_min = tz_offset_min
+            f = self._fills()
+            f["tz"] = tz_offset_min  # the day of the budgets survives a restart
+            self._write(FILLS_FILE, f)
         if self.switch_requested == identity:
             self.switch_requested = None
         self.switch_error = None
         return {"ok": True, "program": program, "identity": identity, "cookies": len(cookies)}
 
     def _op_status(self) -> dict[str, Any]:
-        return {**self._state_dict(), "cookies_loaded": self.cookies_loaded}
+        state = self._state_dict()  # first: the snapshot it reads may show the service's limit
+        f = self._fills()
+        return {
+            **state,
+            "cookies_loaded": self.cookies_loaded,
+            "boot": self.boot,
+            "counters": dict(self.counters),
+            "quotas": {n: self._quota_of(f, n) for n in sorted(self._known())},
+        }
 
     def _op_reset(self, force: bool = False) -> dict[str, Any]:
         if not force:
             pending = False
             with contextlib.suppress(Exception):  # a browser that cannot answer is exactly what a reset repairs
-                pending = challenge(self.driver.snapshot())["pending"]
+                pending = self._challenge(self.driver.snapshot())["pending"]
             if pending:
                 raise HumanNeeded(
                     "a human challenge is on screen: a reset would lose it and the message typed under it; "
                     "wait for the operator, or reset with force"
                 )
-        self._write(MARKER_FILE, None)  # first: a wipe that fails half-way never leaves a stale name
+        # the wipe first: if it fails (the profile is still there, N19), the marker still names its account
         self.driver.wipe()
+        self._write(MARKER_FILE, None)
         self.secrets.clear()
         self.cookies_loaded, self.human_done, self.pending_since = 0, None, None
+        self.passthrough, self.targets = True, []
+        self.watching = False
+        self.upload_armed = False
         self.switch_requested = None
         return {"ok": True, "reset": True}
 
     def _op_human_done(self) -> dict[str, Any]:
         self.human_done = self.clock()
-        print("bh-browser: the operator says the challenge is done", file=sys.stderr, flush=True)
-        return {"ok": True, "human_done_at": self.human_done}
+        pending = self._state_dict()["challenge"]["pending"]
+        self.watching = not pending  # never hand the page back while a challenge is still on it
+        print(
+            "bh-browser: the operator says the challenge is done"
+            + (" but it is still on screen" if pending else "; the screen is now a spectator"),
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"ok": True, "human_done_at": self.human_done, "watching": self.watching, "challenge_pending": pending}
 
     def _op_human_viewing(self, on: bool) -> dict[str, Any]:
         self.viewing_until = self.clock() + VIEWING_TTL_S if on else None
+        if not on:
+            self.watching = False  # the next screen opened is the operator's hand again
         return {"ok": True, "human_viewing": self._viewing()}
 
-    def _op_fill_budget_reset(self) -> dict[str, Any]:
+    def _new_segment(self, budget: int) -> dict[str, Any]:
         f = self._fills()
-        f["segment"] = 0
+        f.update(segment=0, uploads=0, switches=0, segment_budget=budget)
         self._write(FILLS_FILE, f)
+        self.counters = {"challenges": 0, "sessions": 0}
+        self.upload_armed = False
         return {"ok": True, "fills": self._fills_left()}
+
+    def _op_fill_budget_reset(self) -> dict[str, Any]:
+        return self._new_segment(self.fill_segment)
+
+    def _op_fill_budget_set(self, segment: int) -> dict[str, Any]:
+        """The run's share of the identity's daily budget for this segment (0 to FILL_SEGMENT): every counter of
+        the segment starts over."""
+        return self._new_segment(segment)
 
     def _op_snapshot(self) -> dict[str, Any]:
         """What detect.challenge() reads of the page (url, title, visible text head and tail, child frames), with
@@ -704,7 +1162,28 @@ class Controller:
             "text_len": snap.get("text_len") if isinstance(snap.get("text_len"), int) else len(text),
             "frames": frames,
         }
-        return {"snapshot": out, "challenge": challenge(out), "taken_at": self.clock()}
+        return {"snapshot": out, "challenge": self._challenge(out), "taken_at": self.clock()}
+
+    def _op_shot(self) -> dict[str, Any]:
+        """One PNG of the page as the screen shows it, for the PoC (host only: `bh.stats.poc_shot`). Refused while a
+        human challenge is pending or the operator has the screen (spectator included); no gesture, nothing
+        injected in the page: the browser's own compositor capture (CDP Page.captureScreenshot)."""
+        if self._screen_open():
+            raise ScreenBusy("the operator has the screen: no screenshot")
+        if self.pending_since is not None or self._observe(self.driver.snapshot())["pending"]:
+            raise ScreenBusy("a human challenge is pending: no screenshot")
+        data = self.driver.screenshot()
+        if not isinstance(data, (bytes, bytearray)) or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise Unavailable("shot: the browser gave no PNG")
+        if len(data) > SHOT_MAX:
+            raise Unavailable(f"shot: over {SHOT_MAX} bytes")
+        url = scrub_url(str(self.driver.snapshot().get("url") or ""), self._all_secrets())
+        return {
+            "png_b64": base64.b64encode(bytes(data)).decode("ascii"),
+            "bytes": len(data),
+            "url": url,
+            "taken_at": self.clock(),
+        }
 
     def _op_switch_refused(self, identity: str, reason: str) -> dict[str, Any]:
         if self.switch_requested == identity:
@@ -832,10 +1311,15 @@ class Display:
                 self._start_chromium()
 
     def wipe(self) -> None:
+        """Chromium stopped, its profile removed, Chromium started on an empty one. A profile still there after the
+        removal (N19) raises: the caller keeps the identity marker, the account is still in it."""
         with self.lock:
             self._stop("chromium")
             shutil.rmtree(self.profile, ignore_errors=True)
+            left = os.path.exists(self.profile)
         self.ensure()
+        if left:
+            raise RuntimeError(f"the profile {self.profile} is still there after the wipe: its account stays loaded")
 
     def stop(self) -> None:
         with self.lock:
@@ -866,7 +1350,12 @@ class PlaywrightDriver:
         self.net_log: collections.deque = collections.deque(maxlen=NET_KEEP)
         self.frame_log: collections.deque = collections.deque(maxlen=FRAMES_KEEP)
         self.frames_dropped = 0
+        self._net_i = 0  # number of the last line of `net`
+        self._bodies: collections.OrderedDict[int, Any] = collections.OrderedDict()  # net --body: i -> response
         self._seen_pages: set[int] = set()
+        self._rule: dict[str, Any] | None = None  # bh-web ws-rewrite: one armed rewrite at most
+        self._ws_routed = False
+        self._routed_live = 0  # routed websockets still open (their frames need pumping)
 
     # -- connection and listeners
     def _context(self) -> Any:
@@ -884,6 +1373,7 @@ class PlaywrightDriver:
             ctx.on("requestfailed", self._on_failed)
             for p in ctx.pages:
                 self._attach(p)
+            self._ws_routed = False
         return self.browser.contexts[0]
 
     def _attach(self, page: Any) -> None:
@@ -892,19 +1382,146 @@ class PlaywrightDriver:
         self._seen_pages.add(id(page))
         page.on("websocket", self._on_ws)
 
+    def _next_i(self) -> int:
+        self._net_i += 1
+        return self._net_i
+
     def _on_response(self, resp: Any) -> None:
         with contextlib.suppress(Exception):
             req = resp.request
             denied = (resp.headers or {}).get("x-bh-gate") == "denied"
-            rec = {"t": time.time(), "method": req.method, "url": resp.url, "status": resp.status, "denied": denied}
+            i = self._next_i()
+            rec = {
+                "i": i,
+                "t": time.time(),
+                "method": req.method,
+                "url": resp.url,
+                "status": resp.status,
+                "denied": denied,
+            }
             if denied:
                 rec["_resp"] = resp  # the reason is read later, outside the event (net)
+            else:  # net --body: the response object only, its body is read when asked (if Chromium still has it)
+                self._bodies[i] = resp
+                while len(self._bodies) > NET_BODIES:
+                    self._bodies.popitem(last=False)
             self.net_log.append(rec)
 
     def _on_failed(self, req: Any) -> None:
         with contextlib.suppress(Exception):
             failure = str(req.failure or "failed")[:120]
-            self.net_log.append({"t": time.time(), "method": req.method, "url": req.url, "failure": failure})
+            rec = {"i": self._next_i(), "t": time.time(), "method": req.method, "url": req.url, "failure": failure}
+            self.net_log.append(rec)
+
+    # -- bh-web ws-rewrite: only websockets opened while a rule is armed are routed through here
+    def _rule_live(self) -> dict[str, Any] | None:
+        r = self._rule
+        return r if r and not r["used"] and time.time() < r["until"] else None
+
+    def _ws_match(self, url: str) -> bool:
+        r = self._rule_live()
+        return bool(r) and r["url_contains"] in url
+
+    def needs_pump(self) -> bool:
+        return self._ws_routed and (self._routed_live > 0 or self._rule_live() is not None)
+
+    def pump(self) -> None:
+        self._page().wait_for_timeout(1)
+
+    def _route_ws(self, route: Any) -> None:
+        server = route.connect_to_server()
+        url = route.url
+        self._routed_live += 1
+        closed = [False]
+
+        def gone() -> None:
+            if not closed[0]:
+                closed[0] = True
+                self._routed_live = max(0, self._routed_live - 1)
+
+        def page_closed(code: Any = None, reason: Any = None) -> None:  # a close handler disables auto-forwarding
+            gone()
+            with contextlib.suppress(Exception):
+                server.close(code=code, reason=reason or "")
+
+        def server_closed(code: Any = None, reason: Any = None) -> None:
+            gone()
+            with contextlib.suppress(Exception):
+                route.close(code=code, reason=reason or "")
+
+        def from_page(message: Any) -> None:
+            out = message
+            try:
+                r = self._rule_live()
+                done = False
+                if r:
+                    out, done = rewrite_client_frame(message, r["find"], r["replace"])
+                if done and r:
+                    r["used"] = True
+                    sizes = f"{len(r['find'])} -> {len(r['replace'])} chars"
+                    note = f"rewrote 1 occurrence ({sizes}) in a {len(message)}-char frame"
+                    self.frame_log.append({"t": time.time(), "dir": "rewrite", "url": redact.url(url), "text": note})
+                    print(
+                        f"bh-browser: ws-rewrite applied on {redact.url(url)[:80]}: {note}", file=sys.stderr, flush=True
+                    )
+                elif r and isinstance(message, str) and len(message) > 200:
+                    print(
+                        f"bh-browser: ws-rewrite: a {len(message)}-char client frame without the string",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                self._frame("sent", url, out)  # what really left the browser (routed frames may not raise framesent)
+            except Exception as exc:  # noqa: BLE001 - never lose a frame: forward it as the page wrote it
+                out = message
+                print(
+                    f"bh-browser: ws-rewrite handler error {type(exc).__name__}: {str(exc)[:160]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
+                server.send(out)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"bh-browser: ws-rewrite: send to server failed {type(exc).__name__}: {str(exc)[:160]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        def from_server(message: Any) -> None:
+            with contextlib.suppress(Exception):
+                self._frame("recv", url, message)
+            try:
+                route.send(message)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"bh-browser: ws-rewrite: send to page failed {type(exc).__name__}: {str(exc)[:160]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        route.on_message(from_page)
+        server.on_message(from_server)
+        route.on_close(page_closed)
+        server.on_close(server_closed)
+
+    def ws_rewrite(self, find: str, replace: str, url_contains: str, ttl: int) -> dict[str, Any]:
+        ctx = self._context()
+        if not self._ws_routed:
+            ctx.route_web_socket(self._ws_match, self._route_ws)
+            self._ws_routed = True
+        self._rule = {
+            "find": find,
+            "replace": replace,
+            "url_contains": url_contains,
+            "until": time.time() + ttl,
+            "used": False,
+        }
+        return {
+            "armed": True,
+            "url_contains": url_contains,
+            "expires_in": ttl,
+            "applies_to": "websockets opened from now on",
+        }
 
     def _on_ws(self, ws: Any) -> None:
         url = ws.url
@@ -994,6 +1611,46 @@ class PlaywrightDriver:
             out.append(rec)
         return out
 
+    def net_response(self, i: int) -> dict[str, Any] | None:
+        resp = self._bodies.get(i)
+        if resp is None:
+            return None
+        ctype = ""
+        with contextlib.suppress(Exception):
+            ctype = (resp.headers or {}).get("content-type", "")
+        return {"url": resp.url, "status": resp.status, "type": ctype}
+
+    def net_body(self, i: int) -> bytes | None:
+        """The body Chromium still holds for response `i` (CDP Network.getResponseBody: nothing is sent again),
+        None when it is gone (evicted, a redirect, the page navigated away)."""
+        resp = self._bodies.get(i)
+        if resp is None:
+            return None
+        try:
+            return resp.body()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def clipboard(self) -> str | None:
+        """The CLIPBOARD selection of the controller's display, read by xclip (argument list, no shell, 2 s): no
+        script runs in the page, no permission is granted to any origin. None when xclip is missing."""
+        try:
+            r = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                env={**os.environ, "DISPLAY": DISPLAY},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=CLIP_TIMEOUT_S,
+                check=False,
+            )
+        except FileNotFoundError:
+            return None
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"xclip did not answer in {CLIP_TIMEOUT_S} s") from None
+        if r.returncode != 0:  # nothing copied yet ("target STRING not available")
+            return ""
+        return r.stdout[:CLIP_READ_MAX].decode("utf-8", "replace")
+
     def frames(self) -> list[dict[str, Any]]:
         return list(self.frame_log)
 
@@ -1034,6 +1691,18 @@ class PlaywrightDriver:
             "tab": pages.index(page) if page in pages else None,
         }
 
+    def screenshot(self) -> bytes:
+        """The visible page through CDP Page.captureScreenshot: the compositor's frame, no script in the page, no
+        scroll, no style injected (Playwright's page.screenshot may inject a caret-hiding style)."""
+        page = self._page()
+        cdp = self._context().new_cdp_session(page)
+        try:
+            out = cdp.send("Page.captureScreenshot", {"format": "png"})
+        finally:
+            with contextlib.suppress(Exception):
+                cdp.detach()
+        return base64.b64decode(out.get("data") or "")
+
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
         self._context().add_cookies(cookies)
 
@@ -1043,6 +1712,7 @@ class PlaywrightDriver:
                 self.browser.close()  # over CDP: disconnects, the process is stopped by the display
         self.browser, self.current = None, None
         self.net_log.clear()
+        self._bodies.clear()
         self.frame_log.clear()
         self.display.wipe()
 
@@ -1057,7 +1727,16 @@ class Worker(threading.Thread):
     def run(self) -> None:
         ctl = self.make()
         while True:
-            ops, req, box, done = self.jobs.get()
+            # Playwright's sync API only dispatches events inside one of its calls: while a websocket is routed
+            # (bh-web ws-rewrite), its frames would wait for the agent's next command, so the idle loop pumps it.
+            driver = getattr(ctl, "driver", None)
+            needs = getattr(driver, "needs_pump", None)
+            try:
+                ops, req, box, done = self.jobs.get(timeout=PUMP_S if needs and needs() else None)
+            except queue.Empty:
+                with contextlib.suppress(Exception):
+                    driver.pump()
+                continue
             try:
                 box.append(ctl.handle(ops, req))
             except BaseException as exc:  # noqa: BLE001

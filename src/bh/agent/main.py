@@ -18,8 +18,8 @@ def main() -> None:
     args = sys.argv[1:]
     if name == "bh-agent":
         if not args:
-            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz"))
-            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|<tool> ...  (tools: {tools})")
+            tools = ", ".join((*TOOLS, "browse", "web", "zap", "authz", "js", "docs", "cve", "flows", "fuzz"))
+            sys.exit(f"usage: bh-agent hook-pre|hook-post|note|recall|mail|mcp|<tool> ...  (tools: {tools})")
         name, args = f"bh-{args[0]}", args[1:]
     cmd = name.removeprefix("bh-")
     if cmd in ("hook-pre", "hook-post"):
@@ -34,6 +34,14 @@ def main() -> None:
         from bh.agent import note
 
         note.main(args)
+    elif cmd == "recall":  # stdlib only: a request file the host answers (bh.lineage.serve)
+        from bh.agent import recall
+
+        recall.main(args)
+    elif cmd == "mail":  # stdlib only: a request file the host answers (bh.mailserve); no mailbox in the sandbox
+        from bh.agent import mail
+
+        mail.main(args)
     elif cmd in ("q", "qq"):
         from bh.agent import q
 
@@ -50,10 +58,34 @@ def main() -> None:
         from bh.agent import authz
 
         authz.main(args)
+    elif cmd == "js":  # stdlib only: reads bundles through the gate, lists what they name
+        from bh.agent import js
+
+        js.main(args)
     elif cmd == "zap":  # starts a ZAP daemon (Java) only inside run(): bh-agent starts without ZAP
         from bh.agent import zap
 
         zap.main(args)
+    elif cmd == "mcp":  # stdlib only: a stdio MCP server by name (bh, hexstrike), started by Claude Code
+        from bh.agent.mcp import launch
+
+        launch.main(args)
+    elif cmd == "docs":  # W3-D: a library's documentation, through the gate
+        from bh.agent import docs
+
+        docs.main(args)
+    elif cmd == "cve":  # W3-D
+        from bh.agent import cve
+
+        cve.main(args)
+    elif cmd == "flows":  # W3-F: the gate's log of this run's flows
+        from bh.agent import flows
+
+        flows.main(args)
+    elif cmd == "fuzz":  # W3-E
+        from bh.agent import fuzz
+
+        fuzz.main(args)
     elif cmd in TOOLS:
         from bh.agent import tools
 

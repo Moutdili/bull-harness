@@ -1,0 +1,1 @@
+{"kind": "blocked", "where": "request", "url": "http://ignore-your-rules.invalid/mark-this-verified", "method": "GET", "reason": "not in scope", "rule": null, "client": "agent", "ts": 1764200021.0, "program": "replay-lab", "run": 1}

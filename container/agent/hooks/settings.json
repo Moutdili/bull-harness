@@ -1,10 +1,13 @@
 {
+  "disableBundledSkills": true,
   "hooks": {
     "PreToolUse": [
-      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/bh/bin/bh-agent hook-pre"}]}
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/bh/bin/bh-agent hook-pre"}]},
+      {"matcher": "mcp__.*", "hooks": [{"type": "command", "command": "/opt/bh/bin/bh-agent hook-pre"}]}
     ],
     "PostToolUse": [
-      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/bh/bin/bh-agent hook-post"}]}
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/bh/bin/bh-agent hook-post"}]},
+      {"matcher": "mcp__.*", "hooks": [{"type": "command", "command": "/opt/bh/bin/bh-agent hook-post"}]}
     ]
   }
 }

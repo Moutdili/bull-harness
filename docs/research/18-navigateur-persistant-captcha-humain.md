@@ -80,7 +80,8 @@ probablement toute résolution.
   Le reste de l'UI garde sa CSP.
 - « J'ai fini » : `POST /api/captcha/done` (cookie + `X-BH: 1`, comme les autres POST). L'UI écrit
   `var/browser/captcha-done.json` (`{"t": ...}`), que l'hôte lit. Elle appelle aussi `human_done` dans le contrôleur.
-  L'agent voit alors `human_done_at` dans `state()`.
+  L'agent voit alors `human_done_at` dans `state()`. S'il ne reste aucun challenge, l'écran passe en **spectateur**
+  (noVNC en lecture seule, l'agent reprend sous les yeux de l'opérateur) ; s'il en reste un, rien ne change (§7.2).
 
 ### API de l'agent et interface de l'hôte
 
@@ -101,10 +102,13 @@ l'écran.
 4. L'hôte (`watch.ChallengeWatcher`, toutes les 10 s) voit le challenge et pousse une notification ntfy à Mio : au
    plus une toutes les 5 min, un seul rappel 10 min après, rien de plus pour ce challenge.
 5. Mio ouvre `http://<ip-tailscale>:7340/captcha/`, se connecte à l'UI si besoin. Tant que l'écran est ouvert,
-   l'agent ne peut que lire (`human_viewing`, §7.2). Mio résout le challenge à la main, puis clique « J'ai fini ».
-6. La reprise (§7.6) : `wait-human` rend 0 quand `pending` repasse à `false` et dit à l'agent de vérifier que son
-   message est parti. Si le challenge reste au-delà de 300 s, `wait-human` rend 3 : l'agent note
-   `bh-note blocked captcha` et passe à une autre surface.
+   l'agent ne peut que lire (`human_viewing`, §7.2). Mio résout le challenge à la main, puis clique « J'ai fini » :
+   l'écran passe en spectateur (`human_watching`), Mio regarde, l'agent reprend.
+6. La reprise (§7.6) : `wait-human` rend 0 quand `pending` repasse à `false` **et** que l'écran est rendu
+   (`human_viewing` faux : spectateur ou écran fermé), et dit à l'agent de vérifier que son message est parti. Si le
+   challenge reste au-delà de 300 s, `wait-human` rend 3 : l'agent note `bh-note blocked captcha` et passe à une
+   autre surface. Challenge parti mais écran encore en main au bout de 300 s : `wait-human` rend 3 aussi, et dit de
+   relire `bh-web state` plus tard.
 
 ## 4. Mise en service (orchestrateur)
 
@@ -193,13 +197,15 @@ Source de vérité : `src/bh/browser_service/__init__.py` (`AGENT_OPS`, `HOST_OP
 
 - « challenge » : refusé = 409 `human-needed` (`bh-web` sort en 3). La vérification passe avant la page : rien
   n'atteint le challenge. `goto` est refusé aussi : naviguer perdrait le challenge et le message tapé dessous.
-- « écran ouvert » : tant que l'opérateur a `/captcha/` ouvert (`human_viewing`), seules `state`, `text` et
-  `frames` répondent ; le reste rend 409 `human-viewing` (`bh-web` sort en 3).
+- « écran ouvert » : tant que l'opérateur a `/captcha/` ouvert et en main (`human_viewing`), seules `state`, `text`
+  et `frames` répondent ; le reste rend 409 `human-viewing` (`bh-web` sort en 3). Un écran spectateur
+  (`human_watching`, §7.2) ne compte pas : l'agent y a toutes ses ops.
 - `fill` au-delà du budget : 429 `fill-budget` (`bh-web` sort en 4).
 - `switch` ne bascule rien lui-même : il pose `switch_requested`, que l'hôte exécute (§7.5). Coût affiché par
   `bh-web` : un nouveau profil, donc une nouvelle session d'appli, donc **un challenge de plus par bascule**.
 - `bh-web wait-human [--timeout S]` n'est pas une op : il relit `state` toutes les 10 s (timeout d'un appel 15 s)
-  pendant au plus 300 s. Pire cas 315 s, sous les 330 s de `BASH_DEFAULT_TIMEOUT_MS` du runner (test
+  pendant au plus 300 s, et attend le challenge **et** l'écran : il ne rend 0 que si `challenge.pending` et
+  `human_viewing` sont faux tous les deux. Pire cas 315 s, sous les 330 s de `BASH_DEFAULT_TIMEOUT_MS` du runner (test
   `test_wait_human_ends_before_the_bash_tool_timeout`).
 - Jamais : cookies, storage, en-têtes, CDP brut, évaluation de script, capture d'écran. `frames` ne garde aucune
   trame qui nomme un challenge (`ChallengeProof`, `turnstile`, `cf-chl`, `cf_clearance`) ; dans les autres, toute
@@ -212,9 +218,9 @@ Source de vérité : `src/bh/browser_service/__init__.py` (`AGENT_OPS`, `HOST_OP
 |---|---|---|
 | `load_session` | `program`, `identity`, `cookies`, `secrets` | pose les cookies, écrit le marqueur ; 409 si le profil tient une autre identité |
 | `status` | — | état (§7.3) + `cookies_loaded` |
-| `reset` | `force` (bool) | supprime le marqueur puis efface le profil ; sans `force`, 409 si un challenge est à l'écran |
-| `human_done` | — | `human_done_at` = maintenant (« J'ai fini » de l'UI) |
-| `human_viewing` | `on` (bool) | `on` : l'agent ne fait que lire pendant 600 s (`VIEWING_TTL_S`) ; `off` : fin |
+| `reset` | `force` (bool) | supprime le marqueur puis efface le profil ; sans `force`, 409 si un challenge est à l'écran ; met fin au mode spectateur |
+| `human_done` | — | `human_done_at` = maintenant (« J'ai fini » de l'UI) ; sans challenge à l'écran, passe en spectateur ; rend `{ok, human_done_at, watching, challenge_pending}` |
+| `human_viewing` | `on` (bool) | `on` : écran ouvert pendant 600 s (`VIEWING_TTL_S`), l'agent ne fait que lire sauf en spectateur ; `off` : fin, et fin du mode spectateur |
 | `fill_budget_reset` | — | remet à zéro le compteur du segment (pas celui du jour) |
 | `switch_refused` | `identity`, `reason` (≤ 200) | efface `switch_requested`, pose `switch_error` |
 | `snapshot` | — | ce que `detect.challenge()` lit de la page, et son verdict (§7.7) |
@@ -224,6 +230,15 @@ Source de vérité : `src/bh/browser_service/__init__.py` (`AGENT_OPS`, `HOST_OP
   sous un verrou : un `on` tardif d'un écran fermé n'arrive jamais après le `off`. Si l'UI meurt sans `off`, le
   contrôleur l'oublie après 600 s. Tests `test_an_open_screen_tells_human_viewing_on_then_off_when_the_last_one_closes`
   et `test_the_screen_re_asserts_human_viewing_while_open_and_stops_once_closed`.
+- **Mode spectateur** (depuis `f5fc067`, `controller.py` `_op_human_done`, `_op_human_viewing`, `_state_dict`) :
+  - « J'ai fini » sans challenge restant : `human_viewing` faux, `human_watching` vrai. L'écran `/captcha/` passe
+    noVNC en lecture seule (`viewOnly`, étiquette « spectateur : l'agent travaille ») : l'opérateur regarde, aucun
+    clic ni aucune touche n'atteint le navigateur, et l'agent reprend avec toutes ses ops.
+  - Un clic sur « J'ai fini » pendant que le challenge est encore là ne change rien : l'écran reste en main, seul
+    `human_done_at` est noté, et le bouton affiche « Le challenge est encore là ».
+  - Rendent la main à l'opérateur : un nouveau challenge (vu au prochain `state` ou `status`, que l'écran relit en
+    continu), un `reset`, ou la fermeture du dernier écran (`human_viewing off`) ; l'écran ouvert ensuite est de
+    nouveau en main.
 - L'agent ne peut demander aucune op de l'hôte (`AGENT_OPS ∩ HOST_OPS = ∅`, test
   `test_every_agent_op_has_a_command_and_no_host_op_does`).
 
@@ -234,7 +249,8 @@ Source de vérité : `src/bh/browser_service/__init__.py` (`AGENT_OPS`, `HOST_OP
 | `url`, `title` | page pilotée, URL caviardée, titre ≤ 200 |
 | `challenge` | `{pending, reason, since, cleared_at}` : `since` = début du challenge en cours, `cleared_at` = fin du dernier |
 | `human_done_at` | dernier « J'ai fini » de l'opérateur, ou `null` |
-| `human_viewing` | l'opérateur a l'écran ouvert |
+| `human_viewing` | l'opérateur a l'écran ouvert **et en main** : l'agent ne fait que lire (faux en spectateur) |
+| `human_watching` | l'écran est ouvert en spectateur, après « J'ai fini » sans challenge restant : l'agent travaille |
 | `identity`, `program` | lus dans le marqueur du profil (`null` si profil vide, `"?"` si illisible) |
 | `switch_requested`, `switch_error` | bascule demandée par l'agent et pas encore faite ; raison du dernier refus |
 | `fills` | `{segment_left, day_left}` |
@@ -295,7 +311,8 @@ Pas de commande `bh browser snapshot` : la CLI appartient à un autre lot.
 3. Reprise : après résolution, le message part-il seul, ou faut-il Entrée ? Un second challenge dans la même
    session d'appli ?
 4. `human_viewing` : 409 `human-viewing` pour un `click` quand `/captcha/` est ouvert, retour à la normale à la
-   fermeture ; coût réel d'un `podman exec` (latence avant l'affichage de l'écran).
+   fermeture, et passage en spectateur (`human_watching`) après « J'ai fini » ; coût réel d'un `podman exec`
+   (latence avant l'affichage de l'écran).
 5. `switch` de bout en bout : délai réel (annoncé ~10 s), nouveau challenge, `browser-identity.json` lu par le gate.
 6. `frames` sur le hub SignalR de Copilot : aucune trame `ChallengeProof` gardée, réponses lisibles.
 7. `upload` d'un fichier dans le composeur Copilot, sans sélecteur de fichier.

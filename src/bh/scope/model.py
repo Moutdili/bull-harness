@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -79,6 +80,16 @@ _TOKEN_PATH = re.compile(r"(/(\*|[A-Za-z0-9._~-]+))+")
 _SEGMENT = r"(?!\.+(?:/|$))[A-Za-z0-9._~-]+"  # one segment, never `.` nor `..`
 
 
+# T23 (W4): the out-of-band listener, published by Tailscale Funnel under a `.ts.net` name (never a third party's
+# host). Declared in `support` as {value: "<name>[:<port>]", kind: oob, journal: "<host path>"}, at most once. It is
+# NOT a support host the gate opens: it lives in `Scope.oob`, never in `Scope.support`, so no client of the sandbox
+# may reach it (the target's server reaches it from outside). Funnel publishes 443, 8443 and 10000 only.
+OOB_KIND = "oob"
+OOB_PORTS = (443, 8443, 10000)
+OOB_SUFFIX = ".ts.net"
+CALLBACK_PATH = "/c/"  # the callback is https://<value>/c/<canary>: the canary travels in the path, nothing else
+
+
 def _path_glob(pattern: str) -> re.Pattern[str]:
     return re.compile("".join("/" + (_SEGMENT if part == "*" else re.escape(part)) for part in pattern.split("/")[1:]))
 
@@ -112,6 +123,38 @@ class Support:
 
 
 @dataclass(frozen=True)
+class OobHost:
+    """T23: the scope's out-of-band listener. `value` is the name as the callback shows it (`name` or `name:port`,
+    the port written when it is not 443); `journal` the path the host reads its lines from (`~` allowed)."""
+
+    value: str
+    host: str
+    port: int
+    journal: str
+    note: str = ""
+
+    @property
+    def journal_path(self) -> Path:
+        return Path(self.journal).expanduser()
+
+    def callback(self, canary: str) -> str:
+        """The one URL a callback may take: `https://<value>/c/<canary>`, nothing else in it."""
+        return f"https://{self.value}{CALLBACK_PATH}{canary}"
+
+    def __str__(self) -> str:
+        return f"support-oob:{self.value}"
+
+
+@dataclass(frozen=True)
+class RecipientRule:
+    """One `recipient_guard` entry: `url`, a regex searched case-insensitively in the request URL (scheme, host,
+    path and query, raw and %-decoded); `note`, what route it is (from the host survey)."""
+
+    url: str
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class Scope:
     program: str
     platform: str
@@ -130,10 +173,33 @@ class Scope:
     # hub): the hunter drives that browser, it never talks to these paths itself (bh.gate.policy)
     browser_only: tuple[Rule, ...] = ()
     cards: tuple[str, ...] = ()  # card names always given to the hunter on this program (bh.cards, runner)
+    # D34: skills pinned for some model families only ((skill, (family, ...)), ...); read through `pin_for_models`
+    pins: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # T5: path regexes (case-insensitive, matched on the request path only) refused to every client, on top of
+    # bh.gate.policy.PROTECTED_DEFAULT (sign-out, password and account changes, payment)
+    protected_urls: tuple[str, ...] = ()
+    # D27 (O28): data-free hosts the hunter may cite and load (GET/HEAD/OPTIONS, nothing of ours attached); never a
+    # target, a subdomain of a target nor a support host. Read through `payload_hosts`.
+    payload: tuple[str, ...] = ()
+    # D31: routes that name a recipient (a mail, an invitation): for a request whose URL one of these regexes matches,
+    # whoever sends it, the gate wants at least one e-mail address and every one of them our identities' own
+    # (bh.gate.recipients). None = the key is absent (bh.scope.guards wants it on an MSRC scope); () = no `send` route
+    recipient_guard: tuple[RecipientRule, ...] | None = None
+    # S8: the program's public rule pages, read on the host only (bh.rules); never what decides the scope
+    rules_url: tuple[str, ...] = ()
     forbidden_vulns: tuple[str, ...] = ()
-    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?}, enroll?, origins?, role?, tenant?};
-    # never a secret
+    # {name, secret_ref?, login_url?, signup_url?, probe?: {url, status, expect?, method?, headers?, json?}, enroll?,
+    # origins?, role?, tenant?}; never a secret
     identities: tuple[dict[str, Any], ...] = ()
+    # T23: the out-of-band listener (a `support` entry of kind `oob`), None when the scope declares none; read through
+    # `support_hosts("oob")` or `oob`. Never part of `support` (the gate opens nothing for it)
+    oob: OobHost | None = None
+    # W4, read by other lots (parsed and validated here, no other effect): the run's spending cap in USD (lot D);
+    # source trees `{repo: https URL, commit: 40 hex}` for a white-box reading (lot F); the domains the program's own
+    # mails come from (lot H)
+    cost_cap_usd: float | None = None
+    whitebox: tuple[dict[str, str], ...] = ()
+    mail_from: tuple[str, ...] = ()
     source: str | None = None
     synced_at: str | None = None
     notes: str = ""
@@ -159,8 +225,22 @@ class Scope:
         """Websockets to targets: only when the scope says `websockets: true` (absent or null = refused)."""
         return self.websockets is True
 
+    @property
+    def pin_for_models(self) -> dict[str, list[str]]:
+        """D34: `{skill: [model family, ...]}` (`{prompt-injection: [opus, mythos]}`); {} when the scope says none.
+        bh.classes.pinned_skills reads it with the hunt's model."""
+        return {skill: list(families) for skill, families in self.pins}
+
+    @property
+    def payload_hosts(self) -> list[str]:
+        """Payload hosts (exact, normalized names); [] when the scope declares none."""
+        return list(self.payload)
+
     def support_hosts(self, kind: str) -> tuple[str, ...]:
-        """Host patterns (`a.x.com`, `*.x.com`, `api-*.x.com`) of the support entries of `kind`."""
+        """Host patterns (`a.x.com`, `*.x.com`, `api-*.x.com`) of the support entries of `kind`. For `oob`: the
+        listener's `value` (`name` or `name:port`), as the callback `https://<value>/c/<canary>` shows it."""
+        if kind == OOB_KIND:
+            return (self.oob.value,) if self.oob is not None else ()
         return tuple(support_pattern(s.rule) for s in self.support if s.kind == kind)
 
     @property
@@ -190,10 +270,20 @@ _TOP_KEYS = {
     "websockets",
     "browser_only",
     "cards",
+    "protected_urls",
+    "payload_hosts",
+    "recipient_guard",
+    "rules_url",
+    "pin_for_models",
+    "cost_cap_usd",
+    "whitebox",
+    "mail_from",
 }
 _RULE_KEYS = {"type", "value", "note"}
 _SUPPORT_KEYS = {"value", "kind", "note", "type", "token_paths", "get_paths"}
+_OOB_KEYS = {"value", "kind", "journal", "note"}
 _CARD = re.compile(r"[a-z0-9-]+")
+_MODEL_FAMILY = re.compile(r"[a-z][a-z0-9-]{0,31}")  # opus, sonnet, mythos: lowercase, as the runner names them
 
 
 def support_pattern(rule: Rule) -> str:
@@ -212,7 +302,7 @@ def parse_support(entry: Any, ctx: str) -> Support:
         raise ScopeError(f"{ctx}: unknown support keys {sorted(unknown)}")
     kind = entry.get("kind")
     if kind not in SUPPORT_KINDS:
-        raise ScopeError(f"{ctx}: support kind must be one of {list(SUPPORT_KINDS)}, not {kind!r}")
+        raise ScopeError(f"{ctx}: support kind must be one of {[*SUPPORT_KINDS, OOB_KIND]}, not {kind!r}")
     rule = parse_rule({k: v for k, v in entry.items() if k not in ("kind", "token_paths", "get_paths")}, ctx)
     if rule.type not in (RuleType.DOMAIN, RuleType.WILDCARD):
         raise ScopeError(f"{ctx}: a support host is a domain or a wildcard, not {rule.type.value} {rule.value!r}")
@@ -237,6 +327,43 @@ def parse_support(entry: Any, ctx: str) -> Support:
     if any(p.endswith("/") for p in found["token_paths"]):
         raise ScopeError(f"{ctx}: a token path names one exact path, without a trailing '/'")
     return Support(kind, rule, found["token_paths"], found["get_paths"])
+
+
+def parse_oob(entry: Any, ctx: str) -> OobHost:
+    """The `support` entry of kind `oob`: {value: "<name>[:<port>]", kind: oob, journal: "<path>", note?}. One exact
+    host name under `.ts.net` (no scheme, path, wildcard nor IP); a port, when written, among OOB_PORTS; `journal` an
+    absolute path (or under `~`) on the host."""
+    if unknown := set(entry) - _OOB_KEYS:
+        raise ScopeError(f"{ctx}: unknown keys {sorted(unknown)} for an `oob` support host (value, journal, note)")
+    value, journal, note = entry.get("value"), entry.get("journal"), entry.get("note", "")
+    if not isinstance(value, str) or not isinstance(note, str):
+        raise ScopeError(f"{ctx}: an `oob` support host is {{value: <name>[:<port>], kind: oob, journal: <path>}}")
+    name, colon, port_s = value.strip().rpartition(":") if ":" in value else (value.strip(), "", "")
+    port = 443
+    if colon:
+        if not port_s.isdigit() or int(port_s) not in OOB_PORTS:
+            raise ScopeError(f"{ctx}: the `oob` port must be one of {list(OOB_PORTS)} (Funnel), not {port_s!r}")
+        port = int(port_s)
+    try:
+        host = norm_host(name) if name and "*" not in name and "/" not in name else ""
+    except ValueError:
+        host = ""
+    if (
+        not _HOSTNAME.fullmatch(host)
+        or parse_ip(host) is not None
+        or is_public_suffix(host)
+        or not host.endswith(OOB_SUFFIX)
+        or host.count(".") < 3
+    ):
+        raise ScopeError(
+            f"{ctx}: an `oob` value is one exact Funnel name (<machine>.<tailnet>{OOB_SUFFIX}[:<port>]), not {value!r}"
+        )
+    if not isinstance(journal, str) or not journal.strip() or any(ch in journal for ch in "\0\n\r"):
+        raise ScopeError(f"{ctx}: an `oob` support host names its 'journal', the path of the listener's lines")
+    if not Path(journal).expanduser().is_absolute() or ".." in Path(journal).parts:
+        raise ScopeError(f"{ctx}: the `oob` journal is an absolute path (or under ~), not {journal!r}")
+    shown = f"{host}:{port}" if colon else host
+    return OobHost(shown, host, port, journal, note)
 
 
 def _infer_type(value: str) -> RuleType:
@@ -391,7 +518,18 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     sup = doc.get("support") or []
     if not isinstance(sup, list):
         raise ScopeError(f"{origin}: 'support' must be a list")
-    support = tuple(parse_support(e, f"{origin}: support[{i}]") for i, e in enumerate(sup))
+    oobs = [
+        parse_oob(e, f"{origin}: support[{i}]")
+        for i, e in enumerate(sup)
+        if isinstance(e, dict) and e.get("kind") == OOB_KIND
+    ]
+    if len(oobs) > 1:
+        raise ScopeError(f"{origin}: one `oob` support host per scope, not {len(oobs)}")
+    support = tuple(
+        parse_support(e, f"{origin}: support[{i}]")
+        for i, e in enumerate(sup)
+        if not (isinstance(e, dict) and e.get("kind") == OOB_KIND)
+    )
     _support_apart(in_rules, support, origin)
 
     max_rps = doc.get("max_rps")
@@ -437,8 +575,17 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         support=support,
         browser_only=_browser_only(doc.get("browser_only"), origin),
         cards=tuple(dict.fromkeys(cards)),
+        pins=_pin_for_models(doc.get("pin_for_models"), origin),
+        protected_urls=_protected_urls(doc.get("protected_urls"), origin),
+        payload=_payload_names(doc.get("payload_hosts"), origin),
+        recipient_guard=_recipient_guard(doc.get("recipient_guard", ...), origin),
+        rules_url=_rules_url(doc.get("rules_url"), origin),
         forbidden_vulns=tuple(doc.get("forbidden_vulns") or ()),
         identities=tuple(identities),
+        oob=oobs[0] if oobs else None,
+        cost_cap_usd=_cost_cap(doc.get("cost_cap_usd"), origin),
+        whitebox=_whitebox(doc.get("whitebox"), origin),
+        mail_from=_mail_from(doc.get("mail_from"), origin),
         source=doc.get("source"),
         synced_at=str(doc["synced_at"]) if doc.get("synced_at") is not None else None,
         notes=str(doc.get("notes") or ""),
@@ -447,7 +594,224 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     _derived_origins_on_targets(scope, doc.get("identities") or [])
     _identity_urls_in_scope(scope, origin)
     _browser_only_on_targets(scope, origin)
+    _payload_apart(scope, origin)
+    _oob_apart(scope, origin)
     return scope
+
+
+def _cost_cap(raw: Any, origin: str) -> float | None:
+    """`cost_cap_usd`: a positive number (lot D reads it); absent or null: no cap of the scope's own."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not 0 < raw < float("inf"):
+        raise ScopeError(f"{origin}: 'cost_cap_usd' must be a positive number (USD)")
+    return float(raw)
+
+
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def _whitebox(raw: Any, origin: str) -> tuple[dict[str, str], ...]:
+    """`whitebox: [{repo: https URL, commit: 40 hex}]` (lot F reads it). No credentials, no wildcard, no space."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ScopeError(f"{origin}: 'whitebox' is a list of {{repo: <https URL>, commit: <40 hex>}}")
+    out = []
+    for i, entry in enumerate(raw):
+        ctx = f"{origin}: whitebox[{i}]"
+        if not isinstance(entry, dict) or set(entry) != {"repo", "commit"}:
+            raise ScopeError(f"{ctx}: a mapping {{repo: <https URL>, commit: <40 hex>}}, nothing else")
+        repo, commit = entry["repo"], entry["commit"]
+        try:
+            parts = urlsplit(repo) if isinstance(repo, str) else None
+            ok = parts is not None and parts.scheme == "https" and bool(parts.hostname) and parts.username is None
+            ok = ok and parts.port in (None, 443)
+        except ValueError:
+            ok = False
+        if not ok or "*" in repo or any(ch.isspace() for ch in repo):
+            raise ScopeError(f"{ctx}: 'repo' {str(repo)[:80]!r} is not an https URL")
+        if not isinstance(commit, str) or not _COMMIT.fullmatch(commit.lower()):
+            raise ScopeError(f"{ctx}: 'commit' is a full commit id (40 hexadecimal characters)")
+        out.append({"repo": repo, "commit": commit.lower()})
+    return tuple(out)
+
+
+def _mail_from(raw: Any, origin: str) -> tuple[str, ...]:
+    """`mail_from: [<domain>]` (lot H reads it): domain names (no wildcard, address, IP nor public suffix)."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(d, str) for d in raw):
+        raise ScopeError(f"{origin}: 'mail_from' is a list of domain names")
+    out = []
+    for i, d in enumerate(raw):
+        try:
+            name = norm_host(d) if "@" not in d and "*" not in d else ""
+        except ValueError:
+            name = ""
+        if not _HOSTNAME.fullmatch(name) or parse_ip(name) is not None or is_public_suffix(name):
+            raise ScopeError(f"{origin}: mail_from[{i}] {d!r} is not a domain name")
+        out.append(name)
+    return tuple(dict.fromkeys(out))
+
+
+def _pin_for_models(raw: Any, origin: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """D34: `pin_for_models: {<skill>: [<family>, ...]}`. A skill name has the cards' shape ([a-z0-9-]+), a family is
+    lowercase ([a-z][a-z0-9-]*), each list non-empty. Absent or null: no pin. Anything else is an error."""
+    if raw is None:
+        return ()
+    shape = "'pin_for_models' maps a skill name ([a-z0-9-]+) to a non-empty list of model families (lowercase)"
+    if not isinstance(raw, dict):
+        raise ScopeError(f"{origin}: {shape}")
+    out = []
+    for skill, families in raw.items():
+        if not isinstance(skill, str) or not _CARD.fullmatch(skill):
+            raise ScopeError(f"{origin}: {shape}; not the skill {str(skill)[:40]!r}")
+        if (
+            not isinstance(families, list)
+            or not families
+            or not all(isinstance(f, str) and _MODEL_FAMILY.fullmatch(f) for f in families)
+        ):
+            raise ScopeError(f"{origin}: {shape}; not {str(families)[:60]!r} for {skill!r}")
+        out.append((skill, tuple(dict.fromkeys(families))))
+    return tuple(out)
+
+
+def _protected_urls(raw: Any, origin: str) -> tuple[str, ...]:
+    """`protected_urls`: regexes matched case-insensitively on the request path (never the query), added to the
+    gate's defaults. A pattern that does not compile is an error (fail closed, like any typo)."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(r, str) and r.strip() for r in raw):
+        raise ScopeError(f"{origin}: 'protected_urls' is a list of path regexes")
+    for i, r in enumerate(raw):
+        try:
+            re.compile(r, re.I)
+        except re.error as exc:
+            raise ScopeError(f"{origin}: protected_urls[{i}] {r!r} is not a valid regex ({exc})") from exc
+    return tuple(raw)
+
+
+def _recipient_guard(raw: Any, origin: str) -> tuple[RecipientRule, ...] | None:
+    """`recipient_guard: [{url: <regex>, note: <text>}]`. Absent: None; null or []: no route. A regex that does not
+    compile, an unknown key or an empty pattern is an error (fail closed, like protected_urls)."""
+    if raw is ...:
+        return None
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ScopeError(f"{origin}: 'recipient_guard' is a list of {{url: <regex>, note: <text>}}")
+    out = []
+    for i, entry in enumerate(raw):
+        ctx = f"{origin}: recipient_guard[{i}]"
+        if not isinstance(entry, dict) or set(entry) - {"url", "note"}:
+            raise ScopeError(f"{ctx}: a mapping {{url: <regex>, note: <text>}}")
+        pattern, note = entry.get("url"), entry.get("note", "")
+        if not isinstance(pattern, str) or not pattern.strip() or not isinstance(note, str):
+            raise ScopeError(f"{ctx}: 'url' is a non-empty regex, 'note' a text")
+        try:
+            re.compile(pattern, re.I)
+        except re.error as exc:
+            raise ScopeError(f"{ctx}: {pattern!r} is not a valid regex ({exc})") from exc
+        out.append(RecipientRule(pattern, note))
+    return tuple(out)
+
+
+def _rules_url(raw: Any, origin: str) -> tuple[str, ...]:
+    """`rules_url`: the program's public rule pages, https URLs (no credentials, no wildcard)."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(u, str) for u in raw):
+        raise ScopeError(f"{origin}: 'rules_url' is a list of https URLs")
+    for i, u in enumerate(raw):
+        try:
+            parts = urlsplit(u)
+            ok = parts.scheme == "https" and bool(parts.hostname) and parts.username is None
+            ok = ok and parts.port in (None, 443)
+        except ValueError:
+            ok = False
+        if not ok or "*" in u or any(c.isspace() for c in u):
+            raise ScopeError(f"{origin}: rules_url[{i}] {u!r} is not an https URL of a public page")
+    return tuple(dict.fromkeys(raw))
+
+
+_HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}")
+
+
+def _payload_names(raw: Any, origin: str) -> tuple[str, ...]:
+    """`payload_hosts`: exact host names (no wildcard, scheme, port, path nor IP), normalized."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(h, str) for h in raw):
+        raise ScopeError(f"{origin}: 'payload_hosts' is a list of host names")
+    out = []
+    for i, h in enumerate(raw):
+        try:
+            name = norm_host(h)
+        except ValueError:
+            name = ""
+        if not _HOSTNAME.fullmatch(name) or parse_ip(name) is not None or is_public_suffix(name):
+            raise ScopeError(f"{origin}: payload_hosts[{i}] {h!r} is not one exact host name")
+        out.append(name)
+    return tuple(dict.fromkeys(out))
+
+
+def _payload_apart(scope: Scope, origin: str) -> None:
+    """A payload host is never a target (nor under one: a subdomain of a target), an excluded host nor a support
+    host: what it receives carries nothing of ours, so it must be a host no rule of the program names."""
+    for i, h in enumerate(scope.payload):
+        _host_apart(scope, h, f"{origin}: payload_hosts[{i}] {h!r}")
+
+
+def _host_apart(scope: Scope, h: str, ctx: str) -> None:
+    """`h` is no target (nor under one), no excluded host and no support host of `scope`."""
+    from bh.scope.enforce import check, patterns_overlap  # enforce imports this module
+
+    if check(scope, h) or origin_covered(scope, f"https://{h}/") or origin_covered(scope, f"http://{h}/"):
+        raise ScopeError(f"{ctx} is an in-scope target")
+    for rule in scope.in_scope + scope.out_of_scope:
+        if rule.host is None:
+            continue
+        theirs = rule.host if rule.type is RuleType.URL else support_pattern(rule)
+        base = theirs[2:] if theirs.startswith("*.") else theirs.partition(".")[2] if "*" in theirs else theirs
+        if patterns_overlap(h, theirs) or h.endswith("." + base):
+            raise ScopeError(f"{ctx} is (under) the host of the rule {rule.value!r}")
+    for s in scope.support:
+        if patterns_overlap(h, support_pattern(s.rule)):
+            raise ScopeError(f"{ctx} is a support host ({s.kind}: {s.rule.value})")
+
+
+def _oob_apart(scope: Scope, origin: str) -> None:
+    """T23: the listener is no target, no subdomain of one, no excluded host, no other support host and no payload
+    host: it receives only what a target's server sends it, never a request of the sandbox."""
+    if scope.oob is None:
+        return
+    ctx = f"{origin}: the `oob` support host {scope.oob.value!r}"
+    _host_apart(scope, scope.oob.host, ctx)
+    from bh.scope.enforce import patterns_overlap  # enforce imports this module
+
+    if any(patterns_overlap(scope.oob.host, p) or p.endswith("." + scope.oob.host) for p in scope.payload):
+        raise ScopeError(f"{ctx} is (above) a payload host")
+
+
+def origin_covered(scope: Scope, url: str) -> bool:
+    """R1: is the ORIGIN of `url` one of the scope's targets? The URL itself, or its host when an in-scope URL rule
+    of the same scheme and port covers that host (`https://substrate.office.com/m365Copilot/` covers the origin
+    `https://substrate.office.com:443`). Only says where an identity's captured header may be kept and sent: every
+    request is still judged on its full URL by the gate, so a path outside the prefixes stays refused."""
+    from bh.scope.enforce import check, check_target  # enforce imports this module
+    from bh.scope.normalize import TargetError, parse_target
+
+    if check(scope, url):
+        return True
+    try:
+        t = parse_target(url)
+    except TargetError:
+        return False
+    if t.scheme is None:
+        return False
+    host_level = type(t)(raw=t.raw, host=t.host, ip=t.ip, scheme=t.scheme, port=t.port, path=None, path_raw=None)
+    return bool(check_target(scope, host_level))
 
 
 def _browser_only(raw: Any, origin: str) -> tuple[Rule, ...]:
@@ -509,7 +873,22 @@ def _derived_origins_on_targets(scope: Scope, raw: list[Any]) -> None:
                 del ident["origins"]
 
 
-_IDENTITY_KEYS = {"name", "secret_ref", "login_url", "signup_url", "probe", "enroll", "origins", "role", "tenant"}
+_IDENTITY_KEYS = {
+    "name",
+    "secret_ref",
+    "login_url",
+    "signup_url",
+    "probe",
+    "enroll",
+    "origins",
+    "role",
+    "tenant",
+    "private_field",
+}
+# W4 (lot B reads it): `private_field: {url, method, field}`, where an identity's private value lives (the URL a target)
+PRIVATE_FIELD_KEYS = frozenset({"url", "method", "field"})
+PRIVATE_FIELD_METHODS = ("GET", "POST", "PUT", "PATCH")
+_FIELD = re.compile(r"[A-Za-z0-9_.$\[\]/-]{1,128}")
 # role matrix (`admin`, `member`, `guest` / `A`, `B`): short labels, never secrets; they travel in
 # BH_IDENTITY_ROLES as `name=role@tenant`, so no `=`, `@` or `,` inside
 _LABEL = re.compile(r"[A-Za-z0-9_.-]{1,32}")
@@ -517,6 +896,82 @@ _LABEL = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 _SECRET_KEY = re.compile(r"passw|pwd|secret|totp|otp|token|cookie|api[_-]?key|credential|session", re.I)
 _IDENTITY_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,39}")  # the shape the gate accepts in X-BH-Identity
 _HTTP_URL = re.compile(r"https?://", re.I)
+
+
+PROBE_KEYS = frozenset({"url", "status", "expect", "method", "headers", "json"})
+PROBE_METHODS = ("GET", "POST")
+PROBE_HEADERS = frozenset({"accept", "content-type", "x-route-id"})  # compared case-insensitively
+PROBE_JSON_MAX = 2048  # bytes of the serialized body
+PROBE_PLACEHOLDERS = frozenset({"email", "name"})  # resolved by the host from secrets/ at probe time (enroll)
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_HEADER_VALUE = re.compile(r"[\x20-\x7e]{1,256}")
+
+
+def _probe(probe: Any, ctx: str) -> None:
+    """`probe: {url, status, expect?, method?, headers?, json?}` (R43). `expect` may hold `{email}` / `{name}`;
+    `method` GET (default) or POST; `headers` only Accept, Content-Type, x-route-id; `json` (POST only) an object of
+    at most PROBE_JSON_MAX bytes. Anything else is an error."""
+    shape = (
+        "{url: http(s) URL, status: HTTP status code, expect?: text in the body, method?: GET|POST, "
+        "headers?: {Accept|Content-Type|x-route-id: text}, json?: object (POST)}"
+    )
+    if not isinstance(probe, dict) or not {"url", "status"} <= set(probe) or set(probe) - PROBE_KEYS:
+        raise ScopeError(f"{ctx}: 'probe' must be {shape}")
+    if (
+        not isinstance(probe["url"], str)
+        or not _HTTP_URL.match(probe["url"])
+        or isinstance(probe["status"], bool)
+        or not isinstance(probe["status"], int)
+        or not 100 <= probe["status"] <= 599
+    ):
+        raise ScopeError(f"{ctx}: 'probe' must be {shape}")
+    if "expect" in probe:
+        expect = probe["expect"]
+        if not isinstance(expect, str) or not expect:
+            raise ScopeError(f"{ctx}: probe.expect is a non-empty text")
+        if unknown := sorted(set(_PLACEHOLDER.findall(expect)) - PROBE_PLACEHOLDERS):
+            raise ScopeError(f"{ctx}: probe.expect may only use {{email}} and {{name}}, not {unknown}")
+    method = probe.get("method", "GET")
+    if method not in PROBE_METHODS:
+        raise ScopeError(f"{ctx}: probe.method is GET or POST, not {method!r}")
+    if "headers" in probe:
+        hdrs = probe["headers"]
+        if not isinstance(hdrs, dict) or not hdrs:
+            raise ScopeError(f"{ctx}: probe.headers is a mapping of Accept, Content-Type, x-route-id")
+        for k, v in hdrs.items():
+            if not isinstance(k, str) or k.lower() not in PROBE_HEADERS:
+                raise ScopeError(
+                    f"{ctx}: probe.headers: {str(k)[:40]!r} is not one of Accept, Content-Type, x-route-id"
+                )
+            if not isinstance(v, str) or not _HEADER_VALUE.fullmatch(v):
+                raise ScopeError(f"{ctx}: probe.headers.{k}: 1-256 printable ASCII characters")
+        if len({k.lower() for k in hdrs}) != len(hdrs):
+            raise ScopeError(f"{ctx}: probe.headers names a header twice")
+    if "json" in probe:
+        body = probe["json"]
+        if method != "POST":
+            raise ScopeError(f"{ctx}: probe.json goes with method: POST")
+        try:
+            size = len(json.dumps(body, ensure_ascii=False).encode()) if isinstance(body, dict) else None
+        except (TypeError, ValueError):
+            size = None
+        if size is None or size > PROBE_JSON_MAX:
+            raise ScopeError(f"{ctx}: probe.json is an object of at most {PROBE_JSON_MAX} bytes once serialized")
+
+
+def _private_field(pf: Any, ctx: str) -> None:
+    """`private_field: {url: http(s) URL, method: GET|POST|PUT|PATCH, field: name or path}`; the URL is checked
+    against the scope with the other identity URLs (_identity_urls_in_scope)."""
+    shape = "{url: http(s) URL, method: GET|POST|PUT|PATCH, field: a field name or path ([A-Za-z0-9_.$[]/-])}"
+    if not isinstance(pf, dict) or set(pf) != PRIVATE_FIELD_KEYS:
+        raise ScopeError(f"{ctx}: 'private_field' must be {shape}")
+    url, method, name = pf["url"], pf["method"], pf["field"]
+    if not isinstance(url, str) or not _HTTP_URL.match(url) or any(ch.isspace() for ch in url):
+        raise ScopeError(f"{ctx}: private_field.url must be an http(s) URL")
+    if method not in PRIVATE_FIELD_METHODS:
+        raise ScopeError(f"{ctx}: private_field.method is one of {list(PRIVATE_FIELD_METHODS)}, not {method!r}")
+    if not isinstance(name, str) or not _FIELD.fullmatch(name):
+        raise ScopeError(f"{ctx}: private_field.field must be {shape}")
 
 
 def _identity(ident: Any, ctx: str) -> dict[str, Any]:
@@ -545,20 +1000,9 @@ def _identity(ident: Any, ctx: str) -> dict[str, Any]:
     ):
         raise ScopeError(f"{ctx}: 'origins' must be a non-empty list of http(s) URLs (where its headers may go)")
     if "probe" in ident:
-        probe = ident["probe"]
-        if (
-            not isinstance(probe, dict)
-            or not {"url", "status"} <= set(probe) <= {"url", "status", "expect"}
-            or ("expect" in probe and (not isinstance(probe["expect"], str) or not probe["expect"]))
-            or not isinstance(probe["url"], str)
-            or not _HTTP_URL.match(probe["url"])
-            or isinstance(probe["status"], bool)
-            or not isinstance(probe["status"], int)
-            or not 100 <= probe["status"] <= 599
-        ):
-            raise ScopeError(
-                f"{ctx}: 'probe' must be {{url: http(s) URL, status: HTTP status code, expect?: text in the body}}"
-            )
+        _probe(ident["probe"], ctx)
+    if "private_field" in ident:
+        _private_field(ident["private_field"], ctx)
     for key in ("role", "tenant"):
         if key in ident and (not isinstance(ident[key], str) or not _LABEL.fullmatch(ident[key])):
             raise ScopeError(f"{ctx}: '{key}' must match {_LABEL.pattern} (e.g. admin, member, guest / A, B)")
@@ -596,6 +1040,7 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
             ("login_url", ident.get("login_url"), True),
             ("signup_url", ident.get("signup_url"), True),
             ("probe.url", (ident.get("probe") or {}).get("url"), False),
+            ("private_field.url", (ident.get("private_field") or {}).get("url"), False),
             *((k, u, True) for k, u in urls(ident.get("enroll"))),  # sign-up, login, gotos, the OAuth token URL
             *((f"origins[{j}]", u, False) for j, u in enumerate(ident.get("origins") or [])),
             *(
@@ -606,6 +1051,8 @@ def _identity_urls_in_scope(scope: Scope, origin: str) -> None:
             if u is None:
                 continue
             d = check(scope, u)
+            if not d and key.startswith(("origins", "enroll.capture")) and origin_covered(scope, u):
+                continue  # R1: an origin is judged on its host when a URL rule of the same scheme and port covers it
             if not d and not (login and d.support in ("auth", "sso")):
                 raise ScopeError(f"{origin}: identities[{i}].{key} {u!r} is not in scope ({d.reason})")
 

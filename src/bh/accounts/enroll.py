@@ -28,6 +28,7 @@ appears in a return value, a message or an exception.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import subprocess
@@ -87,7 +88,9 @@ def main(raw):
         headers = {"Accept": "application/json, */*", **s.get("headers", {})}
         data = None
         if "json" in s:
-            data, headers["Content-Type"] = json.dumps(s["json"]).encode(), "application/json"
+            data = json.dumps(s["json"]).encode()
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = "application/json"
         elif "form" in s:
             data = urllib.parse.urlencode(s["form"]).encode()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -133,7 +136,12 @@ def main(raw):
 
 
 class AccountError(RuntimeError):
-    """Enrollment failed. The message is one line and holds no credential or token."""
+    """Enrollment failed. The message is one line and holds no credential or token. `cause` (T51): one of CAUSES
+    when a login failed (the message then starts with `[<cause>] `), None otherwise."""
+
+    def __init__(self, message: str = "", cause: str | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -226,10 +234,30 @@ def _why(rec: dict[str, Any] | None, what: str) -> str:
 
 
 # ---------------------------------------------------------------- probe
+def expect_text(ident: Identity, template: str) -> str | None:
+    """A probe's `expect` with `{email}` and `{name}` resolved on the host from the identity's credential (R43):
+    the value goes to the gate script on stdin and nowhere else (never a log, a return value nor the session file,
+    which keeps the template). None when a placeholder cannot be resolved."""
+    if "{" not in template:
+        return template
+    cred = credential(ident) if "{email}" in template else {}
+    values = _values(ident, cred or {})
+    out = template
+    for key in ("email", "name"):
+        if "{" + key + "}" in out:
+            if not values.get(key):
+                return None
+            out = out.replace("{" + key + "}", values[key])
+    return out
+
+
 def probe(ident: Identity) -> tuple[bool | None, str]:
-    """GET the probe URL under the identity (the gate injects its session). (True, detail) when the declared
-    status comes back and the body holds `expect`; (False, detail) when the session is not accepted; (None, why)
-    when nothing can be said: no probe declared, no session file. A gate refusal or a network error raises."""
+    """Send the probe request under the identity (the gate injects its session): GET by default, or the declared
+    `method` with its `headers` and `json` (R43). (True, detail) when the declared status comes back and the body
+    holds `expect`; (False, detail) when the session is not accepted (a redirect is never followed: the status is
+    the first answer's; a bearer the gate refuses as expired); (None, why) when nothing can be said: no probe
+    declared, no session file, an `expect` placeholder without its value. Another gate refusal or a network error
+    raises. The body and the resolved `expect` are never logged nor returned."""
     pr = ident.probe
     if not pr:
         return None, "no probe declared"
@@ -237,11 +265,18 @@ def probe(ident: Identity) -> tuple[bool | None, str]:
         return None, "no session"
     # X-BH-Probe: the gate lends the identity's session to this request (it comes from the gate's own loopback);
     # every other enrollment request logs in with its own credentials and never borrows a session
-    headers = {"X-BH-Identity": ident.name, "X-BH-Probe": "1"}
-    step = {"step": "probe", "method": "GET", "url": pr["url"], "headers": headers}
+    headers = {**(pr.get("headers") or {}), "X-BH-Identity": ident.name, "X-BH-Probe": "1"}
+    step = {"step": "probe", "method": pr.get("method") or "GET", "url": pr["url"], "headers": headers}
+    if "json" in pr:
+        step["json"] = pr["json"]
     if pr.get("expect"):
-        step["expect"] = pr["expect"]
+        expect = expect_text(ident, pr["expect"])
+        if expect is None:
+            return None, "the probe's expected text names a value the credential does not hold"
+        step["expect"] = expect
     rec = run_steps([step])[0]
+    if rec.get("gate") and "identity bearer expired" in rec["gate"]:
+        return False, "identity bearer expired"  # the gate withheld it: a new login renews it
     if rec.get("error") or rec.get("gate"):
         raise AccountError(_why(rec, "probe"))
     ok = rec.get("status") == pr["status"] and rec.get("match", True)
@@ -277,7 +312,13 @@ def _new_session(ident: Identity, headers: dict[str, str], now: float) -> dict[s
         "origin_headers": {},
         "cookies": {},
         "expires_at": None,
-        "probe": {"url": ident.probe["url"], "status": ident.probe["status"]} if ident.probe else None,
+        # the probe's URL, status and method; never its `expect` (a template that may name the account)
+        "probe": (
+            {"url": ident.probe["url"], "status": ident.probe["status"]}
+            | ({"method": ident.probe["method"]} if ident.probe.get("method") else {})
+            if ident.probe
+            else None
+        ),
         "updated": round(now, 3),
     }
 
@@ -366,9 +407,13 @@ def _host_ok(ident: Identity, host: str) -> bool:
 
 
 def _is_target(scope: Scope, url: str) -> bool:
-    from bh.scope.enforce import check
+    """R1: an origin (scheme://host:port) is a target when the scope covers it, or when an in-scope URL rule of the
+    same scheme and port covers its host (`https://substrate.office.com/m365Copilot/` and the origin
+    `https://substrate.office.com:443`): the bearer seen there is kept for that origin only, and the gate still
+    judges every request on its full URL."""
+    from bh.scope.model import origin_covered
 
-    return bool(check(scope, url))
+    return origin_covered(scope, url)
 
 
 def browser_jar(ident: Identity, cookies: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:
@@ -569,7 +614,8 @@ def _login_oauth(ident: Identity, cred: dict[str, Any]) -> None:
 
 # ---------------------------------------------------------------- login
 def _login(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
-    """[sign-up,] log in, write the session. Raises AccountError, never with a secret in it."""
+    """[sign-up,] log in, write the session: one pass over the recipe, each field filled once, never a retry here.
+    Raises AccountError with its `cause` (T51), never with a secret in it."""
     try:
         if ident.kind == "oauth_refresh":
             _login_oauth(ident, cred)
@@ -578,24 +624,97 @@ def _login(ident: Identity, cred: dict[str, Any], *, signup: bool) -> None:
         else:
             _login_json(ident, cred, signup=signup)
     except (AccountError, rc.RecipeError) as exc:
-        raise AccountError(_scrub(str(exc), *_secret_values(cred))) from None
+        raise _caused(_scrub(str(exc), *_secret_values(cred)), login_cause(ident.recipe, str(exc))) from None
+
+
+# ---------------------------------------------------------------- why a login failed (T51)
+CAUSES = ("ok", "credentials", "totp", "out-of-band", "challenge", "unknown")
+# What the failed page or answer shows (the login script's `where`: URL, title, visible field names and button labels,
+# never a value; or the HTTP status and the OAuth error code). Matched in this order.
+_CHALLENGE = re.compile(
+    r"captcha|turnstile|cf-chl|cf-mitigated|just a moment|challenge|\brobot\b|are you (a )?human|verify (that )?you|"
+    r"bot (check|detection)|HTTP 429\b|too many (requests|attempts)",
+    re.I,
+)
+_OUT_OF_BAND = re.compile(
+    r"email_code|no mail from|mailbox|the mail holds a link|\bsms\b|text message|phone|\bpush\b|approve|"
+    r"check your (e-?mail|inbox)|magic link|verification (e-?mail|link)|interaction_required|consent_required",
+    re.I,
+)
+_TOTP = re.compile(r"\btotp\b|authenticator|one[- ]time|\b2fa\b|two[- ]factor|\bmfa\b|\botp\b|security code", re.I)
+_PASSWORD_FIELD = re.compile(r"type=password", re.I)
+_REJECTED = re.compile(
+    r"HTTP (400|401|422)\b|invalid_grant|unauthorized_client|invalid_client|no credential stored|"
+    r"no refresh token stored|(invalid|incorrect|wrong) (e-?mail|password|credentials|user)",
+    re.I,
+)
+_STEP = re.compile(r"step \d+ \((\w+)\): (.*)", re.S)
+
+
+def login_cause(recipe: dict[str, Any] | None, message: str) -> str:
+    """The closed cause (CAUSES, never `ok`) of a failed login, from what the recipe's single pass returned: the
+    failing step's action and the page it stopped on (browser), the status or OAuth error code (json,
+    oauth_refresh). Pure."""
+    m = _STEP.search(message)
+    action, rest = (m.group(1), m.group(2)) if m else (None, message)
+    has_totp = any(s.get("action") == "totp" for s in (recipe or {}).get("steps") or ())
+    if _CHALLENGE.search(rest):
+        return "challenge"
+    if action == "email_code":
+        return "out-of-band"
+    if action == "totp":
+        if "no code from the host" in rest or "TOTP" in message or "totp:" in message:
+            return "totp"  # the field was there and no code could be computed: the seed
+        return "credentials" if _PASSWORD_FIELD.search(rest) else "totp"  # never got to the code's page
+    if "no TOTP seed" in message or message.startswith("totp:"):
+        return "totp"
+    if _OUT_OF_BAND.search(rest):
+        return "out-of-band"
+    if _TOTP.search(rest) and not has_totp:
+        return "totp"  # the site asks for a second factor the recipe does not answer
+    if _REJECTED.search(rest):
+        return "credentials"
+    if action is not None and _PASSWORD_FIELD.search(rest):
+        return "credentials"  # still on a page with a password field after the submit: the password was refused
+    return "unknown"
+
+
+def _caused(message: str, cause: str) -> AccountError:
+    return AccountError(f"[{cause}] {message}", cause=cause)
+
+
+def _with_cause(fn):
+    """Every AccountError out of a login entry point carries a cause: the runner posts it as a `login-failed`
+    blocker (T51). One raised before any login (a limit, the gate's scope, a probe the gate refused) is `unknown`."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except AccountError as exc:
+            if exc.cause is not None:
+                raise
+            raise _caused(str(exc), "unknown") from None
+
+    return wrapper
 
 
 def _confirmed(ident: Identity) -> str:
     """After a login: the probe must accept the new session."""
     ok, detail = probe(ident)
     if ok is False:
-        raise AccountError(f"logged in, but the probe refuses the session ({detail})")
+        raise _caused(f"logged in, but the probe refuses the session ({detail})", "unknown")
     return "probe ok" if ok else detail
 
 
 def _no_credential(ident: Identity) -> AccountError:
     if ident.kind == "oauth_refresh":
-        return AccountError(
+        return _caused(
             f"{ident.name}: no refresh token stored; deposit it once (onboarding) in "
-            f'secrets/identities/{ident.program}/{ident.name}.json as {{"refresh_token": ...}}'
+            f'secrets/identities/{ident.program}/{ident.name}.json as {{"refresh_token": ...}}',
+            "credentials",
         )
-    return AccountError(f"{ident.name}: no credential stored and no 'signup' recipe")
+    return _caused(f"{ident.name}: no credential stored and no 'signup' recipe", "credentials")
 
 
 def _stamp_login(board, ident: Identity, now: float, force: bool) -> None:
@@ -606,6 +725,7 @@ def _stamp_login(board, ident: Identity, now: float, force: bool) -> None:
         _take(board, key, LOGIN_EVERY_S, "login", now)
 
 
+@_with_cause
 def enroll(scope: Scope, name: str, *, board=None, force: bool = False) -> str:
     """Create the account if the program allows it and the identity has no credential, then log in and check.
     `force` lifts the hourly login limit (operator command), never the one-account rule. Returns a summary."""
@@ -631,6 +751,28 @@ def enroll(scope: Scope, name: str, *, board=None, force: bool = False) -> str:
     return ("signed up, " if signup else "") + done + _confirmed(ident)
 
 
+def diagnose(scope: Scope, name: str, *, board=None) -> str:
+    """Why `name` cannot log in, one word of CAUSES (`bh accounts check`): one pass of the recipe, each field filled
+    once and never twice (no sign-up, no second attempt), then the probe. `ok` when the probe accepts the new
+    session (or none is declared). The login is stamped like a forced one (the runner does not retry at once); the
+    session it gets is kept. No secret, no page content in the answer: the word only."""
+    ident = identity(scope, name)
+    if not ident.recipe:
+        return "unknown"
+    check_active(scope.program)
+    board = _board(board)
+    cred = credential(ident)
+    if cred is None:
+        return "credentials"
+    _stamp_login(board, ident, time.time(), True)
+    try:
+        _login(ident, cred, signup=False)
+        ok, _ = probe(ident)
+    except AccountError as exc:
+        return exc.cause if exc.cause in CAUSES else "unknown"
+    return "unknown" if ok is False else "ok"
+
+
 def _stale(board, ident: Identity) -> bool:
     try:
         mark = float(board.meta_get(f"identity-stale:{ident.name}:{ident.program}", "0") or 0)
@@ -640,6 +782,7 @@ def _stale(board, ident: Identity) -> bool:
     return mark > (f.stat().st_mtime if f.exists() else 0.0)
 
 
+@_with_cause
 def refresh(scope: Scope, name: str, *, board=None, force: bool = False, probe_first: bool = True) -> str:
     """Probe first: a good session is only touched (`updated`), which lifts a false `identity-stale` mark.
     Otherwise log in with the stored credential; if that fails and the program allows sign-up, sign the same

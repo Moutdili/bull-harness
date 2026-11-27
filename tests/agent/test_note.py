@@ -13,8 +13,14 @@ def bh_dir(tmp_path, monkeypatch):
 
 
 def test_blocked_writes_one_note(bh_dir):
-    note.main(["blocked", "waf", "a.test challenges every request", "-d", "403 cf", "--intent", "I3", "--host", "a.t"])
-    note.main(["blocked", "account", "IDOR needs a 2nd account"])
+    tried = ["--tried", "3 requests, 1/s", "--would-prove", "a 200 with the page"]
+    note.main(
+        ["blocked", "waf", "a.test challenges every request", "-d", "403 cf", "--intent", "I3", "--host", "a.t", *tried]
+    )
+    note.main(["blocked", "account", "IDOR needs a 2nd account", *tried])
+    with pytest.raises(SystemExit) as exc:  # a closed lead says what was tried and what would prove it (T13)
+        note.main(["blocked", "account", "IDOR needs a 2nd account", "--tried", "x"])
+    assert "--would-prove is required" in str(exc.value.code)
     assert [{k: v for k, v in r.items() if k != "ts"} for r in c.read_jsonl(bh_dir / c.NOTES)] == [
         {
             "op": "blocked",
@@ -23,6 +29,8 @@ def test_blocked_writes_one_note(bh_dir):
             "detail": "403 cf",
             "intent": "I3",
             "host": "a.t",
+            "tried": "3 requests, 1/s",
+            "would_prove": "a 200 with the page",
             "program": "p",
         },
         {
@@ -32,6 +40,8 @@ def test_blocked_writes_one_note(bh_dir):
             "detail": "",
             "intent": "",
             "host": "",
+            "tried": "3 requests, 1/s",
+            "would_prove": "a 200 with the page",
             "program": "p",
         },
     ]
@@ -43,6 +53,9 @@ def test_blocked_writes_one_note(bh_dir):
         ["todo", "auth", "need a session"],  # the human is out of the hunt: no todo channel any more
         ["blocked", "bored", "x"],  # reasons are a closed list
         ["fact", "x", "-k", "blocker"],  # blocker facts are host-written
+        ["intent", "x", "--kind", "plan"],  # intent kinds are a closed list
+        ["done", "I3", "x", "--outcome", "fixed"],  # so are outcomes
+        ["cover", "GET /x", "idor", "safe", "-e", "f"],  # no `safe`: clean is the gate's to confirm
     ],
 )
 def test_refused(bh_dir, argv):

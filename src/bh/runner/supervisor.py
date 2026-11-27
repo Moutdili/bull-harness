@@ -1,21 +1,35 @@
 """Zero-strategy supervisor (sapper-v2 watchdog pattern): keeps segments running, rotates
 programs on stagnation, sleeps on quota, starts a fresh session (handoff) when a session
 has been resumed too many times. It never decides what to test — the agent does — and it
-never waits on a human: a program that cannot go on is paused or parked, the others go on."""
+never waits on a human: a program that cannot go on is paused or parked, the others go on.
+
+Caps (D25), held in code: a hunt on real programs is one session of RUNS_PER_SESSION runs inside a named phase
+(`bh hunt --phase NAME`), SESSIONS_PER_DAY sessions a day, MAX_RUNS_PER_DAY runs a day (a lone `bh run` included),
+RUNS_PER_PHASE runs a phase. A cap refuses: it never waits, never postpones, and no option or variable raises it.
+`platform: local` programs (scopes/lab, scopes/examples) count in none of them.
+
+W4: a program whose last PARK_AFTER segments in a row added neither an anchored fact nor an endpoint the gate saw
+for the first time (read in the tables, never in the count of notes) is parked until the hunt ends (T21). A program
+whose hunt and judge cost reaches the scope's `cost_cap_usd` starts no other segment: it is paused, its state kept,
+and a `pause` decision says so (T50)."""
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from bh.board import Board
+from bh.runner import identity
 from bh.runner.run import (
     RESET_HORIZON_S,
     ProgramNotReady,
     SegmentResult,
     check_automation,
+    note_decision,
     recent_refusals,
     run_segment,
 )
@@ -32,21 +46,236 @@ REFUSALS_TO_PARK = 2
 REFUSAL_LIMIT = 3
 QUOTA_SLEEP_S = 30 * 60  # when the stream gave no reset time
 QUOTA_MARGIN_S = 120
+# D25: Mio's rhythm, 3 sessions a day of 11 runs in a row (morning, afternoon break, evening). Literals on purpose:
+# a test reads this module and fails if one of them comes from the environment or an argument.
+RUNS_PER_SESSION = 11
+SESSIONS_PER_DAY = 3
+MAX_RUNS_PER_DAY = 33
+RUNS_PER_PHASE = 33
+# R44: Copilot gives about 45 prompts a day and account. Spread evenly over 33 runs no run finishes a surface: they
+# are concentrated in quanta of PROMPT_QUANTUM, a remainder of at least PROMPT_FLOOR makes one more quantum. Only the
+# orchestrator changes them, between two phases.
+PROMPT_QUANTUM = 10
+PROMPT_FLOOR = 6
 # Resuming re-reads the whole session history every turn: lab runs 5-7 cost $0.13-0.20 for 3-10 turns,
 # fresh sessions from the board + HANDOFF $0.03-0.04 for similar output. Default: always fresh.
 MAX_RESUMES = int(os.environ.get("BH_MAX_RESUMES", "0"))
+PARK_AFTER = 3  # T21 (K): segments in a row with no new anchored fact and no new endpoint seen by the gate
 
 
+class CapReached(SystemExit):
+    """A run the caps refuse (D25): said with the reason, never waited on."""
+
+
+PHASE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,39}")
+
+
+def _phase_name(phase: str) -> str:
+    if not PHASE_RE.fullmatch(phase or ""):
+        raise CapReached(f"phase {phase!r} refused: letters, digits, - _ . (40 at most)")
+    return phase
+
+
+# ------------------------------------------------------------------ caps (D25)
+def day_of(ts: float) -> str:
+    """The host's local date of `ts`."""
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def session_day(session: str) -> str:
+    return session.rsplit("-", 1)[0]
+
+
+def counted(scope) -> bool:
+    """Real programs count in the caps; `platform: local` ones (lab, examples) never do."""
+    return scope.platform != "local"
+
+
+def _capped_runs(board: Board) -> list:
+    identity.ensure(board)
+    return board.rows("SELECT id, started, phase, session FROM runs WHERE phase IS NOT NULL")
+
+
+def runs_on_day(board: Board, day: str) -> int:
+    """Runs of real programs that belong to `day`: a session's runs to the day it started (even past midnight), a
+    lone run to the day it started."""
+    return sum(
+        1 for r in _capped_runs(board) if (session_day(r["session"]) if r["session"] else day_of(r["started"])) == day
+    )
+
+
+def sessions_on_day(board: Board, day: str) -> list[str]:
+    return sorted({r["session"] for r in _capped_runs(board) if r["session"] and session_day(r["session"]) == day})
+
+
+def runs_in_session(board: Board, session: str) -> int:
+    return sum(1 for r in _capped_runs(board) if r["session"] == session)
+
+
+def runs_in_phase(board: Board, phase: str) -> int:
+    return sum(1 for r in _capped_runs(board) if r["phase"] == phase)
+
+
+def open_session(board: Board, phase: str, now: float) -> str:
+    """`<local date>-<n>` of a new session of `phase`, or CapReached with the reason."""
+    _phase_name(phase)
+    if (k := runs_in_phase(board, phase)) >= RUNS_PER_PHASE:
+        raise CapReached(f"phase {phase}: {k}/{RUNS_PER_PHASE} runs, the phase is over (refused)")
+    day = day_of(now)
+    if len(held := sessions_on_day(board, day)) >= SESSIONS_PER_DAY:
+        raise CapReached(
+            f"session {len(held) + 1} of {day} refused: {SESSIONS_PER_DAY} sessions a day ({', '.join(held)})"
+        )
+    if (n := runs_on_day(board, day)) >= MAX_RUNS_PER_DAY:
+        raise CapReached(f"{day}: {n}/{MAX_RUNS_PER_DAY} runs today, no new session (refused)")
+    return f"{day}-{len(held) + 1}"
+
+
+def admit(board: Board, scope, *, phase: str | None, session: str | None, now: float) -> tuple[str | None, str | None]:
+    """(phase, session) to record for this run, or CapReached with the reason. A local program records neither and
+    is never refused here."""
+    if not counted(scope):
+        return None, None
+    if not phase:
+        raise CapReached(
+            f"{scope.program} ({scope.platform}): a real program runs inside a phase: `--phase NAME` "
+            f"(sessions of {RUNS_PER_SESSION} runs, {SESSIONS_PER_DAY} a day, {MAX_RUNS_PER_DAY} runs a day)"
+        )
+    _phase_name(phase)
+    if (k := runs_in_phase(board, phase)) >= RUNS_PER_PHASE:
+        raise CapReached(f"phase {phase}: {k}/{RUNS_PER_PHASE} runs, the phase is over (run {k + 1} refused)")
+    day = session_day(session) if session else day_of(now)
+    if (n := runs_on_day(board, day)) >= MAX_RUNS_PER_DAY:
+        raise CapReached(f"{day}: {n}/{MAX_RUNS_PER_DAY} runs today (run {n + 1} of the day refused)")
+    if session:
+        if (r := runs_in_session(board, session)) >= RUNS_PER_SESSION:
+            raise CapReached(f"session {session}: {r}/{RUNS_PER_SESSION} runs (run {r + 1} refused)")
+        held = sessions_on_day(board, day)
+        if session not in held and len(held) >= SESSIONS_PER_DAY:
+            raise CapReached(f"session {len(held) + 1} of {day} refused: {SESSIONS_PER_DAY} sessions a day")
+    return phase, session
+
+
+def runs_left(board: Board, session: str | None, programs: int, now: float, limit: int = RUNS_PER_SESSION) -> int:
+    """Runs this program may still get today, this one included (R44): those left in the session plus
+    RUNS_PER_SESSION per session of the day not started yet, over the hunt's programs, rounded up. A lone run: 1."""
+    if not session:
+        return 1
+    day = session_day(session)
+    in_session = max(0, limit - runs_in_session(board, session))
+    started = len(set(sessions_on_day(board, day)) | {session})
+    total = in_session + RUNS_PER_SESSION * max(0, SESSIONS_PER_DAY - started)
+    total = min(total, max(0, MAX_RUNS_PER_DAY - runs_on_day(board, day)))
+    return max(1, math.ceil(total / max(1, programs)))
+
+
+def prompt_allotment(quotas: dict, runs_left: int) -> dict[str, int]:
+    """Prompts each identity may send this run (R44). `quotas`: the controller's {identity: {"left": int, ...}}.
+    k = sum of left // PROMPT_QUANTUM, plus one per identity whose remainder is at least PROMPT_FLOOR. The run is
+    served when k > 0 and runs_left % ceil(runs_left / k) == 0: then every identity with left >= PROMPT_FLOOR gets
+    min(PROMPT_QUANTUM, left), the others 0; otherwise every identity gets 0."""
+    lefts: dict[str, int] = {}
+    for name, q in (quotas or {}).items():
+        v = q.get("left") if isinstance(q, dict) else None
+        lefts[str(name)] = max(0, v) if isinstance(v, int) and not isinstance(v, bool) else 0
+    k = sum(v // PROMPT_QUANTUM for v in lefts.values()) + sum(
+        1 for v in lefts.values() if v % PROMPT_QUANTUM >= PROMPT_FLOOR
+    )
+    served = k > 0 and runs_left > 0 and runs_left % math.ceil(runs_left / k) == 0
+    return {n: (min(PROMPT_QUANTUM, v) if served and v >= PROMPT_FLOOR else 0) for n, v in lefts.items()}
+
+
+def status_line(board: Board, now: float) -> str | None:
+    """`phase NAME: k/33 · session j/3: r/11` (bh status), None before any phased run."""
+    identity.ensure(board)
+    last = board.rows("SELECT phase FROM runs WHERE phase IS NOT NULL ORDER BY id DESC LIMIT 1")
+    if not last:
+        return None
+    phase = last[0]["phase"]
+    held = sessions_on_day(board, day_of(now))
+    r = runs_in_session(board, held[-1]) if held else 0
+    return (
+        f"phase {phase}: {runs_in_phase(board, phase)}/{RUNS_PER_PHASE} · "
+        f"session {len(held)}/{SESSIONS_PER_DAY}: {r}/{RUNS_PER_SESSION}"
+    )
+
+
+# ------------------------------------------------------------------ what a segment added (T21), what it cost (T50)
+def _has_table(board: Board, name: str) -> bool:
+    return bool(board.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name))
+
+
+def barren(board: Board, program: str, run_id: int) -> bool:
+    """Run `run_id` added no anchored fact (facts.grounded, the host's word) and no endpoint the gate saw for the
+    first time (a `gate` or `seen` test of this run on an endpoint no earlier run had). Notes alone add nothing. A
+    run the board does not hold closed (runs.ended, which every segment writes) is read as nothing known, never as
+    barren."""
+    if not board.rows("SELECT 1 FROM runs WHERE id=? AND program=? AND ended IS NOT NULL", run_id, program):
+        return False
+    if board.rows("SELECT 1 FROM facts WHERE program=? AND run_id=? AND grounded=1 LIMIT 1", program, run_id):
+        return False
+    if not (_has_table(board, "tests") and _has_table(board, "assets")):
+        return True
+    return not board.rows(
+        "SELECT 1 FROM tests t JOIN assets a ON a.id=t.asset_id WHERE a.program=? AND a.kind='endpoint' "
+        "AND t.run_id=? AND t.evidence IN ('gate', 'seen') AND NOT EXISTS (SELECT 1 FROM tests u WHERE "
+        "u.asset_id=t.asset_id AND u.evidence IN ('gate', 'seen') AND u.run_id IS NOT NULL AND u.run_id<?) LIMIT 1",
+        program,
+        run_id,
+        run_id,
+    )
+
+
+def cost_cap(scope) -> float | None:
+    """The scope's `cost_cap_usd` (lot A parses it): a positive number of dollars, else None (no cap)."""
+    v = getattr(scope, "cost_cap_usd", None)
+    return float(v) if isinstance(v, int | float) and not isinstance(v, bool) and v > 0 else None
+
+
+def program_cost(board: Board, program: str) -> float:
+    """What the program cost so far: every run's hunt (runs.cost_usd) and judge (runs.verify_cost), in dollars."""
+    return float(
+        board.rows(
+            "SELECT COALESCE(SUM(COALESCE(cost_usd, 0) + COALESCE(verify_cost, 0)), 0) AS n FROM runs WHERE program=?",
+            program,
+        )[0]["n"]
+    )
+
+
+def cost_capped(board: Board, scope) -> str | None:
+    """Why no segment may start on this program (its cost reached the cap), None while it may."""
+    cap = cost_cap(scope)
+    if cap is None:
+        return None
+    spent = program_cost(board, scope.program)
+    if spent < cap:
+        return None
+    return (
+        f"{scope.program}: cost cap reached (${spent:.2f} of ${cap:.2f}, hunt and judge): paused, its board kept; "
+        "raise `cost_cap_usd` in the scope file to go on"
+    )
+
+
+def _last_run(board: Board, program: str) -> int | None:
+    rows = board.rows("SELECT MAX(id) AS id FROM runs WHERE program=?", program)
+    return rows[0]["id"] if rows and rows[0]["id"] is not None else None
+
+
+# ------------------------------------------------------------------ hunt
 @dataclass
 class ProgState:
     file: Path
     program: str
+    counted: bool = False  # a real program: its runs count in the caps
     stagnant: int = 0
     cooldown_until: float = 0.0
     last_run: float = 0.0
     resumes: int = 0
     refusals: int = 0  # in this hunt
     parked: bool = False  # never picked again in this hunt
+    barren: int = 0  # T21: segments in a row that added nothing the tables show
+    capped: bool = False  # T50: its cost reached the scope's cap: paused, never picked again in this hunt
+    scope: object = None  # the scope loaded at preflight (cost cap)
 
 
 def quota_wake(res: SegmentResult, now: float) -> float:
@@ -62,8 +291,26 @@ def _fmt(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def rules_fresh(scope) -> tuple[bool, str]:
+    """bh.rules.fresh(program) (lot H): rules never read, read more than 7 days ago, or changed without `bh rules
+    ack` -> (False, the reason). Without the module nothing changes (True). The rules are the authorisation to
+    test: a check that raises refuses (fails closed). Local labs have no rules page: exempt."""
+    if scope.platform == "local":
+        return True, ""
+    try:
+        from bh import rules
+    except ImportError:
+        return True, ""
+    try:
+        ok, why = rules.fresh(scope.program, scope=scope)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"program rules check failed: {type(exc).__name__}: {exc}"
+    return bool(ok), str(why or "")
+
+
 def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
-    """The programs this hunt may run: onboarding done and fewer than REFUSAL_LIMIT refusals in 7 days."""
+    """The programs this hunt may run: onboarding done, program rules fresh (bh.rules) and fewer than
+    REFUSAL_LIMIT refusals in 7 days."""
     ready = []
     for f in scope_files:
         scope = load_scope(f)
@@ -72,17 +319,35 @@ def preflight(board: Board, scope_files: list[Path]) -> list[ProgState]:
         except ProgramNotReady as exc:
             print(f"{scope.program}: excluded ({exc})")
             continue
+        fresh, why = rules_fresh(scope)
+        if not fresh:
+            print(f"{scope.program}: excluded (program rules: {why or 'not fresh'}; `bh rules check`, `bh rules ack`)")
+            continue
         if (n := len(recent_refusals(board, scope.program, time.time()))) >= REFUSAL_LIMIT:
             print(f"{scope.program}: excluded ({n} model refusals in 7 days: review its [refusal] blockers)")
             continue
-        ready.append(ProgState(f, scope.program))
+        ready.append(ProgState(f, scope.program, counted(scope), scope=scope))
     return ready
 
 
-def _after_refusal(p: ProgState) -> None:
+def _pause_on_cost(board: Board, p: ProgState) -> bool:
+    """T50: the program's cost reached its cap: paused (state kept), a `pause` decision in its last run. True when
+    it was paused now."""
+    if p.capped or p.scope is None or (why := cost_capped(board, p.scope)) is None:
+        return False
+    p.capped = True
+    if (rid := _last_run(board, p.program)) is not None:
+        note_decision(board, SegmentResult(program=p.program, run_id=rid), "pause")
+    print(why)
+    return True
+
+
+def _after_refusal(p: ProgState, board: Board | None = None, res: SegmentResult | None = None) -> None:
     p.refusals += 1
     if p.refusals >= REFUSALS_TO_PARK:
         p.parked = True
+        if board is not None and res is not None:  # T20: the park is journaled in the run that caused it
+            note_decision(board, res, "park")
         print(f"{p.program}: parked until the end of the hunt ({p.refusals} refusals)")
     else:
         p.cooldown_until = time.time() + REFUSAL_COOLDOWN_S
@@ -90,20 +355,55 @@ def _after_refusal(p: ProgState) -> None:
 
 
 def hunt(
-    scope_files: list[Path], *, hours: float, minutes: float, model: str, max_turns: int, effort: str | None = None
+    scope_files: list[Path],
+    *,
+    hours: float,
+    minutes: float,
+    model: str,
+    max_turns: int,
+    effort: str | None = None,
+    phase: str | None = None,
+    runs: int | None = None,
 ) -> None:
+    """One session: RUNS_PER_SESSION runs (or `runs`, which can only lower it) on the given programs, the least
+    recently run first, then a clean stop; `hours` bounds its duration. Real programs need a `phase`; local ones
+    run without one, outside every cap. The gate's preflight runs before each program's first segment."""
+    if runs is not None and not 1 <= runs <= RUNS_PER_SESSION:
+        raise SystemExit(f"--runs {runs} refused: a session is at most {RUNS_PER_SESSION} runs, --runs only lowers it")
     board = Board()
+    identity.ensure(board)
     progs = preflight(board, scope_files)
     if not progs:
         print("hunt: no program is ready: nothing to do")
         return
+    real = [p for p in progs if p.counted]
+    if real and not phase:
+        raise SystemExit(
+            f"hunt refused: {', '.join(p.program for p in real)} is a real program: `--phase NAME` (one session of "
+            f"{RUNS_PER_SESSION} runs, {SESSIONS_PER_DAY} sessions and {MAX_RUNS_PER_DAY} runs a day)"
+        )
+    session = open_session(board, phase, time.time()) if real else None
+    limit = runs or RUNS_PER_SESSION
     deadline = time.time() + hours * 3600
-    print(f"hunt: {len(progs)} program(s) until {_fmt(deadline)} · segments of {minutes:g} min / {max_turns} turns")
+    print(
+        f"hunt: {len(progs)} program(s) until {_fmt(deadline)} · segments of {minutes:g} min / {max_turns} turns"
+        + (f" · phase {phase} · session {session}: {limit} runs" if session else "")
+    )
+    checked: dict[str, dict] = {}  # program -> its preflight result (run once per program and hunt)
+    done = 0  # segments of this hunt (bounds a local-only hunt given --runs)
     while time.time() < deadline:
+        if session and (r := runs_in_session(board, session)) >= limit:
+            print(f"session {session} complete: {r}/{limit} runs")
+            break
+        if not session and runs is not None and done >= runs:
+            print(f"hunt: {done}/{runs} runs done")
+            break
         now = time.time()
-        active = [p for p in progs if not p.parked]
+        for q in progs:
+            _pause_on_cost(board, q)
+        active = [p for p in progs if not p.parked and not p.capped]
         if not active:
-            print("every program is parked: stopping")
+            print("every program is parked or paused: stopping")
             break
         ready = [p for p in active if p.cooldown_until <= now]
         if not ready:
@@ -117,6 +417,7 @@ def hunt(
         p = min(ready, key=lambda x: x.last_run)
         resume = p.resumes < MAX_RESUMES
         p.last_run = time.time()
+        left = runs_left(board, session, len(real), p.last_run, limit) if p.counted else 1
         try:
             res: SegmentResult = run_segment(
                 p.file,
@@ -126,17 +427,28 @@ def hunt(
                 resume=resume,
                 board=board,
                 effort=effort,
+                phase=phase if p.counted else None,
+                session=session if p.counted else None,
+                runs_left=left,
+                preflight=checked.get(p.program, True),
             )
+        except CapReached as exc:  # a cap refuses: the session ends here, nothing waits
+            print(f"hunt: {exc}")
+            break
         except ProgramNotReady as exc:  # its scope file changed mid-hunt; any other SystemExit stops the hunt
             p.parked = True
             print(f"{p.program}: parked until the end of the hunt ({exc})")
             continue
         except Exception as exc:  # noqa: BLE001 - e.g. a sandbox file that breaks ingestion: this program only
-            # SystemExit (container down, lock held: the whole stack) and Ctrl-C are not Exceptions: they still stop
-            # the hunt. A failing program would fail again at once (its files stay): parked, the others go on.
+            # SystemExit (container down, lock held, preflight failed: the whole stack) and Ctrl-C are not
+            # Exceptions: they still stop the hunt. A failing program would fail again at once (its files stay):
+            # parked, the others go on.
             p.parked = True
             print(f"{p.program}: parked until the end of the hunt (segment failed: {exc!r})"[:500])
             continue
+        done += 1
+        if isinstance(getattr(res, "preflight", None), dict):
+            checked[p.program] = res.preflight
         p.resumes = p.resumes + 1 if resume else 0
         if res.status == "parked":  # third-party data or server-side execution: only the operator lifts it
             p.parked = True
@@ -155,7 +467,16 @@ def hunt(
                 p.cooldown_until = time.time() + COOLDOWN_S
                 print(f"{p.program}: cooldown until {_fmt(p.cooldown_until)} (refusal on a cause already refused)")
             else:
-                _after_refusal(p)
+                _after_refusal(p, board, res)
+            continue
+        p.barren = p.barren + 1 if barren(board, p.program, res.run_id) else 0
+        if p.barren >= PARK_AFTER:  # T21
+            p.parked = True
+            note_decision(board, res, "park")
+            print(
+                f"{p.program}: parked until the end of the hunt ({p.barren} segments in a row without a new anchored "
+                "fact or a new endpoint seen by the gate)"
+            )
             continue
         if res.progress == 0:  # a HANDOFF or dead-ends alone is not progress
             p.stagnant += 1

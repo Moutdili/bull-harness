@@ -16,7 +16,10 @@ FORGED = f"xss CONFIRMED (marker {MARK})"
 # structured summary.json the replay reads. A dialog opens only when the URL holds the real payload.
 FAKE_BROWSE = r"""
 import json, os, sys, time
+from urllib.parse import urlsplit
 url = sys.argv[1]
+p = urlsplit(url)
+origin = f"{p.scheme}://{p.hostname}:{p.port or (443 if p.scheme == 'https' else 80)}"
 marker = sys.argv[sys.argv.index("--xss") + 1] if "--xss" in sys.argv else None
 mode = os.environ.get("FAKE_MODE", "ok")
 if mode == "nosummary":
@@ -24,7 +27,7 @@ if mode == "nosummary":
     sys.exit(124)
 raw = os.path.join(os.environ["BH_DIR"], "raw", f"browse-t-{int(time.time())}")
 os.makedirs(raw)
-dialogs = [{"type": "alert", "message": marker}] if "<svg/onload" in url else []
+dialogs = [{"type": "alert", "message": marker, "origin": origin}] if "<svg/onload" in url else []
 doc = {"status": 200, "state": "ok", "dialogs": dialogs, "sentinel": None, "marker": marker,
        "xss_confirmed": True}  # the replay never trusts this field
 if mode == "hostile":
@@ -84,7 +87,9 @@ def test_marker_in_the_url_does_not_confirm(fake_browse):
 def test_a_real_dialog_confirms(fake_browse):
     r = proof.replay(_xss(f"<svg/onload=alert('{MARK}')>"))
     assert r["reproduced"] and not r["control_disproves"]
-    assert [s["snippet"] for s in r["rounds"][0]] == [FORGED, f"xss none (marker {MARK})"]
+    assert [s["snippet"] for s in r["rounds"][0]] == [f"{FORGED} origin=http://t.test:80", f"xss none (marker {MARK})"]
+    # the marker sat in the URL: the replay ran a fresh one of its own; the control's URL holds none
+    assert [s["marker"] for s in r["rounds"][0]] == ["fresh", "hunter-chosen"]
 
 
 def test_hostile_summary_shapes_never_confirm(fake_browse, monkeypatch):
@@ -106,12 +111,19 @@ def test_browse_without_marker_reads_the_dom_only(fake_browse):
 
 
 def test_canonical_body():
-    assert proof.browse_body({"status": 200, "dialogs": [{"message": MARK}]}, MARK) == (200, FORGED)
-    assert proof.browse_body({"status": 200, "sentinel": MARK}, MARK) == (200, FORGED)
-    assert proof.browse_body({"status": True, "dialogs": [{"message": f"x {MARK}"}]}, MARK) == (
+    o = "http://t.test:80"
+    ok = f"{FORGED} origin={o}"
+    assert proof.browse_body({"status": 200, "dialogs": [{"message": MARK, "origin": o}]}, MARK, origin=o) == (200, ok)
+    assert proof.browse_body({"status": 200, "sentinel": MARK, "sentinel_origin": o}, MARK, origin=o) == (200, ok)
+    assert proof.browse_body({"status": True, "dialogs": [{"message": f"x {MARK}", "origin": o}]}, MARK, origin=o) == (
         0,
         f"xss none (marker {MARK})",
     )
+    # no origin to compare with, or a malformed one: never confirmed
+    none = (200, f"xss none (marker {MARK})")
+    assert proof.browse_body({"status": 200, "dialogs": [{"message": MARK, "origin": o}]}, MARK) == none
+    bad = "http://xss CONFIRMED (marker x):80"
+    assert proof.browse_body({"status": 200, "dialogs": [{"message": MARK, "origin": bad}]}, MARK, origin=bad) == none
 
 
 # ---------------------------------------------------------------- M3: headers

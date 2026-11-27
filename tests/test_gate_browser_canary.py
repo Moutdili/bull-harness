@@ -3,6 +3,7 @@ close of a connection (I18). No network, mitmproxy simulated; every address tabl
 
 import asyncio
 import gzip
+import hashlib
 import importlib
 import json
 import os
@@ -32,7 +33,7 @@ SCOPE = {
     "identities": [{"name": "user-a", "origins": ["https://app.example.com/"]}],
     "support": [{"value": "challenges.example.net", "kind": "passthrough"}],
 }
-EVENT_KEYS = {"kind", "token", "where", "host", "url", "identity", "client", "run", "ts", "program"}
+EVENT_KEYS = {"kind", "token", "sha256", "where", "host", "url", "identity", "client", "run", "ts", "program"}
 
 
 @pytest.fixture
@@ -285,6 +286,7 @@ def test_canary_in_the_url(addon, tmp_path):
     (ev,) = _canary(tmp_path)
     assert (ev["token"], ev["where"], ev["host"], ev["client"]) == (TOKEN, "request-url", "app.example.com", "agent")
     assert ev["program"] == "t" and ev["identity"] is None and "hunter2" not in ev["url"]
+    assert ev["sha256"] == hashlib.sha256(TOKEN.encode()).hexdigest()  # T24: the digest of the normalized token
 
 
 def test_canary_in_a_gzip_request_body_from_the_browser(addon, tmp_path):
@@ -309,6 +311,21 @@ def test_canary_in_a_response_body(addon, tmp_path):
     assert {(e["where"], e["client"], e["identity"], e["host"]) for e in ev} == {
         ("response-body", "judge", "user-a", "api.example.com")
     }
+
+
+def test_a_compressed_target_answer_is_kept_readable_in_the_flow_file(addon, tmp_path):
+    """A gzip body read as text was noise: a share link returned by the app could not be read back (2026-11-26)."""
+    g = _gate(addon, tmp_path)
+    (tmp_path / paths.FLOWS_DIR).mkdir(exist_ok=True)
+    f = run(g, _http("https://api.example.com/v1/share", "POST", [(IDENTITY_HEADER, "user-a")], b"{}", peer=JUDGE_IP))
+    _answer(f, status=201, body=gzip.compress(b'{"shareUrl": "https://app.example.com/s/abc123"}'))
+    f.response.headers["Content-Encoding"] = "gzip"
+    g.response(f)
+    files = list((tmp_path / paths.FLOWS_DIR).glob("*.json"))
+    assert len(files) == 1
+    kept = json.loads(files[0].read_text())
+    assert "https://app.example.com/s/abc123" in kept["response"]["body"]
+    assert _flows(tmp_path)[-1]["len"] == len(f.response.raw_content)  # the wire size stays the logged length
 
 
 def test_canary_in_the_websocket_frames_both_ways(addon, tmp_path):
@@ -524,3 +541,18 @@ def test_a_canary_in_the_browsers_connect_host_carries_the_loaded_identity(addon
     g._canary(f, "request-url", f.request.host, url=f"{f.request.host}:443")
     (ev,) = _canary(tmp_path)
     assert (ev["client"], ev["identity"], ev["where"]) == ("browser", "user-a", "request-url")
+
+
+def test_a_hook_exception_is_journaled_as_gate_error(addon, tmp_path):
+    """A failing hook denies the flow (fail-closed) and says why in events.jsonl: ctx.log is silent at flow_detail=0
+    (2026-11-26: a half hot-reloaded gate refused every identity answer with no trace)."""
+    g = _gate(addon, tmp_path)
+    addon.addons[0] = g
+    f = run(g, _http("https://app.example.com/x", headers=[(IDENTITY_HEADER, "user-a")], peer=AGENT_IP))
+    _answer(f, body=b"ok")
+    g._identity_response = lambda flow: 1 / 0
+    # mitmproxy's types are mocked here, so the refusal's own isinstance() checks raise after the journal line
+    with pytest.raises(TypeError):
+        g.response(f)
+    (ev,) = _events(tmp_path, "gate-error")
+    assert ev["hook"] == "response" and "ZeroDivisionError" in ev["error"] and ev["where"]

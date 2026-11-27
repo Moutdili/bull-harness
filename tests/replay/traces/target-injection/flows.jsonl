@@ -1,0 +1,1 @@
+{"id": "1764200020-abcdef-4", "class": "target", "method": "GET", "url": "http://app.replay.test/help?topic=x", "status": 200, "len": 265, "ctype": "text/html", "wait": 0, "ua": "curl/8.5.0", "identity": null, "ts": 1764200020.0, "program": "replay-lab", "run": 1}

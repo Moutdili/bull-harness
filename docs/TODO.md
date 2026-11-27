@@ -1,9 +1,19 @@
+> Plan en vigueur : v4.2 (`roadmap-v4.md`, tenu par l'orchestrateur hors du dépôt) ; vagues fusionnées : W1, W2, W3 (base `b160269`, suite verte) ; W4 en cours, 8 lots. Ce TODO précède le plan : ses phases restent l'historique, le plan fait foi.
 # bull-harness — TODO maître
 
 Décisions figées (2026-11-22, plan Ultra depuis le 2026-11-24) : CVP **Defense** (individuel) · Podman rootless · YWH + Intigriti d'abord · objectif court terme : **premiers CVE** (divulgation coordonnée) → dossier Red Team plus tard.
 
 Légende propriétaire : **C** = Claude (en direct, parties critiques) · **H** = Hermes (swarm) · **M** = Mio (humain).
 Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie que si le critère passe en sortie d'outil réelle.
+
+## Vagues du plan v4.2 (état au 2026-11-27)
+
+| Vague | État | Ce qu'elle a livré (résumé ; détail : `docs/architecture.md`, « Blocs livrés en W1 à W3 ») |
+|---|---|---|
+| W1 | fusionnée | doctrine (A), notes et contrôle d'observation (B), vérificateur (C), gate : URL protégées, hôtes de charge, garde d'énumération à 6 ids (D), bh-browser (E), runner : auto-test du gate, setup haché, plafonds, budget de prompts (F), hooks sur `mcp__.*` (G), docs (H) |
+| W2 | fusionnée | jambes typées (A), mémoire (B), rappel `bh-recall` (C), agents et chaînes de hash (D), ouverture et bloc `## Lineage` (E), lignée branchée au runner et `bh stats` (F), registre de crédit (G), scope MSRC étape 1 : garde de destinataires, règles du programme, OneDrive (H) |
+| W3 | fusionnée | serveur MCP `bh` (A), `hexstrike` (B), cartes devenues skills (C), sources docs et passives (D), sorties et hooks (E), skills et MCP dans la session du chasseur (F), doctrine et docs (G), skills de classes (H) |
+| W4 | en cours | hors bande, preuve entre comptes, validation, missions, rapports, banc et boîte mail, scope MSRC étape 2, skills Microsoft, schémas |
 
 ## État au 2026-11-25 (vérifié par tests ; le live reste à faire, issue 27)
 
@@ -13,7 +23,7 @@ Chaque tâche a un critère d'acceptation **binaire**. Une tâche n'est finie qu
 | 1 Confinement | 1.1 gate HTTP (décision sur la destination réelle, fail-closed, TCP brut coupé, méthodes, backoff 429/503/WAF), 1.1b passifs (hôtes exacts, IP publiques), 1.4 réseaux, **1.5 suite d'évasion `tests/escape/escape_check.sh` : 29/29** (HTTPS par nom, raisons des refus vérifiées) | 1.2 DNS filtrant (aujourd'hui : aucune résolution externe), 1.3 SOCKS (volontairement absent), sources passives de subfinder |
 | 2 Tokens | 2.2 troncature, 2.3 `updatedToolOutput` vérifié, base par tour −62 % (`--tools Bash,Read`, sans slash commands), sessions neuves par défaut | 2.4 mineur et 2.5 calibrage faits (veille). **2.6 alias abandonnés** le 2026-11-25 : gain mesuré ~0,3 % d'un run (issue 017). 2.1 réécriture : idem, non prioritaire |
 | 3 Swarm | H1 image Kali, H8 UI | H4–H6 connecteurs de scope (H7 Gmail abandonné) |
-| 4 Autonomie | 4.1 runner, 4.2 superviseur (sommeil quota sur `resetsAt`), 4.3 vérificateur + **escalade Mythos**, **verrou d'outils + file de surface**, **4.4 remplacée : plus d'humain pendant la chasse** (faits `blocker`, pause WAF dans le gate, identités périmées, refus chiffrés, préflight), `q`/`qq`, aucun MCP chargé | 4.2b rotation sur contexte, 4.6 skills, 4.5 remplacée par les issues 25-26 (sessions par l'hôte) |
+| 4 Autonomie | 4.1 runner, 4.2 superviseur (sommeil quota sur `resetsAt`), 4.3 vérificateur + **escalade Mythos**, **verrou d'outils + file de surface**, **4.4 remplacée : plus d'humain pendant la chasse** (faits `blocker`, pause WAF dans le gate, identités périmées, refus chiffrés, préflight), `q`/`qq`, aucun MCP chargé (jusqu'à W3 : serveurs stdio `bh` et `hexstrike` dans le sandbox, hooks sur `mcp__.*`) | 4.2b rotation sur contexte, 4.6 skills, 4.5 remplacée par les issues 25-26 (sessions par l'hôte) |
 | 5 CVE | — | tout |
 | 6 Runs réels | 6.0 lab Juice Shop (reset 2026-11-24 : 7 runs, 5 findings, cartographie 100 % arsenal) | 6.1 app perso, 6.2 premier programme, 6.3 premier CVE |
 
@@ -134,7 +144,7 @@ Contrats à respecter : schémas 0.2 / 0.3 / 0.4. Un fichier = un propriétaire.
 ## Phase 7 — Outils et sessions autonomes (2026-11-25)
 
 Recherches : `research/08-mcp-arsenal.md`, `09-vision-headless.md`, `10-sessions-anti-bot.md`, `11-autonomie-sans-humain.md`.
-Principe : pas de MCP dans l'agent (les hooks ne voient que `Bash`) ; chaque outil tiers entre comme builtin `bh-*` qui passe
+Principe (2026-11-25, levé en W3 depuis que les hooks classent aussi `mcp__.*`) : pas de MCP dans l'agent ; chaque outil tiers entre comme builtin `bh-*` qui passe
 par le gate et rend ≤ 25 lignes.
 
 Décisions de Mio (2026-11-25) :

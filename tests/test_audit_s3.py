@@ -1,9 +1,12 @@
 """Audit Mythos 2026-11-26, S3 part: doctrine, cards, observation proofs, stop on third-party data, judge model,
 CLI fences. No podman, no Claude, no network."""
 
+import importlib
 import json
 import re
+import sys
 import time
+import types
 
 import pytest
 
@@ -12,10 +15,20 @@ from bh.agent import contract as c
 from bh.agent import hooks
 from bh.board import Board
 from bh.runner import observation, run
-from bh.runner.prompt import DOCTRINE, build_system_prompt, build_task, build_verifier_prompt
+from bh.runner.prompt import OPENINGS, build_system_prompt, build_task, build_verifier_prompt, doctrine
 from bh.scope import scope_from_dict
 
 PT = [{"value": "challenges.cloudflare.com", "kind": "passthrough"}]
+
+
+@pytest.fixture(autouse=True)
+def recall_shipped(monkeypatch):
+    """The default opening names bh-recall (W2-C ships bh.agent.recall): a stand-in until that lot is merged."""
+    monkeypatch.delenv("BH_DOCTRINE_OPENING", raising=False)
+    try:
+        importlib.import_module("bh.agent.recall")
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "bh.agent.recall", types.ModuleType("bh.agent.recall"))
 
 
 def _scope(**kw):
@@ -23,7 +36,9 @@ def _scope(**kw):
 
 
 # ------------------------------------------------------------------ doctrine (B7, I8, R1-R10)
-def test_general_doctrine_keeps_no_human_channel_and_moves_anti_bot_under_network():
+@pytest.mark.parametrize("opening", sorted(OPENINGS))
+def test_general_doctrine_keeps_no_human_channel_and_moves_anti_bot_under_network(opening):
+    DOCTRINE = doctrine(True, opening)
     low = DOCTRINE.lower()
     assert "human" not in low and "todo" not in low and "wait-human" not in low
     network = DOCTRINE.split("## Network (hard rules)")[1].split("## Data safety")[0]
@@ -31,7 +46,9 @@ def test_general_doctrine_keeps_no_human_channel_and_moves_anti_bot_under_networ
     assert "never solved" not in DOCTRINE.split("## Board")[1]  # no longer buried in the Board section
 
 
-def test_doctrine_r6_and_no_stop_priming():
+@pytest.mark.parametrize("opening", sorted(OPENINGS))
+def test_doctrine_r6_and_no_stop_priming(opening):
+    DOCTRINE = doctrine(True, opening)
     assert "name the file or the output line that shows it; a question without one is a no" in DOCTRINE
     assert "Before you stop" not in DOCTRINE
     task = build_task("board", first=False)
@@ -211,7 +228,7 @@ def test_judge_model_is_never_the_hunters():
 
 
 # ------------------------------------------------------------------ I1: observation proofs
-OBS = {"token": "BH-SECRET-0123456789abcdef", "victim": "user-b", "attacker": "user-a"}
+OBS = {"token": "BH-SECRET-0123456789abcdef", "victim": "user-b", "attacker": "user-a", "control": "0/3"}
 
 
 def _ev(ts, where, identity, client="browser", **kw):
@@ -350,13 +367,15 @@ def test_note_observation_form(tmp_path, monkeypatch, capsys):
     canary = capsys.readouterr().out.strip()
     assert c.CANARY_RE.fullmatch(canary)
     base = ["finding", "t", "--severity", "high", "--class", "prompt-injection", "--url", "https://a.test/"]
+    base += ["--control", "0/3", "--counter", "c", "--severity-if", "i", "--severity-why", "w"]
     with pytest.raises(SystemExit):
         note.main([*base, "--observation", canary, "--victim", "user-a", "--attacker", "user-a", "--summary", "s"])
     with pytest.raises(SystemExit):
         note.main([*base, "--observation", "BH-SECRET-xyz", "--victim", "b", "--attacker", "a", "--summary", "s"])
     note.main([*base, "--observation", canary, "--victim", "user-b", "--attacker", "user-a", "--summary", "s"])
     rec = json.loads((tmp_path / c.NOTES).read_text().splitlines()[-1])
-    assert rec["observation"] == {"token": canary, "victim": "user-b", "attacker": "user-a"} and "proof" not in rec
+    assert rec["observation"] == {"token": canary, "victim": "user-b", "attacker": "user-a", "control": "0/3"}
+    assert "proof" not in rec
 
 
 # ------------------------------------------------------------------ I11: stop on third-party data

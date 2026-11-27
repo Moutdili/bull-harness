@@ -91,15 +91,21 @@ RUN apt-get update \
 #     Versions seen in kali-rolling on 2026-11-25 (https://pkg.kali.org/pkg/<source>): xorg-server 2:21.1.25-2
 #     (binary xvfb), x11vnc 0.9.17-3, novnc 1:1.6.0-3 (it depends on websockify 0.13.0+dfsg1-2, installed, unused).
 #     Pinned: a rolling repo that moved fails the build here; bump the ARGs after checking pkg.kali.org.
+#     xclip: `bh-web text --clipboard` reads the page's clipboard on the virtual display (`xclip -selection clipboard
+#     -o`). XCLIP_VERSION: 0.13-4, the kali-rolling candidate read on 2026-11-27 (`apt-cache policy xclip` in the
+#     pinned base); an empty value still fails the build, never an unpinned install.
 ARG XVFB_VERSION=2:21.1.25-2
 ARG X11VNC_VERSION=0.9.17-3
 ARG NOVNC_VERSION=1:1.6.0-3
-RUN apt-get update \
+ARG XCLIP_VERSION=0.13-4
+RUN { test -n "${XCLIP_VERSION}" || { echo "XCLIP_VERSION is empty: pin it from pkg.kali.org/pkg/xclip" >&2; exit 1; }; } \
+ && apt-get update \
  && apt-get install -y --no-install-recommends "xvfb=${XVFB_VERSION}" "x11vnc=${X11VNC_VERSION}" "novnc=${NOVNC_VERSION}" \
+      "xclip=${XCLIP_VERSION}" \
  && rm -rf /var/lib/apt/lists/* \
  && test -f /usr/share/novnc/core/rfb.js \
- && command -v Xvfb x11vnc chromium \
- && dpkg-query -W xvfb x11vnc novnc chromium | tee /opt/bh/browser-versions.txt
+ && command -v Xvfb x11vnc chromium xclip \
+ && dpkg-query -W xvfb x11vnc novnc xclip chromium | tee /opt/bh/browser-versions.txt
 
 # 6. Unprivileged hunter user (claude refuses bypassPermissions as root).
 RUN useradd -m -s /bin/bash hunter && mkdir -p /work /opt/bh/bin && chown -R hunter:hunter /work

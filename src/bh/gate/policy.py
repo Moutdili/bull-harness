@@ -18,6 +18,21 @@ Classes of destination:
             only, the TLS never intercepted (addon: ignore_hosts), nothing of ours inside, bounded
             (PassthroughGuard); a decrypted request to it is refused. Own rate limit, public IPs only, never a test
             (flows class `support`, outside the asset graph and the counts).
+- docs    : library documentation (contract.DOCS_API, Context7, D24): GET/HEAD on the sheet's read routes and
+            parameters only, on 443, public IPs only; no cookie, no Authorization, no identity (refused when sent), no
+            program header (the addon keeps DOCS_HEADERS only); DOCS_RPM per minute, the next refused; never a name of
+            the scope, a canary, a URL, a path, an address nor an identity in the query (docs_query_ok: "scope name in a
+            docs query"). The answer is data. Flows class `docs`, never a test.
+- payload : the scope's `payload_hosts` (D27, O28): data-free hosts the hunter may cite and load (CORS, redirects,
+            an image) without touching a real third party. GET/HEAD/OPTIONS without body from any sandbox client, on
+            80/443, public IPs only, no cookie, no identity, no program header, the program's own rate; every request
+            journaled (flows class `payload`); any other method refused ("payload host: GET/HEAD/OPTIONS only").
+Recipients (D31): a request whose URL a `recipient_guard` regex of the scope matches, whatever the client, needs at
+least one e-mail address and every address one of the program's identities (bh.gate.recipients); else "recipient not
+ours". Approved prefixes (D40): `<state>/scope-extra/<program>.yaml` joins the scope's targets at every reload
+(bh.scope.extra); a revoked one leaves at the next.
+Protected paths (T5): a path matching PROTECTED_DEFAULT or the scope's `protected_urls` is refused to every client,
+bh-browser included, whatever the method ("protected url"): sign-out, password and account changes, payment.
 Websockets (scope `websockets: true`, refused otherwise): the handshake is a target request like any other
 (scope, identity, program headers, rate); then every message is bounded and journaled (WsGuard).
 The persistent browser (`browser`: the client is bh-browser, B2): when the scope has a passthrough host, only it may
@@ -31,28 +46,42 @@ absolute request URL), never on the Host header alone.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
 import os
 import re
 import time
+import unicodedata
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urljoin, urlsplit
 
 from bh.agent.contract import (
     API_PATH,
+    DOCS_API,
+    DOCS_LIBRARY_ID,
+    DOCS_QUESTION_MAX,
+    DOCS_REASON,
+    GENERIC_LABELS,
     IDENTITY_ONLY_METHODS,
     PASSIVE_DENY_PATHS,
+    docs_text_why,
+    is_docs,
     is_passive,
     origin,
+    own_labels,
     path_key,
 )
 from bh import redact
+from bh.gate import recipients
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
+from bh.scope import extra as scope_extra
 from bh.scope.enforce import browser_only, check_support_resolved, support_entry
+from bh.scope.psl import is_public_suffix
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
 SYSTEM_HOSTS = ("api.anthropic.com",)
@@ -80,7 +109,27 @@ MAX_BODY_BYTES = 1 << 20  # larger uploads look like resource exhaustion, not a 
 # Object-id enumeration (reading other users' objects one by one) is refused, not just discouraged:
 # authenticated or API requests may touch at most ID_LIMIT distinct ids per route in ID_WINDOW_S. Only the ids of the
 # path count (I6): a query or body parameter (telemetry `eventid`, a search filter) is no object read.
-ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 12, 600, 5000
+ID_LIMIT, ID_WINDOW_S, ROUTES_MAX = 6, 600, 5000  # D26: six distinct ids, the seventh refused
+# T32: the test objects' registry (bh.gate.objects). A PUT, PATCH or DELETE under an identity whose path id the
+# registry does not hold: `observe` journals it (event `object-unknown`, `would_refuse: true`) and lets it through;
+# `enforce` refuses it (OBJECTS_REASON). Mio's decision: `observe` first, `enforce` after a month counted by the
+# orchestrator. Nothing switches this constant by itself; `enforce` is never the default.
+OBJECTS_MODES = ("observe", "enforce")
+OBJECTS_MODE = "observe"
+OBJECTS_REASON = "not one of your test objects"
+# T5: paths no client may reach, whatever the method (bh-browser included): they end our session, change our
+# accounts or spend money. Matched case-insensitively on the request PATH only (never the query string), raw and
+# normalized (%xx decoded, ;params dropped, // collapsed); a scope adds its own (`protected_urls`), never removes one.
+PROTECTED_DEFAULT = (
+    r"(^|/)(log-?out|sign-?out)(/|$)",
+    r"(^|/)(reset|forgot|change)[-_]?password",
+    r"(^|/)(delete|close|deactivate)[-_]?account",
+    r"(^|/)(checkout|payment|billing|purchase|subscribe)(/|$)",
+)
+PROTECTED_REASON = "protected url"
+RECIPIENT_REASON = recipients.REASON  # "recipient not ours"
+PAYLOAD_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+PAYLOAD_REASON = "payload host: GET/HEAD/OPTIONS only"
 # programs that forbid scanners: this many "not found" answers on one origin in the window is a brute-force
 # (ffuf, dirb, a curl loop over a wordlist), whatever tool sent it. The origin pauses until the window clears.
 MISS_LIMIT, MISS_WINDOW_S = 25, 300
@@ -95,6 +144,20 @@ WAF_MARKERS = re.compile(
 )
 WAF_STATUS = (403, 429, 503)
 WAF_SCAN_BYTES = 64 << 10
+# D24: library documentation (contract.DOCS_API, Context7, anonymous). Requests per minute, every client together, a
+# rate of its own (never the targets'); the (DOCS_RPM+1)-th of a minute is refused, not delayed. BH_DOCS_RPM overrides.
+DOCS_RPM = 10
+DOCS_METHODS = frozenset({"GET", "HEAD"})
+# headers a docs request keeps (the addon drops every other one and sets its own User-Agent): nothing of ours leaves
+DOCS_HEADERS = frozenset({"host", "accept", "accept-encoding", "accept-language", "connection"})
+DOCS_USER_AGENT = "bh-docs"
+_DOCS_VALUES = {
+    "type": re.compile(r"txt|json"),
+    "fast": re.compile(r"true|false"),
+    "language": re.compile(r"[A-Za-z0-9 _+#.-]{1,40}"),
+    "version": re.compile(r"[A-Za-z0-9._+-]{1,40}"),
+}
+DOCS_DECODE_ROUNDS = 3  # %-decoding passes over the URL; still encoded after them: refused
 
 
 def _now() -> float:
@@ -143,10 +206,11 @@ def is_public_ip(ip: str) -> bool:
 @dataclass
 class Verdict:
     allowed: bool
-    klass: str  # system | passive | target | support | deny
+    klass: str  # system | passive | docs | target | support | payload | deny
     reason: str
     rule: str | None = None
     support: str | None = None  # kind of a `support` verdict: "auth" | "assets" | "sso" | "passthrough"
+    recipients: bool = False  # D31: a recipient_guard route that passed (the journal hides its addresses)
 
 
 def deny(reason: str, rule: str | None = None) -> Verdict:
@@ -191,30 +255,64 @@ class Policy:
     waf_seen: dict[str, deque] = field(default_factory=dict)  # host -> deque[ts of WAF answers]
     host_blocked_until: dict[str, float] = field(default_factory=dict)  # host -> end of its WAF cooldown
     local_ips: frozenset[str] = frozenset()  # the gate's own addresses (never a destination, B3)
-    ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # noqa: PLW0108 - defined below
+    ws_limits: WsLimits = field(default_factory=lambda: WsLimits.from_env())  # a lambda: WsLimits is defined below
     ws_limits_browser: WsLimits = field(default_factory=lambda: WsLimits.from_env(browser=True))
     ws_live: dict[str, WsGuard] = field(default_factory=dict)  # open websocket (flow id) -> its guard
-    passthrough: PassthroughGuard = field(default_factory=lambda: PassthroughGuard.from_env())  # noqa: PLW0108 - below
+    passthrough: PassthroughGuard = field(
+        default_factory=lambda: PassthroughGuard.from_env()
+    )  # a lambda: defined below
+    base_scope: Scope | None = None  # the scope file as loaded, before the approved prefixes (D40)
+    extra_sig: object = None  # signature of the scope-extra file merged into `scope`
+    on_event: Callable[[dict], None] | None = None  # journal hook (the addon's events log); None: not journaled
+    docs_rpm: int = field(default_factory=lambda: int(_env_num("BH_DOCS_RPM", DOCS_RPM)))
+    docs_seen: deque = field(default_factory=deque)  # times of the docs requests let through in the last minute
+
+    @property
+    def state_dir(self) -> Path:
+        """The gate's state dir: where the active scope, the allowlist and the approved prefixes live."""
+        return self.scope_path.parent
 
     def reload(self) -> None:
-        """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed)."""
+        """Hot-reload on mtime. Any failure leaves NO scope: everything is denied (fail closed). The approved prefixes
+        (D40) are merged again whenever their file changes; a broken one is ignored and journaled."""
         try:
             mtime = self.scope_path.stat().st_mtime
         except OSError:
             self.scope, self.scope_error, self.scope_mtime = None, "no active scope", -1.0
+            self.base_scope, self.extra_sig = None, None
             return
-        if mtime == self.scope_mtime:
+        if mtime != self.scope_mtime:
+            self.scope_mtime = mtime
+            try:
+                self.base_scope, self.scope_error = load_scope(self.scope_path), None
+            except Exception as exc:  # noqa: BLE001 - whatever the parser raises, fail closed
+                self.base_scope, self.scope_error = None, f"invalid active scope: {exc}"
+            self.scope, self.extra_sig = self.base_scope, object()  # a new base: merge its prefixes again
+            self.buckets.pop("target", None)
+            self.backoff_until = 0.0
+            self.ids_seen.clear()
+            self.misses.clear()
+            # WAF pauses survive a scope reload: a new run on the same program must not hit the challenge again.
+        if self.base_scope is None:
             return
-        self.scope_mtime = mtime
+        sig = scope_extra.signature(self.base_scope.program, self.state_dir)
+        if sig == self.extra_sig:
+            return
+        self.extra_sig = sig
         try:
-            self.scope, self.scope_error = load_scope(self.scope_path), None
-        except Exception as exc:  # noqa: BLE001 - whatever the parser raises, fail closed
-            self.scope, self.scope_error = None, f"invalid active scope: {exc}"
-        self.buckets.pop("target", None)
-        self.backoff_until = 0.0
-        self.ids_seen.clear()
-        self.misses.clear()
-        # WAF pauses survive a scope reload: a new run on the same program must not hit the challenge again.
+            rules, errors = scope_extra.load(self.base_scope, self.state_dir)
+        except Exception as exc:  # noqa: BLE001 - a broken file of prefixes never costs the scope itself
+            rules, errors = (), [f"scope-extra: {exc!r}"[:300]]
+        self.scope = scope_extra.merged(self.base_scope, rules)
+        for err in errors:
+            self._event({"kind": "scope-extra-error", "error": err[:300]})
+        if rules:
+            self._event({"kind": "scope-extra", "prefixes": [r.value for r in rules]})
+
+    def _event(self, rec: dict) -> None:
+        if self.on_event is not None:
+            with contextlib.suppress(Exception):  # logging never decides anything
+                self.on_event(rec)
 
     @property
     def program(self) -> str:
@@ -234,6 +332,17 @@ class Policy:
         if d.rule is not None:  # explicit out-of-scope rule wins over everything
             return deny(d.reason, d.rule)
         return None
+
+    def protected(self, url: str) -> Verdict | None:
+        """T5: refusal for a protected path (PROTECTED_DEFAULT and the scope's `protected_urls`), None otherwise."""
+        extra = self.scope.protected_urls if self.scope is not None else ()
+        if (rule := protected_rule(url, extra)) is not None:
+            return deny(PROTECTED_REASON, rule)
+        return None
+
+    def is_payload(self, host: str) -> bool:
+        """D27: `host` is one of the scope's payload hosts (exact name)."""
+        return self.scope is not None and _host_key(host) in self.scope.payload_hosts
 
     def has_passthrough(self) -> bool:
         return self.scope is not None and any(s.kind == "passthrough" for s in self.scope.support)
@@ -259,7 +368,40 @@ class Policy:
             return _web_port(v, port) or (None if browser else self._waf_cooldown(host, v)) or v
         if is_passive(host):
             return Verdict(port == 443, "passive" if port == 443 else "deny", f"passive source {host}")
+        if is_docs(host):
+            return Verdict(port == 443, "docs" if port == 443 else "deny", f"docs source {host}")
+        if self.is_payload(host):
+            if port not in (80, 443):
+                return deny(f"payload host {host}: port {port} (80 and 443 only)")
+            return Verdict(True, "payload", f"payload host {host}")
         return deny(self.scope_error or "not in scope")
+
+    def recipient_check(
+        self,
+        url: str,
+        body: bytes | None,
+        *,
+        body_len: int,
+        content_type: str | None = None,
+        content_encoding: str | None = None,
+    ) -> tuple[bool, Verdict | None]:
+        """D31: (the URL is a recipient_guard route, its refusal or None). No option loosens it."""
+        rules = self.scope.recipient_guard if self.scope is not None else None
+        if not rules or (rule := recipients.matching(url, rules)) is None:
+            return False, None
+        program, state = self.scope.program, self.state_dir
+        why = recipients.judge(
+            url,
+            body,
+            body_len=body_len,
+            content_type=content_type,
+            content_encoding=content_encoding,
+            ok=lambda a: recipients.allowed(program, a, state=state),
+            has_list=recipients.has_list(program, state=state),
+        )
+        if why is None:
+            return True, None
+        return True, deny(RECIPIENT_REASON, f"recipient_guard {rule.note[:60] or rule.url[:60]}: {why}")
 
     def classify_request(
         self,
@@ -275,16 +417,58 @@ class Policy:
         enroll: bool = False,
         websocket: bool = False,
         browser: bool = False,
+        content_type: str | None = None,
+        content_encoding: str | None = None,
     ) -> Verdict:
         """A decrypted request. `url`/`host` are the real destination, `host_header` what the client sent.
         `enroll`: the client is an enrollment source (the gate itself, bh-login). `websocket`: an upgrade handshake.
-        `browser`: the client is bh-browser (B2: websockets and `browser_only` paths are its own)."""
+        `browser`: the client is bh-browser (B2: websockets and `browser_only` paths are its own). `body`,
+        `content_type`, `content_encoding`: read by the recipient guard (D31) only."""
         method = method.upper()
         if is_system(host):
             return deny(f"the Claude API is only reachable through the relay (gate:{RELAY_PORT})")
         if is_self_address(host, self.local_ips):
             return deny(f"{host} is the gate itself", "self")
         v = self._target(url)
+        if protected := self.protected(url):  # after _target: the scope (and its protected_urls) is loaded
+            return protected
+        guarded, refused = self.recipient_check(
+            url, body, body_len=body_len, content_type=content_type, content_encoding=content_encoding
+        )
+        if refused is not None:  # every client, every class of host: an address that is not ours never leaves
+            return refused
+        out = self._classify(
+            url,
+            host,
+            method,
+            v,
+            host_header=host_header,
+            identity=identity,
+            body_len=body_len,
+            authenticated=authenticated,
+            enroll=enroll,
+            websocket=websocket,
+            browser=browser,
+        )
+        if guarded and out.allowed:
+            out.recipients = True
+        return out
+
+    def _classify(
+        self,
+        url: str,
+        host: str,
+        method: str,
+        v: Verdict | None,
+        *,
+        host_header: str | None,
+        identity: str | None,
+        body_len: int,
+        authenticated: bool,
+        enroll: bool,
+        websocket: bool,
+        browser: bool,
+    ) -> Verdict:
         if websocket:  # the scope opts in; then targets only, and the handshake goes through the target rules below
             if self.scope is None or not self.scope.websockets_on:
                 return deny("websockets are not allowed: this program's scope does not enable them (websockets: true)")
@@ -330,7 +514,34 @@ class Policy:
             if any(("/" + path).startswith(p) for p in PASSIVE_DENY_PATHS.get(host.lower(), ())):
                 return deny(f"passive source {host}: path not allowed")
             return Verdict(True, "passive", f"passive source {host}")
+        if is_docs(host):
+            return self._docs_request(
+                url, host, method, host_header=host_header, body_len=body_len, identity=identity, cookie=authenticated
+            )
+        if self.is_payload(host):
+            return _payload_request(url, host, method, host_header=host_header, body_len=body_len)
         return deny(self.scope_error or "not in scope")
+
+    def _docs_request(
+        self, url: str, host: str, method: str, *, host_header: str | None, body_len: int, identity, cookie: bool
+    ) -> Verdict:
+        """D24: a request to the documentation source. Refused unless every rule holds (policy docstring); the
+        rate is counted last, on a request that would otherwise pass."""
+        if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
+            return deny("docs source with a different Host header")
+        if method not in DOCS_METHODS or body_len:
+            return deny(f"docs source {host}: GET/HEAD without body only, not {method}")
+        if identity or cookie:
+            return deny(f"docs source {host}: no identity, no cookie, no Authorization")
+        if why := docs_query_why(url, None, self.scope):
+            return deny(why, "docs")
+        now = _now()
+        while self.docs_seen and self.docs_seen[0] <= now - 60:
+            self.docs_seen.popleft()
+        if len(self.docs_seen) >= self.docs_rpm:
+            return deny(f"docs rate: over {self.docs_rpm} requests per minute", "docs")
+        self.docs_seen.append(now)
+        return Verdict(True, "docs", f"docs source {host}")
 
     def _support_request(
         self,
@@ -449,13 +660,18 @@ class Policy:
         to the gate itself (loopback, its own addresses), whatever the scope."""
         if is_self_address(ip, self.local_ips):
             return deny(f"{host} resolves to the gate itself ({ip})", "self")
-        if is_system(host) or is_passive(host):
-            klass = "system" if is_system(host) else "passive"
+        if is_system(host) or is_passive(host) or is_docs(host):
+            klass = "system" if is_system(host) else "passive" if is_passive(host) else "docs"
             ok = is_public_ip(ip)
             return Verdict(ok, klass if ok else "deny", "non-target" if ok else f"{host} resolves to non-public {ip}")
         self.reload()
         if self.scope is None:
             return deny(self.scope_error or "no scope")
+        if self.is_payload(host):  # the scope keeps payload hosts apart from every target, exclusion and support host
+            # public addresses only, and never one a rule of the scope names (an excluded or a target CIDR)
+            addr = ip.strip("[]").split("%", 1)[0]
+            ok = is_public_ip(addr) and not check(self.scope, addr).rule
+            return Verdict(ok, "payload" if ok else "deny", "payload host" if ok else f"{host} resolves to {ip}")
         if check(self.scope, host).support is not None:
             d = check_support_resolved(self.scope, host, ip)
             return Verdict(d.allowed, "support" if d.allowed else "deny", d.reason, d.rule, d.support)
@@ -476,7 +692,7 @@ class Policy:
         its host, which is paused after WAF_LIMIT of them within WAF_WINDOW_S."""
         now = _now()
         self.backoff_until = now + BACKOFF_SECONDS
-        if not (waf and host) or is_system(host) or is_passive(host):  # only targets are ever paused
+        if not (waf and host) or is_system(host) or is_passive(host) or is_docs(host):  # only targets are paused
             return
         key = _host_key(host)
         for h in [h for h, until in self.host_blocked_until.items() if until <= now]:  # bounded memory
@@ -509,6 +725,8 @@ class Policy:
         rps = {"passive": PASSIVE_RPS, "support": SUPPORT_RPS}.get(klass)
         if klass == "target":
             rps = self.target_rps()
+        elif klass == "payload":  # D27: bounded by the program's own rate, in a bucket of its own
+            rps = self.scope.rate if self.scope is not None else None
         if rps is None:
             return None
         b = self.buckets.get(klass)
@@ -540,6 +758,145 @@ class Policy:
 
     def ws_end(self, fid: str) -> WsGuard | None:
         return self.ws_live.pop(fid, None)
+
+
+# ------------------------------------------------------------------ D24: what a docs query may say
+_DOCS_NAMES: dict[tuple, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+
+def docs_names(scope: Scope) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(host names, words) a docs query must not hold. Hosts: every host a rule of the scope names (in and out of
+    scope, browser_only, support, the rule pages); payload hosts are left out (data-free by construction, D27). Words:
+    the hosts' own labels (contract.own_labels, public suffix excluded), the program's name and its parts, the
+    identities' names."""
+    key = (scope.program, scope.digest, tuple(r.value for r in scope.in_scope))  # approved prefixes too (D40)
+    if (hit := _DOCS_NAMES.get(key)) is not None:
+        return hit
+    hosts: list[str] = []
+    for rule in (*scope.in_scope, *scope.out_of_scope, *scope.browser_only, *(s.rule for s in scope.support)):
+        if rule.host:
+            hosts.append(rule.host.lower().removeprefix("*."))
+    for u in scope.rules_url:
+        with contextlib.suppress(ValueError):
+            if h := urlsplit(u).hostname:
+                hosts.append(h.lower())
+    words: list[str] = []
+    for h in hosts:
+        words += own_labels(h, is_public_suffix)
+    program = scope.program.lower()
+    words += [program, *(p for p in re.split(r"[^a-z0-9]+", program) if p not in GENERIC_LABELS)]
+    words += [str(i.get("name", "")).lower() for i in scope.identities]
+    out = (tuple(dict.fromkeys(hosts)), tuple(dict.fromkeys(w for w in words if len(w) >= 3)))
+    if len(_DOCS_NAMES) > 64:
+        _DOCS_NAMES.clear()
+    _DOCS_NAMES[key] = out
+    return out
+
+
+def _decoded(text: str, rounds: int = DOCS_DECODE_ROUNDS) -> str | None:
+    """`text` %-decoded (and `+` as a space) until it no longer changes, NFKC-normalized; None if still encoded after
+    `rounds` passes."""
+    for _ in range(rounds):
+        new = unquote_plus(text)
+        if new == text:
+            return unicodedata.normalize("NFKC", text)
+        text = new
+    return None if unquote_plus(text) != text else unicodedata.normalize("NFKC", text)
+
+
+def docs_query_why(url: str, body: bytes | None, scope: Scope | None) -> str | None:
+    """Why a request to the documentation source may not leave, None when it may. Fail closed: no scope, a body, an
+    unreadable or other URL, a route or a parameter off the sheet, a value off its shape. Then the whole decoded URL
+    holds no name of the scope nor a canary (DOCS_REASON), and each free-text value (the question, a library name)
+    follows contract.docs_text_why: at most DOCS_QUESTION_MAX characters, no URL, no path of more than one segment,
+    no e-mail address, no identity name."""
+    if scope is None:
+        return "docs query: no active scope"
+    if body:
+        return "docs query: a body"
+    try:
+        p = urlsplit(url)
+        port = p.port
+    except ValueError:
+        return "docs query: unreadable URL"
+    if p.scheme != "https" or port not in (None, 443) or p.username or p.password or p.fragment:
+        return "docs query: https on 443 only, no credentials, no fragment"
+    if not is_docs(p.hostname or ""):
+        return "docs query: not the documentation host"
+    allowed = (DOCS_API.get("params") or {}).get(p.path)
+    if allowed is None:
+        return f"docs query: {p.path[:60]!r} is not a read route of the documentation API"
+    text = _decoded(url)
+    if text is None:
+        return "docs query: encoded more than twice"
+    hosts, words = docs_names(scope)
+    if docs_text_why(text, hosts=hosts, words=words, max_len=1 << 20) == DOCS_REASON:
+        return DOCS_REASON
+    try:
+        pairs = parse_qsl(p.query, keep_blank_values=True, strict_parsing=bool(p.query), max_num_fields=12)
+    except ValueError:
+        return "docs query: unreadable query string"
+    seen: dict[str, int] = {}
+    for k, raw in pairs:
+        if k not in allowed:
+            return f"docs query: parameter {k[:30]!r} is not one of {list(allowed)}"
+        seen[k] = seen.get(k, 0) + 1
+        if seen[k] > (4 if k == "library" else 1):
+            return f"docs query: parameter {k!r} repeated"
+        v = _decoded(raw)
+        if v is None:
+            return "docs query: encoded more than twice"
+        if k == "libraryId" or (k == "library" and v.startswith("/")):
+            if len(v) > DOCS_QUESTION_MAX or not DOCS_LIBRARY_ID.fullmatch(v):
+                return f"docs query: {k} is a library id /owner/repo[/version]"
+        elif k in _DOCS_VALUES:
+            if not _DOCS_VALUES[k].fullmatch(v):
+                return f"docs query: {k} {v[:40]!r} off its shape"
+        elif why := docs_text_why(v, hosts=hosts, words=words):
+            return why
+    return None
+
+
+def docs_query_ok(url: str, body: bytes | None, scope: Scope | None) -> bool:
+    """D24: may this request go to the documentation source? See docs_query_why (its reason is what the gate logs)."""
+    return docs_query_why(url, body, scope) is None
+
+
+def protected_rule(url: str, extra=()) -> str | None:
+    """The protected-path regex (PROTECTED_DEFAULT, then `extra`) the path of `url` matches, None if none does. The
+    path is read raw and normalized; an unreadable URL is refused (fail closed)."""
+    try:
+        raw = urlsplit(url).path or "/"
+    except ValueError:
+        return PROTECTED_DEFAULT[0]
+    norm = re.sub(r"/{2,}", "/", re.sub(r";[^/]*", "", unquote(raw)))
+    for pattern in (*PROTECTED_DEFAULT, *extra):
+        rx = _protected_rx(pattern)
+        if rx.search(raw) or rx.search(norm):
+            return pattern
+    return None
+
+
+_PROTECTED_RX: dict[str, re.Pattern[str]] = {}
+
+
+def _protected_rx(pattern: str) -> re.Pattern[str]:
+    rx = _PROTECTED_RX.get(pattern)
+    if rx is None:
+        rx = _PROTECTED_RX[pattern] = re.compile(pattern, re.I)  # the scope validated it at load
+    return rx
+
+
+def _payload_request(url: str, host: str, method: str, *, host_header: str | None, body_len: int) -> Verdict:
+    """D27: a payload host (data-free: example.org, our own bh.datk.ch). GET/HEAD/OPTIONS without body, on 80/443,
+    under its own name; the addon strips every cookie, identity and program header."""
+    if method not in PAYLOAD_METHODS or body_len:
+        return deny(PAYLOAD_REASON)
+    if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
+        return deny("payload host with a different Host header")
+    if _port(url) not in (80, 443):
+        return deny(f"payload host {host}: port {_port(url)} (80 and 443 only)")
+    return Verdict(True, "payload", f"payload host {host}")
 
 
 def _support_client(v: Verdict, host: str, enroll: bool) -> Verdict | None:

@@ -203,7 +203,10 @@ def test_the_agent_never_clicks_types_or_presses_on_a_challenge():
 
 def test_human_done_is_shown_to_the_agent():
     ctl = Controller(FakeDriver(), clock=lambda: 1234.5)
-    assert ctl.handle(HOST_OPS, {"op": "human_done"}) == (200, {"ok": True, "human_done_at": 1234.5})
+    assert ctl.handle(HOST_OPS, {"op": "human_done"}) == (
+        200,
+        {"ok": True, "human_done_at": 1234.5, "watching": True, "challenge_pending": False},
+    )
     assert ctl.handle(AGENT_OPS, {"op": "state"})[1]["human_done_at"] == 1234.5
 
 

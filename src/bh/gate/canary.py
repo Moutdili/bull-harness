@@ -4,6 +4,11 @@ Pure (no mitmproxy): the addon calls `find` on a request's URL and body, a respo
 on the whole content before any truncation, and journals each hit (event `canary`, see bh.gate.addon). Nothing but
 the token itself ever leaves this module: the journal never holds the content around it.
 
+Digest (T24): every token found is a `Hit`, a str (the token, so every caller comparing strings is unchanged) that
+also carries `sha256`, the hex SHA-256 of the normalized token's ASCII bytes (`digest`). The gate journals it as the
+event's `sha256`: a canary the host planted (bh.accounts.canary) is known to the host by that digest only, and the
+observation proof compares digests (bh.runner.observation, `token_sha256`).
+
 Bounds: at most SCAN_BYTES of each content are looked at (after decoding), at most MAX_HITS distinct tokens are
 reported per content. A compressed body (Content-Encoding gzip, deflate, br, zstd) is decoded with an output limit of
 SCAN_BYTES, so a decompression bomb costs SCAN_BYTES of memory, never more:
@@ -18,6 +23,7 @@ flow: the scan decides nothing).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import zlib
 
@@ -67,18 +73,39 @@ def decode(data: bytes, encoding: str | None, limit: int = SCAN_BYTES) -> bytes:
     return data
 
 
-def find(data: bytes | str | None, limit: int = SCAN_BYTES) -> list[str]:
+def normalize(token: str) -> str:
+    """`BH-SECRET-<lowercase hex>`: the form the gate journals and digests (a host name carries it lowercased)."""
+    return "BH-SECRET-" + token[10:].lower()
+
+
+def digest(token: str) -> str:
+    """Hex SHA-256 of the normalized token (ASCII): what the host keeps of a canary it planted."""
+    return hashlib.sha256(normalize(token).encode("ascii")).hexdigest()
+
+
+class Hit(str):
+    """A token found: the normalized token itself, with its `sha256` (digest)."""
+
+    sha256: str
+
+    def __new__(cls, token: str) -> Hit:
+        hit = super().__new__(cls, token)
+        hit.sha256 = digest(token)
+        return hit
+
+
+def find(data: bytes | str | None, limit: int = SCAN_BYTES) -> list[Hit]:
     """Distinct canary tokens in the first `limit` bytes of `data`, in order of appearance, normalized to
-    `BH-SECRET-<lowercase hex>` (a host name carries it lowercased)."""
+    `BH-SECRET-<lowercase hex>` (a host name carries it lowercased), each with its digest (`Hit.sha256`)."""
     if not data:
         return []
     if isinstance(data, str):
         data = data.encode("utf-8", "surrogateescape")
-    out: list[str] = []
+    out: list[Hit] = []
     for m in TOKEN.finditer(data, 0, limit):
-        tok = "BH-SECRET-" + m.group(0)[10:].decode("ascii").lower()
+        tok = normalize(m.group(0).decode("ascii"))
         if tok not in out:
-            out.append(tok)
+            out.append(Hit(tok))
             if len(out) >= MAX_HITS:
                 break
     return out

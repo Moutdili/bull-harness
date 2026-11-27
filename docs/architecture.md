@@ -1,6 +1,8 @@
-# bull-harness — architecture v0 (2026-11-22)
+# bull-harness — architecture
 
-Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifier avant d'écrire le code qui en dépend.
+Écrite en v0 (2026-11-22), tenue à jour vague après vague ; état à `b160269` (W1 à W3 fusionnées). Les blocs livrés
+depuis ont leur section à la fin (« Blocs livrés en W1 à W3 »), et les schémas sont dans `docs/diagrams.md`. Ce que le
+dépôt n'a pas encore est marqué « W4 » ou « non construit ». Les points ⚠ datent de la v0.
 
 ## Contraintes fixées
 
@@ -20,18 +22,21 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
  ├─ ui (web, SSE)          │  SQLite board : facts (+ blockers) / intents / findings / todos submit
                            ▼
  ┌────────── réseau "egress" ──────────┐
- │  gate  (mitmproxy + SOCKS5 + DNS)   │ ← seul conteneur avec Internet
+ │  gate  (mitmproxy, relais :8081)    │ ← seul conteneur avec Internet
  │   · allowlist = scope en dur        │
  │   · token bucket req/s par programme│
  │   · injection en-têtes + cookies    │
- │   · HAR de chaque flux (preuve PoC) │
+ │   · journal caviardé de chaque flux │
  └──────────────┬──────────────────────┘
         réseau "sandbox" (internal, pas de route)
  ┌──────────────┴──────────────────────┐
  │  agent (kali-rolling + headless)    │
  │   · claude -p (headless, OAuth Pro) │
  │   · hooks Pre/PostToolUse           │
+ │     (Bash et mcp__.*)               │
  │   · /opt/bh/bin : alias + builtins  │
+ │   · MCP stdio : bh, hexstrike (W3)  │
+ │   · skills (W3)                     │
  └─────────────────────────────────────┘
  ┌─────────────────────────────────────┐
  │  judge (même image, même gate)      │ ← vérificateur : son /work (var/judge),
@@ -47,12 +52,16 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
   `websockets` (`true` pour les ouvrir vers les cibles ; absent ou `null` = refusés), `required_headers{}`, `user_agent`, `max_rps`, `automation_allowed`, `forbidden_vulns[]`, `identities[]` (références vers des secrets, jamais les secrets eux-mêmes), `source`, `synced_at`, `hash`.
 - `enforce(url|host|ip) → allow|deny + raison` : **une seule fonction**, utilisée par le proxy, les builtins et `bh`. Un out-of-scope l'emporte toujours sur un in-scope.
 - Un actif découvert hors scope est consigné (fait `out-of-scope`, un par run), **jamais** ajouté au scope ni ciblé.
-- Sync : API researcher Intigriti (token personnel, bêta), API YesWeHack (bearer + TOTP, non documentée), `bounty-targets-data` pour le diff des programmes publics. Toute modification passe par un diff affiché à l'humain, puis une validation.
+- Sync : seul l'import YesWeHack d'un programme public existe (`bh scope import ywh`, `src/bh/scope/yeswehack.py`) ;
+  l'API Intigriti et `bounty-targets-data` ne sont pas construits. Un import n'élargit jamais un scope ; l'humain relit.
+  Les programmes MSRC sont écrits à la main depuis un relevé d'hôtes (`scopes/msrc/`, `docs/research/21-…`).
 
 ### 2. `gate/` — sortie réseau contrôlée
 - HTTP(S) : addon mitmproxy. Refuse ce qui est hors scope (403 + fait `blocked` sur le board), limite le débit par programme, injecte les en-têtes requis et les cookies de session, écrit le HAR.
-- DNS : résolveur local qui ne répond que pour les noms du scope (et pour le proxy).
-- Autre TCP : SOCKS5 avec allowlist ; l'agent passe par `proxychains`. **v1 : pas de scan SYN brut**, seulement des scans connect. C'est cohérent avec les règles YWH/Intigriti qui limitent le scan.
+- DNS : non construit (TODO 1.2). La sandbox n'a aucune résolution externe : le gate résout lui-même et vérifie chaque
+  IP (`policy.check_ip`) avant de s'y connecter.
+- Autre TCP : non construit, volontairement (TODO 1.3, pas de SOCKS5) ; le TCP brut est coupé par le gate (`tcp_start`),
+  sauf un tunnel `passthrough` enregistré au CONNECT. Pas de scan SYN brut.
 - Allowlist système séparée : `api.anthropic.com` et ses dépendances (pour `claude`), dépôts de paquets au moment du build seulement.
 - Allowlist **passive** séparée (web.archive.org, CommonCrawl, OTX, urlscan, crt.sh, sources subfinder) : GET seulement, ni cookies ni en-têtes de programme, débit propre. Un hôte passif n'est jamais une cible (voir `research/07-repos-mio.md`).
 - **Hôtes de support** (`support[]` du scope, `{value, kind: auth|assets|sso|passthrough, note, token_paths?,
@@ -159,12 +168,17 @@ Statut : **proposition, à valider par Mio**. Les points ⚠ restent à vérifie
 - Pas de secrets cibles dans le conteneur : les cookies sont injectés par le gate.
 
 ### 4. `tokens/` — économie de tokens
-- **Hook PreToolUse** : journalise chaque commande (JSONL) ; si la commande correspond à une recette avec filtre, il la réécrit vers `bhf <recette> -- <cmd>` (`updatedInput`).
-- **Hook PostToolUse** : au-delà de N lignes ou K octets, il remplace la sortie par un résumé + `raw: /work/raw/<id>.log` (`updatedToolOutput`).
+- **Hook PreToolUse** (`bh-agent hook-pre`, `src/bh/agent/hooks.py`, déclaré dans `container/agent/hooks/settings.json`
+  pour `Bash` et pour `mcp__.*`) : journalise chaque appel dans `commands.jsonl` (outil, classe, décision) et applique
+  les règles du programme et le verrou (§5). Il ne réécrit aucune commande : la réécriture vers un filtre de recette
+  (`bhf`, `updatedInput`) prévue en v0 n'existe pas.
+- **Hook PostToolUse** (`bh-agent hook-post`) : sur `Bash`, au-delà de `BH_TRUNC_CHARS` (8000 caractères par défaut),
+  la sortie devient tête + queue + le chemin du brut sous `raw/` (`updatedToolOutput`). Sur `mcp__.*`, aucune
+  réécriture (la forme du résultat est celle du serveur) : une sortie trop longue est notée dans `trunc.jsonl`.
 - **Mineur** (le « watchdog ») : lit le JSONL des hooks, extrait préfixe + emplacements d'argument et classe par `économie × fréquence`. Il propose, il n'applique pas.
-- **Compilateur d'alias** : écrit des wrappers dans `/opt/bh/bin/<symbole>` qui passent `"$@"`, refuse les collisions PATH/builtins/mots réservés, et n'aliase jamais une commande destructive.
+- **Compilateur d'alias** : abandonné le 2026-11-25 (gain mesuré ~0,3 % d'un run, TODO 2.6) ; aucun alias n'est écrit.
 - **Calibrage sur Claude** : pas d'API key sur Pro → mesure différentielle via `claude -p --output-format json` (champ `usage`), avec et sans le symbole. ⚠ À valider : bruit dû au cache.
-- **Index** : la table `symbole → intention` est injectée une fois après le system prompt. L'expansion vit dans le wrapper.
+- **Index** : abandonné avec les alias ; rien n'est injecté après le system prompt.
 
 ### 5. `agent/` — arsenal (builtins) et verrou d'outils
 Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/agent`). Un seul exécutable
@@ -174,6 +188,13 @@ Code du sandbox, stdlib seule, monté en lecture seule dans l'agent (`src/bh/age
 - `bh-crawl` = katana + extracteur maison des chemins cités dans le JS/HTML (avec le verbe HTTP quand il est visible).
 - **Verrou** (hook PreToolUse) : `curl`/`wget`/`python`… vers une origine sont refusés tant que crawl, content et scan
   n'y ont pas tourné. Le message `[bh-lock]` donne les commandes exactes.
+- **Outils MCP** (W3) : le même hook PreToolUse voit chaque appel `mcp__<serveur>__<outil>` et le classe avec la table
+  de `src/bh/agent/mcp_policy.py` (mapper, scanner, request, note, passive, browser) : un outil absent de la table est
+  refusé, un scanner l'est quand le programme interdit les scanners, un outil `request` est sous le même verrou que
+  `curl` sur les origines de ses URL, et le juge n'a aucun outil MCP. Une erreur du hook refuse l'appel (à l'inverse
+  de `Bash`, où il laisse passer : le gate reste la frontière).
+- **Skills** (W3) : une méthode par classe ou par surface, `src/bh/skills/<nom>/SKILL.md`, que l'agent charge avant
+  de tester ; elles prennent la place des cartes épinglées (`src/bh/cards/` reste). La doctrine ne fait que les nommer.
 - **File de surface** : le runner ajoute au board les endpoints trouvés et pas encore testés (testé = touché par un
   `curl` autorisé ou un builtin de test).
 - Métrique par run : commandes arsenal / manuelles / verrouillées (`runs.arsenal_calls` …).
@@ -222,6 +243,81 @@ Vue en direct du flux de l'agent, board, findings + PoC (requêtes HAR rejouable
 `bh scope add|sync|diff|check <url>` · `bh run [--program X] [--once]` · `bh todo [done <id>]` (soumissions) · `bh blockers [programme] [--since H]` · `bh finding ls|show|verify` · `bh target local <url>` (cible perso : scope généré, en-têtes vides, débit libre) · `bh tokens calibrate|mine` (veille, alias abandonnés) · `bh ui`.
 C'est l'interface par laquelle Claude (cette session) pilote le harnais.
 
+## Blocs livrés en W1 à W3
+
+Une section par bloc, quinze lignes au plus, chacune renvoie à son code. Schémas : `docs/diagrams.md`.
+
+### Auto-test du gate (T4)
+`src/bh/runner/preflight.py` : avant le premier segment de `bh run` et de `bh hunt`, la suite d'évasion
+`tests/escape/escape_check.sh` tourne depuis le conteneur agent (`BH_ESC_JSONL=1`, une ligne JSON par contrôle). Profil
+`lab` sur le scope du lab (refus, contrôles positifs et témoin), puis profil `msrc` sur le scope réel quand il a un hôte
+passthrough (refus seulement). Prérequis : le lab tourne, aucun run actif. Un contrôle raté, une ligne illisible ou un
+résumé absent annulent : pas de mode dégradé. `BH_PREFLIGHT=0` ne vaut que pour un programme `platform: local`.
+`bh hunt` le fait une fois par programme et le transmet (`src/bh/runner/run.py`, `run_segment`). `arsenal()` vérifie
+avant chaque segment que le binaire de chaque builtin est dans l'image ; il n'annule rien, il retire l'outil manquant de
+l'Arsenal du system prompt. Résultat gardé dans `runs.preflight`.
+
+### URL protégées (T5)
+`src/bh/gate/policy.py` (`PROTECTED_DEFAULT`, `protected_rule`, `Policy.protected`) : un chemin de déconnexion, de
+mot de passe, de suppression ou fermeture de compte, de paiement ou d'abonnement est refusé à tout client, bh-browser
+compris, quelle que soit la méthode (« protected url »). Comparé sans casse sur le chemin seul (jamais la query), brut et
+normalisé (`%xx` décodé, `;params` retirés, `//` réduits). Le scope en ajoute par `protected_urls`, n'en retire jamais.
+Le contrôle passe juste après le chargement du scope, avant la garde de destinataires (`classify_request`).
+
+### Garde de destinataires (D31)
+`src/bh/gate/recipients.py` : une requête dont l'URL correspond à une entrée `recipient_guard` du scope (une route qui
+porte un destinataire, invitation ou envoi) doit nommer au moins une adresse, et chaque adresse doit être celle d'une
+identité du programme ; sinon « recipient not ours », quel que soit le client et la classe d'hôte. Refus aussi : un
+destinataire nommé par un id, un corps illisible (compressé, trop long, multipart défectueux), aucune liste. La liste
+`<state>/recipients.json` ne contient que des empreintes SHA-256, écrites par l'hôte depuis `secrets/` avant le segment
+(`src/bh/runner/run.py`, `write_recipients`). Aucune option ne la desserre. `scopes/msrc/onedrive.yaml` l'active.
+
+### Hôtes de charge (D27, O28)
+`payload_hosts` du scope (`src/bh/scope/model.py`), jugés par `src/bh/gate/policy.py` (`is_payload`, `_payload_request`,
+`check_ip`) : des hôtes sans données que le chasseur peut citer et charger (CORS, redirection, image) sans toucher un
+tiers réel. GET, HEAD et OPTIONS sans corps, ports 80 et 443, IP publiques jamais nommées par une règle du scope ; ni
+cookie, ni identité, ni en-tête de programme ; seau propre au débit du programme ; une ligne `class: payload` par
+requête, jamais un test. Le scope refuse un hôte de charge qui serait une cible, un sous-domaine de cible ou un support.
+Les skills écrivent `<payload-host>` et renvoient au bloc de scope ; aucun listé : `bh-note blocked other`.
+
+### Règles du programme (S8, `bh rules`)
+`src/bh/rules.py` : `bh rules check <scope>` lit chaque `rules_url` (GET simple, sans cookie ni en-tête de programme),
+garde le texte visible sous `var/rules/<programme>/<date UTC>.txt` avec son SHA-256 et compare à la lecture d'avant ; un
+changement ouvre une todo `rules-changed`. `bh rules ack <programme>` l'acquitte, `bh rules diff` montre l'écart.
+`fresh()` : chaque page lue depuis moins de `FRESH_DAYS` (7) jours, aucun changement non acquitté. Le superviseur exclut
+un programme qui ne l'est pas (`src/bh/runner/supervisor.py`, `rules_fresh`, en échec fermé). Rien de ce qu'une page
+dit ne change le scope ni une garde : un humain lit le diff. Hôte seul, jamais monté dans un conteneur.
+
+### Sessions et plafonds (D25)
+`src/bh/runner/supervisor.py` : sur un programme réel, une chasse est une session de `RUNS_PER_SESSION` (11) runs dans
+une phase nommée (`bh hunt --phase NOM`), `SESSIONS_PER_DAY` (3) sessions et `MAX_RUNS_PER_DAY` (33) runs par jour
+(un `bh run` seul compris), `RUNS_PER_PHASE` (33) runs par phase. `admit()`, appelé par `run_segment` sous le verrou,
+refuse avec la raison : un plafond n'attend jamais, ne reporte rien, et aucune option ni variable ne le relève.
+`--runs` ne peut que l'abaisser. Les programmes `platform: local` (lab) ne comptent dans aucun. Le budget de prompts de
+bh-browser se répartit sur les runs restants du jour (`prompt_allotment`, R44).
+
+### Lignée et mémoire (W2)
+`src/bh/lineage/`, hôte seul, jamais monté : chaque session `claude -p` est un agent numéroté (`identity.birth`,
+pseudo, parent, condensat de naissance), qui naît du setup haché du segment (`src/bh/runner/identity.py`) et se clôt
+en fin de segment ou à une rotation (`src/bh/runner/lineage_hooks.py`). Ses notes deviennent des items de mémoire
+(`store.py` : `mem_items` sous une clé canonique `key.py`, plein texte FTS5, étiquette posée par l'hôte `OBSERVED`,
+`JUDGED`, `ANCHORED` ou `NOTE`, datés puis remplacés, jamais effacés). Le successeur reçoit le bloc `## Lineage` de sa
+tâche (`block.py`, 60 lignes au plus) et interroge `bh-recall` (`src/bh/agent/recall.py` dans la sandbox, réponse
+écrite par le thread `serve.py` du runner, bornée par `recall.py`, avec un reçu `R-<id>`). La trace de chaque agent et
+les blocs qui relient les agents d'un programme forment une chaîne de hash (`chain.py`) ; `score.py` tient le registre
+de crédit (`ledger`), compté sur ce que l'hôte a vérifié ; `archive.py` écrit l'archive caviardée sous `var/lineage/`.
+Toute requête filtre par programme. Commandes : `bh agent`, `bh memory`, `bh lineage`.
+
+### Skills et MCP (W3)
+Skills : `src/bh/skills/<nom>/SKILL.md` (frontmatter `name`, `description` de 200 caractères au plus, `requires:
+scanners` éventuel), lues par `src/bh/classes.py` (`all_skills`) sans liste en dur. Le runner lie dans le HOME neuf de la
+session toutes celles que le programme permet (`allowed_skills` : sans scanners, celles qui en exigent sont retirées ;
+`link_skills`) ; la tâche nomme celles du programme (`cards` du scope) et donne en entier celles épinglées pour un
+modèle (`pin_for_models`). Le juge n'en reçoit aucune. MCP : deux serveurs stdio dans la sandbox,
+`bh-agent mcp bh` (`src/bh/agent/mcp/`, 12 outils) et `bh-agent mcp hexstrike` (`src/bh/agent/hexstrike/`, 3
+méta-outils) ; chaque appel `mcp__*` passe par le hook PreToolUse et la table de `src/bh/agent/mcp_policy.py` (§5).
+Un skill est une méthode, jamais une source de périmètre : le scope et le gate décident.
+
 ## Stack
 Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQLite pour le board : un agent à la fois, pas besoin de Postgres.
 
@@ -238,17 +334,23 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   pour subir la même politique que l'agent.
 - **Session morte** : un 401 sous identité peut être un refus d'accès légitime (objet d'un autre). La marque « périmée »
   qu'il pose est levée au segment suivant si la sonde de l'identité (`probe`, avec contenu attendu) répond bien.
-- **MCP** : la session de l'agent et celle du juge ne chargent aucun serveur MCP (`--strict-mcp-config` sans
-  `--mcp-config`), et un `.mcp.json` laissé dans le dossier de travail est effacé entre deux segments. Raison : les hooks
-  ne voient que `Bash`. Les outils tiers entrent comme builtins `bh-*` (`research/08-mcp-arsenal.md`).
+- **MCP** (W3) : la session de l'agent charge deux serveurs stdio, lancés dans le conteneur agent par
+  `bh-agent mcp bh` (les builtins en 12 outils typés, `mcp__bh__*`) et `bh-agent mcp hexstrike` (trois méta-outils,
+  `mcp__hexstrike__tools_list`, `tool_help`, `tool_run`) ; aucun autre serveur ne démarre, et l'agent voit 20 outils
+  MCP au plus. Le juge n'en charge aucun (`--strict-mcp-config` sans `--mcp-config`) et son hook refuse tout outil
+  `mcp__*`. Un `.mcp.json` laissé dans le dossier de travail est toujours effacé entre deux segments. Le hook
+  PreToolUse couvre `Bash` et `mcp__.*` avec la même classification (§5) ; ce sont des aides, le gate reste la
+  frontière : une requête lancée par un outil MCP passe par lui comme celle d'une commande `Bash`. Le relais ne
+  change pas (paragraphe suivant).
 - **Jeton OAuth** : n'existe que dans le gate ; l'agent a un jeton factice et `ANTHROPIC_BASE_URL=http://gate:8081`.
   Le relais n'accepte que les conteneurs agent et juge (résolus par nom, `BH_AGENT_HOST` / `BH_JUDGE_HOST`, cache
   60 s, une relecture DNS au plus toutes les 5 s pour une IP refusée ; le gate est aussi sur le réseau du lab, qui
   reste refusé), que les deux appels que fait
   Claude Code (`POST /v1/messages`, `/v1/messages/count_tokens`, mesuré sur 2.1.330), seulement pendant un run, et
   au plus `3 × max_turns + 30` requêtes par segment (plus un budget pendant la vérification). Il lit le corps :
-  outils serveur (`web_search`, `web_fetch`…), `mcp_servers`, sources URL et en-têtes `anthropic-beta` hors liste
-  sont refusés, et chaque conteneur a sa liste de modèles (audit H1). Il journalise statut, id de message et
+  outils serveur (`web_search`, `web_fetch`…), `mcp_servers` (serveur MCP distant), sources URL et en-têtes
+  `anthropic-beta` hors liste sont refusés (inchangé en W3 : les outils des serveurs stdio du sandbox arrivent au
+  relais comme des outils client ordinaires), et chaque conteneur a sa liste de modèles (audit H1). Il journalise statut, id de message et
   `stop_reason` de chaque réponse, que le runner croise avant de croire un quota ou un refus. Reste : dans ce budget, un `claude -p` imbriqué consomme le
   quota (sans jeton à exfiltrer).
 - **Le sandbox n'est pas une frontière** : hooks, verrou d'outils et fichiers du contrat sont des aides. Les garanties
@@ -267,8 +369,8 @@ Python 3.12 + `uv` (mitmproxy et les hooks sont en Python ; un seul langage). SQ
   avant le rejeu (pour l'état de la cible, plus pour l'isolation). Reste : le juge lit des réponses de la cible
   (injection de prompt possible, comme pour tout relecteur) ; il partage avec le chasseur l'image, le gate, le
   budget de relais du run et le code sandbox monté en lecture seule.
-- **Énumération** : comptée sur les ids du chemin seulement (I6), route normalisée, au plus 12 ids distincts par route
-  en 10 min (le 13e est refusé). Un id passé en query string, en corps formulaire, JSON ou GraphQL n'est pas compté :
+- **Énumération** : comptée sur les ids du chemin seulement (I6), route normalisée, au plus 6 ids distincts par route
+  en 10 min (le 7e est refusé ; `policy.ID_LIMIT`, `policy.ID_WINDOW_S`). Un id passé en query string, en corps formulaire, JSON ou GraphQL n'est pas compté :
   la doctrine (preuve sur nos propres objets) et le juge couvrent ce cas.
 - **bh-browser** : reconnu par son IP. Un autre conteneur qui reprendrait cette IP (bh-browser arrêté, IP réattribuée
   avant l'expiration du cache de 60 s) en hériterait : identité de la jarre, `browser_only`, méthodes d'identité. Le

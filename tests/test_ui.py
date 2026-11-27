@@ -136,3 +136,52 @@ def test_todos_api_returns_submissions_only(tmp_path, monkeypatch):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_lineage_page_needs_auth_and_keeps_agent_text_declared(tmp_path, monkeypatch):
+    from bh.board import Board
+    from bh.lineage import score
+
+    srv, cookie = _serve(tmp_path, monkeypatch)
+    try:
+        b = Board()
+        assert json.loads(_get(srv, "/api/lineage", cookie)[1]) == {"programs": []}  # no W2 table: empty, no error
+        b.db.executescript(
+            "CREATE TABLE agents (no INTEGER, pseudo TEXT, program TEXT, generation INTEGER, run_id INTEGER, "
+            "status TEXT);"
+        )
+        rid = b.run_start("lab", "sonnet")
+        b.run_end(rid, status="done", cost_usd=1.25)
+        b.db.execute("INSERT INTO agents VALUES (1, ?, 'lab', 1, ?, 'done')", ("Ra\u200bven", rid))
+        b.db.commit()
+        fid = b.add_finding("lab", "t", run_id=rid, vuln_class="idor", url="http://t.test/a", proof={"s": 1})
+        b.set_finding(fid, "verified")
+        score.compute(b, "lab")
+        for path in ("/api/lineage", "/api/lineage/lab"):
+            assert _get(srv, path)[0] == 401
+        assert json.loads(_get(srv, "/api/lineage", cookie)[1]) == {"programs": ["lab"]}
+        code, body = _get(srv, "/api/lineage/lab", cookie)
+        page = json.loads(body)
+        assert code == 200
+        a = page["agents"][0]
+        assert a["no"] == 1 and a["cost_usd"] == 1.25 and a["points"] == 100 - 5  # verified, no handoff
+        assert "pseudo" not in a  # the host's columns only
+        assert page["declared"] == [{"no": 1, "pseudo": "Ra\\u{200B}ven"}]
+        assert {r["signal"] for r in page["ledger"]} == {"finding_verified", "handoff_missing"}
+        assert page["honor"] and len(page["weights_sha256"]) == 64
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_lineage_tab_renders_the_pseudo_in_the_declared_block():
+    from pathlib import Path
+
+    static = Path(__file__).parents[1] / "src" / "bh" / "ui" / "static"
+    assert 'data-tab="lineage"' in (static / "index.html").read_text()
+    js = (static / "app.js").read_text()
+    view = js[js.index("views.lineage") : js.index("// ----", js.index("views.lineage"))]
+    assert "Declared by the agent" in view and "innerHTML" not in view
+    # the pseudo appears once, after the declared block opens
+    assert view.count("pseudo") >= 1 and view.index("d.pseudo") > view.index("Declared by the agent")
+    assert "a.pseudo" not in view

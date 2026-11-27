@@ -18,6 +18,7 @@ REQUIRED_PHASES has run on that origin (see hooks.pre_tool_use).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -53,6 +54,135 @@ PASSIVE_HOSTS = (
 # Paths refused even on a passive host (server-side fetch of an arbitrary URL).
 PASSIVE_DENY_PATHS = {"web.archive.org": ("/save",)}
 
+# Library documentation (D24, bh-docs): Context7, anonymous, read routes only (docs/research/context7-api.md). A class
+# of its own at the gate (`docs`), never passive and never a target: GET/HEAD on these exact paths, these parameters,
+# no cookie, no Authorization, no identity, no program header, DOCS_RPM per minute, and never a name of the scope in
+# the query (bh.gate.policy.docs_query_ok). /api/v3/fetch (fetches any URL for the caller) is deliberately absent.
+DOCS_API: dict = {
+    "host": "context7.com",
+    "search": "/api/v2/libs/search",  # libraryName, query -> {"results": [{"id", "title"}, ...]}
+    "context": "/api/v2/context",  # libraryId, query, type?, fast?, language?, version?
+    "params": {
+        "/api/v2/libs/search": ("libraryName", "query"),
+        "/api/v2/context": ("libraryId", "query", "type", "fast", "language", "version"),
+        "/api/v3/search": ("query", "library", "version", "language", "type"),
+    },
+}
+DOCS_REASON = "scope name in a docs query"
+DOCS_QUESTION_MAX = 200  # characters of one free-text parameter (the question, a library name)
+# libraryId as the sheet gives it: /owner/repo, /owner/repo/<version> or /owner/repo@<version>
+DOCS_LIBRARY_ID = re.compile(r"/[^/\s]+/[^/\s]+([/@][^/\s]+)?")
+# Labels too common to name a program (`api.x.com` names x, not api): skipped, except the label just before the public
+# suffix (the name someone registered), which always counts. Shorter than 3 characters: skipped too.
+GENERIC_LABELS = frozenset(
+    (  # noqa: SIM905 - a list of words reads better as one string
+        "www www1 www2 api apis app apps web m mobile cdn static assets img images media login auth account accounts "
+        "admin portal dev test staging stage prod beta mail email docs help support status blog shop store gateway gw "
+        "edge secure service services cloud online data files download downloads ws wss socket svc global int internal "
+        "public user users client clients partner partners my go sso id"
+    ).split()
+)
+# Commands that only read a third-party documentation or advisory source (never a target): neither locked by the
+# tool lock nor counted as manual HTTP (uses_manual_http).
+PASSIVE_TOOLS = ("bh-docs", "bh-cve", "/opt/bh/bin/bh-docs", "/opt/bh/bin/bh-cve")
+# Commands the host answers from a request file in BH_DIR (bh-recall: the lineage; bh-mail: our identities' mail): no
+# request leaves the sandbox, like a note. Neither locked, nor manual HTTP, nor a scanner: their arguments are text.
+HOST_SERVED_TOOLS = ("bh-recall", "bh-mail", "/opt/bh/bin/bh-recall", "/opt/bh/bin/bh-mail")
+
+
+def is_docs(host: str) -> bool:
+    return bool(DOCS_API.get("host")) and host.lower().rstrip(".") == DOCS_API["host"]
+
+
+def own_labels(host: str, is_suffix=None) -> list[str]:
+    """Labels of `host` that name its owner: those before the public suffix (`is_suffix(name) -> bool`; default: the
+    last label only), minus GENERIC_LABELS and labels under 3 characters, the registrable label always kept. A label
+    holding a `*` (`api-*`) gives its fixed parts."""
+    labels = [x for x in host.lower().strip(".").removeprefix("*.").split(".") if x]
+    cut = len(labels) - 1
+    if is_suffix is not None:
+        cut = next((i for i in range(len(labels)) if is_suffix(".".join(labels[i:]))), len(labels))
+    out = []
+    for i, label in enumerate(labels[:cut]):
+        parts = [p.strip("-") for p in label.split("*")] if "*" in label else [label]
+        for p in parts:
+            if len(p) >= 3 and (i == cut - 1 or p not in GENERIC_LABELS):
+                out.append(p)
+    return out
+
+
+def _word_rx(name: str) -> re.Pattern:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])")
+
+
+def names_in(text: str, hosts=(), words=()) -> str | None:
+    """The first scope name found in `text` (lowercased by the caller or not): a full host name, also with its dots
+    and dashes dropped (`copilotmicrosoftcom`), or a word (a label, the program, an identity) as a whole word."""
+    low = text.lower()
+    compact = re.sub(r"[^a-z0-9]", "", low)
+    for raw in hosts:
+        h = raw.lower().strip(".").removeprefix("*.")
+        if "*" in h or not h:
+            continue
+        flat = re.sub(r"[^a-z0-9]", "", h)
+        if h in low or (len(flat) >= 6 and flat in compact):
+            return h
+    for raw in words:
+        w = raw.lower()
+        if len(w) >= 3 and _word_rx(w).search(low):
+            return w
+    return None
+
+
+_DOCS_URL = re.compile(r"[a-z][a-z0-9+.-]{0,20}:/{1,3}\S|(^|[^a-z0-9])www\.[a-z0-9-]|(^|\s)//[a-z0-9]", re.I)
+_DOCS_PATH = re.compile(r"/[^/\s]+/")  # /a/b, a/b/c, /a/: a path of more than one segment
+_DOCS_MAIL = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+", re.I)
+# An IP literal (v4, or v6 with at least two groups around a ::, or 8 groups): a scope written as a CIDR names no host,
+# so the name check cannot see its target (lab 2026-11-27: "10.231.0.10" reached Context7). No docs question needs one.
+_DOCS_IP_TOKEN = re.compile(r"(?<![\w:.])[0-9a-f:.]*[:.][0-9a-f:.]*(?![\w:.])|(?<![\w:.])[0-9.]+(?=:\d)", re.I)
+
+
+def _has_ip(text: str) -> bool:
+    """An IPv4 or IPv6 literal (std::vector, 12:30:45 and versions like 18.2.0 are not addresses)."""
+    for raw in _DOCS_IP_TOKEN.findall(text):
+        tok = raw.strip(".")
+        for cand in (tok, tok.rsplit(":", 1)[0]):  # 1.2.3.4:8080 is an address and a port
+            if cand.count(".") != 3 and cand.count(":") < 2:
+                continue
+            try:
+                ipaddress.ip_address(cand)
+            except ValueError:
+                continue
+            return True
+    return False
+
+
+_DOCS_CANARY = re.compile(r"bh-?secret", re.I)
+
+
+def docs_text_why(text: str, *, hosts=(), words=(), max_len: int = DOCS_QUESTION_MAX) -> str | None:
+    """Why a free-text part of a docs query (the question, a library name) may not leave, None when it may. Rules,
+    the gate's and bh-docs's alike: no scope name (DOCS_REASON), no canary, at most `max_len` characters, no URL, no
+    path of more than one segment, no e-mail address. `words`: the scope's labels, program name and identity names."""
+    if _DOCS_CANARY.search(text) or CANARY_RE.search(text):
+        return DOCS_REASON
+    if names_in(text, hosts, words):
+        return DOCS_REASON
+    if len(text) > max_len:
+        return f"docs query: over {max_len} characters"
+    if _DOCS_URL.search(text):
+        return "docs query: a URL"
+    if _DOCS_PATH.search(text.replace("\\", "/")):
+        return "docs query: a path of more than one segment"
+    if _DOCS_MAIL.search(text):
+        return "docs query: an e-mail address"
+    if _has_ip(text):
+        return "docs query: an IP address"
+    if any(ord(ch) < 32 for ch in text):
+        return "docs query: a control character"
+    return None
+
+
 IDENTITY_HEADER = "X-BH-Identity"
 GATE_HEADER = "X-BH-Gate"  # set by the gate on its own refusals only (it strips it from target answers)
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
@@ -62,7 +192,32 @@ RULES_MARK = "[bh-rules]"  # prefix of a denial imposed by the program's rules
 SEVERITIES = ("critical", "high", "medium", "low", "info")  # most severe first
 WORK_ROOT = "/work"  # the agent's work volume (var/work on the host)
 # Fact kinds the agent may write. "blocker" is not one: the host writes it from `bh-note blocked` and gate events.
-FACT_KINDS = ("fact", "recon", "handoff", "dead-end")
+# `think` (D15): a line of the agent's reasoning, never grounded. `threat-model` (T16): one active per program, the
+# latest; an older one stays with its date.
+FACT_KINDS = ("fact", "recon", "handoff", "dead-end", "think", "threat-model")
+# Why a lead is a dead end (T13): required with `-k dead-end`, shown on the frontier
+DEAD_END_WHY = ("technical", "environment", "approach", "external", "rule")
+# A fact's quote (T12): one line, at most QUOTE_MAX characters, an exact substring of the response body of a gate flow
+# of the run (the host checks it, after bh.redact). Shorter than QUOTE_MIN it anchors nothing ("{" is in every body).
+QUOTE_MAX = 400
+QUOTE_MIN = 10
+RECENT_FLOWS = 200  # a quote without --flow is looked for in the run's last RECENT_FLOWS target flows
+FLOW_ID_RE = re.compile(r"\d{1,12}-[0-9a-f]{6}-\d{1,12}")  # the gate's flow ids (gate/addon.py, _record)
+# Typed intents (T15): map needs no recall; test and prove carry one (`--recall R-<id>` or `none`). A prove is refused
+# by the host without a grounded fact on the same endpoint.
+INTENT_KINDS = ("map", "test", "prove")
+RECALL_NEEDED = ("test", "prove")
+RECALL_RE = re.compile(r"R-[A-Za-z0-9_.:-]{1,64}|none")
+# How an intent ends (T13), beside --reached: what the hunt learned. An intent a run leaves open is an open proof gap.
+INTENT_OUTCOMES = ("confirmed", "ruled_out", "open_proof_gap")
+# Coverage of one (endpoint, class) (T14). `clean` stands only on an endpoint the gate saw tested by hand in the run:
+# the host stores it as `retry` otherwise. Lack of information is never a proof of safety.
+COVER_OUTCOMES = ("clean", "suspect", "blocked", "retry")
+THREAT_MODEL_LINES = 8  # lines of a threat model (T16); a line cites its receipt as `<claim> :: <exact quote>`
+THREAT_QUOTE_SEP = " :: "
+INFERRED = " (inferred)"  # added by the host to a threat-model line without an anchored quote
+# A request to widen the scope (D40): an https URL prefix the agent saw used, judged on the host, never by the agent
+SCOPE_REQUEST_STATUS = ("pending", "approved", "refused", "revoked")
 # Why a lead is blocked. Nobody unblocks the agent during the hunt: a blocker closes the lead, it pages no one.
 BLOCKER_REASONS = (
     "auth",
@@ -92,6 +247,37 @@ CHALLENGE_BLOCKER_TTL_S = 30 * 60
 # Canary of an observation proof (audit I1): planted by the hunter in the victim's data only, then found by the gate in
 # what the attacker receives. The gate logs {"kind": "canary", "token", "where", "identity", "client", ...}.
 CANARY_RE = re.compile(r"BH-SECRET-[0-9a-f]{16}")
+# The control of an observation proof (audit N6): the same steps without the attacker's payload, run N times; k is how
+# many times the canary crossed all the same. Written "k/N", 1 <= N <= 1000, k <= N. Without it (or with k > 0) the
+# content of A is not shown to be the cause: the host's verdict is `inconclusive`, never `verified-evidence`.
+CONTROL_RE = re.compile(r"(\d{1,4})/(\d{1,4})")
+CONTROL_MAX = 1000
+# Exit criteria of an intent (bh-note intent --success/--abandon) and how `bh-note done --reached` names the one met
+REACHED = ("success", "abandon")
+CRITERION_MAX = 300  # stored length of one criterion (board)
+CRITERION_SHOWN = 120  # shown length in the frontier
+# The frontier writes an open intent with criteria as "- I<n> <title> · success: <...> · abandon: <...>"
+_FRONTIER_INTENT = re.compile(r"^- I(\d{1,12}) ")
+_FRONTIER_CRITERIA = re.compile(r" · (success|abandon): ")
+
+
+def parse_control(value: object) -> tuple[int, int] | None:
+    """(k, N) of a well-formed control "k/N", else None (a sandbox-written value: never trusted as typed)."""
+    m = CONTROL_RE.fullmatch(value) if isinstance(value, str) else None
+    if m is None:
+        return None
+    k, n = int(m.group(1)), int(m.group(2))
+    return (k, n) if 1 <= n <= CONTROL_MAX and k <= n else None
+
+
+def intent_has_criteria(frontier: str, intent_id: int) -> bool | None:
+    """Whether the frontier shows open intent I<intent_id> with an exit criterion; None when it is not listed."""
+    for line in frontier.splitlines():
+        m = _FRONTIER_INTENT.match(line)
+        if m and int(m.group(1)) == intent_id:
+            return bool(_FRONTIER_CRITERIA.search(line))
+    return None
+
 
 NOTES, COVERAGE, ENDPOINTS, TOUCHED, COMMANDS = (
     "notes.jsonl",
@@ -284,6 +470,47 @@ def endpoint_key(url: str, method: str = "GET") -> tuple[str, str] | None:
     return o, f"{method.upper()} {path_key(urlsplit(url).path)}"
 
 
+_LABEL = re.compile(r"([A-Za-z]{3,7})\s+(\S+)")
+
+
+def endpoint_label(value: object, method: str = "GET") -> str | None:
+    """`"METHOD route"` of a typed note (facts.endpoint, intents.endpoint, coverage_class.endpoint): the route as
+    endpoint_key and family make it (/basket/7 -> /basket/{id}), without the origin. Accepts a URL, `METHOD URL`,
+    `/route` or `METHOD /route`; None for anything else (a sandbox value: never trusted as typed)."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        return None
+    s = value.strip()
+    if m := _LABEL.fullmatch(s):
+        method, s = m.group(1), m.group(2)
+    method = method.upper()
+    if s.startswith(("http://", "https://")):
+        k = endpoint_key(s, method)
+        return family(k[1]) if k else None
+    if s.startswith("/") and not s.startswith("//") and not any(ch.isspace() for ch in s):
+        return family(f"{method} {path_key(s)}")
+    return None
+
+
+def scope_prefix(value: object) -> str | None:
+    """A scope request's prefix (D40), normalized: `https://host[:port]/path`, no joker, no query, no fragment, no
+    credentials, no whitespace. None when it is not one."""
+    if not isinstance(value, str) or not value or len(value) > 500 or any(ch.isspace() for ch in value):
+        return None
+    if "*" in value or "?" in value or "#" in value or "\\" in value:
+        return None
+    try:
+        p = urlsplit(value)
+        port = p.port
+    except ValueError:
+        return None
+    if p.scheme != "https" or not p.hostname or "@" in p.netloc or "%" in p.netloc:
+        return None
+    host = p.hostname.lower().rstrip(".")
+    if not re.fullmatch(r"([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?", host):
+        return None  # a name with a dot and a letter TLD: no IP address, no single label
+    return f"https://{host}{f':{port}' if port and port != 443 else ''}{p.path or '/'}"
+
+
 def query_params(url: str) -> list[str]:
     return sorted({k for k, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True)})
 
@@ -454,6 +681,7 @@ MAPPERS = (
     "bh-browse",
     "bh-zap",
     "bh-authz",
+    "bh-js",  # reads an app's JavaScript bundles for routes and actions: mapping, neither a scan nor a manual request
     "katana",
     "subfinder",
     "httpx-toolkit",
@@ -495,6 +723,7 @@ SCANNERS = (
     "x8",
     "paramspider",
     "crlfuzz",
+    "bh-fuzz",  # several probes on one parameter (T43): a scanner for the tool lock, the verifier and program rules
 )
 _BUILTIN_SCANS = "|".join(t.removeprefix("bh-") for t in SCANNERS if t.startswith("bh-"))
 
@@ -686,4 +915,9 @@ def uses_arsenal(cmd: str) -> bool:
 
 
 def uses_manual_http(cmd: str) -> bool:
+    """A command that hand-crafts HTTP to a URL. bh-docs and bh-cve (PASSIVE_TOOLS) read third-party sources through
+    the gate's own classes, bh-recall and bh-mail (HOST_SERVED_TOOLS) are answered by the host: their calls are left
+    out (a substitution inside one still counts)."""
+    if any(t in cmd for t in (*PASSIVE_TOOLS, *HOST_SERVED_TOOLS)):
+        cmd = without_commands(cmd, (*PASSIVE_TOOLS, *HOST_SERVED_TOOLS))
     return bool(_MANUAL.search(cmd)) and bool(urls_in(cmd))

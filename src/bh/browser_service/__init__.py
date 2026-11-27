@@ -29,7 +29,7 @@ DISPLAY = ":99"
 SCREEN = (1280, 900)
 PROFILE_ROOT = "/profile"  # named volume `browser-profile`: the profile survives a restart, `reset` wipes it
 MARKER_FILE = "bh-identity.json"  # in PROFILE_ROOT: {program, identity, loaded_at} of the session in the profile
-FILLS_FILE = "bh-fills.json"  # in PROFILE_ROOT: the fill budget (segment, identity and day); survives a reset
+FILLS_FILE = "bh-fills.json"  # in PROFILE_ROOT: budgets (segment, identity, day), the service limit seen; kept by reset
 RUN_DIR = "/tmp/bh-browser"  # 0700, the container user's own: control socket
 CTL_SOCK = RUN_DIR + "/ctl.sock"
 GATE_PROXY = "http://gate:8080"
@@ -38,11 +38,11 @@ TOKEN_ENV = "BH_BROWSER_TOKEN"
 # What the agent may ask (HTTP API) and what only the host may ask (podman exec). Anything else is refused.
 AGENT_OPS = frozenset(
     {"goto", "fill", "click", "press", "text", "wait", "state"}
-    | {"outline", "attr", "net", "tabs", "upload", "frames", "switch"}
+    | {"outline", "attr", "net", "tabs", "upload", "frames", "switch", "ws_rewrite"}
 )
 HOST_OPS = frozenset(
     {"load_session", "status", "reset", "human_done", "human_viewing", "fill_budget_reset", "switch_refused"}
-    | {"snapshot"}
+    | {"snapshot", "fill_budget_set", "shot"}
 )
 # While the operator has the screen open (/captcha/ws), the agent may only read.
 VIEWING_OPS = frozenset({"state", "text", "frames"})

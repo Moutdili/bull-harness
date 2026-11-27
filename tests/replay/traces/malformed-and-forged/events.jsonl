@@ -1,0 +1,2 @@
+{"kind": "blocked", "where": "request", "url": "http://app.replay.test/x", "method": "GET", "reason": "rate", "rule": null, "client": "agent", "ts": 1764200000.0, "program": "another-program", "run": 9}
+{"kind": "identity-missing", "identity": "user-c", "url": "http://app.replay.test/api/v1/me", "ts": 1764200001.0, "program": "replay-lab", "run": 1}

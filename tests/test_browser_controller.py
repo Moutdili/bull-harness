@@ -4,6 +4,7 @@ a real-shaped DOM (B4), switch (I2), reading and driving ops (I3), websocket fra
 
 import base64
 import json
+import types
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import ClassVar
@@ -166,7 +167,7 @@ def test_cleared_at_tells_when_the_challenge_went_away():
 
 # ---------------------------------------------------------------- I17: fill budget
 def test_the_81st_fill_of_a_segment_is_refused_and_the_host_resets_it(tmp_path):
-    ctl = Controller(FakeDriver(), store=str(tmp_path), clock=lambda: 1_700_000_000.0)
+    ctl = Controller(FakeDriver(), store=str(tmp_path), clock=lambda: 1_700_000_000.0, fill_day=1000)
     ctl.handle(HOST_OPS, session_req())
     for _ in range(FILL_SEGMENT):
         assert ctl.handle(AGENT_OPS, {"op": "fill", "css": "textarea", "text": "hi"})[0] == 200
@@ -189,7 +190,7 @@ def test_the_daily_budget_is_per_identity_and_survives_a_reset_and_a_restart(tmp
     again = Controller(FakeDriver(), store=str(tmp_path), clock=lambda: day, fill_segment=1000, fill_day=3)
     code, out = again.handle(AGENT_OPS, {"op": "fill", "css": "t", "text": "x"})
     assert code == 429 and "daily" in out["detail"]
-    # another identity has its own day; the next UTC day starts over
+    # another identity has its own day; the next day (host clock, UTC without tz_offset_min) starts over
     again.handle(HOST_OPS, {"op": "reset"})
     again.handle(HOST_OPS, {**session_req(), "identity": "user-b"})
     assert again.handle(AGENT_OPS, {"op": "fill", "css": "t", "text": "x"})[0] == 200
@@ -237,6 +238,53 @@ def test_while_the_operator_looks_the_agent_only_reads():
     ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
     now[0] += 601
     assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 200
+
+
+def test_j_ai_fini_turns_the_open_screen_into_a_spectator_and_the_agent_goes_on():
+    now = [1000.0]
+    d = FakeDriver()
+    ctl = Controller(d, clock=lambda: now[0])
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 409
+    code, out = ctl.handle(HOST_OPS, {"op": "human_done"})
+    assert code == 200 and out["watching"] is True and out["challenge_pending"] is False
+    st = ctl.handle(AGENT_OPS, {"op": "state"})[1]
+    assert st["human_viewing"] is False and st["human_watching"] is True
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 200
+    # the UI keeps re-asserting "on" while the screen stays open: still a spectator
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    assert ctl.handle(AGENT_OPS, {"op": "press", "key": "Enter"})[0] == 200
+
+
+def test_a_new_challenge_gives_the_screen_back_to_the_operator():
+    d = FakeDriver()
+    ctl = Controller(d, clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    ctl.handle(HOST_OPS, {"op": "human_done"})
+    d.snap = {**d.snap, "frames": [{"url": TURNSTILE, "visible": True}]}
+    st = ctl.handle(AGENT_OPS, {"op": "state"})[1]
+    assert st["challenge"]["pending"] and st["human_viewing"] is True and st["human_watching"] is False
+    d.snap = {**d.snap, "frames": []}
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 409  # solved, but not handed back yet
+
+
+def test_j_ai_fini_while_the_challenge_is_still_there_keeps_the_agent_off():
+    d = FakeDriver()
+    d.snap = {**d.snap, "frames": [{"url": TURNSTILE, "visible": True}]}
+    ctl = Controller(d, clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    code, out = ctl.handle(HOST_OPS, {"op": "human_done"})
+    assert code == 200 and out["watching"] is False and out["challenge_pending"] is True
+    assert ctl.handle(AGENT_OPS, {"op": "state"})[1]["human_viewing"] is True
+
+
+def test_closing_the_last_screen_ends_the_spectator_mode():
+    ctl = Controller(FakeDriver(), clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    ctl.handle(HOST_OPS, {"op": "human_done"})
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": False})
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})  # reopened: the operator's hand again
+    assert ctl.handle(AGENT_OPS, {"op": "click", "css": "a"})[0] == 409
 
 
 def test_the_agent_cannot_set_human_viewing():
@@ -402,3 +450,63 @@ def test_snapshot_is_what_detect_reads_scrubbed_and_feeds_challenge_back(tmp_pat
     saved = json.loads(f.read_text())
     assert challenge(saved["snapshot"]) == saved["challenge"]  # the file is a fixture detect can be tested on
     assert host.save_snapshot(f, call_=lambda req: {"code": 503, "error": "down"})["code"] == 503
+
+
+# ---------------------------------------------------------------- bh-web ws-rewrite (Mio, 2026-11-26)
+def test_rewrite_changes_one_occurrence_of_a_client_text_frame():
+    from bh.browser_service.detect import rewrite_client_frame
+
+    frame = '{"arguments":[{"conversationTransferToken":"eyJBBBB","x":"eyJBBBB"}]}\x1e'
+    out, done = rewrite_client_frame(frame, "eyJBBBB", "eyJCCCC")
+    assert done and out == '{"arguments":[{"conversationTransferToken":"eyJCCCC","x":"eyJBBBB"}]}\x1e'
+    assert rewrite_client_frame(frame, "absent-string", "x") == (frame, False)
+
+
+def test_rewrite_never_touches_a_challenge_frame_nor_a_binary_one():
+    from bh.browser_service.detect import rewrite_client_frame
+
+    proof = '{"arguments":[{"type":"ChallengeProof","method":"CloudflareTurnstile","token":"abcdefgh"}]}'
+    assert rewrite_client_frame(proof, "abcdefgh", "zzzzzzzz") == (proof, False)
+    blob = b"abcdefgh-binary"
+    assert rewrite_client_frame(blob, "abcdefgh", "zzzzzzzz") == (blob, False)
+
+
+def test_ws_rewrite_is_an_agent_op_validated_and_handed_to_the_driver():
+    d = FakeDriver()
+    armed = []
+    d.ws_rewrite = lambda find, replace, url_contains, ttl: armed.append((find, replace, url_contains, ttl)) or {
+        "armed": True
+    }
+    ctl = Controller(d)
+    code, out = ctl.handle(AGENT_OPS, {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "eyJCCCCCC"})
+    assert code == 200 and out["ok"] and armed == [("eyJBBBBBB", "eyJCCCCCC", "/Chathub/", 180)]
+    for bad in (
+        {"op": "ws_rewrite", "find": "short", "replace": "x"},  # under 8 characters: too vague to aim
+        {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "x", "ttl": 3600},
+        {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "x", "extra": 1},
+    ):
+        assert ctl.handle(AGENT_OPS, bad)[0] == 400, bad
+    assert len(armed) == 1
+
+
+def test_ws_rewrite_waits_like_any_action_while_the_operator_has_the_screen():
+    ctl = Controller(FakeDriver(), clock=lambda: 1000.0)
+    ctl.handle(HOST_OPS, {"op": "human_viewing", "on": True})
+    code, out = ctl.handle(AGENT_OPS, {"op": "ws_rewrite", "find": "eyJBBBBBB", "replace": "eyJCCCCCC"})
+    assert code == 409 and out["error"] == "human-viewing"
+
+
+def test_the_idle_worker_pumps_the_driver_while_a_websocket_is_routed():
+    """Playwright's sync API forwards routed frames only inside one of its calls: an idle worker must pump."""
+    import time as _time
+
+    from bh.browser_service.controller import Worker
+
+    pumped = []
+    drv = types.SimpleNamespace(needs_pump=lambda: True, pump=lambda: pumped.append(1))
+    ctl = types.SimpleNamespace(driver=drv, handle=lambda ops, req: (200, {"ok": True}))
+    w = Worker(lambda: ctl)
+    w.start()
+    _time.sleep(0.2)
+    assert len(pumped) >= 3
+    assert w.call(AGENT_OPS, {"op": "state"}, timeout=5) == (200, {"ok": True})

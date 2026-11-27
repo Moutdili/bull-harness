@@ -1,5 +1,5 @@
 ## Sensitive information disclosure
-When: backups, configs, debug/metrics/actuator, logs, `.git`, exports, verbose errors (bh-content and bh-scan hits).
+When: backups, configs, debug/metrics/actuator, logs, `.git`, exports, verbose errors.
 Do:
 1. Open each candidate once and look for actual values: keys, tokens, passwords, connection strings, other users' data.
 2. Check whether a found secret is live with ONE harmless read-only call on the program's own service, if the rules allow it.

@@ -22,7 +22,21 @@ Identity (--as): X-BH-Identity is added request by request in the route handler 
 the targets and the `sso` hosts, never globally: a passthrough host never receives anything of ours. A websocket
 handshake cannot be given a header this way (Playwright routes it apart), so it carries no identity.
 
-Classification: a mapper; with --xss a scanner (refused when the program forbids scanners).
+XSS (--xss MARKER): confirmed only by a dialog whose whole message is the marker, or window.__bhxss set to it, raised
+in a document of the page's own origin (the origin is taken when the dialog opens, from the frame that raised it, so
+a script run on another origin, then a navigation or a history rewrite back to the target, never confirms). A click,
+a submit or a key press on a javascript: URL is not made: the hunter's own script proves nothing. The line is
+`xss CONFIRMED (marker <M>) origin=<origin>`.
+
+Inventory (T48): after the load and after each step (fill, click, submit, key press), the page's forms (action,
+method, field names), the keys of localStorage and sessionStorage and the console errors (tagged with the step) are
+read again and merged; the summary names them, never a value (STORAGE_JS reads keys only, FORMS_JS names only).
+The summary ends with `next: <one action>`; a failure adds `[bh-fail] <class>: <action>` and writes no endpoint; an
+--xss marker not confirmed says `[bh] no proof.json on this test`.
+
+Classification: a mapper. `--xss` on a single page is an observation, not a scan (Mio's decision, audit I14): it
+runs on a program that forbids scanners. `--xss` with `--routes` carries the marker across the pages it walks: a
+scanner, refused when the program forbids scanners.
 This is the only sandbox module that imports playwright, inside run(): bh-agent starts without it.
 """
 
@@ -45,6 +59,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from bh.agent import contract as c
+from bh.agent import fail
 import contextlib
 
 SUMMARY_LINES = 25
@@ -65,6 +80,24 @@ MARGIN_S = 8  # seconds kept at the end of the budget to write the artifacts
 SELECTOR_ENGINE = re.compile(r"^(css|xpath|text|role|id|data-test(?:-?id)?|alt|placeholder|label|title)=")
 A11Y_ROLES = ("heading", "textbox", "searchbox", "combobox", "button", "link", "checkbox")
 A11Y_LINE = re.compile(rf'^\s*- ({"|".join(A11Y_ROLES)}) "([^"]*)"(?:[^:]*: (.*))?')
+
+# Whether a click, submit or key press would follow a javascript: URL (a link, an image map area, a form action, a
+# button's formaction), as the browser resolves it (`java\tscript:` is javascript:). Such a step is not made.
+JS_URL_TARGET = """(el) => {
+  if (!el) return false;
+  const proto = (u) => { try { return new URL(String(u), document.baseURI).protocol; } catch (e) { return ''; } };
+  const hrefOf = (a) => (typeof a.href === 'string' ? a.href
+    : (a.getAttribute('href') || a.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || ''));
+  const urls = [];
+  const a = el.closest && el.closest('a, area');
+  if (a) urls.push(hrefOf(a));
+  const b = el.closest && el.closest('button, input');
+  if (b && b.hasAttribute('formaction')) urls.push(b.getAttribute('formaction'));
+  const f = el.form || (el.closest && el.closest('form'));
+  if (f && f.hasAttribute('action')) urls.push(f.getAttribute('action'));
+  return urls.some((u) => u && proto(u) === 'javascript:');
+}"""
+_JS_SCHEME = re.compile(r"^[\x00-\x20]*" + r"[\t\n\r]*".join("javascript") + r"[\t\n\r]*:", re.I)
 
 # Records URLs set by pushState/replaceState and hash changes (SPA routes), read back by --routes.
 ROUTE_HOOK = """(() => {
@@ -88,6 +121,14 @@ FORMS_JS = """() => {
   if (loose.length) out.push({id: '(no form)', method: '', action: '', fields: loose});
   return out;
 }"""
+
+# Keys only: a value of the page's storage is never read (tokens live there).
+STORAGE_JS = """() => {
+  const keys = (name) => { try { const s = window[name]; return s ? Object.keys(s) : []; } catch (e) { return []; } };
+  return {local: keys('localStorage'), session: keys('sessionStorage')};
+}"""
+CONSOLE_SHOWN = 5
+STORAGE_SHOWN = 12
 
 
 # ------------------------------------------------------------------ arguments
@@ -163,6 +204,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     a.timeout = max(15, a.timeout)
     if "://" not in a.url:
         a.url = "https://" + a.url
+    if urlsplit(a.url).scheme.lower() not in ("http", "https"):
+        parser().error("bh-browse loads http(s) pages only")
     return a
 
 
@@ -296,16 +339,74 @@ def add_endpoints(d: Path, origin_: str, items: Items) -> list[str]:
     return [r["key"] for r in recs]
 
 
-def xss_confirmed(marker: str | None, dialogs: object, sentinel: object) -> bool:
-    """A dialog whose whole message is the marker (alert('<marker>')), or window.__bhxss set to the marker string.
-    A message that merely contains it does not count: a page that shows its own URL in a dialog is not an XSS.
-    Also the replay's own verdict (bh.agent.proof), computed from summary.json: hostile input, checked by type."""
+def js_url(url: str) -> bool:
+    """A javascript: URL as a browser reads it (leading controls and spaces, tabs and newlines inside the scheme)."""
+    return bool(_JS_SCHEME.match(url or ""))
+
+
+def _evidence(marker: str | None, dialogs: object, sentinel: object, sentinel_origin: object) -> list[object]:
+    """Origins of the documents where the marker showed: a dialog whose whole message is the marker
+    (alert('<marker>')), or window.__bhxss set to the marker string. A message that merely contains it does not
+    count: a page that shows its own URL in a dialog is not an XSS. Hostile input (summary.json), checked by type."""
     if not marker or not MARKER.match(str(marker)):
+        return []
+    out = [
+        d.get("origin")
+        for d in (dialogs if isinstance(dialogs, list) else [])
+        if isinstance(d, dict) and isinstance(d.get("message"), str) and d["message"].strip() == marker
+    ]
+    if isinstance(sentinel, str) and sentinel == marker:
+        out.append(sentinel_origin)
+    return out
+
+
+def marker_seen(marker: str | None, dialogs: object, sentinel: object, sentinel_origin: object = None) -> bool:
+    """The marker showed, whatever the origin (to say why it does not confirm)."""
+    return bool(_evidence(marker, dialogs, sentinel, sentinel_origin))
+
+
+def xss_confirmed(
+    marker: str | None, dialogs: object, sentinel: object, origin: object, sentinel_origin: object = None
+) -> bool:
+    """The marker showed (_evidence) in a document of `origin`, the page's own (contract.origin form): a script run on
+    another origin, or on none known (a data: frame, a dialog whose frame is unknown), never confirms. Also the
+    replay's own verdict (bh.agent.proof), computed from summary.json against the origin of the step's URL."""
+    if not isinstance(origin, str) or not origin:
         return False
-    shown = [d.get("message") for d in (dialogs if isinstance(dialogs, list) else []) if isinstance(d, dict)]
-    return any(isinstance(m, str) and m.strip() == marker for m in shown) or (
-        isinstance(sentinel, str) and sentinel == marker
-    )
+    return origin in [o for o in _evidence(marker, dialogs, sentinel, sentinel_origin) if isinstance(o, str)]
+
+
+def dialog_origins(dialogs: list[dict], events: list[dict]) -> list[dict]:
+    """Each dialog gets the origin of the frame that raised it: from Chromium's Page.javascriptDialogOpening event
+    (`url` is that frame's URL), matched in order on type and message. Without the event, the page's origin at the
+    moment the dialog opened when the page had one frame only (the dialog can only be the main frame's), else None:
+    a cross-origin iframe never lends its dialog to the page."""
+    pool = [
+        (str(e.get("type", "")), str(e.get("message", "")), c.origin(str(e.get("url", ""))))
+        for e in events
+        if isinstance(e, dict)
+    ]
+    out = []
+    for d in dialogs:
+        kind, message = str(d.get("type", "")), str(d.get("message", ""))
+        hit = next((i for i, (t, m, _) in enumerate(pool) if t == kind and m == message), None)
+        origin = d.get("page_origin") if d.get("frames") == 1 else None  # a one-frame page: only its main frame
+        if hit is not None:
+            origin = pool.pop(hit)[2]
+        out.append({"type": kind, "message": message, "origin": origin})
+    return out
+
+
+def pick_sentinel(
+    found: list[tuple[str, str | None]], marker: str | None, origin: str
+) -> tuple[str | None, str | None]:
+    """(value, origin of its frame) among the frames that hold a window.__bhxss string: the marker on the page's
+    origin first, then the marker anywhere (said, not confirmed), then any value."""
+    for want in ((marker, origin), (marker, None), (None, None)):
+        for value, o in found:
+            if (want[0] is None or value == want[0]) and (want[1] is None or o == want[1]):
+                return value, o
+    return None, None
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -358,13 +459,20 @@ class Result:
     dialogs: list[dict] = field(default_factory=list)
     marker: str | None = None
     sentinel: str | None = None
-    console_errors: list[str] = field(default_factory=list)
+    sentinel_origin: str | None = None  # origin of the frame that held the sentinel
+    origin: str = ""  # the page's own origin (contract.origin of the URL asked): the only one an XSS confirms on
+    console_errors: list[str] = field(default_factory=list)  # "[<step>] <first line>"
     forms: list[dict] = field(default_factory=list)
+    local_keys: list[str] = field(default_factory=list)  # names only, never a value
+    session_keys: list[str] = field(default_factory=list)
     routes: list[str] = field(default_factory=list)
     new_keys: list[str] = field(default_factory=list)
     a11y: list[str] = field(default_factory=list)
     shot: tuple[str, int, int] | None = None
     raw: str = ""
+
+    def __post_init__(self) -> None:
+        self.origin = self.origin or c.origin(self.url) or ""
 
 
 def _short(url: str) -> str:
@@ -393,30 +501,55 @@ def render(r: Result) -> list[str]:
     if r.support["sso"] or r.support["passthrough"]:
         body.append(
             f"support: sso {r.support['sso']} (the app's own sign-in), passthrough {r.support['passthrough']} "
-            "(anti-bot challenge, not intercepted; never solve nor work around it: blocked = bh-note blocked captcha)"
+            "(anti-bot challenge, not intercepted; never solve nor work around it: a human passes it, run "
+            "`bh-web wait-human`)"
         )
     if r.websockets:
-        body.append(f"websockets: {r.websockets} refused (the gate forbids them; socket.io may fall back to polling)")
+        body.append(f"websockets: {r.websockets} refused locally (not enabled by the scope for this host)")
     if r.websockets_open:
-        body.append(f"websockets: {r.websockets_open} opened to the target (frames bounded and journaled by the gate)")
+        body.append(
+            f"websockets: {r.websockets_open} opened to the target, handshake accepted (frames bounded and journaled "
+            "by the gate)"
+        )
     if r.xhr:
         shown = " · ".join(f"{m} {_short(u)} {s}" for m, u, s in r.xhr[:6])
         body.append(f"xhr: {shown}" + (f" (+{len(r.xhr) - 6} in raw har.json)" if len(r.xhr) > 6 else ""))
     body += [f"step: {s}" for s in r.steps[:4]]
-    confirmed = xss_confirmed(r.marker, r.dialogs, r.sentinel)
-    verdict = f"xss CONFIRMED (marker {r.marker})" if confirmed else ""
+    confirmed = xss_confirmed(r.marker, r.dialogs, r.sentinel, r.origin, r.sentinel_origin)
+    verdict = f"xss CONFIRMED (marker {r.marker}) origin={r.origin}" if confirmed else ""
     if r.dialogs:
         shown = " · ".join(f'{d.get("type")}("{str(d.get("message", ""))[:40]}")' for d in r.dialogs[:3])
         body.append(f"dialogs: {len(r.dialogs)} — {shown}" + (f" ← {verdict}" if verdict else ""))
     if verdict and not r.dialogs:
         body.append(f"{verdict} via window.{SENTINEL}")
-    if r.marker and not confirmed:
+    if r.marker and not confirmed and marker_seen(r.marker, r.dialogs, r.sentinel, r.sentinel_origin):
+        body.append(
+            f"xss: marker {r.marker} showed in a document of another origin than the page's {r.origin}, or of an "
+            "unknown one: not confirmed"
+        )
+    elif r.marker and not confirmed:
         body.append(f"xss: marker {r.marker} not seen (no dialog, no window.{SENTINEL}): not confirmed")
     if r.console_errors:
-        body.append(f"console: {len(r.console_errors)} errors ({r.console_errors[0][:120]})")
+        shown = " · ".join(e[:90] for e in r.console_errors[:CONSOLE_SHOWN])
+        extra = len(r.console_errors) - CONSOLE_SHOWN
+        more = f" (+{extra} in raw console.log)" if extra > 0 else ""
+        body.append(f"console errors: {len(r.console_errors)}: {shown}{more}")
+    if r.local_keys or r.session_keys:
+        body.append(
+            "storage keys: "
+            + " · ".join(
+                f"{name} {', '.join(k[:40] for k in keys[:STORAGE_SHOWN])}"
+                + (f" (+{len(keys) - STORAGE_SHOWN})" if len(keys) > STORAGE_SHOWN else "")
+                for name, keys in (("localStorage", r.local_keys), ("sessionStorage", r.session_keys))
+                if keys
+            )
+        )
     for f in r.forms[:3]:
-        target = f" → {f.get('method') or 'GET'} {_short(f['action'])}" if f.get("action") else ""
-        body.append(f"form {f.get('id') or '?'}: ({', '.join(f.get('fields', [])[:8])}){target}")
+        action = _short(f["action"]) if f.get("action") else "(this page)"
+        body.append(
+            f"form {f.get('id') or '?'}: {f.get('method') or 'GET'} {action} fields: "
+            f"{', '.join(f.get('fields', [])[:8]) or '-'}"
+        )
     if len(r.forms) > 3:
         body.append(f"forms: +{len(r.forms) - 3} in raw dom.html")
     routes = [k.split(" ", 1)[1] for k in r.new_keys if "#" in k]
@@ -432,24 +565,75 @@ def render(r: Result) -> list[str]:
     if r.shot:
         path, w, h = r.shot
         body.append(f"shot: {path} {w}x{h} ≈ {image_tokens(w, h)} tokens (Read it only if needed)")
-    budget = SUMMARY_LINES - 2  # headline + raw line
+    klass = failure_class(r)
+    end = [f"raw: {r.raw}/"]
+    if klass:
+        end.append(fail.line(klass))
+    elif r.marker and not confirmed:
+        end.append(fail.NO_PROOF)
+    end.append(f"next: {next_step(r, klass, confirmed)}")
+    budget = SUMMARY_LINES - 1 - len(end)  # headline + the closing lines
     if len(body) > budget:
         body = [*body[: budget - 1], f"... {len(body) - budget + 1} more lines in raw"]
     lines = [head[:LINE_CHARS], *("  " + b[: LINE_CHARS - 2] for b in body)]
-    return [*lines, f"raw: {r.raw}/"]
+    return [*lines, *(x[:LINE_CHARS] for x in end)]
+
+
+def failure_class(r: Result) -> str | None:
+    """The fail class of a run that did not end well, None when it did."""
+    if r.state == "ok":
+        return None
+    if r.state.startswith("partial"):
+        return "timeout"
+    if r.state == "error rc=127":
+        return "missing-tool"
+    if r.state.startswith("error step"):
+        return "bad-argument"
+    return fail.classify(1, r.error, False)
+
+
+def next_step(r: Result, klass: str | None, confirmed: bool) -> str:
+    """One action, the harness's words: never a quote of the page."""
+    if klass:
+        return {
+            "timeout": "bh-browse the same page with a larger --timeout, or without --routes",
+            "missing-tool": "bh-web, the persistent browser, for this page",
+            "bad-argument": "bh-browse the page alone, read its a11y lines for the right selector, then the step",
+        }.get(klass, "bh-note frontier")
+    if confirmed:
+        return (
+            "write proof.json with this bh-browse step (attack) and the same page without the marker (control), then "
+            "bh-note finding --class xss --proof proof.json"
+        )
+    if r.marker:
+        return "grep the marker in dom.html (raw/) to see where it landed, then fit the payload to that context"
+    if any("#" in k for k in r.new_keys):
+        return "bh-browse the first new route above (a client-side route only shows rendered)"
+    if r.forms:
+        return "submit the first form above with your own values (--fill CSS=VALUE --submit CSS)"
+    return "bh-note frontier"
 
 
 def summary(r: Result) -> dict:
-    """summary.json: the structured result. The replay of a proof reads `status`, `dialogs` and `sentinel` and
-    decides itself; `xss_confirmed` is for a human reading the raw dir. Never the URL, the title or the console."""
+    """summary.json: the structured result. The replay of a proof reads `status`, `dialogs` (with the origin of the
+    frame that raised each), `sentinel` and `sentinel_origin`, and decides itself against the origin of its own step
+    URL; `xss_confirmed` is for a human reading the raw dir. Never the URL, the title or the console."""
     return {
         "status": r.status,
         "state": r.state,
         "new": r.new_keys,
-        "dialogs": [{"type": str(d.get("type", "")), "message": str(d.get("message", ""))} for d in r.dialogs],
+        "dialogs": [
+            {
+                "type": str(d.get("type", "")),
+                "message": str(d.get("message", "")),
+                "origin": d.get("origin") if isinstance(d.get("origin"), str) else None,
+            }
+            for d in r.dialogs
+        ],
         "sentinel": r.sentinel,
+        "sentinel_origin": r.sentinel_origin,
         "marker": r.marker,
-        "xss_confirmed": xss_confirmed(r.marker, r.dialogs, r.sentinel),
+        "xss_confirmed": xss_confirmed(r.marker, r.dialogs, r.sentinel, r.origin, r.sentinel_origin),
     }
 
 
@@ -683,23 +867,44 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             r.xhr.append((req.method, resp.url, resp.status))
 
     console: list[str] = []
+    stage = ["load"]  # the page action the console errors follow (load, step <i>, routes)
 
     def on_console(msg) -> None:
         line = f"{msg.type}: {msg.text}"
-        console.append(line)
+        console.append(f"[{stage[0]}] {line}")
         if msg.type == "error" and "ERR_BLOCKED_BY_CLIENT" not in msg.text:  # our own local blocks
-            r.console_errors.append(msg.text.splitlines()[0] if msg.text else "error")
+            r.console_errors.append(f"[{stage[0]}] " + (msg.text.splitlines()[0] if msg.text else "error"))
 
     def on_pageerror(exc) -> None:
-        console.append(f"pageerror: {exc}")
-        r.console_errors.append(f"pageerror: {str(exc).splitlines()[0] if str(exc) else exc}")
+        console.append(f"[{stage[0]}] pageerror: {exc}")
+        r.console_errors.append(f"[{stage[0]}] pageerror: {str(exc).splitlines()[0] if str(exc) else exc}")
+
+    def inventory() -> None:
+        """Forms and storage keys of the page as it is now, merged with what earlier states showed."""
+        try:
+            forms = page.evaluate(FORMS_JS)
+        except PwError:
+            forms = []
+        merge_inventory(r, forms if isinstance(forms, list) else [], _storage(page, PwError))
+
+    dialog_events: list[dict] = []  # Page.javascriptDialogOpening (CDP): the URL of the frame that raised each
 
     def on_dialog(dialog) -> None:
-        rec = {"type": dialog.type, "message": dialog.message}
+        # at this moment, not at the end: a navigation or a history rewrite afterwards does not move the dialog
+        rec = {
+            "type": dialog.type,
+            "message": dialog.message,
+            "page_origin": c.origin(page.url),
+            "frames": len(page.frames),
+        }
         r.dialogs.append(rec)
         c.append_jsonl(raw / "dialogs.jsonl", rec)
         with contextlib.suppress(PwError):
             dialog.dismiss()
+
+    def on_websocket(ws) -> None:
+        if ws_through(ws.url, host, extra.websockets, extra.targets):  # mocked ones are counted by on_ws
+            count_when_open(ws, r)
 
     def settle(cap: float | None) -> None:
         refuse_sockets()
@@ -732,13 +937,9 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             page.on("console", on_console)
             page.on("pageerror", on_pageerror)
             page.on("dialog", on_dialog)
-            page.on(  # mocked ones may show here too: count only those let through
-                "websocket",
-                lambda ws: (
-                    ws_through(ws.url, host, extra.websockets, extra.targets)
-                    and setattr(r, "websockets_open", r.websockets_open + 1)
-                ),
-            )
+            page.on("websocket", on_websocket)  # mocked ones may show here too: count only those let through
+            if a.xss:
+                watch_dialogs(ctx, page, dialog_events, PwError)
 
             resp = page.goto(a.url, wait_until="domcontentloaded", timeout=left_ms())
             r.status = resp.status if resp else None
@@ -748,17 +949,27 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 page.wait_for_selector(a.wait_for, timeout=left_ms())
             else:
                 settle(15)
+            inventory()
 
             for i, (kind, value) in enumerate(a.steps, 1):
+                stage[0] = f"step {i}"
                 try:
                     if kind == "fill":
                         page.fill(value[0], value[1], timeout=left_ms(20))
+                    elif follows_js_url(page, kind, value, left_ms(20)):
+                        r.steps.append(
+                            f"{i} --{kind} {value}: a javascript: URL, not followed (the hunter's own script proves "
+                            "nothing)"
+                        )
+                        r.state = f"error step {i}"
+                        break
                     elif kind == "press":
                         page.keyboard.press(value)  # a chat box sends on Enter, with no button to click
                         settle(15)
                     else:
                         page.click(value, timeout=left_ms(20))
                         settle(15 if kind == "submit" else 3)
+                    inventory()
                 except PwError as exc:
                     sel = value[0] if kind == "fill" else value
                     r.steps.append(f"{i} --{kind} {sel} failed: {str(exc).splitlines()[0][:120]}")
@@ -767,14 +978,15 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
 
             if a.xss:
                 page.wait_for_timeout(min(1500, left_ms()))
-                r.sentinel = _sentinel(page, PwError)
+                r.sentinel, r.sentinel_origin = pick_sentinel(_sentinels(page, PwError), a.xss, r.origin)
 
             links = _links(page, PwError)
             seen_urls.append(("GET", page.url, r.status))
             if a.routes:
+                stage[0] = "routes"
                 seen_urls += _explore(page, links, host=host, deadline=deadline, err=PwError, settle=settle)
-                if a.xss and r.sentinel != a.xss:
-                    r.sentinel = _sentinel(page, PwError)
+                if a.xss and not xss_confirmed(a.xss, [], r.sentinel, r.origin, r.sentinel_origin):
+                    r.sentinel, r.sentinel_origin = pick_sentinel(_sentinels(page, PwError), a.xss, r.origin)
             seen_urls += [("GET", u, None) for u in links if same_site(u, host)]
 
             r.final_url = page.url
@@ -786,10 +998,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
                 r.a11y = a11y_summary(aria)
             except PwError as exc:
                 (raw / "aria.yml").write_text(f"# aria snapshot failed: {exc}\n")
-            try:
-                r.forms = page.evaluate(FORMS_JS)
-            except PwError:
-                r.forms = []
+            inventory()
             if a.shot:
                 shot = raw / "shot.png"
                 if a.clip:
@@ -804,6 +1013,7 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
             r.state, r.error = "error rc=1", str(exc).splitlines()[0][:200]
         finally:
             r.seconds = time.monotonic() - t0
+            r.dialogs = dialog_origins(r.dialogs, dialog_events)
             for closing in (ctx, browser):  # closing the context writes the HAR
                 if closing is not None:
                     with contextlib.suppress(PwError):
@@ -822,18 +1032,86 @@ def run(a: argparse.Namespace, raw: Path, r: Result) -> None:
     items = endpoint_items(seen_urls, origin_)
     form_fields = {f["action"].split("#")[0]: f.get("fields") or [] for f in r.forms if f.get("action")}
     items = [(k, u, p + form_fields.get(u, []), s) for k, u, p, s in items]
-    r.new_keys = add_endpoints(c.bh_dir(), origin_, items)
+    # a failed run writes no endpoint (T36); a partial one keeps what it observed
+    r.new_keys = [] if r.state.startswith("error") else add_endpoints(c.bh_dir(), origin_, items)
 
 
-def _sentinel(page, err) -> str | None:
+def _storage(page, err) -> dict:
+    try:
+        doc = page.evaluate(STORAGE_JS)
+    except err:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def merge_inventory(r: Result, forms: list, storage: dict) -> None:
+    """Add the forms (by action, method and field names) and storage keys not seen yet. Names only."""
+    seen = {(f.get("action"), f.get("method"), tuple(f.get("fields") or [])) for f in r.forms}
+    for f in forms:
+        if not isinstance(f, dict):
+            continue
+        rec = {
+            "id": str(f.get("id") or "")[:60],
+            "method": str(f.get("method") or "")[:10],
+            "action": str(f.get("action") or "")[:500],
+            "fields": [str(x)[:60] for x in (f.get("fields") or []) if isinstance(x, str)][:40],
+        }
+        key = (rec["action"], rec["method"], tuple(rec["fields"]))
+        if key not in seen:
+            seen.add(key)
+            r.forms.append(rec)
+    for attr, name in (("local_keys", "local"), ("session_keys", "session")):
+        have = getattr(r, attr)
+        for k in storage.get(name) or []:
+            if isinstance(k, str) and k not in have:
+                have.append(k[:200])
+
+
+def count_when_open(ws, r: Result) -> None:
+    """r.websockets_open counts `ws` once a frame crossed it: only an accepted handshake carries frames. The page's
+    `websocket` event comes when the socket is created, before the handshake, and for a refused one too."""
+    seen = False
+
+    def frame(_payload=None) -> None:
+        nonlocal seen
+        if not seen:
+            seen = True
+            r.websockets_open += 1
+
+    ws.on("framesent", frame)
+    ws.on("framereceived", frame)
+
+
+def _sentinels(page, err) -> list[tuple[str, str | None]]:
+    """(window.__bhxss, origin of the frame) for every frame that holds a string there."""
+    found = []
     for frame in page.frames:
         try:
             v = frame.evaluate("n => (typeof window[n] === 'string' ? window[n] : null)", SENTINEL)
         except err:
             continue
-        if v:
-            return v
-    return None
+        if isinstance(v, str) and v:
+            found.append((v, c.origin(frame.url)))
+    return found
+
+
+def watch_dialogs(ctx, page, events: list[dict], err) -> None:
+    """Chromium tells which frame raised a dialog (Page.javascriptDialogOpening, `url`): a CDP session of our own
+    listens. Without it (an error), dialog_origins falls back on a one-frame page only."""
+    try:
+        cdp = ctx.new_cdp_session(page)
+        cdp.on("Page.javascriptDialogOpening", events.append)
+        cdp.send("Page.enable")
+    except err:
+        return
+
+
+def follows_js_url(page, kind: str, value, timeout: float) -> bool:
+    """A click, submit or key press that would follow a javascript: URL (JS_URL_TARGET): the element the selector
+    names, or the focused one for a key press. Raises the page's error when the element is missing, like the step."""
+    if kind == "press":
+        return bool(page.evaluate(f"() => ({JS_URL_TARGET})(document.activeElement)"))
+    return bool(page.locator(value).first.evaluate(JS_URL_TARGET, timeout=timeout))
 
 
 def _links(page, err) -> list[str]:
@@ -852,7 +1130,7 @@ def _explore(page, links: list[str], *, host: str, deadline: float, err, settle)
     visits = 0
     while queue and visits < MAX_ROUTE_VISITS and time.monotonic() < deadline - 5:
         u = queue.pop(0)
-        if u in visited or RISKY_LINK.search(u) or not spa_route(u) or not _same_document(u, page.url):
+        if u in visited or js_url(u) or RISKY_LINK.search(u) or not spa_route(u) or not _same_document(u, page.url):
             continue
         visited.add(u)
         visits += 1
@@ -881,7 +1159,11 @@ def main(argv: list[str] | None = None) -> None:
     r = Result(url=a.url, identity=a.identity, raw=str(job.raw))
 
     def hard_stop(_sig, _frm) -> None:  # the sync API can hang past its own timeouts: never past the budget
-        print(f"bh-browse {a.url}: killed after {a.timeout + 30} s [error rc=124]\nraw: {job.raw}/", flush=True)
+        print(
+            f"bh-browse {a.url}: killed after {a.timeout + 30} s [error rc=124]\nraw: {job.raw}/\n"
+            f"{fail.line('timeout')}\nnext: {next_step(r, 'timeout', False)}",
+            flush=True,
+        )
         os._exit(124)
 
     signal.signal(signal.SIGALRM, hard_stop)
@@ -890,9 +1172,10 @@ def main(argv: list[str] | None = None) -> None:
     signal.alarm(0)
     with open(job.raw / "summary.json", "w") as fh:  # what a proof replay reads (bh.agent.proof._browse)
         json.dump(summary(r), fh)
-    if a.xss:
+    if a.xss and r.state == "ok":  # a route counts as tested only when the run ended well
         c.record_touched(c.bh_dir(), [a.url], via="browse-xss")
-    c.record_phase(c.bh_dir(), job.origin, "browse", status=r.state, count=len(r.new_keys), raw=str(job.raw))
+    status = "error: partial (timeout)" if r.state.startswith("partial") else r.state  # never counted as done
+    c.record_phase(c.bh_dir(), job.origin, "browse", status=status, count=len(r.new_keys), raw=str(job.raw))
     print("\n".join(render(r)))
     if r.state.startswith("error"):
         sys.exit(1)

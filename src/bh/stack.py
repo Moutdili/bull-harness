@@ -23,6 +23,9 @@ LOGIN_USER = "hunter"
 BROWSER_CTR = "bh-browser"
 BROWSER_USER = "hunter"
 BROWSER_SERVICE = "browser"
+# The practice lab (compose service `juiceshop`, profile `lab`): the gate's preflight runs its positive checks against
+# it before every hunt, a real one included (bh.runner.preflight).
+LAB_CTR = "bh-lab-juiceshop"
 VERIFY_SUBDIR = ".verify"  # /work/<program>/.verify/F<id>: a verifier's work dir, only in the judge container
 COMPOSE_FILE = "container/compose.yaml"
 
@@ -276,3 +279,56 @@ def kill_agent(program: str, grace: float = 8.0, bh_dir: str | None = None) -> N
     agent_sh(
         _KILL_SCRIPT, pidfile, str(int(grace * 2)), user="root", timeout=grace + 20, container=container_of(bh_dir)
     )
+
+
+# The processes of the agent user now (the tools in progress), for the UI's read-only view: pid, seconds alive,
+# command name, command line, last line of the file its stdout goes to (a builtin's raw output), tab-separated.
+# Run as the hunter (it reads its own /proc entries); the container's keep-alive is left out. Everything here is
+# written by the hunter's processes: the host parses it as untrusted text.
+_TOOLS_SCRIPT = r"""
+keep=" $(for r in $(pgrep -u root -x runuser); do pgrep -P "$r"; done | tr '\n' ' ') "
+for p in $(pgrep -u hunter); do
+  case "$keep" in *" $p "*) continue ;; esac
+  comm=$(cat "/proc/$p/comm" 2>/dev/null) || continue
+  et=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')
+  args=$(tr '\000\t\n\r' '    ' < "/proc/$p/cmdline" 2>/dev/null | head -c 400)
+  out=$(readlink "/proc/$p/fd/1" 2>/dev/null)
+  last=""
+  case "$out" in
+    /*) [ -f "$out" ] && last=$(tail -c 4000 -- "$out" 2>/dev/null | tr -d '\r' | grep -v '^[[:space:]]*$' \
+          | tail -n 1 | tr '\t' ' ' | head -c 300) ;;
+  esac
+  printf '%s\t%s\t%s\t%s\t%s\n' "$p" "${et:-0}" "$comm" "$args" "$last"
+done
+true
+"""
+TOOLS_SHOWN = 50
+
+
+def agent_tools(sh=None) -> list[dict]:
+    """[{"pid", "seconds", "name", "cmd", "last"}] of the agent user's processes, longest-running first; [] when the
+    agent is down. Read-only: stopping stays kill_agent's (the UI's Stop)."""
+    from bh import redact
+
+    sh = sh or agent_sh
+    try:
+        r = sh(_TOOLS_SCRIPT, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5 or not parts[0].isdigit():
+            continue
+        pid, secs, name, cmd, last = parts
+        out.append(
+            {
+                "pid": int(pid),
+                "seconds": int(secs) if secs.isdigit() else None,
+                "name": name[:32],
+                "cmd": redact.text(cmd)[:400],
+                "last": redact.text(last)[:300],
+            }
+        )
+    out.sort(key=lambda t: -(t["seconds"] or 0))
+    return out[:TOOLS_SHOWN]

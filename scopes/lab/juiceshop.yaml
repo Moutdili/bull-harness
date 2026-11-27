@@ -9,6 +9,8 @@ required_headers: {X-Bug-Bounty: bull-harness-lab}
 in_scope:
   - {value: "10.231.0.10/32", note: "Juice Shop, http://10.231.0.10:3000"}
   - {value: "juiceshop.lab", note: "not resolvable; use the IP"}
+# data-free host the hunter may cite and load (D27): GET/HEAD/OPTIONS only, nothing of ours attached
+payload_hosts: [example.org]
 out_of_scope: []
 forbidden_vulns: [dos]
 # Test accounts. Juice Shop keeps its DB in memory: after a restart, `bh accounts refresh` signs the same accounts

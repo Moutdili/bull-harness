@@ -123,6 +123,19 @@ function renderEvent(e) {
   return el("div", { class: "ev result" }, el("div", { class: "h" }, `fin · ${e.turns ?? "?"} tours${e.cost ? ` · $${e.cost.toFixed(2)} éq.` : ""}`), e.body);
 }
 
+// ------------------------------------------------------------------ tools in progress (T46): read-only
+const dur = (s) => s == null ? "—" : s < 60 ? `${s} s` : s < 3600 ? `${(s / 60) | 0} min ${s % 60} s` : `${(s / 3600) | 0} h ${((s % 3600) / 60) | 0} min`;
+views.tools = async () => {
+  const d = await api("/api/agent/tools");
+  fill($("#tools"),
+    el("div", { class: "row" }, el("b", {}, "Processus du conteneur agent"), el("span", { class: "muted small" }, "lecture seule · l'arrêt reste le bouton Stop (Programmes)")),
+    !d.running ? el("div", { class: "empty" }, "Le conteneur agent ne tourne pas.")
+      : !d.tools.length ? el("div", { class: "empty" }, "Aucun outil en cours.")
+        : el("table", {}, el("tr", {}, ...["pid", "durée", "outil", "commande", "dernière ligne"].map((h) => el("th", {}, h))),
+          ...d.tools.map((t) => el("tr", {}, el("td", { class: "small" }, t.pid), el("td", { class: "small" }, dur(t.seconds)), el("td", {}, t.name),
+            el("td", { class: "mono small" }, t.cmd), el("td", { class: "mono small muted" }, t.last || "—")))));
+};
+
 // ------------------------------------------------------------------ findings
 views.findings = async () => {
   const f = await api("/api/findings");
@@ -134,20 +147,42 @@ function findingTable(f) {
       el("td", {}, `F${x.id}`), el("td", {}, sev(x.severity)), el("td", {}, x.title), el("td", {}, x.vuln_class || "—"),
       el("td", {}, x.program), el("td", { class: `st-${x.status}` }, x.status), el("td", { class: "mono small" }, x.url || ""))));
 }
+const OUTCOME_STATUSES = ["verified", "verified-evidence", "submitted"];
+const OUTCOMES = ["accepted", "paid", "duplicate", "informative", "na"];
+const money = (v) => (typeof v === "number" ? `$${v.toFixed(2)}` : (v ?? "—"));
 async function openFinding(id) {
   const f = await api(`/api/findings/${id}`);
   const body = el("div");
   const tabs = { overview: "Vue d'ensemble", verify: "Vérification", poc: "PoC", proof: "Non prouvé", traffic: `Trafic (${f.flows.length})`, triage: "Triage" };
+  if (OUTCOME_STATUSES.includes(f.status)) tabs.outcome = "Issue plateforme";
   const pane = el("div");
   const sub = el("div", { class: "subtabs" }, ...Object.entries(tabs).map(([k, v]) => el("button", { "data-k": k, onclick: () => sel(k) }, v)));
   function sel(k) {
     sub.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.k === k));
-    if (k === "overview") fill(pane, el("dl", {},
-      el("dt", {}, "Sévérité"), el("dd", {}, sev(f.severity)), el("dt", {}, "Statut"), el("dd", { class: `st-${f.status}` }, f.status),
-      el("dt", {}, "Classe"), el("dd", {}, f.vuln_class || "—"), el("dt", {}, "Programme"), el("dd", {}, f.program),
-      el("dt", {}, "URL"), el("dd", { class: "mono" }, f.url || "—"), el("dt", {}, "Créé"), el("dd", {}, time(f.created)),
-      el("dt", {}, "Verdict"), el("dd", {}, f.verdict || "—"), el("dt", {}, "Preuve (fichier)"), el("dd", { class: "mono" }, f.evidence || "—")),
-      el("h2", {}, "Impact / résumé"), el("pre", {}, f.summary || ""));
+    // Provenance (audit T3): what the harness replayed and decided, then what the hunter wrote, never mixed.
+    if (k === "overview") {
+      const P = f.provenance || { declared: {}, observed: {} }, D = P.declared || {}, O = P.observed || {};
+      const r = O.replay || null;
+      fill(pane,
+        el("h2", {}, "Observed by the harness"),
+        el("dl", {},
+          el("dt", {}, "Statut"), el("dd", { class: `st-${O.status}` }, O.status || "—"),
+          el("dt", {}, "Rejeu"), el("dd", {}, r ? (r.observation ? `observation : ${r.observation.status || "?"}` : `reproduit=${!!r.reproduced}, le contrôle infirme=${!!r.control_disproves}, ${(r.rounds || []).length} tour(s)`) : "pas encore rejoué"),
+          el("dt", {}, "Verdict"), el("dd", {}, O.verdict || "—"),
+          el("dt", {}, "Programme"), el("dd", {}, f.program), el("dt", {}, "Créé"), el("dd", {}, time(f.created))),
+        el("h2", {}, "Declared by the agent"),
+        el("p", { class: "muted small" }, "Texte du chasseur : rien de ce bloc n'est vérifié par le harnais."),
+        el("dl", {},
+          el("dt", {}, "Titre"), el("dd", {}, D.title || "—"),
+          el("dt", {}, "Sévérité"), el("dd", {}, sev(D.severity), D.severity_if ? ` si ${D.severity_if}` : ""),
+          el("dt", {}, "Pourquoi"), el("dd", {}, D.severity_why || "—"),
+          el("dt", {}, "Classe"), el("dd", {}, f.vuln_class || "—"),
+          el("dt", {}, "URL"), el("dd", { class: "mono" }, f.url || "—"),
+          el("dt", {}, "Preuve (fichier)"), el("dd", { class: "mono" }, f.evidence || "—")),
+        el("h3", {}, "Résumé"), el("pre", {}, D.summary || ""),
+        el("h3", {}, "Non prouvé"), el("pre", {}, D.not_proven || "(rien déclaré)"),
+        el("h3", {}, "Contre-preuve"), el("pre", {}, D.counter || "(rien déclaré)"));
+    }
     if (k === "verify") {
       let replay = null; try { replay = f.replay ? JSON.parse(f.replay) : null; } catch (e) { replay = null; }
       const steps = (replay?.rounds || []).flatMap((r, i) => r.map((s) => el("tr", {},
@@ -166,6 +201,20 @@ async function openFinding(id) {
       el("pre", { style: "max-height:70vh" }, f.poc || "(vide)"));
     if (k === "proof") fill(pane, el("p", { class: "muted small" }, "Ce que l'agent déclare NE PAS avoir prouvé. À lire avant toute soumission."), el("pre", {}, f.not_proven || "(rien déclaré)"));
     if (k === "traffic") fill(pane, f.flows.length ? flowTable(f.flows.slice().reverse()) : el("div", { class: "empty" }, "Aucun flux du gate sur cet hôte."));
+    if (k === "outcome") {
+      // L4: what the platform decided, typed by Mio after the triage (the same function as `bh outcome`)
+      const bounty = el("input", { type: "number", min: 0, step: "any", placeholder: "prime (optionnel)", style: "width:160px", value: f.bounty ?? "" });
+      const note = el("input", { placeholder: "note (optionnel)", style: "flex:1", maxlength: 1000, value: f.outcome_note || "" });
+      const act = (o) => el("button", { class: `btn ${o === f.outcome ? "primary" : ""}`, onclick: async () => {
+        try {
+          await api(`/api/finding/${f.id}/outcome`, { outcome: o, bounty: bounty.value === "" ? null : Number(bounty.value), note: note.value });
+          toast(`F${f.id} : issue ${o}`); openFinding(f.id); refresh();
+        } catch (e) { toast(`erreur: ${e.message}`); } } }, o);
+      fill(pane, el("p", { class: "muted small" }, "L'issue donnée par la plateforme après le triage. Elle recalcule le registre de crédit ; le juge ne la voit jamais."),
+        el("dl", {}, el("dt", {}, "Issue"), el("dd", {}, f.outcome || "—"), el("dt", {}, "Prime"), el("dd", {}, f.bounty ?? "—"),
+          el("dt", {}, "Saisie"), el("dd", {}, time(f.outcome_ts)), el("dt", {}, "Note"), el("dd", {}, f.outcome_note || "—")),
+        el("div", { class: "row" }, bounty, note), el("div", { class: "row" }, ...OUTCOMES.map(act)));
+    }
     if (k === "triage") {
       const v = el("input", { placeholder: "verdict / note", style: "flex:1", value: f.verdict || "" });
       const act = (s) => el("button", { class: `btn ${s === "verified" || s === "submitted" ? "primary" : ""}`, onclick: async () => {
@@ -174,7 +223,8 @@ async function openFinding(id) {
         el("div", { class: "row" }, v), el("div", { class: "row" }, ...["verified", "submitted", "inconclusive", "needs-proof", "duplicate", "rejected", "new"].map(act)));
     }
   }
-  fill(body, el("div", { class: "row" }, sev(f.severity), el("h3", { style: "margin:0" }, `F${f.id} · ${f.title}`)), sub, pane);
+  // the header: status, class and URL; the hunter's free-text title is shown only in the "Declared by the agent" block
+  fill(body, el("div", { class: "row" }, el("span", { class: `st-${f.status}` }, f.status), el("h3", { style: "margin:0" }, `F${f.id} · ${f.vuln_class || "?"}`), el("span", { class: "mono small muted" }, f.url || "")), sub, pane);
   sel("overview");
   drawer(body);
 }
@@ -288,6 +338,42 @@ views.board = async () => {
         el("td", {}, `I${x.id}`), el("td", {}, x.status), el("td", {}, x.title, x.outcome ? el("div", { class: "small muted" }, x.outcome) : null)))) : el("div", { class: "empty" }, "—"))));
 };
 
+// ------------------------------------------------------------------ lineage (W2-G)
+// Credit counted by the host (gate, judge, canary), next to the cost of each run, never mixed with it. The pseudo is
+// the agent's own word: shown only in the "Declared by the agent" block, escaped by the server (escape_invisible).
+let lineageProg = null;
+const pts = (v) => el("span", { class: v > 0 ? "pos" : v < 0 ? "neg" : "muted" }, v > 0 ? `+${v}` : String(v ?? 0));
+views.lineage = async () => {
+  const { programs } = await api("/api/lineage");
+  if (!programs.length) { fill($("#lineage"), el("div", { class: "empty" }, "Pas encore d'agent numéroté (lignée W2).")); return; }
+  if (!programs.includes(lineageProg)) lineageProg = programs.includes(status.active_scope?.program) ? status.active_scope.program : programs[0];
+  const sel = el("select", { onchange: (e) => { lineageProg = e.target.value; views.lineage(); } }, ...programs.map((n) => el("option", { value: n, selected: n === lineageProg }, n)));
+  const L = await api(`/api/lineage/${encodeURIComponent(lineageProg)}`);
+  const signals = L.ledger.map((r) => r.signal);
+  fill($("#lineage"),
+    el("div", { class: "row" }, "Programme ", sel, el("span", { class: "muted small mono" }, `poids ${L.weights_sha256.slice(0, 12)}`)),
+    el("h2", {}, "Observed by the harness"),
+    el("p", { class: "muted small" }, "Crédit calculé par l'hôte (statuts, étiquettes, clés, compteurs). L'agent en cours ne le voit pas ; le juge non plus."),
+    L.honor.length ? el("div", { class: "card" }, el("b", {}, "Tableau d'honneur (contributions)"), ...L.honor.map((h) => el("div", { class: "small" }, h))) : null,
+    el("h2", {}, "Agents"),
+    L.agents.length ? el("div", { style: "overflow-x:auto" }, el("table", {},
+      el("tr", {}, ...["n°", "génération", "statut", "run", "crédit", ...signals, "coût run", "coût vérif"].map((h) => el("th", {}, h))),
+      ...L.agents.map((a) => el("tr", {},
+        el("td", {}, `#${a.no}`), el("td", {}, a.generation ?? "—"), el("td", {}, el("span", { class: "badge" }, a.status || "—")),
+        el("td", {}, a.run_id ?? "—"), el("td", {}, el("b", {}, pts(a.points))),
+        ...signals.map((s) => el("td", { class: "small" }, a.credit[s] == null ? "—" : pts(a.credit[s]))),
+        el("td", {}, usd(a.cost_usd)), el("td", { class: "small muted" }, usd(a.verify_cost))))))
+      : el("div", { class: "empty" }, "Aucun agent sur ce programme."),
+    el("h2", {}, "Registre par signal"),
+    L.ledger.length ? el("table", {}, el("tr", {}, ...["signal", "lignes", "points"].map((h) => el("th", {}, h))),
+      ...L.ledger.map((r) => el("tr", {}, el("td", { class: "mono small" }, r.signal), el("td", {}, r.n), el("td", {}, pts(r.points)))))
+      : el("div", { class: "empty" }, "Registre vide (calculé à la clôture de chaque agent)."),
+    el("div", { class: "declared" }, el("h2", {}, "Declared by the agent"),
+      el("p", { class: "muted small" }, "Pseudos choisis par les agents : rien de ce bloc n'est vérifié par le harnais."),
+      L.declared.length ? el("table", {}, el("tr", {}, el("th", {}, "n°"), el("th", {}, "pseudo")),
+        ...L.declared.map((d) => el("tr", {}, el("td", {}, `#${d.no}`), el("td", {}, d.pseudo || "—")))) : el("div", { class: "muted small" }, "—")));
+};
+
 // ------------------------------------------------------------------ metrics (observability)
 const usd = (v) => (v == null ? "—" : `$${v.toFixed(2)}`);
 const kTok = (v) => (v == null ? "—" : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v));
@@ -344,6 +430,13 @@ function programCard(p, busy) {
     el("div", { class: "row" }, el("b", {}, `${p.platform}/${p.program}`), el("span", { class: "muted small mono" }, p.file),
       el("span", { class: "badge" }, `${p.rps ?? "∞"} req/s`), el("span", { class: "badge" }, p.automation === false ? "automation interdite" : p.automation ? "automation OK" : "automation ?"),
       el("span", { class: "muted small" }, `${p.runs} runs · dernier ${ago(p.last_run)}`)),
+    el("div", { class: "small" }, el("span", { class: "muted" }, "coût cumulé "), money(p.cost_usd),
+      el("span", { class: "muted" }, " · plafond "), p.cost_cap_usd == null ? "—" : money(p.cost_cap_usd),
+      el("span", { class: "muted" }, " · par finding vérifié "), money(p.cost_per_verified),
+      el("span", { class: "muted" }, " · par finding payé "), money(p.cost_per_paid),
+      el("span", { class: "muted" }, " · issues "), Object.entries(p.outcomes || {}).map(([k, n]) => `${k} ${n}`).join(", ") || "—",
+      el("span", { class: "muted" }, " · primes "), money(p.bounty_total)),
+    ...(p.alerts || []).map((a) => el("div", { class: "small err" }, a)),
     el("div", { class: "small" }, el("span", { class: "muted" }, "in: "), p.in_scope.join(", ")),
     p.out_of_scope.length ? el("div", { class: "small" }, el("span", { class: "muted" }, "out: "), p.out_of_scope.join(", ")) : null,
     el("div", { class: "small muted" }, `en-têtes: ${Object.entries(p.headers).map(([k, v]) => `${k}: ${v}`).join(" · ") || "—"} · identités: ${p.identities.join(", ") || "—"}`),
@@ -361,4 +454,4 @@ async function refresh() {
 window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (Object.hasOwn(views, t) && t !== current) show(t); });
 const start = (location.hash || "#dash").slice(1);
 show(Object.hasOwn(views, start) ? start : "dash");
-setInterval(() => { if (["dash", "live", "submit", "blockers", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);
+setInterval(() => { if (["dash", "live", "tools", "submit", "blockers", "traffic"].includes(current) && $("#drawer").classList.contains("hidden")) refresh(); else loadStatus().catch(() => {}); }, 3000);

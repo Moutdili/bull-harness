@@ -156,10 +156,42 @@ def reset(program: str = "", force: bool = False, call_=None) -> dict[str, Any]:
     return out
 
 
-def load(program: str, name: str, call_=None) -> dict[str, Any]:
+def scope_targets(scope) -> list[str]:
+    """URL prefixes of the scope's targets, for `bh-web net --body`: a URL rule as written (normalized), a domain
+    as https:// and http:// on its root. A wildcard or a network has no prefix: its responses stay unread (closed)."""
+    from bh.scope.model import RuleType
+    from bh.scope.normalize import DEFAULT_PORTS
+
+    out: list[str] = []
+    for r in getattr(scope, "in_scope", None) or ():
+        if not r.host or "*" in r.host:
+            continue
+        if r.type is RuleType.URL and r.scheme in ("http", "https"):
+            port = "" if r.port in (None, DEFAULT_PORTS[r.scheme]) else f":{r.port}"
+            out.append(f"{r.scheme}://{r.host}{port}{r.path or '/'}")
+        elif r.type is RuleType.DOMAIN:
+            out += [f"https://{r.host}/", f"http://{r.host}/"]
+    return list(dict.fromkeys(out))
+
+
+def tz_offset_min(now: float | None = None) -> int:
+    """Minutes east of UTC of this host's local clock (the controller's day and the service's reset time)."""
+    return int(time.localtime(now).tm_gmtoff // 60)
+
+
+def load(program: str, name: str, call_=None, *, scope=None) -> dict[str, Any]:
     """Load `name`'s session (the controller refuses it on a profile that holds another account); on success the
-    gate is told which identity bh-browser holds."""
+    gate is told which identity bh-browser holds.
+
+    With `scope`, the controller is told what it must know of it (it knows no scope): `passthrough` (a third-party
+    challenge host: a challenge label at the end of the page is enough) and `targets` (the URL prefixes whose
+    responses `net --body` may read). Without it: no target, passthrough left to the controller's default (true).
+    `tz_offset_min` (this host's clock) always."""
     req, _ = identity_payload(program, name)
+    req["tz_offset_min"] = tz_offset_min()
+    req["targets"] = scope_targets(scope) if scope is not None else []
+    if scope is not None:
+        req["passthrough"] = bool(scope.support_hosts("passthrough"))
     out = (call_ or call)(req)
     if out.get("code") == 200:
         write_identity(program, name)
@@ -179,8 +211,16 @@ def mark_done() -> dict[str, Any]:
     tmp = f.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec))
     os.replace(tmp, f)
-    told = call({"op": "human_done"}, timeout=30).get("code") == 200
-    return {"ok": True, "t": rec["t"], "browser_told": told}
+    out = call({"op": "human_done"}, timeout=30)
+    told = out.get("code") == 200
+    # watching: the screen turns spectator (the agent goes on); challenge_pending: the click came too early
+    return {
+        "ok": True,
+        "t": rec["t"],
+        "browser_told": told,
+        "watching": bool(out.get("watching")) if told else False,
+        "challenge_pending": bool(out.get("challenge_pending")) if told else None,
+    }
 
 
 def snapshot_file():
@@ -206,6 +246,22 @@ def save_snapshot(path=None, call_=None) -> dict[str, Any]:
             indent=1,
         )
     return {"ok": True, "file": str(f), "challenge": out["challenge"]}
+
+
+def shot(dest, call_=None) -> dict[str, Any]:
+    """One PNG of bh-browser's page (controller op `shot`, host only), written 0600 to `dest`. The controller
+    refuses it while a human challenge is pending or the operator has the screen. The image stays on the host:
+    never mounted in a container, never given to the judge or the agent (bh.stats.poc_shot)."""
+    from bh.stats import write_png
+
+    out = (call_ or call)({"op": "shot"})
+    if out.get("code") != 200:
+        return {"ok": False, "error": f"{out.get('error', 'no reply')} {out.get('detail', '')}".strip()}
+    try:
+        n = write_png(Path(dest), out.get("png_b64") or "")
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    return {"ok": True, "file": str(dest), "bytes": n}
 
 
 def view_url(host: str | None = None, port: int = 7340) -> str:

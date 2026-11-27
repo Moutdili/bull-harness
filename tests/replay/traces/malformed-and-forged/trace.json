@@ -1,0 +1,29 @@
+{
+ "synthetic": true,
+ "about": "Notes the sandbox wrote badly (not JSON, not an object, a field of the wrong type, a threat model without lines) and notes that try to pass for the host: a [refusal] title, a blocker or harness kind, a refusal reason. The board keeps the hunter's words as the hunter's, never as the host's.",
+ "program": "replay-lab",
+ "run_id": 1,
+ "model": "claude-replay",
+ "identities": [
+  "user-a",
+  "user-b"
+ ],
+ "scope": {
+  "program": "replay-lab",
+  "platform": "local",
+  "in_scope": [
+   "app.replay.test"
+  ],
+  "forbidden_vulns": [
+   "dos"
+  ],
+  "identities": [
+   {
+    "name": "user-a"
+   },
+   {
+    "name": "user-b"
+   }
+  ]
+ }
+}

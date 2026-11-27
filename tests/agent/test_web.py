@@ -23,7 +23,8 @@ def test_wait_human_returns_once_cleared_and_gives_up_at_the_timeout(capsys):
     t = iter(range(0, 1000, 50))
     pending = {"challenge": {"pending": True, "since": 1.0}}
     assert web.wait_human(100, call=lambda r, t_: pending, sleep=lambda s: None, clock=lambda: next(t)) == 3
-    assert "blocked captcha" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "blocked captcha" not in err and "bh-web wait-human" in err and "bh-note intent" in err  # R5
 
 
 def test_without_a_token_bh_web_says_the_browser_is_unavailable(monkeypatch):
@@ -89,7 +90,7 @@ def test_every_agent_op_has_a_command_and_no_host_op_does():
     from bh.browser_service import AGENT_OPS, HOST_OPS
 
     for op in AGENT_OPS:
-        assert f"bh-web {op}" in web.__doc__, op
+        assert f"bh-web {op.replace('_', '-')}" in web.__doc__, op  # ws_rewrite is `bh-web ws-rewrite`
     for op in HOST_OPS:
         assert web.request_for([op]) is None and web.request_for([op, "x"]) is None, op
 
@@ -160,3 +161,34 @@ def test_print_exit_codes(capsys):
     assert web._print({"error": "goto: TimeoutError: x"}, "goto") == 1
     assert web._print({"text": "abc", "truncated": True, "length": 9, "from": "tail"}, "text") == 0
     assert "truncated at the start: 9" in capsys.readouterr().out
+
+
+def test_wait_human_waits_for_the_screen_to_be_handed_back(capsys):
+    """N3: the challenge is gone but the operator still has the screen; rc 0 only once he clicks J'ai fini."""
+    states = iter(
+        [
+            {"challenge": {"pending": True}, "human_viewing": True},
+            {"challenge": {"pending": False}, "human_viewing": True},
+            {"challenge": {"pending": False}, "human_viewing": False, "human_done_at": 5.0},
+        ]
+    )
+    assert web.wait_human(100, call=lambda r, t: next(states), sleep=lambda s: None) == 0
+    assert '"cleared"' in capsys.readouterr().out
+    t = iter([0, 200])
+    viewing = {"challenge": {"pending": False}, "human_viewing": True}
+    assert web.wait_human(100, call=lambda r, t_: viewing, sleep=lambda s: None, clock=lambda: next(t)) == 3
+
+
+def test_ws_rewrite_command_line(tmp_path):
+    tok = tmp_path / "tok.txt"
+    tok.write_text("eyJCCCCCC\n")
+    assert web.request_for(["ws-rewrite", "eyJBBBBBB", f"@{tok}", "--url-contains", "/Chathub/", "--ttl", "120"]) == {
+        "op": "ws_rewrite",
+        "find": "eyJBBBBBB",
+        "replace": "eyJCCCCCC",
+        "url_contains": "/Chathub/",
+        "ttl": 120,
+    }
+    assert web.request_for(["ws-rewrite", "only-one"]) is None
+    assert web.request_for(["ws-rewrite", "a", "b", "--bogus", "1"]) is None
+    assert web.request_for(["ws-rewrite", "@/nonexistent/file", "b"]) is None

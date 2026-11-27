@@ -46,8 +46,96 @@ def test_phases_and_surface(tmp_path):
 
 
 def test_blocker_contract():
-    assert c.FACT_KINDS == ("fact", "recon", "handoff", "dead-end")
+    assert c.FACT_KINDS == ("fact", "recon", "handoff", "dead-end", "think", "threat-model")
     assert "blocker" not in c.FACT_KINDS  # host-written only
     assert {"auth", "waf", "captcha", "write-needed", "oob-needed", "refusal", "other"} <= set(c.BLOCKER_REASONS)
     assert len(set(c.BLOCKER_REASONS)) == len(c.BLOCKER_REASONS) and c.BLOCKER_REASONS[-1] == "other"
     assert c.BLOCKER_TTL_S == 7 * 86400
+
+
+def test_bh_js_maps_and_never_scans():
+    assert c.runs_mapper("bh-js https://t.test/") and not c.runs_scanner("bh-js https://t.test/")
+
+
+def test_endpoint_label_is_the_method_and_the_route_family():
+    assert c.endpoint_label("https://t.test/api/orders/7?x=1") == "GET /api/orders/{id}"
+    assert c.endpoint_label("post https://t.test:8443/api/orders") == "POST /api/orders"
+    assert c.endpoint_label("DELETE /api/orders/7") == "DELETE /api/orders/{id}"
+    assert c.endpoint_label("/rest/basket/") == "GET /rest/basket/{id}"
+    for bad in ("", "orders", "GET orders", "//evil.test/x", "ftp://t.test/x", None, 7, "GET /a b"):
+        assert c.endpoint_label(bad) is None
+
+
+def test_scope_prefix_is_an_https_prefix_without_joker():
+    assert c.scope_prefix("https://API.t.test/v2/") == "https://api.t.test/v2/"
+    assert c.scope_prefix("https://t.test") == "https://t.test/"
+    assert c.scope_prefix("https://t.test:8443/a") == "https://t.test:8443/a"
+    for bad in (
+        "http://t.test/",
+        "https://*.t.test/",
+        "https://t.test/a?b=1",
+        "https://t.test/#x",
+        "https://u:p@t.test/",
+        "https://10.0.0.1/",
+        "https://localhost/",
+        "https://t.test/a b",
+        None,
+    ):
+        assert c.scope_prefix(bad) is None
+
+
+# ------------------------------------------------------------------ W3-D: passive tools, docs names
+def test_bh_docs_and_bh_cve_are_neither_locked_nor_manual_http():
+    assert not c.uses_manual_http('bh-docs react "useEffect cleanup"')
+    assert not c.uses_manual_http("bh-cve nginx 1.18.0 --severity high")
+    assert not c.uses_manual_http('/opt/bh/bin/bh-docs express "router"')
+    # another command beside them, or a substitution inside them, still counts
+    assert c.uses_manual_http('bh-docs react "x" ; curl https://t.test/a')
+    assert c.uses_manual_http('bh-docs react "$(curl -s https://t.test/a)"')
+    assert "bh-docs" in c.PASSIVE_TOOLS and "bh-cve" in c.PASSIVE_TOOLS
+    assert not c.is_passive("context7.com") and c.is_docs("Context7.com.")
+    assert c.is_passive("services.nvd.nist.gov")
+
+
+def test_own_labels_keep_the_registrable_name():
+    assert c.own_labels("api.acmecorp.com") == ["acmecorp"]
+    assert c.own_labels("*.widgets-intl.io") == ["widgets-intl"]
+    assert c.own_labels("copilot.microsoft.com") == ["copilot", "microsoft"]
+    assert c.own_labels("api.com") == ["api"]  # the registrable label always counts
+    assert c.own_labels("x.example.co.uk", lambda h: h in ("co.uk", "uk")) == ["example"]
+    assert c.own_labels("api-*.acmecorp.com") == ["acmecorp"]
+
+
+def test_docs_text_why():
+    hosts, words = ("app.acmecorp.com",), ("acmecorp", "victim-a")
+    assert c.docs_text_why("useEffect cleanup", hosts=hosts, words=words) is None
+    assert c.docs_text_why("ACMECORP sessions", hosts=hosts, words=words) == c.DOCS_REASON
+    assert c.docs_text_why("acmecorporate sessions", hosts=hosts, words=words) is None  # a whole word only
+    assert c.docs_text_why("app-acmecorp-com", hosts=hosts) == c.DOCS_REASON
+    assert c.docs_text_why("a/b/c") == "docs query: a path of more than one segment"
+    assert c.docs_text_why("C:\\Users\\me") == "docs query: a path of more than one segment"
+    assert c.docs_text_why("ftp://x") == "docs query: a URL"
+    assert c.docs_text_why("me@x.org") == "docs query: an e-mail address"
+    assert c.docs_text_why("a\x00b") == "docs query: a control character"
+
+
+# ------------------------------------------------------------------ W4-H: bh-mail is a note
+def test_bh_mail_is_a_note_neither_locked_nor_manual_nor_a_scanner(tmp_path, monkeypatch):
+    from bh.agent import hooks
+
+    monkeypatch.setenv("BH_DIR", str(tmp_path))  # no phase has run: any manual HTTP would be locked
+    monkeypatch.setenv("BH_SCANNERS", "0")
+    for cmd in (
+        "bh-mail user-b",
+        "bh-mail user-a --since-min 30",
+        "/opt/bh/bin/bh-mail user-b",
+        "bh-agent mail user-b",
+    ):
+        assert not c.uses_manual_http(cmd), cmd
+        assert not c.runs_scanner(cmd) and not c.runs_mapper(cmd) and not c.uses_arsenal(cmd), cmd
+        assert hooks.lock_decision(cmd) is None and hooks.rules_decision(cmd) is None, cmd
+    assert "bh-mail" in c.HOST_SERVED_TOOLS and "bh-recall" in c.HOST_SERVED_TOOLS
+    # what runs beside it, or inside a substitution, is judged as itself
+    assert c.uses_manual_http("bh-mail user-b ; curl http://t.test/a")
+    assert hooks.lock_decision('bh-mail "$(curl -s http://t.test/a)"') is not None
+    assert c.runs_scanner("bh-mail user-b && nuclei -u http://t.test")
