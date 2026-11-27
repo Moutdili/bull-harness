@@ -7,6 +7,10 @@ Wave W2 (D9) adds what makes an agent relaunchable as it was: the hook layer (`h
 hooks/settings.json and bh.agent.mcp_policy), the gate policy (`policy_sha256`), the doctrine opening, the naming
 rule (`pseudo_rule` = bh.lineage.names.TABLES_SHA256) and whether the pseudo is shown (BH_LINEAGE_PSEUDO), the score
 weights (lot G's `score.weights_sha256()`, None while it does not exist) and the recall parameters.
+Wave W3 adds what the agent is given to work with: `skills` (name and condensate of every skill linked into its HOME),
+`mcp` (its MCP servers, condensates of container/agent/hooks/mcp.json, of the HexStrike registry and of the server
+code; `enabled` False and no server with BH_MCP=0), `tools` (the --tools list) and `pinned` (the skills whose text
+the task carries for this program and model, D34).
 Two segments set up alike share a condensate; any change to one knob changes it. The document never holds a
 secret: identities are names and roles (never a session, a credential or a recipe), texts are condensates.
 
@@ -36,6 +40,8 @@ COLUMNS = (
     ("friction", "TEXT"),  # D35: {"challenges_extra", "browser_429"} of a bh-browser segment
     ("quota", "TEXT"),  # R44: {"identity", "allot", "sent", "remaining_pct", "spent"} of a bh-browser segment
     ("decisions", "INTEGER"),  # T20: bh_decision events of the run (rotation, nudge, budget tier, WAF pause, stop)
+    ("repeats", "INTEGER"),  # W3: tool calls the hooks refused as a repeat ([bh-repeat])
+    ("fails", "INTEGER"),  # W3: [bh-fail] lines in the tool results
 )
 
 
@@ -130,6 +136,62 @@ def score_weights_sha256() -> str | None:
     return None
 
 
+MCP_FILE = _BH.parents[1] / "container" / "agent" / "hooks" / "mcp.json"
+MCP_CODE = (_BH / "agent" / "mcp", _BH / "agent" / "hexstrike")  # the servers' code (lots A and B), when present
+HEXSTRIKE_REGISTRY = _BH / "agent" / "hexstrike" / "registry.py"
+
+
+def tree_sha256(root: Path) -> str | None:
+    """One condensate for a directory: {relative path: sha256} of every file under it (links are not followed out of
+    it), None when it does not exist. A file `root` is hashed as such."""
+    if root.is_file():
+        return file_sha256(root)
+    if not root.is_dir():
+        return None
+    files = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and "__pycache__" not in p.parts:
+            files[p.relative_to(root).as_posix()] = file_sha256(p)
+    return sha256(canonical(files))
+
+
+def mcp_enabled(env=None) -> bool:
+    """BH_MCP=0: the hunter starts without its MCP servers."""
+    env = os.environ if env is None else env
+    return str(env.get("BH_MCP", "1")).strip() != "0"
+
+
+def mcp_servers(path: Path = MCP_FILE) -> list[str]:
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    servers = doc.get("mcpServers") if isinstance(doc, dict) else None
+    return sorted(servers) if isinstance(servers, dict) else []
+
+
+def mcp_setup(env=None) -> dict:
+    """The hunter's MCP servers as this segment starts them. The condensates are kept with BH_MCP=0 too: what the
+    image holds does not change, `enabled` and `servers` do."""
+    on = mcp_enabled(env)
+    return {
+        "enabled": on,
+        "servers": mcp_servers() if on else [],
+        "config_sha256": file_sha256(MCP_FILE),
+        "registry_sha256": file_sha256(HEXSTRIKE_REGISTRY),
+        "code_sha256": sha256(canonical({p.name: tree_sha256(p) for p in MCP_CODE})),
+    }
+
+
+def skill_sha256(name: str) -> str | None:
+    """Condensate of one skill's directory (every file of it), None when it cannot be read."""
+    try:
+        root = Path(classes.skills_dir()) / name
+    except Exception:  # noqa: BLE001 (lot C's classes.skills_dir absent: the skill cannot be hashed)
+        return None
+    return tree_sha256(root)
+
+
 def pseudo_shown_setting(env=None) -> str:
     """BH_LINEAGE_PSEUDO as the segment runs with it: "0" (pseudo hidden from the agent) or "1" (the default)."""
     env = os.environ if env is None else env
@@ -157,9 +219,15 @@ def setup(
     doctrine_opening: str = DOCTRINE_OPENING,
     recall_params: dict | None = None,
     pseudo_shown: str | None = None,
+    skills: list[str] | None = None,
+    pinned: list[str] | None = None,
+    tools: str | None = None,
+    mcp: dict | None = None,
 ) -> tuple[str, dict]:
     """(sha256 of the canonical document, the document). `recall_params`: what the agent is given of its elders
-    (counts, windows), numbers and names only; `pseudo_shown` defaults to BH_LINEAGE_PSEUDO."""
+    (counts, windows), numbers and names only; `pseudo_shown` defaults to BH_LINEAGE_PSEUDO. W3: `skills` the skills
+    linked into the session (None: none, the cards path), `pinned` the skills the task carries in full, `tools` the
+    --tools list, `mcp` the servers (mcp_setup() by default)."""
     try:  # the lineage is optional to a run (lineage_hooks): without it the setup still hashes
         from bh.lineage import names
 
@@ -201,5 +269,10 @@ def setup(
         "pseudo_shown": pseudo_shown_setting() if pseudo_shown is None else str(pseudo_shown),
         "score_weights_sha256": score_weights_sha256(),
         "recall_params": redact.data(dict(recall_params or {})),
+        # W3 (D18-D22, D34)
+        "skills": None if skills is None else [{"name": n, "sha256": skill_sha256(n)} for n in sorted(skills)],
+        "pinned": sorted(pinned or ()),
+        "tools": tools,
+        "mcp": mcp_setup() if mcp is None else mcp,
     }
     return sha256(canonical(doc)), doc

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "bh": {
+      "type": "stdio",
+      "command": "/opt/bh/bin/bh-agent",
+      "args": ["mcp", "bh"],
+      "env": {}
+    },
+    "hexstrike": {
+      "type": "stdio",
+      "command": "/opt/bh/bin/bh-agent",
+      "args": ["mcp", "hexstrike"],
+      "env": {}
+    }
+  }
+}
