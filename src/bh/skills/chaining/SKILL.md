@@ -10,6 +10,7 @@ the "sum of CVSS times a synergy factor" chain score. -->
 # Chaining
 
 ## When
+- An open intent `chain F<a>+F<b>`: the host adds one per pair of findings the judge did not reject.
 - A new fact lands next to older ones (`bh-note frontier`).
 - A finding alone would be closed "informative": self-XSS, open redirect, a public id list, a permissive CORS.
 
@@ -35,7 +36,8 @@ the "sum of CVSS times a synergy factor" chain score. -->
 
 ## Proof
 One proof.json for the chain: setup steps in order, the last `attack` step shows the final impact, the `control`
-breaks one link (the same final request without the first link's effect) and expects the final step to fail.
+breaks one link (the same final request without the first link's effect) and expects the final step to fail. It is
+the chain's own file, written for it: never the proof.json of one of its findings, which stays as it was.
 `bh-note finding "<title>" --severity <the final impact's> --class <the final link's class> --url <url> --proof
 proof.json --summary "<link 1 (actor) -> link 2 (actor)>" --not-proven "<first link not run>" --counter "<...>"
 --severity-if "<...>" --severity-why "<...>"`.

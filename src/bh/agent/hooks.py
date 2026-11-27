@@ -11,10 +11,12 @@ PostToolUse(Bash): an output is recognised before it is cut (T37): a binary one 
   shows 16 bytes in hex and the path; a minified bundle (few lines, a line over BUNDLE_LINE characters) its type,
   size and path; else a long output goes to raw/ and the model sees head + tail + the path. Exception: a single
   `bh-web text|frames|outline` or `bh-web net --body <i>` (already bounded by bh-browser; a chat's answer sits at the
-  end and must not be elided) is shown whole up to EXEMPT_CHARS. Then the turn budget (budget_line). The first
-  REPEAT_LINES lines of every output are kept under repeat/ for T33.
+  end and must not be elided) is shown whole up to EXEMPT_CHARS. Then the turn budget (budget_line) and the
+  progress review (review_line). The first REPEAT_LINES lines of every output are kept under repeat/ for T33.
 PostToolUse(mcp__*): no rewrite (the shape of an MCP result is the server's); an output over MAX_CHARS is logged in
-  trunc.jsonl.
+  trunc.jsonl. The call counts for the progress review, which the next Bash output carries.
+Progress review (T34): REVIEW_EVERY tool calls without a new line in notes.jsonl, once per slice of REVIEW_EVERY, six
+  questions signed `[bh-review]` and the way to the board. No second model; nothing in it asks to finish.
 
 Both fail open on unexpected errors: a broken hook must not stall the hunt (the gate is the boundary, the hooks
 only help). An unknown MCP tool is not an error: it is refused. An unreadable coverage file is not an error either,
@@ -75,6 +77,20 @@ BUDGET_STEPS = (70, 85, 95)
 BUDGET_LINE = (
     "[bh-budget] {pct}% of the turn budget is used: save your state now with bh-note handoff. "
     "This is not a request to finish."
+)
+
+
+# Progress review (T34): state in review.json, reset by a new line in notes.jsonl or a new turn budget (a new leg)
+REVIEW, REVIEW_EVERY, REVIEW_MARK = "review.json", 15, "[bh-review]"
+REVIEW_TEXT = (
+    "[bh-review] {n} tool calls since the last line of your notes. Six questions:\n"
+    "1. What have I learned that a request can verify?\n"
+    "2. Which lead is closed, and why?\n"
+    "3. What would prove the lead still open?\n"
+    "4. Have I asked `bh-recall` about it?\n"
+    "5. Which surface have I not touched?\n"
+    "6. What do I write down now?\n"
+    "The board: `bh-note frontier`."
 )
 
 
@@ -541,6 +557,41 @@ def _safe_budget_line() -> str | None:
         return None
 
 
+def _notes_mark(d: Path) -> list[int] | None:
+    try:
+        st = os.stat(d / c.NOTES)
+    except OSError:
+        return None
+    return [st.st_ino, st.st_size]
+
+
+def review_line(d: Path | None = None, *, show: bool = True) -> str | None:
+    """T34: one more tool call. When REVIEW_EVERY calls went by without a new line in notes.jsonl, the `[bh-review]`
+    questions, once per slice of REVIEW_EVERY calls; None otherwise. `show` False (an MCP call, whose output the hook
+    does not rewrite): counted, never said, so the next Bash output says it. Never for the verifier."""
+    if c.is_verifier():
+        return None
+    d = d or c.bh_dir()
+    mark = _notes_mark(d)
+    budget = c.read_json(d / BUDGET, None)
+    leg = budget.get("ts") if isinstance(budget, dict) else None
+    doc = c.read_json(d / REVIEW, None)
+    if not isinstance(doc, dict) or doc.get("leg") != leg:
+        doc = {"leg": leg, "notes": mark, "calls": 1, "said": 0}  # a new leg: this call is its first
+    elif doc.get("notes") != mark:
+        doc = {"leg": leg, "notes": mark, "calls": 0, "said": 0}  # a new note: the count starts after it
+    else:
+        calls, said = doc.get("calls"), doc.get("said")
+        doc["calls"] = (calls if isinstance(calls, int) and not isinstance(calls, bool) else 0) + 1
+        doc["said"] = said if isinstance(said, int) and not isinstance(said, bool) else 0
+    out = None
+    if show and doc["calls"] // REVIEW_EVERY > doc["said"]:
+        doc["said"] = doc["calls"] // REVIEW_EVERY
+        out = REVIEW_TEXT.format(n=doc["calls"])
+    c.write_json(d / REVIEW, doc)
+    return out
+
+
 def _size(resp: object) -> int:
     if isinstance(resp, str):
         return len(resp)
@@ -554,6 +605,7 @@ def post_tool_use(ev: dict) -> dict | None:
     name = ev.get("tool_name")
     resp = ev.get("tool_response")
     if mcp_policy.is_mcp(name):
+        _safe(lambda: review_line(show=False))  # counted; the next Bash output carries the review
         # no rewrite: the result's shape belongs to the server; an oversized one is only logged
         if (size := _size(resp)) > MAX_CHARS:
             c.append_jsonl(c.bh_dir() / "trunc.jsonl", {"tool": name[:200], "chars": size})
@@ -573,12 +625,14 @@ def post_tool_use(ev: dict) -> dict | None:
     if isinstance(cmd, str):
         _safe(repeat_record, cmd, ev.get("session_id"), stdout, resp.get("stderr") or "")
     budget = _safe_budget_line()
-    if not (s1 or s2 or budget):
+    review = _safe(review_line)
+    if not (s1 or s2 or budget or review):
         return None
     if s1 or s2:
         c.append_jsonl(c.bh_dir() / "trunc.jsonl", {"stdout": s1, "stderr": s2})
-    if budget:
-        out = out + ("\n" if out and not out.endswith("\n") else "") + budget
+    for line in (budget, review):
+        if line:
+            out = out + ("\n" if out and not out.endswith("\n") else "") + line
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",

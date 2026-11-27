@@ -87,7 +87,8 @@ HARD = (
 # measured with ID_LIMIT 6 and ID_WINDOW_S 600, opening `legacy`: every line added to the doctrine is paid each turn.
 # W2-E: +3 lines in the Board section (lot A's --quote, bh-recall/--kind/--recall, -k dead-end --why, cover, think).
 # W3-G: +4 lines, +528 bytes in each variant (skills and MCP: 2 in the Arsenal; T40: 1 under `q`; T35: 1 in Method).
-SIZE = {True: (11621, 111), False: (11329, 109)}
+# W4-D: +1 line, +225 bytes in each variant (lot C: `--proof-level` and `--cvss` on the finding command, one line).
+SIZE = {True: (11846, 112), False: (11554, 110)}
 # D17: each opening raises the bound by its own exact size (bytes, lines), no more
 OPENING_SIZE = {"legacy": (0, 0), "a": (2392, 32), "b": (1041, 12), "c": (553, 6)}
 OPENING_SHA = {

@@ -14,6 +14,7 @@ believed only where another source agrees (see `refusal_confirmed`, `quota_confi
 from __future__ import annotations
 
 import fcntl
+import importlib
 import inspect
 import json
 import os
@@ -21,6 +22,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -37,7 +39,7 @@ from bh import classes, paths, retention, stack
 from bh.assets import Graph
 from bh.agent import contract as c
 from bh.board import Board
-from bh.runner import identity, ingest, lineage_hooks
+from bh.runner import identity, ingest, lineage_hooks, missions
 from bh.runner.prompt import build_system_prompt, build_task, opening_name
 from bh.scope import Scope, load_scope
 from bh.text import one_line
@@ -77,6 +79,12 @@ CONTINUE_PROMPT = (
     "Continue in this session: about {turns} turns and {minutes} minutes remain. Run `bh-note frontier`, "
     "take the next untested endpoint or open intent, or the next unchecked surface of the program card, test it, "
     "record the outcome, and keep going. Keep the HANDOFF fact current."
+)
+# The same, for a session on a mission (T17): the objective, not the whole board, is what it goes on with.
+MISSION_CONTINUE_PROMPT = (
+    "Continue in this session: about {turns} turns and {minutes} minutes remain for the mission. Run `bh-note "
+    "frontier`, take the next angle of the mission's objective, test it, record the outcome, and keep going. Keep the "
+    "HANDOFF fact current."
 )
 # Context rotation (issue 10, TODO 4.2b). A turn's context = input + cache read + cache write tokens. Measured
 # (plan v3 §1): 8.4-10.3k at the base of a session, a 19.4k peak over 22 turns (run 12). 30k is 3x the base and
@@ -833,7 +841,7 @@ def push_system_prompt(text: str) -> None:
         raise SystemExit(f"cannot write the system prompt in {stack.AGENT}: {r.stderr.strip()}")
 
 
-def rotate_notes(program: str, run_id: int, leg: int | None = None) -> Path:
+def rotate_notes(program: str, run_id: int, leg: int | str | None = None) -> Path:
     """Freeze this segment's notes under a per-run name (per leg for a mid-segment context rotation, so the
     end-of-segment rotation never re-reads a file already ingested); returns the host path to ingest."""
     name = f"notes-{run_id}.jsonl" if leg is None else f"notes-{run_id}-leg{leg}.jsonl"
@@ -1105,9 +1113,11 @@ def agent_command(
     extra_env: dict[str, str] | None = None,
     user: str = "hunter",
     identities: list[str] | None = None,
+    canary_at: float | None = None,
 ) -> list[str]:
     """claude -p inside the agent for this program. `bh_dir`/`extra_env`/`user` let the verifier reuse it with
     its own work dir, role and Unix user. `identities`: the names offered to the agent (default: every one).
+    `canary_at` (lot B): when the host planted a canary for this program, BH_CANARY_AT (epoch seconds).
 
     The hunter (no `bh_dir`, user `hunter`, no verifier role) gets the skills linked in its HOME (the `Skill` tool, so
     no `--disable-slash-commands`, which turns every skill off) and the two MCP servers of MCP_CONFIG (none with
@@ -1127,6 +1137,7 @@ def agent_command(
         "BH_IDENTITIES": ",".join(identities),
         "BH_IDENTITY_ROLES": identity_roles(scope, identities),  # never a secret: role and tenant labels
         "HOME": sandbox_home(run_id),
+        **({"BH_CANARY_AT": f"{canary_at:.3f}"} if canary_at is not None else {}),
         **BASH_TIMEOUT_MS,
         **(HUNTER_ENV if hunter else {}),
         **(extra_env or {}),
@@ -1509,6 +1520,10 @@ def finish(
     set aside, new out-of-scope hosts are recorded once."""
     prog = scope.program
     facts, findings, blockers = ingest.notes(board, prog, res.run_id, rotate_notes(prog, res.run_id), scope)
+    try:  # lot B: the gate reads the segment's baseline from var/state/baseline/
+        save_baseline(prog)
+    except OSError as exc:
+        print(f"  ⚠ baseline not copied: {type(exc).__name__}: {one_line(str(exc), 160)}", flush=True)
     # added to what a mid-segment context rotation already ingested
     res.new_facts += facts
     res.new_findings += findings
@@ -1729,7 +1744,7 @@ def closing_handoff(board: Board, scope: Scope, res: SegmentResult) -> bool:
 # ------------------------------------------------------------------ decisions journal (T20)
 # What the runner decided on its own, one `bh_decision` event each, in the run log and the agent's trace. The event
 # holds the kind of decision and the run, never a word of the target (no host, no URL, no title).
-DECISIONS = ("rotation", "nudge", "lock", "threshold", "pause", "stop", "park")
+DECISIONS = ("rotation", "nudge", "lock", "threshold", "pause", "stop", "park", "mission", "extension")
 
 
 def decision_event(what: str, run_id: int, now: float | None = None) -> dict:
@@ -2081,6 +2096,8 @@ def setup_doc(
         pinned=task_skills(scope, model)[1] if skills is not None else [],
         tools=hunter_tools(),
         mcp=identity.mcp_setup(),
+        missions=missions.setting(),
+        cost_cap_usd=sv.cost_cap(scope),
     )
     for k, v in lineage_setup().items():
         doc.setdefault(k, v)
@@ -2427,6 +2444,213 @@ def revoke_request(board: Board, rid: int, by: str = "operator") -> dict | None:
     return rows[0]
 
 
+# ------------------------------------------------------------------ chains (T29)
+CHAIN_MAX_NEW = 3  # chain intents one call adds at most: the next calls add the other pairs
+_CHAIN_INTENT = re.compile(r"^chain F(\d+)\+F(\d+)\b")
+
+
+def chain_intents(board: Board, program: str) -> list[int]:
+    """T29: two findings verified, verified-evidence or inconclusive on a program make one intent `chain F<a>+F<b>`
+    that names the skill `chaining` (once per pair, open or closed since). Written by the host (no run: no agent
+    closes it as left open). Returns the new intent ids; never raises."""
+    try:
+        have = {
+            (int(m.group(1)), int(m.group(2)))
+            for r in board.rows("SELECT title FROM intents WHERE program=? AND title LIKE 'chain F%'", program)
+            if (m := _CHAIN_INTENT.match(r["title"] or ""))
+        }
+        out: list[int] = []
+        for a, b in missions.chain_pairs(board, program):
+            if (a, b) in have:
+                continue
+            out.append(board.add_intent(program, missions.chain_title(a, b), None, kind="test", basis=f"F{a}"))
+            if len(out) >= CHAIN_MAX_NEW:
+                break
+        return out
+    except Exception as exc:  # noqa: BLE001 (a chain is a lead: the segment never fails on it)
+        print(f"  ⚠ chain intents not added: {type(exc).__name__}: {one_line(str(exc), 160)}", flush=True)
+        return []
+
+
+# ------------------------------------------------------------------ other lots' hooks (W4), each one guarded
+def _optional(modules: tuple[str, ...], attr: str):
+    """The first `module.attr` that imports, None when no lot has shipped it."""
+    for name in modules:
+        try:
+            fn = getattr(importlib.import_module(name), attr, None)
+        except ImportError:
+            continue
+        if callable(fn):
+            return fn
+    return None
+
+
+def after_verification(board: Board, scope: Scope, before: dict[int, str], say) -> list[int]:
+    """Findings this verification moved to `verified` or `verified-evidence`: lot F derives their techniques
+    (`techniques.derive(board, fid)`); on a persistent-browser scope lot E takes the PoC screenshot
+    (`bh.stats.poc_shot(program, fid)`, which checks itself for a pending challenge or the operator at the screen);
+    then T29's chain intents. Never raises."""
+    done = []
+    try:
+        for r in board.rows("SELECT id, status FROM findings WHERE program=?", scope.program):
+            if r["status"] in ("verified", "verified-evidence") and before.get(r["id"]) != r["status"]:
+                done.append(int(r["id"]))
+    except Exception as exc:  # noqa: BLE001
+        say(f"  ⚠ verified findings not read: {type(exc).__name__}")
+        return []
+    derive = _optional(("bh.techniques", "bh.lineage.techniques"), "derive")
+    shot = _optional(("bh.stats",), "poc_shot") if has_browser(scope) else None
+    for fid in done:
+        for name, call in (
+            ("techniques", derive and (lambda f=fid: derive(board, f))),
+            ("poc shot", shot and (lambda f=fid: shot(scope.program, f))),
+        ):
+            if not call:
+                continue
+            try:
+                call()
+            except Exception as exc:  # noqa: BLE001 (another lot's step: said, never fatal)
+                say(f"  ⚠ F{fid}: {name} skipped ({type(exc).__name__}: {one_line(str(exc), 120)})")
+    chain_intents(board, scope.program)
+    return done
+
+
+BASELINE_FILE = "baseline.json"  # lot B: the sandbox's baseline, copied for the gate after each ingestion
+BASELINE_MAX = 4 << 20
+
+
+def save_baseline(program: str) -> Path | None:
+    """Lot B: the baseline the segment left in its .bh dir, copied to var/state/baseline/<program>.json (atomic; a
+    link, a non-regular file or one over BASELINE_MAX is left where it is). None when there is none."""
+    src = paths.work_bh(program) / BASELINE_FILE
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > BASELINE_MAX:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = fh.read(BASELINE_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(data) > BASELINE_MAX:
+        return None
+    dst = paths.state() / "baseline" / f"{program}.json"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, dst)
+    return dst
+
+
+def planted_canary_at(program: str) -> float | None:
+    """Lot B: when the host planted a canary for this program (`bh.gate.canary.planted_at`), None without one."""
+    fn = _optional(("bh.gate.canary",), "planted_at")
+    if fn is None:
+        return None
+    try:
+        v = fn(program)
+    except Exception:  # noqa: BLE001
+        return None
+    return float(v) if isinstance(v, int | float) and not isinstance(v, bool) else None
+
+
+def start_mail(scope: Scope, run_id: int, say):
+    """Lot H: bh.mailserve.MailServer(program, run_id, scope), started for a scope with `mail_from`; None otherwise
+    or when it cannot start (the segment runs without bh-mail)."""
+    if not getattr(scope, "mail_from", ()):
+        return None
+    try:
+        from bh.mailserve import MailServer
+
+        server = MailServer(scope.program, run_id, scope)
+        server.start()
+        return server
+    except Exception as exc:  # noqa: BLE001
+        say(f"  ⚠ bh-mail not started: {type(exc).__name__}: {one_line(str(exc), 160)}")
+        return None
+
+
+def stop_mail(server, say=None) -> None:
+    if server is None:
+        return
+    try:
+        server.stop()
+    except Exception as exc:  # noqa: BLE001
+        if say:
+            say(f"  ⚠ bh-mail not stopped cleanly: {type(exc).__name__}")
+
+
+# ------------------------------------------------------------------ missions (T17)
+def continue_prompt(mission: dict | None) -> str:
+    """The nudge of a session: the mission's own on a narrow mission, the generalist one otherwise."""
+    return MISSION_CONTINUE_PROMPT if mission is not None and mission.get("kind") != "free" else CONTINUE_PROMPT
+
+
+def draw_mission(board: Board, scope: Scope, say) -> dict | None:
+    """The mission of this segment with BH_MISSIONS=1, None otherwise (and when the draw fails: the segment is then
+    the generalist one)."""
+    if not missions.enabled():
+        return None
+    try:
+        missions.ensure(board)
+        return missions.next(board, scope)
+    except Exception as exc:  # noqa: BLE001 (an experiment: it never stops a segment)
+        say(f"  ⚠ missions: no draw ({type(exc).__name__}: {one_line(str(exc), 160)}): generalist segment")
+        return None
+
+
+def split_notes(path: Path, cutoff: float, tmp: Path) -> tuple[Path, Path]:
+    """The rotated notes file in two, host side: lines written before `cutoff`, then the others (their `ts`)."""
+    old, new = [], []
+    try:
+        lines = path.read_text(errors="replace").splitlines(keepends=True)
+    except OSError:
+        lines = []
+    for ln in lines:
+        try:
+            ts = json.loads(ln).get("ts")
+        except (ValueError, AttributeError):
+            ts = None
+        recent = isinstance(ts, int | float) and not isinstance(ts, bool) and ts >= cutoff
+        (new if recent else old).append(ln if ln.endswith("\n") else ln + "\n")
+    a, b = tmp / "older.jsonl", tmp / "recent.jsonl"
+    a.write_text("".join(old))
+    b.write_text("".join(new))
+    return a, b
+
+
+def extend_mission(board: Board, scope: Scope, res: SegmentResult, mission: dict, stopper: StopWatcher | None) -> int:
+    """The host's one extension of a mission (T17): the notes so far ingested (the last EXTENSION_RECENT_TURNS turns
+    apart, to count their anchored facts), then missions.extension_due. Returns the turns added, 0 for none."""
+    import tempfile
+
+    prog = scope.program
+    if stopper is not None:  # a stop note in the lines about to move still fires
+        stopper.poll()
+    turns = res.turn_log
+    n = missions.EXTENSION_RECENT_TURNS
+    ts = turns[-n].get("ts") if len(turns) >= n else None
+    cutoff = float(ts) if isinstance(ts, int | float) and not isinstance(ts, bool) else 0.0
+    rotated = rotate_notes(prog, res.run_id, f"{res.legs}-ext")
+    with tempfile.TemporaryDirectory(prefix="bh-notes-") as d:
+        older, recent = split_notes(rotated, cutoff, Path(d))
+        f1, fi1, b1 = ingest.notes(board, prog, res.run_id, older, scope)
+        mark = last_fact_id(board)
+        f2, fi2, b2 = ingest.notes(board, prog, res.run_id, recent, scope)
+    res.new_facts += f1 + f2
+    res.new_findings += fi1 + fi2
+    res.new_blockers += b1 + b2
+    grounded = board.rows(
+        "SELECT COUNT(*) AS n FROM facts WHERE program=? AND run_id=? AND id>? AND grounded=1", prog, res.run_id, mark
+    )[0]["n"]
+    if not missions.extension_due(board, prog, mission, res.run_id, grounded):
+        return 0
+    return missions.extension_turns(mission)
+
+
 # ------------------------------------------------------------------ segment
 def run_segment(
     scope_file: Path,
@@ -2457,6 +2681,8 @@ def run_segment(
     board = board or Board()
     identity.ensure(board)
     check_automation(scope)
+    if (why := sv.cost_capped(board, scope)) is not None:  # T50: no segment starts past the program's cost cap
+        raise ProgramNotReady(scope.program, ["cost_cap_usd"], why)
     for name in (stack.GATE, stack.AGENT):
         if not stack.container_running(name):
             raise SystemExit(f"container {name} is not running — start the stack with `bh up`")
@@ -2521,9 +2747,13 @@ def _run_locked(
     except OSError as exc:
         print(f"retention: {exc}", file=sys.stderr)
     activate_scope(scope_file)
+    chain_intents(board, prog)  # T29: findings judged since the last segment (`bh verify`) name their chains
+    mission = draw_mission(board, scope, say)  # T17, BH_MISSIONS=1: drawn by code from the board
     hunt_session = session
     session = None
-    if resume:  # T9: a run that left the sandbox is never resumed: a fresh session from the board instead
+    if resume and mission is not None:  # a mission starts from a fresh context
+        say(f"  ↺ {prog}: a mission starts a fresh session, no resume")
+    elif resume:  # T9: a run that left the sandbox is never resumed: a fresh session from the board instead
         session = resumable(board, prog)
         if session is None and board.last_session(prog):
             say(f"  ↺ {prog}: the last run sent requests with effects: fresh session from the board, no resume")
@@ -2536,6 +2766,8 @@ def _run_locked(
         preflight=json.dumps(preflight, sort_keys=True) if preflight is not None else None,
         early_stop=0,
     )
+    if mission is not None:
+        board.run_set(run_id, mission=missions.dumps(mission))
     skills = allowed_skills(scope)  # D18: None while lot C's skills are not there (the cards path)
     clean_sandbox(prog, sandbox_home(run_id), skills)
     # before the prompt is written: a recipe identity without a live session is left out of it
@@ -2595,10 +2827,23 @@ def _run_locked(
         shape=shape,
         skills=skills,
     )
+    if mission is not None:  # the setup keeps the operator's budget; the mission's is the segment's (T17)
+        max_turns = mission["turns"]
     # W2: the agent of this segment is born from the setup; its memory is the `## Lineage` block of its task
-    agent = lineage_hooks.start(board, scope, run_id, digest, parent_no=lineage_parent, mode=lineage_mode)
+    agent = lineage_hooks.start(
+        board,
+        scope,
+        run_id,
+        digest,
+        parent_no=lineage_parent,
+        mode=lineage_mode,
+        mission=missions.dumps(mission) if mission is not None else None,
+    )
     res = SegmentResult(program=prog, run_id=run_id, session_id=session, preflight=preflight, agent=agent)
+    mail = None
     try:
+        mail = start_mail(scope, run_id, say)  # lot H, next to the recall server: bh-mail for this segment
+        extra = {**({"mission": mission} if mission is not None else {}), **({"mail": True} if mail else {})}
         block = lineage_hooks.task_block(board, scope, agent)
         task = (
             lineage_task(
@@ -2609,6 +2854,7 @@ def _run_locked(
                 cards=segment_guides(scope, model, cards),
                 refused=refused,
                 **shape,
+                **extra,
             )
             + harness
             + "".join(f"\n\n{line}" for line in first_lines)
@@ -2618,6 +2864,7 @@ def _run_locked(
         lineage_hooks.remember(agent, system_prompt=system_prompt, task=task)
         write_recipients(scope, say)
     except BaseException:
+        stop_mail(mail, say)
         lineage_hooks.close(board, scope, res.agent, run_id, "error")
         raise
     log_path = paths.run_log(run_id, prog)
@@ -2627,6 +2874,7 @@ def _run_locked(
         f"▶ run {run_id} · {scope.platform}/{prog} · model={model} effort={effort or 'default'} · "
         f"max {max_turns} turns / {minutes:g} min"
         + (f" · resume {session[:8]}" if session else "")
+        + (f" · mission {mission['kind']} {mission.get('vuln_class') or ''}".rstrip() if mission is not None else "")
         + (f" · {'skills' if skills is not None else 'cards'} {', '.join(guides)}" if guides else "")
     )
 
@@ -2634,7 +2882,9 @@ def _run_locked(
     prompt, timed_out, next_session = task, False, session
     limit, max_legs = segment_limits(scope)
     events_at = events_size()  # the relay's journal of this segment starts here
-    set_active_run(run_id, prog, relay_budget(max_turns))
+    set_active_run(run_id, prog, relay_budget(max_turns + missions.extension_turns(mission)))
+    canary_at = planted_canary_at(prog)  # lot B: BH_CANARY_AT for every leg
+    extended = 0  # turns the host added to the mission (T17), once
     # the agent's sessions are kept alive while it hunts (renewal before expiry and on session-dead)
     keeper = SessionKeeper(scope, board.path, run_id, identities, say, events_offset=events_at).start()
     # third-party data or server-side execution: push, stop, park (audit I11)
@@ -2642,6 +2892,8 @@ def _run_locked(
     try:
         with open(log_path, "x", buffering=1) as log:  # never overwrite another run's log
             res._log = log  # decisions go through this handle while it is open
+            if mission is not None:
+                record_decision(res, "mission")
             while res.legs < max_legs and not stopper.triggered:
                 res.legs += 1
                 if res.legs > 1:  # whatever the previous leg planted goes before the next one loads it
@@ -2661,6 +2913,7 @@ def _run_locked(
                     effort=effort,
                     session=next_session,
                     identities=identities,
+                    canary_at=canary_at,
                 )
                 if watcher is not None:
                     watcher.start()
@@ -2713,6 +2966,27 @@ def _run_locked(
                 )
                 say(f"  ◆ leg {res.legs}: {len(leg_turns)} turns, context max {max_ctx} / last {last_ctx} tokens")
                 left_turns, left_s = max_turns - res.turns, deadline - time.monotonic()
+                if (  # T17: the mission's budget is spent; the host alone decides one extension
+                    mission is not None
+                    and not extended
+                    and res.session_id
+                    and not timed_out
+                    and res.status in ("ok", "max_turns")
+                    and (res.status == "max_turns" or left_turns < MIN_LEFT_TURNS)
+                    and left_s >= MIN_LEFT_S
+                    and not stopper.poll()
+                    and (extended := extend_mission(board, scope, res, mission, stopper))
+                ):
+                    max_turns += extended
+                    left_turns = max_turns - res.turns
+                    max_legs = max(max_legs, res.legs + 1)
+                    res.status = "ok"
+                    board.run_set(run_id, mission=missions.dumps({**mission, "extended": extended}))
+                    record_decision(res, "extension")
+                    say(f"  ⊕ mission extended by the host: +{extended} turns")
+                    prompt = continue_prompt(mission).format(turns=left_turns, minutes=int(left_s // 60))
+                    next_session = res.session_id
+                    continue
                 if (
                     stopper.poll()
                     or timed_out
@@ -2772,6 +3046,7 @@ def _run_locked(
                             refused=refused,
                             rotated=True,
                             **shape,
+                            **extra,
                         )
                         + harness
                         + operator
@@ -2780,7 +3055,7 @@ def _run_locked(
                 else:
                     record_decision(res, "nudge")
                     say(f"  ↻ stopped early ({res.turns}/{max_turns} turns): nudging the same session to continue")
-                    prompt = CONTINUE_PROMPT.format(turns=left_turns, minutes=int(left_s // 60))
+                    prompt = continue_prompt(mission).format(turns=left_turns, minutes=int(left_s // 60))
                     prompt += f"\n\n{new_cards}" if new_cards else ""
                     next_session = res.session_id
                 if stopped_early:
@@ -2795,6 +3070,7 @@ def _run_locked(
         with signals_ignored():
             keeper.stop()
             stopper.stop()
+            stop_mail(mail, say)
             stopped = isinstance(exc, KeyboardInterrupt)
             res.status = "stopped" if stopped else "error"
             note = "stopped by operator" if stopped else f"harness error: {exc!r}"
@@ -2812,6 +3088,7 @@ def _run_locked(
     with signals_ignored():
         keeper.stop()
         stopper.stop()
+        stop_mail(mail, say)
         stopper.poll()  # a stop note written as the last leg ended
         set_active_run(None)
         stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
@@ -2849,11 +3126,16 @@ def _run_locked(
             # sessions first: one the gate saw die (or a false mark) is refreshed before the replay leans on it
             refresh_identities(board, scope, run_id, say)
             say(f"▶ verifying {pending} finding(s) with {judge}")
+            statuses = {
+                r["id"]: r["status"] for r in board.rows("SELECT id, status FROM findings WHERE program=?", prog)
+            }
             set_active_run(run_id, prog)  # the verifier's requests are this run's traffic too
             try:
                 verify_pending(board, scope, run_id=run_id, model=judge, effort=effort, say=say)
             finally:
                 set_active_run(None)
+            # lots F and E on the findings this verification confirmed, then their chains (T29)
+            after_verification(board, scope, statuses, say)
         # D40: the endpoint requests of the hunt go to the judge (same model, no tool, no network)
         if res.status not in ("quota", "parked") and not res.quota_claimed:
             review_requests_safe(board, scope, run_id=run_id, model=model, effort=effort, say=say)
