@@ -16,7 +16,7 @@ flowchart LR
     VER --> BOARD
   end
   subgraph AGENT["agent container · Kali · sandbox network"]
-    CC["claude -p<br/>hooks · builtins · bh-note"]
+    CC["claude -p<br/>hooks · builtins · bh-note<br/>MCP stdio · skills"]
   end
   subgraph GATE["gate container · mitmproxy · the only one with egress"]
     POL["policy<br/>scope · methods · ports<br/>rate · ids · scanner guard"]
@@ -46,7 +46,7 @@ the module map.
 | Program rules | gate + host | Rate limit with backoff on 429, 503 and WAF answers. Enumeration is capped: more than 6 distinct ids in the path of one normalized route in 10 min are refused. Bodies are capped at 1 MiB. Where a program forbids scanners, 25 not-found answers in 5 min pause the origin. |
 | Credentials and quota | gate | The Claude OAuth token exists only in the gate. The relay serves only the agent container, only the calls Claude Code makes, only while a run is active, and at most a request budget per segment. Identity sessions are injected by the gate. Logs and PoCs are redacted by `bh.redact`. |
 | Unknown rules | runner | A real program runs only once a human has set `automation_allowed` and `scanners_allowed` in its scope file. |
-| Method | sandbox hooks (an aid) | Hand-made HTTP to an origin is refused until the mapping tools have run on it. One tool table serves the scanner ban and the metrics. |
+| Method | sandbox hooks (an aid) | Hand-made HTTP to an origin is refused until the mapping tools have run on it. One tool table serves the scanner ban and the metrics. The hooks see `Bash` and every `mcp__*` tool, classified the same way: an unclassified MCP tool is refused, and the judge gets none. |
 | False positives | host verifier | Stage A replays the structured `proof.json` twice through the gate. The control must be the attack's twin, and an answer to it that satisfies the attack disproves the proof. Stage B runs a fresh Opus judge as its own Unix user, with a clean HOME, after every hunter process has been killed. Its verdict counts only with a nonce given to that process alone. `verified` requires both stages. |
 | Isolation between runs | runner | Each session starts with no process, HOME or CLAUDE.md from the previous one. A segment reaches only its own program's work directory. |
 
@@ -76,7 +76,11 @@ flowchart LR
 | `src/bh/agent/` | Code that runs **inside** the sandbox (stdlib only): file contract, tool table, builtins, hooks, `bh-note`, proof replay |
 | `src/bh/runner/` | One segment (`run.py`), board ingestion (`ingest.py`), doctrine (`prompt.py`), supervisor |
 | `src/bh/verify.py` | Two-stage verifier, deduplication, triager PoC |
-| `src/bh/classes.py`, `src/bh/cards/` | Vulnerability classes (aliases, signals, proof standard) and 12 method cards |
+| `src/bh/classes.py`, `src/bh/cards/` | Vulnerability classes (aliases, signals, proof standard) and 24 method cards |
+| `src/bh/skills/` | Skills (W3): one method per class or surface, `<name>/SKILL.md`, loaded by the agent on demand in place of pinned cards |
+| `src/bh/agent/mcp/` | Sandbox MCP server `bh` (W3): the builtins as 12 typed tools over stdio, started by `bh-agent mcp bh` |
+| `src/bh/agent/hexstrike/` | Sandbox MCP server `hexstrike` (W3): HexStrike's tool table behind three meta-tools, no shell, started by `bh-agent mcp hexstrike` |
+| `src/bh/lineage/` | Lineage (host side): numbered agents, the memory they hand on in `board.sqlite`, `bh-recall` search |
 | `src/bh/assets.py` | Asset graph (hosts, origins, endpoints, coverage, tests) built from the sandbox and the gate |
 | `src/bh/redact.py` | The single definition of "sensitive" (credential headers and keys, personal data, JWTs) |
 | `src/bh/board/`, `src/bh/ui/` | SQLite board, and the web UI (stdlib server, CSP, HMAC session) |
