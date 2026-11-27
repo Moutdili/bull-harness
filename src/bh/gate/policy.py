@@ -18,6 +18,11 @@ Classes of destination:
             only, the TLS never intercepted (addon: ignore_hosts), nothing of ours inside, bounded
             (PassthroughGuard); a decrypted request to it is refused. Own rate limit, public IPs only, never a test
             (flows class `support`, outside the asset graph and the counts).
+- docs    : library documentation (contract.DOCS_API, Context7, D24): GET/HEAD on the sheet's read routes and
+            parameters only, on 443, public IPs only; no cookie, no Authorization, no identity (refused when sent), no
+            program header (the addon keeps DOCS_HEADERS only); DOCS_RPM per minute, the next refused; never a name of
+            the scope, a canary, a URL, a path, an address nor an identity in the query (docs_query_ok: "scope name in a
+            docs query"). The answer is data. Flows class `docs`, never a test.
 - payload : the scope's `payload_hosts` (D27, O28): data-free hosts the hunter may cite and load (CORS, redirects,
             an image) without touching a real third party. GET/HEAD/OPTIONS without body from any sandbox client, on
             80/443, public IPs only, no cookie, no identity, no program header, the program's own rate; every request
@@ -48,18 +53,27 @@ import json
 import os
 import re
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urljoin, urlsplit
 
 from bh.agent.contract import (
     API_PATH,
+    DOCS_API,
+    DOCS_LIBRARY_ID,
+    DOCS_QUESTION_MAX,
+    DOCS_REASON,
+    GENERIC_LABELS,
     IDENTITY_ONLY_METHODS,
     PASSIVE_DENY_PATHS,
+    docs_text_why,
+    is_docs,
     is_passive,
     origin,
+    own_labels,
     path_key,
 )
 from bh import redact
@@ -67,6 +81,7 @@ from bh.gate import recipients
 from bh.scope import Decision, Scope, check, check_resolved, load_scope
 from bh.scope import extra as scope_extra
 from bh.scope.enforce import browser_only, check_support_resolved, support_entry
+from bh.scope.psl import is_public_suffix
 
 # Upstream of the relay (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 removes telemetry hosts).
 SYSTEM_HOSTS = ("api.anthropic.com",)
@@ -122,6 +137,20 @@ WAF_MARKERS = re.compile(
 )
 WAF_STATUS = (403, 429, 503)
 WAF_SCAN_BYTES = 64 << 10
+# D24: library documentation (contract.DOCS_API, Context7, anonymous). Requests per minute, every client together, a
+# rate of its own (never the targets'); the (DOCS_RPM+1)-th of a minute is refused, not delayed. BH_DOCS_RPM overrides.
+DOCS_RPM = 10
+DOCS_METHODS = frozenset({"GET", "HEAD"})
+# headers a docs request keeps (the addon drops every other one and sets its own User-Agent): nothing of ours leaves
+DOCS_HEADERS = frozenset({"host", "accept", "accept-encoding", "accept-language", "connection"})
+DOCS_USER_AGENT = "bh-docs"
+_DOCS_VALUES = {
+    "type": re.compile(r"txt|json"),
+    "fast": re.compile(r"true|false"),
+    "language": re.compile(r"[A-Za-z0-9 _+#.-]{1,40}"),
+    "version": re.compile(r"[A-Za-z0-9._+-]{1,40}"),
+}
+DOCS_DECODE_ROUNDS = 3  # %-decoding passes over the URL; still encoded after them: refused
 
 
 def _now() -> float:
@@ -170,7 +199,7 @@ def is_public_ip(ip: str) -> bool:
 @dataclass
 class Verdict:
     allowed: bool
-    klass: str  # system | passive | target | support | payload | deny
+    klass: str  # system | passive | docs | target | support | payload | deny
     reason: str
     rule: str | None = None
     support: str | None = None  # kind of a `support` verdict: "auth" | "assets" | "sso" | "passthrough"
@@ -228,6 +257,8 @@ class Policy:
     base_scope: Scope | None = None  # the scope file as loaded, before the approved prefixes (D40)
     extra_sig: object = None  # signature of the scope-extra file merged into `scope`
     on_event: Callable[[dict], None] | None = None  # journal hook (the addon's events log); None: not journaled
+    docs_rpm: int = field(default_factory=lambda: int(_env_num("BH_DOCS_RPM", DOCS_RPM)))
+    docs_seen: deque = field(default_factory=deque)  # times of the docs requests let through in the last minute
 
     @property
     def state_dir(self) -> Path:
@@ -330,6 +361,8 @@ class Policy:
             return _web_port(v, port) or (None if browser else self._waf_cooldown(host, v)) or v
         if is_passive(host):
             return Verdict(port == 443, "passive" if port == 443 else "deny", f"passive source {host}")
+        if is_docs(host):
+            return Verdict(port == 443, "docs" if port == 443 else "deny", f"docs source {host}")
         if self.is_payload(host):
             if port not in (80, 443):
                 return deny(f"payload host {host}: port {port} (80 and 443 only)")
@@ -474,9 +507,34 @@ class Policy:
             if any(("/" + path).startswith(p) for p in PASSIVE_DENY_PATHS.get(host.lower(), ())):
                 return deny(f"passive source {host}: path not allowed")
             return Verdict(True, "passive", f"passive source {host}")
+        if is_docs(host):
+            return self._docs_request(
+                url, host, method, host_header=host_header, body_len=body_len, identity=identity, cookie=authenticated
+            )
         if self.is_payload(host):
             return _payload_request(url, host, method, host_header=host_header, body_len=body_len)
         return deny(self.scope_error or "not in scope")
+
+    def _docs_request(
+        self, url: str, host: str, method: str, *, host_header: str | None, body_len: int, identity, cookie: bool
+    ) -> Verdict:
+        """D24: a request to the documentation source. Refused unless every rule holds (policy docstring); the
+        rate is counted last, on a request that would otherwise pass."""
+        if host_header and host_header.lower().rstrip(".") != host.lower().rstrip("."):
+            return deny("docs source with a different Host header")
+        if method not in DOCS_METHODS or body_len:
+            return deny(f"docs source {host}: GET/HEAD without body only, not {method}")
+        if identity or cookie:
+            return deny(f"docs source {host}: no identity, no cookie, no Authorization")
+        if why := docs_query_why(url, None, self.scope):
+            return deny(why, "docs")
+        now = _now()
+        while self.docs_seen and self.docs_seen[0] <= now - 60:
+            self.docs_seen.popleft()
+        if len(self.docs_seen) >= self.docs_rpm:
+            return deny(f"docs rate: over {self.docs_rpm} requests per minute", "docs")
+        self.docs_seen.append(now)
+        return Verdict(True, "docs", f"docs source {host}")
 
     def _support_request(
         self,
@@ -595,8 +653,8 @@ class Policy:
         to the gate itself (loopback, its own addresses), whatever the scope."""
         if is_self_address(ip, self.local_ips):
             return deny(f"{host} resolves to the gate itself ({ip})", "self")
-        if is_system(host) or is_passive(host):
-            klass = "system" if is_system(host) else "passive"
+        if is_system(host) or is_passive(host) or is_docs(host):
+            klass = "system" if is_system(host) else "passive" if is_passive(host) else "docs"
             ok = is_public_ip(ip)
             return Verdict(ok, klass if ok else "deny", "non-target" if ok else f"{host} resolves to non-public {ip}")
         self.reload()
@@ -627,7 +685,7 @@ class Policy:
         its host, which is paused after WAF_LIMIT of them within WAF_WINDOW_S."""
         now = _now()
         self.backoff_until = now + BACKOFF_SECONDS
-        if not (waf and host) or is_system(host) or is_passive(host):  # only targets are ever paused
+        if not (waf and host) or is_system(host) or is_passive(host) or is_docs(host):  # only targets are paused
             return
         key = _host_key(host)
         for h in [h for h, until in self.host_blocked_until.items() if until <= now]:  # bounded memory
@@ -693,6 +751,108 @@ class Policy:
 
     def ws_end(self, fid: str) -> WsGuard | None:
         return self.ws_live.pop(fid, None)
+
+
+# ------------------------------------------------------------------ D24: what a docs query may say
+_DOCS_NAMES: dict[tuple, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+
+def docs_names(scope: Scope) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(host names, words) a docs query must not hold. Hosts: every host a rule of the scope names (in and out of
+    scope, browser_only, support, the rule pages); payload hosts are left out (data-free by construction, D27). Words:
+    the hosts' own labels (contract.own_labels, public suffix excluded), the program's name and its parts, the
+    identities' names."""
+    key = (scope.program, scope.digest, tuple(r.value for r in scope.in_scope))  # approved prefixes too (D40)
+    if (hit := _DOCS_NAMES.get(key)) is not None:
+        return hit
+    hosts: list[str] = []
+    for rule in (*scope.in_scope, *scope.out_of_scope, *scope.browser_only, *(s.rule for s in scope.support)):
+        if rule.host:
+            hosts.append(rule.host.lower().removeprefix("*."))
+    for u in scope.rules_url:
+        with contextlib.suppress(ValueError):
+            if h := urlsplit(u).hostname:
+                hosts.append(h.lower())
+    words: list[str] = []
+    for h in hosts:
+        words += own_labels(h, is_public_suffix)
+    program = scope.program.lower()
+    words += [program, *(p for p in re.split(r"[^a-z0-9]+", program) if p not in GENERIC_LABELS)]
+    words += [str(i.get("name", "")).lower() for i in scope.identities]
+    out = (tuple(dict.fromkeys(hosts)), tuple(dict.fromkeys(w for w in words if len(w) >= 3)))
+    if len(_DOCS_NAMES) > 64:
+        _DOCS_NAMES.clear()
+    _DOCS_NAMES[key] = out
+    return out
+
+
+def _decoded(text: str, rounds: int = DOCS_DECODE_ROUNDS) -> str | None:
+    """`text` %-decoded (and `+` as a space) until it no longer changes, NFKC-normalized; None if still encoded after
+    `rounds` passes."""
+    for _ in range(rounds):
+        new = unquote_plus(text)
+        if new == text:
+            return unicodedata.normalize("NFKC", text)
+        text = new
+    return None if unquote_plus(text) != text else unicodedata.normalize("NFKC", text)
+
+
+def docs_query_why(url: str, body: bytes | None, scope: Scope | None) -> str | None:
+    """Why a request to the documentation source may not leave, None when it may. Fail closed: no scope, a body, an
+    unreadable or other URL, a route or a parameter off the sheet, a value off its shape. Then the whole decoded URL
+    holds no name of the scope nor a canary (DOCS_REASON), and each free-text value (the question, a library name)
+    follows contract.docs_text_why: at most DOCS_QUESTION_MAX characters, no URL, no path of more than one segment,
+    no e-mail address, no identity name."""
+    if scope is None:
+        return "docs query: no active scope"
+    if body:
+        return "docs query: a body"
+    try:
+        p = urlsplit(url)
+        port = p.port
+    except ValueError:
+        return "docs query: unreadable URL"
+    if p.scheme != "https" or port not in (None, 443) or p.username or p.password or p.fragment:
+        return "docs query: https on 443 only, no credentials, no fragment"
+    if not is_docs(p.hostname or ""):
+        return "docs query: not the documentation host"
+    allowed = (DOCS_API.get("params") or {}).get(p.path)
+    if allowed is None:
+        return f"docs query: {p.path[:60]!r} is not a read route of the documentation API"
+    text = _decoded(url)
+    if text is None:
+        return "docs query: encoded more than twice"
+    hosts, words = docs_names(scope)
+    if docs_text_why(text, hosts=hosts, words=words, max_len=1 << 20) == DOCS_REASON:
+        return DOCS_REASON
+    try:
+        pairs = parse_qsl(p.query, keep_blank_values=True, strict_parsing=bool(p.query), max_num_fields=12)
+    except ValueError:
+        return "docs query: unreadable query string"
+    seen: dict[str, int] = {}
+    for k, raw in pairs:
+        if k not in allowed:
+            return f"docs query: parameter {k[:30]!r} is not one of {list(allowed)}"
+        seen[k] = seen.get(k, 0) + 1
+        if seen[k] > (4 if k == "library" else 1):
+            return f"docs query: parameter {k!r} repeated"
+        v = _decoded(raw)
+        if v is None:
+            return "docs query: encoded more than twice"
+        if k == "libraryId" or (k == "library" and v.startswith("/")):
+            if len(v) > DOCS_QUESTION_MAX or not DOCS_LIBRARY_ID.fullmatch(v):
+                return f"docs query: {k} is a library id /owner/repo[/version]"
+        elif k in _DOCS_VALUES:
+            if not _DOCS_VALUES[k].fullmatch(v):
+                return f"docs query: {k} {v[:40]!r} off its shape"
+        elif why := docs_text_why(v, hosts=hosts, words=words):
+            return why
+    return None
+
+
+def docs_query_ok(url: str, body: bytes | None, scope: Scope | None) -> bool:
+    """D24: may this request go to the documentation source? See docs_query_why (its reason is what the gate logs)."""
+    return docs_query_why(url, body, scope) is None
 
 
 def protected_rule(url: str, extra=()) -> str | None:

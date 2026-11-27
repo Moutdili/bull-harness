@@ -18,6 +18,8 @@ max_rps: 2
 # traffic, not automation: keep the message rate low, one conversation at a time.
 websockets: true
 forbidden_vulns: [dos]
+# D34 (Mio): the prompt-injection skill is pinned for the Opus and Mythos hunts (bh.classes.pinned_skills)
+pin_for_models: {prompt-injection: [opus, mythos]}
 in_scope:
   - {value: "copilot.microsoft.com", note: "target (redirects to copilot.com)"}
   - {value: "copilot.com", note: "target: Copilot consumer web"}

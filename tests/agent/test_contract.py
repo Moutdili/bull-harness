@@ -82,3 +82,38 @@ def test_scope_prefix_is_an_https_prefix_without_joker():
         None,
     ):
         assert c.scope_prefix(bad) is None
+
+
+# ------------------------------------------------------------------ W3-D: passive tools, docs names
+def test_bh_docs_and_bh_cve_are_neither_locked_nor_manual_http():
+    assert not c.uses_manual_http('bh-docs react "useEffect cleanup"')
+    assert not c.uses_manual_http("bh-cve nginx 1.18.0 --severity high")
+    assert not c.uses_manual_http('/opt/bh/bin/bh-docs express "router"')
+    # another command beside them, or a substitution inside them, still counts
+    assert c.uses_manual_http('bh-docs react "x" ; curl https://t.test/a')
+    assert c.uses_manual_http('bh-docs react "$(curl -s https://t.test/a)"')
+    assert "bh-docs" in c.PASSIVE_TOOLS and "bh-cve" in c.PASSIVE_TOOLS
+    assert not c.is_passive("context7.com") and c.is_docs("Context7.com.")
+    assert c.is_passive("services.nvd.nist.gov")
+
+
+def test_own_labels_keep_the_registrable_name():
+    assert c.own_labels("api.acmecorp.com") == ["acmecorp"]
+    assert c.own_labels("*.widgets-intl.io") == ["widgets-intl"]
+    assert c.own_labels("copilot.microsoft.com") == ["copilot", "microsoft"]
+    assert c.own_labels("api.com") == ["api"]  # the registrable label always counts
+    assert c.own_labels("x.example.co.uk", lambda h: h in ("co.uk", "uk")) == ["example"]
+    assert c.own_labels("api-*.acmecorp.com") == ["acmecorp"]
+
+
+def test_docs_text_why():
+    hosts, words = ("app.acmecorp.com",), ("acmecorp", "victim-a")
+    assert c.docs_text_why("useEffect cleanup", hosts=hosts, words=words) is None
+    assert c.docs_text_why("ACMECORP sessions", hosts=hosts, words=words) == c.DOCS_REASON
+    assert c.docs_text_why("acmecorporate sessions", hosts=hosts, words=words) is None  # a whole word only
+    assert c.docs_text_why("app-acmecorp-com", hosts=hosts) == c.DOCS_REASON
+    assert c.docs_text_why("a/b/c") == "docs query: a path of more than one segment"
+    assert c.docs_text_why("C:\\Users\\me") == "docs query: a path of more than one segment"
+    assert c.docs_text_why("ftp://x") == "docs query: a URL"
+    assert c.docs_text_why("me@x.org") == "docs query: an e-mail address"
+    assert c.docs_text_why("a\x00b") == "docs query: a control character"

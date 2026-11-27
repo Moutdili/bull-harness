@@ -53,6 +53,110 @@ PASSIVE_HOSTS = (
 # Paths refused even on a passive host (server-side fetch of an arbitrary URL).
 PASSIVE_DENY_PATHS = {"web.archive.org": ("/save",)}
 
+# Library documentation (D24, bh-docs): Context7, anonymous, read routes only (docs/research/context7-api.md). A class
+# of its own at the gate (`docs`), never passive and never a target: GET/HEAD on these exact paths, these parameters,
+# no cookie, no Authorization, no identity, no program header, DOCS_RPM per minute, and never a name of the scope in
+# the query (bh.gate.policy.docs_query_ok). /api/v3/fetch (fetches any URL for the caller) is deliberately absent.
+DOCS_API: dict = {
+    "host": "context7.com",
+    "search": "/api/v2/libs/search",  # libraryName, query -> {"results": [{"id", "title"}, ...]}
+    "context": "/api/v2/context",  # libraryId, query, type?, fast?, language?, version?
+    "params": {
+        "/api/v2/libs/search": ("libraryName", "query"),
+        "/api/v2/context": ("libraryId", "query", "type", "fast", "language", "version"),
+        "/api/v3/search": ("query", "library", "version", "language", "type"),
+    },
+}
+DOCS_REASON = "scope name in a docs query"
+DOCS_QUESTION_MAX = 200  # characters of one free-text parameter (the question, a library name)
+# libraryId as the sheet gives it: /owner/repo, /owner/repo/<version> or /owner/repo@<version>
+DOCS_LIBRARY_ID = re.compile(r"/[^/\s]+/[^/\s]+([/@][^/\s]+)?")
+# Labels too common to name a program (`api.x.com` names x, not api): skipped, except the label just before the public
+# suffix (the name someone registered), which always counts. Shorter than 3 characters: skipped too.
+GENERIC_LABELS = frozenset(
+    (  # noqa: SIM905 - a list of words reads better as one string
+        "www www1 www2 api apis app apps web m mobile cdn static assets img images media login auth account accounts "
+        "admin portal dev test staging stage prod beta mail email docs help support status blog shop store gateway gw "
+        "edge secure service services cloud online data files download downloads ws wss socket svc global int internal "
+        "public user users client clients partner partners my go sso id"
+    ).split()
+)
+# Commands that only read a third-party documentation or advisory source (never a target): neither locked by the
+# tool lock nor counted as manual HTTP (uses_manual_http).
+PASSIVE_TOOLS = ("bh-docs", "bh-cve", "/opt/bh/bin/bh-docs", "/opt/bh/bin/bh-cve")
+
+
+def is_docs(host: str) -> bool:
+    return bool(DOCS_API.get("host")) and host.lower().rstrip(".") == DOCS_API["host"]
+
+
+def own_labels(host: str, is_suffix=None) -> list[str]:
+    """Labels of `host` that name its owner: those before the public suffix (`is_suffix(name) -> bool`; default: the
+    last label only), minus GENERIC_LABELS and labels under 3 characters, the registrable label always kept. A label
+    holding a `*` (`api-*`) gives its fixed parts."""
+    labels = [x for x in host.lower().strip(".").removeprefix("*.").split(".") if x]
+    cut = len(labels) - 1
+    if is_suffix is not None:
+        cut = next((i for i in range(len(labels)) if is_suffix(".".join(labels[i:]))), len(labels))
+    out = []
+    for i, label in enumerate(labels[:cut]):
+        parts = [p.strip("-") for p in label.split("*")] if "*" in label else [label]
+        for p in parts:
+            if len(p) >= 3 and (i == cut - 1 or p not in GENERIC_LABELS):
+                out.append(p)
+    return out
+
+
+def _word_rx(name: str) -> re.Pattern:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])")
+
+
+def names_in(text: str, hosts=(), words=()) -> str | None:
+    """The first scope name found in `text` (lowercased by the caller or not): a full host name, also with its dots
+    and dashes dropped (`copilotmicrosoftcom`), or a word (a label, the program, an identity) as a whole word."""
+    low = text.lower()
+    compact = re.sub(r"[^a-z0-9]", "", low)
+    for raw in hosts:
+        h = raw.lower().strip(".").removeprefix("*.")
+        if "*" in h or not h:
+            continue
+        flat = re.sub(r"[^a-z0-9]", "", h)
+        if h in low or (len(flat) >= 6 and flat in compact):
+            return h
+    for raw in words:
+        w = raw.lower()
+        if len(w) >= 3 and _word_rx(w).search(low):
+            return w
+    return None
+
+
+_DOCS_URL = re.compile(r"[a-z][a-z0-9+.-]{0,20}:/{1,3}\S|(^|[^a-z0-9])www\.[a-z0-9-]|(^|\s)//[a-z0-9]", re.I)
+_DOCS_PATH = re.compile(r"/[^/\s]+/")  # /a/b, a/b/c, /a/: a path of more than one segment
+_DOCS_MAIL = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+", re.I)
+_DOCS_CANARY = re.compile(r"bh-?secret", re.I)
+
+
+def docs_text_why(text: str, *, hosts=(), words=(), max_len: int = DOCS_QUESTION_MAX) -> str | None:
+    """Why a free-text part of a docs query (the question, a library name) may not leave, None when it may. Rules,
+    the gate's and bh-docs's alike: no scope name (DOCS_REASON), no canary, at most `max_len` characters, no URL, no
+    path of more than one segment, no e-mail address. `words`: the scope's labels, program name and identity names."""
+    if _DOCS_CANARY.search(text) or CANARY_RE.search(text):
+        return DOCS_REASON
+    if names_in(text, hosts, words):
+        return DOCS_REASON
+    if len(text) > max_len:
+        return f"docs query: over {max_len} characters"
+    if _DOCS_URL.search(text):
+        return "docs query: a URL"
+    if _DOCS_PATH.search(text.replace("\\", "/")):
+        return "docs query: a path of more than one segment"
+    if _DOCS_MAIL.search(text):
+        return "docs query: an e-mail address"
+    if any(ord(ch) < 32 for ch in text):
+        return "docs query: a control character"
+    return None
+
+
 IDENTITY_HEADER = "X-BH-Identity"
 GATE_HEADER = "X-BH-Gate"  # set by the gate on its own refusals only (it strips it from target answers)
 LOCK_MARK = "[bh-lock]"  # prefix of every hook denial, counted by the runner
@@ -784,4 +888,8 @@ def uses_arsenal(cmd: str) -> bool:
 
 
 def uses_manual_http(cmd: str) -> bool:
+    """A command that hand-crafts HTTP to a URL. bh-docs and bh-cve (PASSIVE_TOOLS) read third-party sources through
+    the gate's own classes: their calls are left out (a substitution inside one still counts)."""
+    if any(t in cmd for t in PASSIVE_TOOLS):
+        cmd = without_commands(cmd, PASSIVE_TOOLS)
     return bool(_MANUAL.search(cmd)) and bool(urls_in(cmd))
