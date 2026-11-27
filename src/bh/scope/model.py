@@ -140,6 +140,8 @@ class Scope:
     # hub): the hunter drives that browser, it never talks to these paths itself (bh.gate.policy)
     browser_only: tuple[Rule, ...] = ()
     cards: tuple[str, ...] = ()  # card names always given to the hunter on this program (bh.cards, runner)
+    # D34: skills pinned for some model families only ((skill, (family, ...)), ...); read through `pin_for_models`
+    pins: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # T5: path regexes (case-insensitive, matched on the request path only) refused to every client, on top of
     # bh.gate.policy.PROTECTED_DEFAULT (sign-out, password and account changes, payment)
     protected_urls: tuple[str, ...] = ()
@@ -182,6 +184,12 @@ class Scope:
         return self.websockets is True
 
     @property
+    def pin_for_models(self) -> dict[str, list[str]]:
+        """D34: `{skill: [model family, ...]}` (`{prompt-injection: [opus, mythos]}`); {} when the scope says none.
+        bh.classes.pinned_skills reads it with the hunt's model."""
+        return {skill: list(families) for skill, families in self.pins}
+
+    @property
     def payload_hosts(self) -> list[str]:
         """Payload hosts (exact, normalized names); [] when the scope declares none."""
         return list(self.payload)
@@ -221,10 +229,12 @@ _TOP_KEYS = {
     "payload_hosts",
     "recipient_guard",
     "rules_url",
+    "pin_for_models",
 }
 _RULE_KEYS = {"type", "value", "note"}
 _SUPPORT_KEYS = {"value", "kind", "note", "type", "token_paths", "get_paths"}
 _CARD = re.compile(r"[a-z0-9-]+")
+_MODEL_FAMILY = re.compile(r"[a-z][a-z0-9-]{0,31}")  # opus, sonnet, mythos: lowercase, as the runner names them
 
 
 def support_pattern(rule: Rule) -> str:
@@ -468,6 +478,7 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
         support=support,
         browser_only=_browser_only(doc.get("browser_only"), origin),
         cards=tuple(dict.fromkeys(cards)),
+        pins=_pin_for_models(doc.get("pin_for_models"), origin),
         protected_urls=_protected_urls(doc.get("protected_urls"), origin),
         payload=_payload_names(doc.get("payload_hosts"), origin),
         recipient_guard=_recipient_guard(doc.get("recipient_guard", ...), origin),
@@ -484,6 +495,28 @@ def scope_from_dict(doc: dict[str, Any], origin: str = "<dict>") -> Scope:
     _browser_only_on_targets(scope, origin)
     _payload_apart(scope, origin)
     return scope
+
+
+def _pin_for_models(raw: Any, origin: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """D34: `pin_for_models: {<skill>: [<family>, ...]}`. A skill name has the cards' shape ([a-z0-9-]+), a family is
+    lowercase ([a-z][a-z0-9-]*), each list non-empty. Absent or null: no pin. Anything else is an error."""
+    if raw is None:
+        return ()
+    shape = "'pin_for_models' maps a skill name ([a-z0-9-]+) to a non-empty list of model families (lowercase)"
+    if not isinstance(raw, dict):
+        raise ScopeError(f"{origin}: {shape}")
+    out = []
+    for skill, families in raw.items():
+        if not isinstance(skill, str) or not _CARD.fullmatch(skill):
+            raise ScopeError(f"{origin}: {shape}; not the skill {str(skill)[:40]!r}")
+        if (
+            not isinstance(families, list)
+            or not families
+            or not all(isinstance(f, str) and _MODEL_FAMILY.fullmatch(f) for f in families)
+        ):
+            raise ScopeError(f"{origin}: {shape}; not {str(families)[:60]!r} for {skill!r}")
+        out.append((skill, tuple(dict.fromkeys(families))))
+    return tuple(out)
 
 
 def _protected_urls(raw: Any, origin: str) -> tuple[str, ...]:

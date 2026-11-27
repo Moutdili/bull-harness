@@ -36,6 +36,9 @@ The persistent browser (bh-browser, compose service BH_BROWSER_HOST=`browser`, r
   the request is refused ("identity bearer expired"), with one `bearer-expired` event per identity and minute.
 Payload hosts (scope `payload_hosts`, policy docstring): GET/HEAD/OPTIONS from any sandbox client, every Cookie and
 Authorization removed, no identity, no program header, flows class `payload`.
+Documentation (D24, contract.DOCS_API, policy docstring): GET/HEAD to Context7's read routes, judged by
+policy.docs_query_ok; only policy.DOCS_HEADERS are kept and the User-Agent is ours (no key, no Authorization, no
+program header ever added), flows class `docs`, never a test.
 
 Canaries (I1, bh.gate.canary): every request URL and body, response body and websocket frame (both ways) is searched
 for `BH-SECRET-<16 hex>` on its whole content (decoded, bounded to canary.SCAN_BYTES) before any truncation; each hit
@@ -123,6 +126,8 @@ from bh.accounts.expiry import jwt_exp
 from bh.agent.contract import GATE_HEADER, IDENTITY_HEADER, origin
 from bh.gate import canary, recipients, session
 from bh.gate.policy import (
+    DOCS_HEADERS,
+    DOCS_USER_AGENT,
     SYSTEM_HOSTS,
     Policy,
     Verdict,
@@ -137,6 +142,7 @@ from bh.gate.policy import (
 
 MAX_BODY = 16_384
 PUSHBACK_STATUS = (429, 503)
+_RECORDED = ("target", "passive", "support", "payload", "docs")  # classes whose answers (or errors) are journaled
 # R37: bh-browser's "not in scope" refusals (a page polling a host of no program: admin.microsoft.com once a second)
 # are journaled once per host and NOISE_WINDOW_S; the next line of that host carries `repeats`. Decisions unchanged.
 NOISE_WINDOW_S, NOISE_HOSTS_MAX = 60.0, 1024
@@ -970,6 +976,13 @@ class Gate:
                 self._label_identity(flow, identity)
             elif identity:
                 self._apply_identity(flow, identity, cookies_only=True)  # cookies only: no bearer, no refusal
+        elif v.klass == "docs":
+            # D24: nothing of ours reaches the documentation source: no identity, no cookie, no Authorization (the
+            # policy refused them), no program header, no header of the client's but DOCS_HEADERS, our own UA
+            flow.metadata["bh_identity"] = None
+            for k in {k.lower() for k in req.headers.keys()} - DOCS_HEADERS:  # noqa: SIM118 - mitmproxy Headers
+                req.headers.pop(k, None)
+            req.headers["User-Agent"] = DOCS_USER_AGENT
         elif v.klass in ("passive", "payload") or (v.klass == "support" and v.support == "assets"):
             # never applied off target: the journal must not claim it was. A payload host (D27) gets nothing of ours,
             # whoever asks (bh-browser's own cookies included)
@@ -1134,7 +1147,7 @@ class Gate:
         if flow.response is None or flow.metadata.get("bh_denied"):
             return
         flow.response.headers.pop(GATE_HEADER, None)  # only the gate's own refusals carry it
-        if flow.metadata.get("bh_class") not in ("target", "passive", "support", "payload"):
+        if flow.metadata.get("bh_class") not in _RECORDED:
             return
         resp = flow.response
         self._canary(flow, "response-body", resp.raw_content, encoding=resp.headers.get("content-encoding"))
@@ -1146,7 +1159,7 @@ class Gate:
             self._identity_cookies(flow)  # a rotated cookie of ours still goes to the jar, never to the client
             self._deny(flow, deny(why), "response")
             return
-        if flow.metadata.get("bh_class") == "payload":  # D27: one journal line (class payload), never a test
+        if flow.metadata.get("bh_class") in ("payload", "docs"):  # D27, D24: one journal line, never a test
             self._record(flow, flow.response.status_code)
             return
         if flow.metadata.get("bh_class") == "support":  # one journal line, never a test nor a WAF count
@@ -1196,7 +1209,7 @@ class Gate:
     @fail_closed
     def error(self, flow: http.HTTPFlow) -> None:
         """Requests that never got a response (timeouts, resets) are part of the audit trail too."""
-        if flow.metadata.get("bh_class") in ("target", "passive", "support", "payload") and flow.response is None:
+        if flow.metadata.get("bh_class") in _RECORDED and flow.response is None:
             self._record(flow, "error", str(flow.error)[:200] if flow.error else "error")
 
     def _record(self, flow: http.HTTPFlow, status, error: str | None = None) -> str:
